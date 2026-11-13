@@ -61,6 +61,7 @@ mod record;
 mod room;
 mod segment;
 mod waits;
+mod writes;
 
 pub use preparer::LogWait;
 #[cfg(test)]
@@ -88,6 +89,7 @@ use preparer::{PreparerTask, Told};
 use room::{Pad, Room};
 use segment::{Segments, Typed};
 use waits::{Look, Waits};
+use writes::Writes;
 
 #[cfg(test)]
 crate::thread::thread_local! {
@@ -95,6 +97,8 @@ crate::thread::thread_local! {
     pub(crate) static COPIED_IN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Turns of the flush taken on this thread.
     pub(crate) static TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The log's part callbacks and observers under way on this thread ([`PartDepth`]).
+    pub(crate) static PART_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Segments released on this thread.
     pub(crate) static SEGMENTS_RELEASED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Segment files opened by name on this thread ([`segment::Segments::open`]).
@@ -194,10 +198,15 @@ pub struct Log {
     input: CachePadded<AtomicBool>,
     /// Where the flush taking its turn writes from next: the turn's own.
     submitted: CachePadded<AtomicU64>,
-    /// Writes submitted and not yet retired: a place is taken at submission and given back at the
-    /// write's retirement ([`write_retired`](Self::write_retired)), never at its result's
-    /// publication. Moved by every write twice, so on a line of its own.
+    /// Writes submitted and not yet retired, the records of [`writes`](Self::writes) not at rest:
+    /// a place is taken with its record and given back when the record rests, at its last part's
+    /// retirement ([`part_retired`](Self::part_retired)), never at its result's publication. Moved
+    /// by every write twice, so on a line of its own.
     in_flight: CachePadded<AtomicUsize>,
+    /// The writes in flight, each a record its parts are written from (ASYNC1 D2d v1.4): a write's
+    /// bytes come from the block of a record published in place and where in it the write starts,
+    /// or, with no source, the ring.
+    writes: Writes<(Arc<AlignedBlock>, usize)>,
     /// Asked for by every commit, so on a line of its own.
     flushes: CachePadded<Solo>,
     /// The sync in flight, without durable writes.
@@ -268,6 +277,29 @@ pub(crate) struct Counts {
     pub(crate) force_raced: AtomicUsize,
     /// This many turns, the next ones taken, each ask for another inside themselves.
     pub(crate) ask_in_turns: AtomicUsize,
+    /// Whole writes landed.
+    pub(crate) landings: AtomicUsize,
+    /// The doorbell's rings.
+    pub(crate) rings: AtomicUsize,
+    /// Each part submitted, in order.
+    pub(crate) parts: crate::storage::atoll::locks::Mutex<Vec<PartNote>>,
+    /// The thread each part's callback ran on, in order.
+    pub(crate) delivered_on: crate::storage::atoll::locks::Mutex<Vec<String>>,
+}
+
+/// A part of a write as it was submitted: its record, where in the log it starts and how long it
+/// is, whether it is written from a published record's block, the writes in flight, the thread
+/// that submitted it and the log's part callbacks and observers under way there.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PartNote {
+    pub(crate) record: usize,
+    pub(crate) from: Lsn,
+    pub(crate) len: u64,
+    pub(crate) in_place: bool,
+    pub(crate) in_flight: usize,
+    pub(crate) thread: String,
+    pub(crate) depth: usize,
 }
 
 /// A test's holds at named points of the log's plans and units: the thread that passes a point
@@ -343,10 +375,6 @@ impl Drop for Admitted {
         }
     }
 }
-
-/// Where a write's bytes come from: the block of a record published in place and where in it the
-/// write starts, or, for `None`, the ring.
-type WriteSource = Option<(Arc<AlignedBlock>, usize)>;
 
 /// A log opened alone, and the executor of its own that steps its preparer, with no worker, its
 /// callers running it (DESIGN.md 22.7). The executor is the opener's, never the log's: a log owns
@@ -523,6 +551,7 @@ impl Log {
             input: CachePadded::new(AtomicBool::new(true)),
             submitted: CachePadded::new(AtomicU64::new(start)),
             in_flight: CachePadded::new(AtomicUsize::new(0)),
+            writes: Writes::new(config.writes_in_flight),
             flushes: CachePadded::default(),
             sync: CachePadded::default(),
             sync_members: AtomicUsize::new(0),
@@ -1341,8 +1370,8 @@ impl Log {
         }
         let (writes, unprepared) = self.plan_writes();
         drop(turn);
-        for (start, end, block) in writes {
-            self.submit_write(start, end, block);
+        for j in writes {
+            self.submit_part(j);
         }
         // Padding waits for a segment: the preparer's, made due by whoever sets the word first.
         if unprepared && self.preparation.need() {
@@ -1357,7 +1386,7 @@ impl Log {
     /// most one padding attempt, its padded block the plan's last; the in-place extents read only
     /// after the capture, locked once when there are any and passed once by a cursor; at most
     /// `writes_in_flight` writes.
-    fn plan_writes(&self) -> (Vec<(Lsn, Lsn, WriteSource)>, bool) {
+    fn plan_writes(&self) -> (Vec<usize>, bool) {
         let mut writes = Vec::new();
         if self.failed.load(Ordering::Acquire) {
             return (writes, false);
@@ -1455,14 +1484,37 @@ impl Log {
                 Some((s, ..)) => (end.min(chunk_end).min(segment_end).min(s), None),
                 None => (end.min(chunk_end).min(segment_end), None),
             };
+            // At most one chunk or one published block, so far below what a record counts; checked
+            // before the take, so a failure here leaves no record taken.
+            if u32::try_from(write_end - start).is_err() {
+                self.fail(CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "a log write longer than a record counts",
+                ));
+                break;
+            }
+            // A free record is there: one rests before its place is given back, and the count read
+            // above acquired that.
+            let Some(j) = self.writes.take() else {
+                self.fail(CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "a log write found no record at rest",
+                ));
+                break;
+            };
+            // SAFETY: taken here, and handed on only by its submission.
+            unsafe {
+                self.writes.with(j, |f| {
+                    f.start = start;
+                    f.end = write_end;
+                    f.source = from.map(|(block, s)| (block, (start - s) as usize));
+                    f.done = 0;
+                });
+            }
             self.in_flight.fetch_add(1, Ordering::AcqRel);
             #[cfg(test)]
             self.counts.writes.fetch_add(1, Ordering::Relaxed);
-            writes.push((
-                start,
-                write_end,
-                from.map(|(block, s)| (block, (start - s) as usize)),
-            ));
+            writes.push(j);
             start = write_end;
         }
         self.submitted.store(start, Ordering::Relaxed);
@@ -1480,30 +1532,46 @@ impl Log {
     /// Rings the log's doorbell (D1b §3.1), from a retirement observer before its request is
     /// uncounted, or from the unit itself (the sync submitter's hold, D1b §2).
     fn ring(&self) {
+        #[cfg(test)]
+        self.counts.rings.fetch_add(1, Ordering::Relaxed);
         self.segments.counted_io().ring_log();
     }
 
-    /// Writes `[start, end)`: from a record published in place, its block and where in it
-    /// `start` lies, or from the ring. Its retirement, before it is uncounted, lets its place
-    /// among the writes in flight go and rings the log's doorbell (D1b §2).
-    fn submit_write(self: &Arc<Self>, start: Lsn, end: Lsn, from: WriteSource) {
-        let segment = self.segments.number(start);
-        let file = self.segments.file(segment);
-        let buffer = match from {
-            Some((block, offset)) => block.region(offset, (end - start) as usize),
-            None => {
-                let (slot, offset) = self.slot(start);
-                slot.block.region(offset, (end - start) as usize)
-            }
+    /// Submits the next part of the write in record `j`, which this thread owns: what is not yet
+    /// written of it, from its block or the ring, at its place in its segment. A write lies within
+    /// one segment, so its rest does too. The part's callback is [`part_written`](Self::part_written)
+    /// and its retirement observer, before it is uncounted, [`part_retired`](Self::part_retired)
+    /// (D1b §2). Refused, nothing will retire it: the log fails and the record rests here, with no
+    /// ring, since a failed log plans nothing a ring would start (ASYNC1 D2d v1.4, #5137).
+    fn submit_part(self: &Arc<Self>, j: usize) {
+        #[cfg(test)]
+        self.note_part(j);
+        // SAFETY: owned by this thread: taken by its plan, or claimed by the unit's owed pass.
+        let (from, end, buffer) = unsafe {
+            self.writes.with(j, |f| {
+                f.told = false;
+                let from = f.start + u64::from(f.done);
+                let len = (f.end - from) as usize;
+                let buffer = match &f.source {
+                    Some((block, offset)) => block.region(offset + f.done as usize, len),
+                    None => {
+                        let (slot, offset) = self.slot(from);
+                        slot.block.region(offset, len)
+                    }
+                };
+                (from, f.end, buffer)
+            })
         };
+        let segment = self.segments.number(from);
+        let file = self.segments.file(segment);
         let me = self.held();
-        let len = end - start;
         let c = Completion::new_write(move |res| {
             if let Some(me) = me.upgrade() {
-                me.written(start, end, whole(len as usize, res));
+                me.part_written(j, res);
             }
         });
-        let at = start - self.segments.start(segment);
+        debug_assert!(end > from, "a part of a write with nothing left to write");
+        let at = from - self.segments.start(segment);
         let durable = self.durable_writes;
         let retired = self.held();
         let submitted = file.submit_then(
@@ -1517,27 +1585,63 @@ impl Log {
             },
             move || {
                 if let Some(me) = retired.upgrade() {
-                    me.write_retired();
+                    me.part_retired(j);
                 }
             },
         );
         if let Err(e) = submitted {
             self.fail(io_failure(&e));
+            self.rest_refused(j);
         }
     }
 
-    /// A write's callback: its landing recorded, and with durable writes the durable position
-    /// raised and its waiters woken. It submits and rings nothing (D1b §2).
-    fn written(
-        self: &Arc<Self>,
-        start: Lsn,
-        end: Lsn,
-        res: std::result::Result<(), CompletionError>,
-    ) {
-        if let Err(e) = res {
-            self.fail(e);
-            return;
+    /// A part's callback, for the request that owns record `j` until its observer: the bytes it
+    /// wrote added to what the write has written. The whole written, it lands, once: recorded,
+    /// and with durable writes the durable position raised and its waiters woken. A part that
+    /// wrote nothing, or more than it was asked, fails the log as a short write does. It submits
+    /// and rings nothing (D1b §2).
+    fn part_written(self: &Arc<Self>, j: usize, res: std::result::Result<i32, CompletionError>) {
+        #[cfg(test)]
+        let _delivering = PartDepth::enter();
+        #[cfg(test)]
+        self.counts.delivered_on.lock().push(
+            crate::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string(),
+        );
+        // SAFETY: the part's request owns the record until its observer, which runs after this.
+        let (start, end, done) = unsafe {
+            self.writes.with(j, |f| {
+                f.told = true;
+                (f.start, f.end, f.done)
+            })
+        };
+        let n = match res {
+            Ok(n) => n,
+            Err(e) => return self.fail(e),
+        };
+        let asked = end - start - u64::from(done);
+        let after = match u64::try_from(n) {
+            Ok(n) if n > 0 && n <= asked => u64::from(done) + n,
+            _ => return self.fail(CompletionError::ShortWrite),
+        };
+        // At most the write's length, which the take bounded by `u32::MAX`.
+        let Ok(after) = u32::try_from(after) else {
+            return self.fail(CompletionError::ShortWrite);
+        };
+        // SAFETY: as above.
+        unsafe { self.writes.with(j, |f| f.done = after) };
+        if u64::from(after) == end - start {
+            self.written(start, end);
         }
+    }
+
+    /// A whole write's landing: recorded, and with durable writes the durable position raised and
+    /// its waiters woken.
+    fn written(self: &Arc<Self>, start: Lsn, end: Lsn) {
+        #[cfg(test)]
+        self.counts.landings.fetch_add(1, Ordering::Relaxed);
         self.landed.complete(start, end);
         crate::race::point("log.written.landed");
         if self.durable_writes {
@@ -1546,12 +1650,93 @@ impl Log {
         }
     }
 
-    /// A write retired, before it is uncounted: its place among those in flight goes, and the
-    /// work that may now be owed rings the doorbell.
-    fn write_retired(self: &Arc<Self>) {
+    /// A part retired, before it is uncounted, for the request that owned record `j`. Written in
+    /// part, the log not failed: the record is owed to the IO thread's unit, which submits its next
+    /// part, and the doorbell rung, its place kept. Otherwise the record rests and its place goes.
+    /// A part retired untold, which no backend does for a write the log never aborts, fails the log.
+    fn part_retired(self: &Arc<Self>, j: usize) {
+        #[cfg(test)]
+        let _delivering = PartDepth::enter();
+        // SAFETY: owned by the part's request until this hands it on.
+        let (told, part_written) = unsafe {
+            self.writes.with(j, |f| {
+                (f.told, f.done > 0 && u64::from(f.done) < f.end - f.start)
+            })
+        };
+        if !told {
+            self.fail(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "a log write retired with no outcome",
+            ));
+        }
+        if part_written && !self.failed.load(Ordering::Acquire) {
+            self.writes.owe(j);
+            self.ring();
+            crate::race::point("log.part_retired.owed");
+            return;
+        }
+        self.rest(j);
+    }
+
+    /// Rests record `j`, owned by the caller, and gives its place back, then rings the doorbell:
+    /// from a part's observer, while its request still counts, or from the unit's owed pass.
+    fn rest(&self, j: usize) {
+        self.writes.rest(j);
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.ring();
         crate::race::point("log.write_retired.rang");
+    }
+
+    /// Rests record `j`, whose part was refused, after the log failed: its place given back, and
+    /// no ring (ASYNC1 D2d v1.4, #5137).
+    fn rest_refused(&self, j: usize) {
+        self.writes.rest(j);
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Notes the part of record `j` about to be submitted, for a test.
+    #[cfg(test)]
+    fn note_part(&self, j: usize) {
+        // SAFETY: called by the record's owner, before it submits.
+        let (from, end, in_place) = unsafe {
+            self.writes.with(j, |f| {
+                (f.start + u64::from(f.done), f.end, f.source.is_some())
+            })
+        };
+        self.counts.parts.lock().push(PartNote {
+            record: j,
+            from,
+            len: end - from,
+            in_place,
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            thread: crate::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string(),
+            depth: PART_DEPTH.with(|d| d.get()),
+        });
+    }
+
+    /// (Records at rest, records owed, writes in flight, each record's rests), for a test reading
+    /// them once nothing is in flight.
+    #[cfg(test)]
+    pub(crate) fn writes_for_test(&self) -> (u32, u32, usize, Vec<usize>) {
+        let (free, owed) = self.writes.counts();
+        (
+            free,
+            owed,
+            self.in_flight.load(Ordering::SeqCst),
+            self.writes.rests(),
+        )
+    }
+
+    /// Fails the log, as a write's or a sync's failure does, for a test.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&self) {
+        self.fail(CompletionError::IOError(
+            std::io::ErrorKind::Other,
+            "a test failed the log",
+        ));
     }
 
     /// The unit's sync start (D1b §4 step 1), for files that do not write durably: one take of the
@@ -1881,11 +2066,22 @@ impl Log {
 }
 
 impl LogWork for Log {
-    /// One unit of the log's follow-on work (D1b §4), on the IO thread: the sync start, for files
-    /// that do not write durably, then one flush turn. Whether more is owed.
+    /// One unit of the log's follow-on work (D1b §4), on the IO thread: the next part of each write
+    /// owed one, the sync start, for files that do not write durably, then one flush turn. Whether
+    /// more is owed.
     fn unit(self: Arc<Self>) -> bool {
         #[cfg(test)]
         self.holds.at("unit.started");
+        // The writes owed their next part first, each word of them claimed once: a record owed
+        // again meanwhile is the next unit's, run by the ring that owed it. On a failed log each
+        // rests instead (ASYNC1 D2d v1.4 §2, §3).
+        self.writes.claim_owed(|j| {
+            if self.failed.load(Ordering::Acquire) {
+                self.rest(j);
+            } else {
+                self.submit_part(j);
+            }
+        });
         if self.failed.load(Ordering::Acquire) {
             return false;
         }
@@ -1917,6 +2113,27 @@ fn io_failure(e: &LimboError) -> CompletionError {
     match e {
         LimboError::CompletionError(e) => *e,
         _ => CompletionError::IOError(std::io::ErrorKind::Other, "log IO submission"),
+    }
+}
+
+/// A part's callback or observer under way on this thread, for a test's look at where a part was
+/// submitted from.
+#[cfg(test)]
+struct PartDepth;
+
+#[cfg(test)]
+impl PartDepth {
+    fn enter() -> Self {
+        PART_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PartDepth {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        PART_DEPTH.with(|d| d.set(d.get() - 1));
     }
 }
 

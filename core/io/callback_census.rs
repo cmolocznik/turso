@@ -180,9 +180,9 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "storage/atoll/log/mod.rs",
-        "submit_write",
+        "submit_part",
         "new_write",
-        "records the write landed and wakes, submitting nothing",
+        "records the part written and, the whole written, the write landed, waking; submitting nothing",
     ),
     (
         "storage/atoll/log/preparer.rs",

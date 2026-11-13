@@ -52,6 +52,20 @@ struct Probe {
     calls: Mutex<Vec<Call>>,
     refuse_sync_of: Mutex<Option<String>>,
     counted: Mutex<Option<Weak<Counted>>>,
+    /// Writes longer than a block write half of it in whole blocks, at least one, and say so.
+    halve: AtomicBool,
+    /// Writes delivered only when the IO is stepped, one a step, and a step saying what it found,
+    /// a waiter registered at a step that found none woken by the next write: a pumped
+    /// backend's. Set before the log opens, so the database is shaped for it.
+    defer: AtomicBool,
+    deferred: Mutex<VecDeque<(Completion, i32)>>,
+    registered: Mutex<Vec<(crate::io::ReadyKey, std::task::Waker)>>,
+    /// The write calls made since a test set the count to 0, and the one of them, numbered from
+    /// 1, that is held, refused, or writes nothing.
+    write_calls: AtomicUsize,
+    hold_call: AtomicUsize,
+    refuse_call: AtomicUsize,
+    zero_call: AtomicUsize,
 }
 
 impl Probe {
@@ -142,6 +156,14 @@ impl UnitIO {
                 calls: Mutex::new(Vec::new()),
                 refuse_sync_of: Mutex::new(None),
                 counted: Mutex::new(None),
+                halve: AtomicBool::new(false),
+                defer: AtomicBool::new(false),
+                deferred: Mutex::new(VecDeque::new()),
+                registered: Mutex::new(Vec::new()),
+                write_calls: AtomicUsize::new(0),
+                hold_call: AtomicUsize::new(0),
+                refuse_call: AtomicUsize::new(0),
+                zero_call: AtomicUsize::new(0),
             }),
         })
     }
@@ -174,9 +196,16 @@ impl IO for UnitIO {
         self.inner.rename_file(from, to)
     }
     fn delivery(&self) -> crate::io::Delivery {
+        if self.probe.defer.load(Ordering::SeqCst) {
+            return crate::io::Delivery::Pumped;
+        }
         self.inner.delivery()
     }
     fn step(&self) -> Result<()> {
+        if self.probe.defer.load(Ordering::SeqCst) {
+            self.probe.deliver_one();
+            return Ok(());
+        }
         self.inner.step()
     }
     fn try_step(
@@ -184,12 +213,30 @@ impl IO for UnitIO {
         key: crate::io::ReadyKey,
         ready: &std::task::Waker,
     ) -> Result<crate::io::Stepped> {
-        self.inner.try_step(key, ready)
+        if !self.probe.defer.load(Ordering::SeqCst) {
+            return self.inner.try_step(key, ready);
+        }
+        if self.probe.deliver_one() {
+            return Ok(crate::io::Stepped::Delivered);
+        }
+        // Registered under the lock a write takes to wake: one queued after the look above finds
+        // the registration.
+        let mut registered = self.probe.registered.lock();
+        if !self.probe.deferred.lock().is_empty() {
+            return Ok(crate::io::Stepped::Delivered);
+        }
+        registered.retain(|(k, _)| *k != key);
+        registered.push((key, ready.clone()));
+        Ok(crate::io::Stepped::Empty)
     }
     fn says_what_a_step_found(&self) -> bool {
-        self.inner.says_what_a_step_found()
+        self.probe.defer.load(Ordering::SeqCst) || self.inner.says_what_a_step_found()
     }
     fn withdraw(&self, key: crate::io::ReadyKey) {
+        if self.probe.defer.load(Ordering::SeqCst) {
+            self.probe.registered.lock().retain(|(k, _)| *k != key);
+            return;
+        }
         self.inner.withdraw(key)
     }
 }
@@ -256,6 +303,9 @@ impl File for UnitFile {
         })
     }
     fn pwrite(&self, at: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        if let Some(shaped) = self.shaped("pwrite", at, &buffer, &c) {
+            return shaped;
+        }
         let len = buffer.len();
         self.call("pwrite", || {
             if self.probe.hold_writes.load(Ordering::SeqCst) {
@@ -272,6 +322,9 @@ impl File for UnitFile {
         })
     }
     fn pwrite_durable(&self, at: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        if let Some(shaped) = self.shaped("pwrite_durable", at, &buffer, &c) {
+            return shaped;
+        }
         let len = buffer.len();
         self.call("pwrite_durable", || {
             if self.probe.hold_writes.load(Ordering::SeqCst) {
@@ -314,6 +367,78 @@ impl File for UnitFile {
     }
     fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
         self.file.truncate(n, c)
+    }
+}
+
+impl UnitFile {
+    /// A write the probe shapes, when a test asks it to: refused; or written in part, half of it
+    /// in whole blocks, or nothing, and said so, then delivered at once as memory delivers, held
+    /// for the test, or deferred to a step. `None` when the write goes to memory as it is.
+    fn shaped(
+        &self,
+        what: &'static str,
+        at: u64,
+        buffer: &Arc<Buffer>,
+        c: &Completion,
+    ) -> Option<Result<Completion>> {
+        let probe = &self.probe;
+        let n = probe.write_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let refused = probe.refuse_call.load(Ordering::SeqCst) == n;
+        let zero = probe.zero_call.load(Ordering::SeqCst) == n;
+        let held = probe.hold_call.load(Ordering::SeqCst) == n;
+        let halve = probe.halve.load(Ordering::SeqCst);
+        let defer = probe.defer.load(Ordering::SeqCst);
+        if !(refused || zero || held || halve || defer) {
+            return None;
+        }
+        Some(self.call(what, || {
+            if refused {
+                return Err(LimboError::CompletionError(CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "a probe's write refused",
+                )));
+            }
+            let len = buffer.len();
+            let wrote = if zero {
+                0
+            } else if halve && len > BLOCK as usize {
+                (len / 2 / BLOCK as usize * BLOCK as usize).max(BLOCK as usize)
+            } else {
+                len
+            };
+            if wrote > 0 {
+                let part = Arc::new(Buffer::new(buffer.as_slice()[..wrote].to_vec()));
+                drop(self.file.pwrite(at, part, Completion::new_write(|_| {}))?);
+            }
+            c.keep_write_buffer_alive(buffer.clone());
+            if held {
+                return probe.hold(c.clone(), wrote as i32);
+            }
+            if defer {
+                c.accept();
+                probe.deferred.lock().push_back((c.clone(), wrote as i32));
+                let woken = std::mem::take(&mut *probe.registered.lock());
+                for (_, waker) in woken {
+                    waker.wake();
+                }
+                return Ok(c.clone());
+            }
+            c.deliver(Ok(wrote as i32));
+            Ok(c.clone())
+        }))
+    }
+}
+
+impl Probe {
+    /// Delivers the oldest deferred write, as a pumped backend's step does: whether there was one.
+    fn deliver_one(&self) -> bool {
+        let next = self.deferred.lock().pop_front();
+        let Some((c, n)) = next else {
+            return false;
+        };
+        c.complete(n);
+        c.retire();
+        true
     }
 }
 
@@ -3292,4 +3417,746 @@ fn over_deferred_memory_the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait
     the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait_is_dropped(Arc::new(
         crate::io::MemoryYieldIO::new(),
     ));
+}
+
+// ASYNC1 D2d (v): a log write its backend writes short is continued, part by part, by the IO
+// thread's unit, and lands once, at the whole (D2D v1.4).
+
+/// The parts a write of `len` bytes from `from` is submitted in when every write longer than a
+/// block writes half of it in whole blocks: each part asks for the rest.
+fn halving_parts(from: Lsn, len: u64) -> Vec<(Lsn, u64)> {
+    let mut parts = Vec::new();
+    let (mut at, mut left) = (from, len);
+    loop {
+        parts.push((at, left));
+        let wrote = if left > BLOCK {
+            (left / 2 / BLOCK * BLOCK).max(BLOCK)
+        } else {
+            left
+        };
+        if wrote == left {
+            return parts;
+        }
+        at += wrote;
+        left -= wrote;
+    }
+}
+
+/// A log over `io` with one write in flight and chunks of 32 KiB, its first block durable, its
+/// preparer at rest, every request of that retired and its units ended, and its counts, notes
+/// and the probe's write calls started from none: the log, where it is durable to, whether all of
+/// that came within [`SETTLE`], and each record's rests so far.
+fn short_write_log(io: &Arc<UnitIO>) -> (AloneLog, Lsn, bool, Vec<usize>) {
+    short_write_log_opened(io, false)
+}
+
+/// [`short_write_log`], the log opened async when `opened_async`, its first block made durable
+/// as such a log's is.
+fn short_write_log_opened(
+    io: &Arc<UnitIO>,
+    opened_async: bool,
+) -> (AloneLog, Lsn, bool, Vec<usize>) {
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let config = LogConfig {
+        chunk_bytes: 32 << 10,
+        writes_in_flight: 1,
+        ..small()
+    };
+    let (log, quiet) = if opened_async {
+        let log = open_async(io, config, 1);
+        let quiet = durable_start_async(&log, &dyn_io);
+        (log, quiet)
+    } else {
+        let log = open(io, config);
+        let quiet = durable_start(&log, &dyn_io);
+        (log, quiet)
+    };
+    // Before the counts start: the preparer at rest; every request of the warm-up retired, each
+    // retirement's ring made before its request is uncounted; and the units those rings start
+    // ended.
+    let rested = preparer_resting_within(&log);
+    let requests = log.segments.counted_io().requests().clone();
+    let retired = within_settle(|| requests.outstanding() == 0);
+    let quiet = quiet && rested && retired && settled(&log);
+    let from = log.durable();
+    reset(&log.counts);
+    log.counts.parts.lock().clear();
+    log.counts.delivered_on.lock().clear();
+    log.counts.landings.store(0, Ordering::SeqCst);
+    log.counts.rings.store(0, Ordering::SeqCst);
+    io.probe.clear();
+    io.probe.write_calls.store(0, Ordering::SeqCst);
+    let rests = log.writes_for_test().3;
+    (log, from, quiet, rests)
+}
+
+/// Records of 996 bytes appended until 13,000 bytes past `from`: the last one's end, and how
+/// many. Waited for, they are written as a write of 12 KiB of whole blocks or more and one of the
+/// padded last block, within one chunk.
+fn append_past(log: &Arc<Log>, io: &Arc<dyn IO>, from: Lsn) -> (Lsn, usize) {
+    let (mut end, mut appended) = (from, 0);
+    while end < from + 13_000 {
+        end = append(log, io, 996);
+        appended += 1;
+    }
+    (end, appended)
+}
+
+/// The records read back from the log's start, each its payload's length if the payload is all
+/// 7s and 0 if not; or the reader's error, with how many records it read first.
+fn read_back(io: &Arc<UnitIO>) -> std::result::Result<Vec<usize>, String> {
+    let mut reader = Log::reader(io.clone(), BASE, &small(), 0);
+    let mut lens = Vec::new();
+    loop {
+        match reader.next_record() {
+            Ok(Some(r)) => {
+                let p = &r.payload;
+                lens.push(if p.iter().all(|&b| b == 7) {
+                    p.len()
+                } else {
+                    0
+                });
+            }
+            Ok(None) => return Ok(lens),
+            Err(e) => return Err(format!("{e}, after {} records", lens.len())),
+        }
+    }
+}
+
+/// Whether `done` came true within [`SETTLE`], looked at once a millisecond.
+fn within_settle(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + SETTLE;
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
+/// The writes' state read with the IO thread held before its idle: (records at rest, owed, in
+/// flight, each record's rests since `before`), and whether the hold was reached.
+fn writes_at_idle(log: &Log, before: &[usize]) -> ((u32, u32, usize, Vec<usize>), bool) {
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle(log.requests_for_test());
+    let reached = held.is_some();
+    let (free, owed, in_flight, rests) = log.writes_for_test();
+    drop(held);
+    let since = rests.iter().zip(before).map(|(r, b)| r - b).collect();
+    ((free, owed, in_flight, since), reached)
+}
+
+/// The parts noted, as the writes they make: each write's parts, the halving of the first, the
+/// next write starting where the last ended; `None` if the parts are not such writes.
+fn halved_writes(parts: &[(Lsn, u64)]) -> Option<Vec<Vec<(Lsn, u64)>>> {
+    let mut writes = Vec::new();
+    let mut i = 0;
+    while i < parts.len() {
+        let (from, len) = parts[i];
+        let write = halving_parts(from, len);
+        if parts.get(i..i + write.len()) != Some(&write[..]) {
+            return None;
+        }
+        i += write.len();
+        if parts.get(i).is_some_and(|&(next, _)| next != from + len) {
+            return None;
+        }
+        writes.push(write);
+    }
+    Some(writes)
+}
+
+/// D2d v1.4 T1: writes its backend writes half of at a time land whole, in parts: 13,000 bytes of
+/// records or more waited for are a write from the ring of 12 KiB or more, in parts of 4 KiB and
+/// more, and a padded last block.
+/// Each part asks for the rest, from where the last stopped. At the first part's retirement, the
+/// IO thread's unit held at its start, the record is owed and its one place held. Every part is
+/// submitted with that one write in flight, and every rest by the IO thread's unit, outside any
+/// part's callback or observer. Each write lands once; the records appended read back, every one
+/// whole; and at the end the record is at rest, rested once a write. The durability wait is
+/// bounded, so a lost rest fails an assertion rather than hanging (mutants: `log-short-fails`, a
+/// short part failing the log; `log-rest-in-callback`, the rest submitted from the part's
+/// callback; `log-place-let-go`, the record rested at a short part). Over memory delivering
+/// inline, in a database opened synchronously; and over the probe's pumped backend, delivering
+/// only at a step and saying what it found, in a database opened async, whose IO thread and
+/// executor worker step it, so a part's callback runs on whichever of them stepped.
+fn a_write_written_short_is_continued_part_by_part_and_lands_once(pumped: bool) {
+    let io = UnitIO::new(true);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    io.probe.defer.store(pumped, Ordering::SeqCst);
+    let (log, from, quiet, before) = short_write_log_opened(&io, pumped);
+    let records_before = read_back(&io);
+    io.probe.halve.store(true, Ordering::SeqCst);
+    let (arrived, go) = log.holds.set("unit.started");
+    let (end, appended) = append_past(&log, &dyn_io, from);
+    let mut wait = LogWait::default();
+    let _ = log.wait_durable(&mut wait, end);
+    let at_unit = arrived.recv_timeout(SETTLE).is_ok();
+    let at_first_retirement = log.writes_for_test();
+    let parts_at_unit = log.counts.parts.lock().len();
+    drop(go);
+    let durable_in_time = within_settle(|| log.durable() >= end);
+    let waited = durable_in_time.then(|| drive(&dyn_io, || log.wait_durable(&mut wait, end)));
+    drop(wait);
+    let settled = settled(&log);
+    let (state, reached) = writes_at_idle(&log, &before);
+    io.probe.halve.store(false, Ordering::SeqCst);
+    let parts = log.counts.parts.lock().clone();
+    let delivered_on = log.counts.delivered_on.lock().clone();
+    let (writes, landings) = (
+        log.counts.writes.load(Ordering::SeqCst),
+        log.counts.landings.load(Ordering::SeqCst),
+    );
+    let failure = log.failure();
+    let lens = read_back(&io);
+    drop(log);
+    assert!(
+        quiet && settled,
+        "the log's units did not end within {SETTLE:?}"
+    );
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(
+        failure.is_none(),
+        "the log failed at a short part: {failure:?}"
+    );
+    // Read only if the unit started with the first part alone submitted; whether it did is
+    // asserted last.
+    if at_unit && parts_at_unit == 1 {
+        assert_eq!(
+            (
+                at_first_retirement.0,
+                at_first_retirement.1,
+                at_first_retirement.2
+            ),
+            (0, 1, 1),
+            "(records at rest, owed, writes in flight) at the first part's retirement, the unit \
+             held: a short part's retirement let its record and its place go"
+        );
+    }
+    assert!(
+        durable_in_time && waited.is_some_and(|w| w.is_ok()),
+        "the write never became durable within {SETTLE:?}"
+    );
+    let asked: Vec<(Lsn, u64)> = parts.iter().map(|p| (p.from, p.len)).collect();
+    assert_eq!(
+        asked.first().map(|p| p.0),
+        Some(from),
+        "the first part's start"
+    );
+    let Some(halved) = halved_writes(&asked) else {
+        panic!(
+            "the parts asked for are not each the rest of a write from where the last stopped: \
+             {asked:?}"
+        );
+    };
+    assert_eq!(
+        halved.len(),
+        writes,
+        "the writes the parts make, against the writes planned"
+    );
+    assert!(
+        halved.iter().any(|w| w.len() >= 3),
+        "no write from the ring continued twice: {asked:?}"
+    );
+    assert_eq!(
+        parts
+            .iter()
+            .map(|p| (p.in_place, p.in_flight))
+            .collect::<Vec<_>>(),
+        vec![(false, 1); parts.len()],
+        "(written from a published block, writes in flight) at each part's submission"
+    );
+    // A write's first part is its plan's; every later part is a rest.
+    let mut rests = Vec::new();
+    let mut i = 0;
+    for w in &halved {
+        rests.extend(
+            parts[i + 1..i + w.len()]
+                .iter()
+                .map(|p| (p.thread.as_str(), p.depth)),
+        );
+        i += w.len();
+    }
+    assert_eq!(
+        rests,
+        vec![(IO_THREAD, 0); asked.len() - halved.len()],
+        "(thread, part callbacks and observers under way) at each rest's submission: a rest \
+         submitted inside a part's delivery"
+    );
+    assert_eq!(
+        landings, writes,
+        "the writes' landings, against the writes planned"
+    );
+    assert_eq!(
+        state,
+        (1, 0, 0, vec![writes]),
+        "(records at rest, owed, writes in flight, the record's rests) at the end"
+    );
+    let (Ok(before), Ok(after)) = (&records_before, &lens) else {
+        panic!("the log did not read back: {records_before:?}, then {lens:?}");
+    };
+    assert_eq!(
+        (&after[..before.len()], &after[before.len()..]),
+        (&before[..], &vec![996; appended][..]),
+        "the records read back, before and after the appends: the appended not all there, or not \
+         all whole"
+    );
+    // The first part, submitted by the waiting thread's flush: inline, delivered there; pumped,
+    // delivered by one of the database's own threads, its IO thread's driver or its executor's
+    // worker, which step the backend while that thread waits without stepping.
+    let first = (
+        parts[0].thread.as_str(),
+        delivered_on.first().map(String::as_str),
+    );
+    let by_the_database = first
+        .1
+        .is_some_and(|t| t == IO_THREAD || t.starts_with("atoll-worker-"));
+    assert!(
+        first.0 != IO_THREAD
+            && if pumped {
+                by_the_database
+            } else {
+                first.1 == Some(first.0)
+            },
+        "(the first part's submitter, its callback's thread): {first:?}"
+    );
+    assert!(
+        at_unit && parts_at_unit == 1,
+        "the IO thread's unit started with {parts_at_unit} parts submitted, not the first alone \
+         (started: {at_unit})"
+    );
+}
+
+#[test]
+fn a_write_written_short_inline_is_continued_part_by_part_and_lands_once() {
+    a_write_written_short_is_continued_part_by_part_and_lands_once(false);
+}
+
+#[test]
+fn a_write_written_short_over_a_pumped_backend_opened_async_is_continued_part_by_part() {
+    a_write_written_short_is_continued_part_by_part_and_lands_once(true);
+}
+
+/// D2d v1.4 T1, a record published in place: its write, from the record's own block, is
+/// continued from that block, part by part, and the block is let go once the record rests.
+#[test]
+fn a_write_from_a_record_published_in_place_is_continued_from_its_block() {
+    let io = UnitIO::new(true);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let (log, from, quiet, before) = short_write_log(&io);
+    io.probe.halve.store(true, Ordering::SeqCst);
+    let p = vec![7u8; 11_000];
+    let mut block = AlignedBlock::zeroed(32 << 10);
+    block.bytes_mut()[record::HEADER..record::HEADER + p.len()].copy_from_slice(&p);
+    let room = framed_len(p.len()).next_multiple_of(BLOCK) + BLOCK;
+    let mut admitted = drive(&dyn_io, || log.admit(&mut LogWait::default(), room)).unwrap();
+    let (at, lsn) = log.publish(&mut admitted, &header(), block, p.len(), |_| {});
+    drop(admitted);
+    let mut wait = LogWait::default();
+    let _ = log.wait_durable(&mut wait, lsn);
+    let durable_in_time = within_settle(|| log.durable() >= lsn);
+    let waited = durable_in_time.then(|| drive(&dyn_io, || log.wait_durable(&mut wait, lsn)));
+    drop(wait);
+    let settled = settled(&log);
+    let (state, reached) = writes_at_idle(&log, &before);
+    io.probe.halve.store(false, Ordering::SeqCst);
+    let parts = log.counts.parts.lock().clone();
+    let failure = log.failure();
+    let lens = read_back(&io);
+    drop(log);
+    assert!(
+        quiet && settled,
+        "the log's units did not end within {SETTLE:?}"
+    );
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(failure.is_none(), "the log failed: {failure:?}");
+    assert!(
+        durable_in_time && waited.is_some_and(|w| w.is_ok()),
+        "the record never became durable within {SETTLE:?}"
+    );
+    let from_block: Vec<&PartNote> = parts.iter().filter(|p| p.from >= at.get()).collect();
+    assert!(
+        from_block.iter().all(|p| p.in_place && p.in_flight == 1),
+        "a part of the in-place write submitted without its record's block, or with other than \
+         its one place in flight: {from_block:?}"
+    );
+    let in_place: Vec<(Lsn, u64)> = from_block.iter().map(|p| (p.from, p.len)).collect();
+    assert!(in_place.len() >= 3, "the in-place write's parts: {parts:?}");
+    assert_eq!(
+        in_place,
+        halving_parts(in_place[0].0, in_place[0].1),
+        "the in-place write's parts, each the rest from where the last stopped"
+    );
+    assert_eq!(
+        (state.0, state.1, state.2),
+        (1, 0, 0),
+        "(at rest, owed, in flight) at the end"
+    );
+    assert!(
+        lens.as_ref().is_ok_and(|l| l.contains(&11_000)),
+        "the record published in place did not read back whole: {lens:?} from {from}"
+    );
+}
+
+/// D2d v1.4 T2: with files that do not write durably, no sync is made for a write until its last
+/// part is delivered: its second part held after the first landed half, the IO thread's units
+/// rung and run while it is held make no sync; once it is let go and the write is whole, the
+/// first sync after it makes the log durable to the append (mutant `log-lands-a-part`: each part
+/// landing its own range, which the unit's sync start syncs while the rest is held).
+#[test]
+fn no_sync_is_made_for_a_write_before_its_last_part_is_delivered() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let (log, from, quiet, before) = short_write_log(&io);
+    io.probe.halve.store(true, Ordering::SeqCst);
+    io.probe.hold_call.store(2, Ordering::SeqCst);
+    let (end, _) = append_past(&log, &dyn_io, from);
+    let mut wait = LogWait::default();
+    let _ = log.wait_durable(&mut wait, end);
+    // The second part held; then the doorbell rung twice more, each ring a unit.
+    let held = within_settle(|| io.probe.queued().len() == 1);
+    for _ in 0..2 {
+        log.ring();
+        settled(&log);
+    }
+    let syncs_while_held = io.probe.syncs();
+    let landed_while_held = log.counts.landings.load(Ordering::SeqCst);
+    let calls_at_release = io.probe.calls().len();
+    io.probe.hold_call.store(0, Ordering::SeqCst);
+    let answered = answer_all(&log, &io.probe);
+    let waited = drive(&dyn_io, || log.wait_durable(&mut wait, end));
+    let settled = settled(&log);
+    let (state, reached) = writes_at_idle(&log, &before);
+    io.probe.halve.store(false, Ordering::SeqCst);
+    let calls = io.probe.calls();
+    let durable = log.durable();
+    drop((wait, log));
+    assert!(
+        quiet && settled && answered,
+        "the log's units did not end within {SETTLE:?}"
+    );
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(held, "the write's second part was never held");
+    assert_eq!(
+        (syncs_while_held, landed_while_held),
+        (0, 0),
+        "(syncs, landings) while the write's second part was held: a sync began before the \
+         write was whole"
+    );
+    let first_sync = calls.iter().position(|c| c.what == "sync");
+    assert!(
+        first_sync.is_some_and(|s| s >= calls_at_release),
+        "the first sync came before the write's held part was let go: {calls:?}"
+    );
+    assert!(
+        waited.is_ok() && durable >= end,
+        "durable to {durable}, short of {end}"
+    );
+    assert_eq!(
+        (state.0, state.1, state.2),
+        (1, 0, 0),
+        "(at rest, owed, in flight) at the end"
+    );
+}
+
+/// D2d v1.4 T3: a part that writes nothing fails the log with a short write, the write never
+/// lands, and its record rests once.
+#[test]
+fn a_part_that_writes_nothing_fails_the_log_and_rests_its_record() {
+    let io = UnitIO::new(true);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let (log, from, quiet, before) = short_write_log(&io);
+    io.probe.zero_call.store(1, Ordering::SeqCst);
+    let (end, _) = append_past(&log, &dyn_io, from);
+    let waited = drive(&dyn_io, || log.wait_durable(&mut LogWait::default(), end));
+    let settled = settled(&log);
+    let (state, reached) = writes_at_idle(&log, &before);
+    io.probe.zero_call.store(0, Ordering::SeqCst);
+    let (failure, landings) = (log.failure(), log.counts.landings.load(Ordering::SeqCst));
+    drop(log);
+    assert!(
+        quiet && settled,
+        "the log's units did not end within {SETTLE:?}"
+    );
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(
+        waited.is_err(),
+        "the wait ended well past a part that wrote nothing"
+    );
+    assert_eq!(
+        (failure, landings),
+        (Some(CompletionError::ShortWrite), 0),
+        "(the log's failure, landings)"
+    );
+    assert_eq!(
+        state,
+        (1, 0, 0, vec![1]),
+        "(at rest, owed, in flight, rests) at the end"
+    );
+}
+
+/// D2d v1.4 T4: the log failing while a write's record is owed: its first part written short and
+/// the record owed, the IO thread's unit held at its start, the log failed, then the unit let go:
+/// it rests the record, submitting nothing (mutant `log-owed-kept-on-failure`: the unit's return
+/// on a failed log before its owed pass, which leaves the record owed).
+#[test]
+fn a_record_owed_when_the_log_fails_is_rested_by_the_unit() {
+    let io = UnitIO::new(true);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let (log, from, quiet, before) = short_write_log(&io);
+    io.probe.halve.store(true, Ordering::SeqCst);
+    let (arrived, go) = log.holds.set("unit.started");
+    let (end, _) = append_past(&log, &dyn_io, from);
+    let mut wait = LogWait::default();
+    let _ = log.wait_durable(&mut wait, end);
+    let at_unit = arrived.recv_timeout(SETTLE).is_ok();
+    let owed_then = log.writes_for_test();
+    log.fail_for_test();
+    let calls_before = io.probe.write_calls.load(Ordering::SeqCst);
+    drop(go);
+    let settled = settled(&log);
+    let (state, reached) = writes_at_idle(&log, &before);
+    let calls_after = io.probe.write_calls.load(Ordering::SeqCst);
+    io.probe.halve.store(false, Ordering::SeqCst);
+    drop((wait, log));
+    assert!(
+        quiet && settled,
+        "the log's units did not end within {SETTLE:?}"
+    );
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(at_unit, "the IO thread's unit never started");
+    assert_eq!(
+        (owed_then.1, owed_then.2),
+        (1, 1),
+        "(owed, in flight) with the unit held: the first part did not leave the record owed"
+    );
+    assert_eq!(
+        state,
+        (1, 0, 0, vec![1]),
+        "(at rest, owed, in flight, rests) once the unit ran: an owed record stayed held after \
+         the log failed"
+    );
+    assert_eq!(
+        calls_after, calls_before,
+        "a part submitted on a failed log"
+    );
+}
+
+/// D2d v1.4 T5: a refused part rests its record, once, with no ring, the log failed: (a) a first
+/// part, refused on the waiting thread's own flush, outside any unit; (b) a rest, refused in the
+/// IO thread's unit (mutant `log-refused-kept`: the refusal only failing the log, the record kept
+/// and its place with it).
+fn a_refused_part_rests_its_record_once_with_no_ring(continuation: bool) {
+    let io = UnitIO::new(true);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let (log, from, quiet, before) = short_write_log(&io);
+    io.probe.halve.store(continuation, Ordering::SeqCst);
+    io.probe
+        .refuse_call
+        .store(if continuation { 2 } else { 1 }, Ordering::SeqCst);
+    let (end, _) = append_past(&log, &dyn_io, from);
+    let waited = drive(&dyn_io, || log.wait_durable(&mut LogWait::default(), end));
+    let settled = settled(&log);
+    let (state, reached) = writes_at_idle(&log, &before);
+    io.probe.refuse_call.store(0, Ordering::SeqCst);
+    io.probe.halve.store(false, Ordering::SeqCst);
+    let (failure, rings) = (log.failure(), log.counts.rings.load(Ordering::SeqCst));
+    drop(log);
+    assert!(
+        quiet && settled,
+        "the log's units did not end within {SETTLE:?}"
+    );
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(
+        waited.is_err() && failure.is_some(),
+        "the log did not fail at a refused part"
+    );
+    assert_eq!(
+        state,
+        (1, 0, 0, vec![1]),
+        "(at rest, owed, in flight, rests) after the refusal"
+    );
+    // A continuation's one ring is the first part's observer's, which owed it.
+    assert_eq!(rings, usize::from(continuation), "the doorbell's rings");
+}
+
+#[test]
+fn a_refused_first_part_rests_its_record_once_with_no_ring() {
+    a_refused_part_rests_its_record_once_with_no_ring(false);
+}
+
+#[test]
+fn a_refused_continuation_rests_its_record_once_with_no_ring() {
+    a_refused_part_rests_its_record_once_with_no_ring(true);
+}
+
+/// D2d v1.4 §4, the log's physical-call census. The log calls a file only where it opens its
+/// segments, submits a write's part (`submit_part`), submits a sync member (`submit_sync`), and
+/// reads a record. No callback or retirement observer it hands over (the argument of a
+/// completion's making or of `on_retired`, and the last argument of `submit_then`) reaches any of
+/// those through any function of the log it calls, followed call by call: no callback or observer
+/// submits (mutant `log-rest-in-callback`: the part's callback calling `submit_part`).
+#[test]
+fn no_callback_or_observer_of_the_log_reaches_a_file_call_or_a_submission() {
+    let path = crate::storage::atoll::testing::atoll_dir().join("log/mod.rs");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let code = crate::source_test::without_test_modules(&crate::source_test::code_of(&text));
+    // Each function of the file: its name and its body, to the next function.
+    let starts: Vec<(usize, String)> = code
+        .match_indices("fn ")
+        .filter(|(at, _)| *at == 0 || !code.as_bytes()[at - 1].is_ascii_alphanumeric())
+        .map(|(at, _)| (at, identifier_at(&code, at + 3)))
+        .filter(|(_, name)| !name.is_empty())
+        .collect();
+    let mut bodies: std::collections::BTreeMap<String, Vec<std::ops::Range<usize>>> =
+        std::collections::BTreeMap::new();
+    for (i, (at, name)) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).map_or(code.len(), |(next, _)| *next);
+        bodies.entry(name.clone()).or_default().push(*at..end);
+    }
+    let caller = |at: usize| -> String {
+        starts
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= at)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_default()
+    };
+    let mut wrong = Vec::new();
+    // The file calls, each where it is ruled.
+    let mut files = 0;
+    for (call, sites) in [
+        (".pread(", &["read_record"][..]),
+        (".pwrite(", &["open_segments", "submit_part"][..]),
+        (".pwrite_durable(", &["submit_part"][..]),
+        (".pwritev(", &[][..]),
+        (".sync(", &[][..]),
+        (".sync_data(", &["open_segments", "submit_sync"][..]),
+        (".truncate(", &[][..]),
+    ] {
+        for (at, _) in code.match_indices(call) {
+            files += 1;
+            let site = caller(at);
+            if !sites.contains(&site.as_str()) {
+                wrong.push(format!("{call} in {site}, not where it is ruled"));
+            }
+        }
+    }
+    // What a callback or an observer may never reach.
+    let forbidden = ["open_segments", "submit_part", "submit_sync", "read_record"];
+    let mut handed = Vec::new();
+    for opener in [
+        "Completion::new_read(",
+        "Completion::new_write(",
+        "Completion::new_sync(",
+        "on_retired(",
+    ] {
+        for (at, _) in code.match_indices(opener) {
+            handed.push((caller(at), arguments(&code, at + opener.len())));
+        }
+    }
+    for (at, _) in code.match_indices(".submit_then(") {
+        let args = arguments(&code, at + ".submit_then(".len());
+        // The observer: the last argument that is not empty, a trailing comma leaving one that is.
+        let mut depth = 0;
+        let mut from = args.start;
+        let mut spans = Vec::new();
+        for (i, ch) in code[args.clone()].char_indices() {
+            match ch {
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    spans.push(from..args.start + i);
+                    from = args.start + i + 1;
+                }
+                _ => {}
+            }
+        }
+        spans.push(from..args.end);
+        let observer = spans
+            .into_iter()
+            .rev()
+            .find(|span| !code[span.clone()].trim().is_empty())
+            .expect("submit_then's arguments");
+        handed.push((caller(at), observer));
+    }
+    for (site, span) in &handed {
+        // The functions of the file it calls, and theirs, followed until none is new.
+        let mut reached: std::collections::BTreeSet<String> = called(&code, span.clone(), &bodies);
+        let mut frontier: Vec<String> = reached.iter().cloned().collect();
+        while let Some(f) = frontier.pop() {
+            for body in &bodies[&f] {
+                for g in called(&code, body.clone(), &bodies) {
+                    if reached.insert(g.clone()) {
+                        frontier.push(g);
+                    }
+                }
+            }
+        }
+        for f in forbidden {
+            if reached.contains(f) {
+                wrong.push(format!(
+                    "a callback or an observer handed over in {site} reaches {f}"
+                ));
+            }
+        }
+    }
+    assert!(
+        files > 0 && !handed.is_empty() && wrong.is_empty(),
+        "the log's file calls and submissions reached off their ruled sites: {wrong:#?} ({files} \
+         file calls, {} callbacks and observers)",
+        handed.len()
+    );
+}
+
+/// The identifier starting at `at` in `code`.
+fn identifier_at(code: &str, at: usize) -> String {
+    code[at..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// The span of the argument list that opens just before `open`, to its closing parenthesis.
+fn arguments(code: &str, open: usize) -> std::ops::Range<usize> {
+    let mut depth = 1;
+    for (i, ch) in code[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return open..open + i;
+        }
+    }
+    open..code.len()
+}
+
+/// The functions of the file called in `span`: each identifier followed by an opening parenthesis
+/// that names one.
+fn called(
+    code: &str,
+    span: std::ops::Range<usize>,
+    bodies: &std::collections::BTreeMap<String, Vec<std::ops::Range<usize>>>,
+) -> std::collections::BTreeSet<String> {
+    let text = &code[span];
+    let bytes = text.as_bytes();
+    let mut out = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let starts = (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let name = identifier_at(text, i);
+        i += name.len();
+        let next = text[i..].trim_start().chars().next();
+        if next == Some('(') && bodies.contains_key(&name) {
+            out.insert(name);
+        }
+    }
+    out
 }

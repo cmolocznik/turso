@@ -10,12 +10,12 @@ use crate::storage::atoll::cooperative::Frame;
 use crate::storage::atoll::db::Opening;
 use crate::storage::atoll::page::{HEADER_SIZE, MIN_PAGE_SIZE};
 use crate::storage::atoll::requests::{
-    counted_async_with_frames_for_test, counted_for_test, Counted, Requests,
+    counted_async_with_frames_for_test, counted_for_test, Counted, Requests, Turn,
 };
 use crate::storage::atoll::store::StoreConfig;
-use crate::storage::atoll::testing::drive;
 #[cfg(all(unix, not(miri)))]
 use crate::storage::atoll::testing::in_child;
+use crate::storage::atoll::testing::{drive, io_thread_held_before_idle_unregistered};
 use crate::storage::atoll::tests::{config, ending_inside_a_block, BASE};
 use crate::LimboError;
 use std::thread::ThreadId;
@@ -60,6 +60,8 @@ enum Rule {
 /// can hold or fail ([`Rule`]).
 #[derive(Default)]
 struct Probe {
+    /// Itself, for each file it opens to hold.
+    me: Weak<Probe>,
     inner: MemoryIO,
     calls: Mutex<Vec<Call>>,
     refuse_open: Mutex<Option<String>>,
@@ -71,7 +73,10 @@ struct Probe {
 
 impl Probe {
     fn new() -> Arc<Self> {
-        Arc::default()
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            ..Self::default()
+        })
     }
 
     fn record(&self, what: &'static str, path: &str) {
@@ -174,7 +179,7 @@ impl IO for Probe {
         Ok(Arc::new(ProbeFile {
             file,
             path: path.to_string(),
-            probe: self as *const Probe as usize,
+            probe: self.me.upgrade().expect("a probe opening a file is alive"),
         }))
     }
     fn sync_directory(&self, path: &str) -> Result<()> {
@@ -205,14 +210,14 @@ impl IO for Probe {
 struct ProbeFile {
     file: Arc<dyn File>,
     path: String,
-    /// Its probe, which outlives every file it opens in these tests (each holds the probe).
-    probe: usize,
+    /// Its probe, held so the probe outlives the file: a file an IO thread drops after the test has
+    /// let go of everything else still finds the probe's count of its files.
+    probe: Arc<Probe>,
 }
 
 impl ProbeFile {
     fn probe(&self) -> &Probe {
-        // SAFETY: each test holds its probe until every file it opened has dropped.
-        unsafe { &*(self.probe as *const Probe) }
+        &self.probe
     }
 }
 
@@ -450,20 +455,46 @@ fn page_in_a_cold_file(
     base: &str,
     opened_async: bool,
 ) -> (PageId, Arc<Counted>, Arc<BufferPool>) {
-    let io: Arc<dyn IO> = probe.clone();
+    let (mut pids, counted, pool) = pages_in_a_cold_file(probe.clone(), base, opened_async, 1);
+    (pids.remove(0), counted, pool)
+}
+
+/// [`page_in_a_cold_file`] for `n` pages over `io`, any backend.
+fn pages_in_a_cold_file(
+    io: Arc<dyn IO>,
+    base: &str,
+    opened_async: bool,
+    n: usize,
+) -> (Vec<PageId>, Arc<Counted>, Arc<BufferPool>) {
     let (first_counted, first) = pool_on(io.clone(), base, false);
     let first_io: Arc<dyn IO> = first_counted.clone();
-    let (pid, frame) = dirty_page(&first, &first_io, false);
-    start_writing_out(&first, frame);
+    let written: Vec<_> = (0..n)
+        .map(|_| dirty_page(&first, &first_io, false))
+        .collect();
+    for &(_, frame) in &written {
+        start_writing_out(&first, frame);
+    }
     drive(&first_io, || first.settle_writes()).unwrap();
-    let slot = first
-        .store
-        .swap_slot(pid)
-        .expect("the page written out to a swap slot");
+    let slots: Vec<_> = written
+        .iter()
+        .map(|&(pid, _)| {
+            let slot = first
+                .store
+                .swap_slot(pid)
+                .expect("the page written out to a swap slot");
+            (pid, slot)
+        })
+        .collect();
     drop((first, first_io, first_counted));
     let (counted, pool) = pool_on(io, base, opened_async);
-    pool.store.set_swap(pid, slot);
-    (pid, counted, pool)
+    for &(pid, slot) in &slots {
+        pool.store.set_swap(pid, slot);
+    }
+    (
+        slots.into_iter().map(|(pid, _)| pid).collect(),
+        counted,
+        pool,
+    )
 }
 
 fn child_ended_cleanly(ended: Option<crate::storage::atoll::testing::Ended>) {
@@ -1601,4 +1632,159 @@ fn a_finish_after_a_failed_recovery_drops_its_owners_only_after_the_drain() {
         "(the log's segment open after the failure, at the drain's look, after the drop)"
     );
     assert_eq!(left, 0, "a held request left after the drop");
+}
+
+// ASYNC1 D2d (ii): over a pumped backend the database's IO thread steps what it submits, so a
+// queued frame request reaches its end with no one waiting for it and no one else stepping.
+
+/// D2d §6.1 test 1, over `backend`: a frame's load whose wait is dropped, a load cancelled once the
+/// backend has accepted its read, and a write-out whose wait is dropped, each queued in a frame
+/// while the IO thread is held before its idle with its registration withdrawn, so only the step it
+/// owes after the record can drive the request. The pool has no workers, and once a request is
+/// queued the test steps nothing. At the IO thread's next idle each request has ended: the frame
+/// records at rest and nothing counted (mutant `no-io-driver`: the loop never steps, and the
+/// request is left in the backend there).
+fn the_io_thread_drives_the_frame_requests_no_one_waits_for(backend: Arc<dyn IO>) {
+    let records = MIN_BUDGET / MIN_PAGE_SIZE;
+    let base = "/db/frame-driven";
+    let (pids, counted, pool) = pages_in_a_cold_file(backend, base, true, 2);
+    let io: Arc<dyn IO> = counted.clone();
+    // The page-table leaves resident, so each load's own request is the one queued.
+    let leaves: Vec<_> = pids
+        .iter()
+        .map(|&pid| drive(&io, || pool.store.leaf(pid)).unwrap())
+        .collect();
+    let requests = counted.requests().clone();
+    let at_rest = || (requests.frames_at_rest(), requests.outstanding());
+    // A load, its wait dropped with the poll's result.
+    let held = io_thread_held_before_idle_unregistered(&requests);
+    let reached = held.is_some();
+    let idle = requests.on_io_idle();
+    let load = {
+        let _frame = Frame::enter();
+        pool.fix_exclusive(pids[0], None)
+            .map(|r| matches!(r, IOResult::IO(_)))
+    };
+    drop(held);
+    let idled = idle.recv_timeout(SETTLE).is_ok();
+    let after_load = at_rest();
+    // A load cancelled after its take: its carrier accepted by the backend, then its own request
+    // finished as a backend's cancel finishes it, and its wait dropped.
+    let held = io_thread_held_before_idle_unregistered(&requests);
+    let reached = reached && held.is_some();
+    let idle = requests.on_io_idle();
+    let (returned, go) = requests.pause_frame_returned();
+    let second = {
+        let _frame = Frame::enter();
+        pool.fix_exclusive(pids[1], None)
+            .map(|r| matches!(r, IOResult::IO(_)))
+    };
+    drop(held);
+    let accepted = returned.recv_timeout(SETTLE).is_ok();
+    let cancelled = last_frame_request();
+    if let Some(c) = &cancelled {
+        c.abort();
+    }
+    let finished_at_cancel = cancelled.as_ref().is_some_and(|c| c.finished());
+    drop(cancelled);
+    let _ = go.send(());
+    let idled = idled && idle.recv_timeout(SETTLE).is_ok();
+    let after_cancel = at_rest();
+    // A write-out of the page the first load read, changed, its settlement's wait dropped with the
+    // poll's result.
+    let frame = {
+        let mut g = drive(&io, || pool.fix_exclusive(pids[0], None)).unwrap();
+        stamp(&mut g.page_mut(), pids[0], 2);
+        g.changed();
+        g.frame
+    };
+    start_writing_out(&pool, frame);
+    let held = io_thread_held_before_idle_unregistered(&requests);
+    let reached = reached && held.is_some();
+    let idle = requests.on_io_idle();
+    let write_out = {
+        let _frame = Frame::enter();
+        pool.settle_writes().map(|r| matches!(r, IOResult::IO(_)))
+    };
+    drop(held);
+    let idled = idled && idle.recv_timeout(SETTLE).is_ok();
+    let after_write = at_rest();
+    drop((leaves, pool, io, counted, requests));
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert_eq!(
+        (load.ok(), second.ok(), write_out.ok()),
+        (Some(true), Some(true), Some(true)),
+        "a frame's miss or settlement returned no wait"
+    );
+    assert!(
+        accepted && finished_at_cancel,
+        "the cancelled load's carrier not accepted, or its request not finished by the cancel"
+    );
+    assert!(idled, "the IO thread's idle notes");
+    assert_eq!(
+        [after_load, after_cancel, after_write],
+        [(records, 0); 3],
+        "(frame records at rest, requests counted) at the IO thread's idle after the load, the \
+         cancelled load and the write-out: a request no one waits for left in the backend"
+    );
+}
+
+#[test]
+fn over_crash_io_the_io_thread_drives_the_frame_requests_no_one_waits_for() {
+    the_io_thread_drives_the_frame_requests_no_one_waits_for(Arc::new(
+        crate::io::crash::CrashIO::new(9),
+    ));
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn over_deferred_memory_the_io_thread_drives_the_frame_requests_no_one_waits_for() {
+    the_io_thread_drives_the_frame_requests_no_one_waits_for(Arc::new(
+        crate::io::MemoryYieldIO::new(),
+    ));
+}
+
+/// D2d §6.1 test 5, over CrashIO: three loads queued by three frames' misses while the IO thread
+/// is held, its registration withdrawn, are served one at a time, with a step of the backend
+/// between any two, so records coming one after another never keep the backend unstepped (mutant
+/// `step-only-on-empty`: the records, then the steps).
+#[test]
+fn over_a_pumped_backend_the_io_thread_steps_between_any_two_records_it_serves() {
+    let backend: Arc<dyn IO> = Arc::new(crate::io::crash::CrashIO::new(11));
+    let (pids, counted, pool) = pages_in_a_cold_file(backend, "/db/frame-fair", true, 3);
+    let io: Arc<dyn IO> = counted.clone();
+    // The page-table leaves resident, so each miss queues the page's own load.
+    let leaves: Vec<_> = pids
+        .iter()
+        .map(|&pid| drive(&io, || pool.store.leaf(pid)).unwrap())
+        .collect();
+    let requests = counted.requests().clone();
+    let held = io_thread_held_before_idle_unregistered(&requests);
+    let reached = held.is_some();
+    let idle = requests.on_io_idle();
+    let queued: Vec<_> = pids
+        .iter()
+        .map(|&pid| {
+            let _frame = Frame::enter();
+            pool.fix_exclusive(pid, None)
+                .map(|r| matches!(r, IOResult::IO(_)))
+                .ok()
+        })
+        .collect();
+    requests.record_io_turns();
+    drop(held);
+    let idled = idle.recv_timeout(SETTLE).is_ok();
+    let turns = requests.io_turns();
+    drop((leaves, pool, io, counted, requests));
+    let served = turns.iter().filter(|t| **t == Turn::Served).count();
+    assert!(
+        reached && idled,
+        "(held before idle, idle again): {turns:?}"
+    );
+    assert_eq!(queued, [Some(true); 3], "a frame's miss returned no wait");
+    assert!(served >= 3, "fewer than three records served: {turns:?}");
+    assert!(
+        !turns.windows(2).any(|w| w == [Turn::Served, Turn::Served]),
+        "two records served with no step of the backend between them: {turns:?}"
+    );
 }

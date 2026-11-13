@@ -636,3 +636,143 @@ fn atoll_refuses_to_open_over_a_pumped_backend_whose_steps_cannot_say() {
     }
     assert!(named, "opened over a backend whose waits would poll it");
 }
+
+// ASYNC1 D2d (ii): the database's IO thread over a pumped backend, woken by the backend's wake and
+// taking its registration back as it ends.
+
+/// How long a test waits for the IO thread to reach a note.
+#[cfg(not(any(shuttle, atoll_loom)))]
+const NOTED: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A counted IO over `io` for a database opened async, whose IO thread steps a pumped backend
+/// (D2d v1.2), and its requests.
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn counted_async(io: Arc<dyn IO>) -> (Arc<dyn IO>, Arc<Requests>) {
+    let counted = counted_async_for_test(io, 0, 1);
+    let requests = counted.requests().clone();
+    (counted, requests)
+}
+
+/// D2d §6.1 test 3, over `backend`, in a database opened async: the IO thread held where it would
+/// mark itself idle, registered with its backend by the step that found it holding nothing. A
+/// request submitted to the backend itself meanwhile wakes that registration; once let go, the
+/// thread does not mark itself idle but steps, and delivers the request on its own thread before
+/// its next idle (mutant `pump-unparks-only`: the wake unparks the thread and sets no bit, so it
+/// marks itself idle with the request undelivered).
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn a_wake_between_the_io_threads_look_and_its_park_makes_it_step(backend: Arc<dyn IO>) {
+    let (io, requests) = counted_async(backend.clone());
+    let file = backend
+        .open_file("/db/raw", OpenFlags::Create, false)
+        .unwrap();
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle(&requests);
+    let reached = held.is_some();
+    let delivered_on = Arc::new(Mutex::new(None::<String>));
+    let c = {
+        let on = delivered_on.clone();
+        Completion::new_read(Arc::new(Buffer::new_temporary(512)), move |_| {
+            let thread = crate::thread::current();
+            *on.lock() = Some(thread.name().unwrap_or("unnamed").to_string());
+            None
+        })
+    };
+    let c = file.pread(0, c).unwrap();
+    let idle = requests.on_io_idle();
+    drop(held);
+    let idled = idle.recv_timeout(NOTED).is_ok();
+    let at_idle = delivered_on.lock().clone();
+    // Delivered here if the IO thread left it, so the backend holds nothing at the end.
+    while !c.finished() {
+        backend.step().unwrap();
+    }
+    drop((c, file, io, requests));
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(idled, "the IO thread's idle note");
+    assert_eq!(
+        at_idle.as_deref(),
+        Some("atoll-io"),
+        "the thread that had delivered, at the IO thread's idle, the request submitted between its \
+         look and its park"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn over_crash_io_a_wake_between_the_io_threads_look_and_its_park_makes_it_step() {
+    a_wake_between_the_io_threads_look_and_its_park_makes_it_step(Arc::new(CrashIO::new(12)));
+}
+
+#[cfg(all(feature = "io_memory_yield", not(any(shuttle, atoll_loom))))]
+#[test]
+fn over_deferred_memory_a_wake_between_the_io_threads_look_and_its_park_makes_it_step() {
+    a_wake_between_the_io_threads_look_and_its_park_makes_it_step(Arc::new(
+        crate::io::MemoryYieldIO::new(),
+    ));
+}
+
+/// D2d §6.1 test 4, over `backend`, in a database opened async: the IO thread held before its
+/// idle, registered with its backend by a step that found it holding nothing; then the database's
+/// close, which seals the count, stops the thread and joins it. Once the close returns the backend
+/// holds no registration (mutant `exit-keeps-registration`: the thread ends with its registration
+/// standing).
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn the_io_thread_takes_its_registration_back_as_it_ends(
+    backend: Arc<dyn IO>,
+    registered: impl Fn() -> usize,
+) {
+    let (io, requests) = counted_async(backend);
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle(&requests);
+    let reached = held.is_some();
+    let while_held = registered();
+    drop(held);
+    requests.drain(&*io);
+    let after_close = registered();
+    drop((io, requests));
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert_eq!(
+        (while_held, after_close),
+        (1, 0),
+        "(the backend's registrations while the IO thread was held, after the close): the IO \
+         thread ended registered"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn over_crash_io_the_io_thread_takes_its_registration_back_as_it_ends() {
+    let crash = Arc::new(CrashIO::new(13));
+    let counts = crash.clone();
+    the_io_thread_takes_its_registration_back_as_it_ends(crash, move || counts.registered());
+}
+
+#[cfg(all(feature = "io_memory_yield", not(any(shuttle, atoll_loom))))]
+#[test]
+fn over_deferred_memory_the_io_thread_takes_its_registration_back_as_it_ends() {
+    let memory = Arc::new(crate::io::MemoryYieldIO::new());
+    let counts = memory.clone();
+    the_io_thread_takes_its_registration_back_as_it_ends(memory, move || counts.registered());
+}
+
+/// D2d §2.1: a database over a pumped backend takes one IO thread, and two are refused by name
+/// before any thread starts.
+#[test]
+fn a_pumped_backend_takes_one_io_thread() {
+    let made = Counted::with_shape(
+        Arc::new(CrashIO::new(14)),
+        Arc::new(Requests::default()),
+        Shape {
+            opened_async: true,
+            io_threads: 2,
+            meta_reads: 1,
+            frames: 0,
+            slots: 0,
+        },
+    );
+    let refused = made.err().map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("2 IO threads over a pumped backend: it takes 1")),
+        "two IO threads over CrashIO: {refused:?}"
+    );
+}

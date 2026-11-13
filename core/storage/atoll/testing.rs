@@ -295,6 +295,42 @@ pub(super) fn step_past<T>(
     passed
 }
 
+/// The IO thread of `requests` held where it would mark itself idle, no bit set and no step owed,
+/// until the returned sender sends or drops; `None` if it did not get there within a minute. It is
+/// woken first, as its pumped backend's wake wakes it, so it gets there whatever it was doing, past
+/// a step that found a pumped backend holding nothing and registered it there (ASYNC1 D2d §6.1).
+/// A note of its idle armed now is sent only after a request queued now: the thread cannot mark
+/// itself idle before the release, nor after it while the request's bit is set.
+#[cfg(not(any(shuttle, atoll_loom)))]
+pub(super) fn io_thread_held_before_idle(
+    requests: &super::requests::Requests,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    held_before_idle(requests, false)
+}
+
+/// [`io_thread_held_before_idle`], the thread's registration with its pumped backend withdrawn
+/// there: no submission wakes it, so what makes it step after a record it serves is the step owed
+/// alone, whatever its backend's registrations would add.
+#[cfg(not(any(shuttle, atoll_loom)))]
+pub(super) fn io_thread_held_before_idle_unregistered(
+    requests: &super::requests::Requests,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    held_before_idle(requests, true)
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn held_before_idle(
+    requests: &super::requests::Requests,
+    withdrawn: bool,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    let (there, release) = requests.pause_io_before_idle(withdrawn);
+    requests.wake_io_pump();
+    there
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .is_ok()
+        .then_some(release)
+}
+
 crate::thread::thread_local! {
     /// Run, and taken, as a database on this thread begins to close: a test's pause in the close.
     pub(crate) static CLOSE_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =

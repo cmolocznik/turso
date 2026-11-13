@@ -3238,3 +3238,58 @@ fn slots_let_go(requests: &Requests) -> bool {
     }
     true
 }
+
+// ASYNC1 D2d (ii): over a pumped backend the database's IO thread steps what its units submit, so a
+// flush rung from a frame lands with no one waiting for it and no one else stepping.
+
+/// D2d §6.1 test 2, over `backend`, with no worker: a durability wait in a frame rings the log's
+/// door while the IO thread is held before its idle with its registration withdrawn, so only the
+/// step it owes after the log's bit can drive the unit's requests, and is dropped at once. Once the
+/// append's first block is durable the test steps nothing, so only the IO thread steps the backend.
+/// At its next idle the unit's write and its sync have landed and nothing is counted (mutants
+/// `no-io-driver` and `owed-only-for-queued`, which owes no step after the log's bit: the log is
+/// short of the append there).
+fn the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait_is_dropped(backend: Arc<dyn IO>) {
+    let log = Log::open_async(backend.clone(), BASE, small(), 0).unwrap();
+    let quiet = durable_start_async(&log, &backend);
+    let lsn = append(&log, &backend, 100);
+    let requests = log.segments.counted_io().requests().clone();
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle_unregistered(&requests);
+    let reached = held.is_some();
+    let idle = requests.on_io_idle();
+    let mut wait = LogWait::default();
+    let rang = matches!(
+        in_frame(|| log.wait_durable(&mut wait, lsn)),
+        Ok(IOResult::IO(_))
+    );
+    drop(wait);
+    drop(held);
+    let idled = idle.recv_timeout(SETTLE).is_ok();
+    let at_idle = (log.durable() >= lsn, requests.outstanding());
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(reached, "the IO thread never reached its pause before idle");
+    assert!(rang, "the wait in the frame returned no registration");
+    assert!(idled, "the IO thread's idle note");
+    assert_eq!(
+        at_idle,
+        (true, 0),
+        "(the log durable to the append, requests counted) at the IO thread's idle: the unit's \
+         write or sync left in the backend"
+    );
+}
+
+#[test]
+fn over_crash_io_the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait_is_dropped() {
+    the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait_is_dropped(Arc::new(
+        crate::io::crash::CrashIO::new(10),
+    ));
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn over_deferred_memory_the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait_is_dropped() {
+    the_io_thread_drives_a_unit_rung_from_a_frame_whose_wait_is_dropped(Arc::new(
+        crate::io::MemoryYieldIO::new(),
+    ));
+}

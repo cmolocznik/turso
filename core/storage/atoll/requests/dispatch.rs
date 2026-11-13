@@ -10,7 +10,7 @@
 //! metadata cache's reads are the first such owner, and the others are D2's later slices.
 
 use super::{io_failure, CountedFile, Requests};
-use crate::io::Completion;
+use crate::io::{Completion, Stepped, IO};
 use crate::storage::atoll::buffer::HeldRecord;
 #[cfg(test)]
 use crate::storage::atoll::locks::Mutex;
@@ -824,6 +824,18 @@ struct Notes {
     /// The next queued frame request's branch after its backend call, once run: its record.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     frame_served: Option<std::sync::mpsc::Sender<usize>>,
+    /// A pause of the IO thread once its take found no bit and it owes no step, before it marks
+    /// itself idle: whether it first withdraws its registration with a pumped backend, the note it
+    /// is there, and the release it waits for (ASYNC1 D2d §6.1).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    before_idle: Option<(
+        bool,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    /// The bits the IO thread serves and the steps it makes, in its order, while a test records
+    /// them.
+    turns: Option<Vec<Turn>>,
     /// A pause at one point of a slot record's take or release (D2c §3.8): where, the record
     /// there, and the release the paused thread waits for.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
@@ -832,6 +844,15 @@ struct Notes {
         std::sync::mpsc::Sender<usize>,
         std::sync::mpsc::Receiver<()>,
     )>,
+}
+
+/// One turn of an IO thread's loop, as a test records them: a bit served, or a step of its pumped
+/// backend.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::storage::atoll) enum Turn {
+    Served,
+    Stepped,
 }
 
 /// Where a test pauses a slot record's take or release (D2c §3.8).
@@ -853,8 +874,10 @@ pub(super) const SUPERBLOCK: std::ops::Range<usize> = META_WRITES.end..META_WRIT
 const RECORDS: usize = SUPERBLOCK.end;
 /// The log's doorbell bit, after the records.
 pub(super) const LOG: usize = RECORDS;
-/// The queued requests' first bit, after the log's.
-pub(super) const QUEUED: usize = LOG + 1;
+/// A pumped backend's wake of its IO thread, which then steps it (ASYNC1 D2d §2.3).
+pub(super) const PUMP: usize = LOG + 1;
+/// The queued requests' first bit, after the pump's.
+pub(super) const QUEUED: usize = PUMP + 1;
 
 /// A record taken for one chain, by its index.
 pub(in crate::storage::atoll) struct Held(usize);
@@ -1062,10 +1085,12 @@ impl Dispatch {
     }
 
     /// Serves bit `bit` the IO thread took: the log's door, a follow-on's record, a queued
-    /// metadata read's, a queued frame request's or a queued read-back read's.
+    /// metadata read's, a queued frame request's or a queued read-back read's. The pump's wake
+    /// serves nothing itself: the step owed after it does.
     fn serve_bit(self: &Arc<Self>, bit: usize) {
         match bit {
             LOG => self.serve_log(),
+            PUMP => {}
             b if b < RECORDS => self.serve(b),
             b if b < self.frames_bit() => self.serve_queued(b - QUEUED),
             b if b < self.slots_bit() => self.serve_frame(b - self.frames_bit()),
@@ -1218,9 +1243,20 @@ impl Dispatch {
 
     /// IO thread `k`'s loop: a take of one subtree at a time, then, with none set, a park until a
     /// producer or the stop takes its idle bit and unparks it; once stopped and every bit served,
-    /// its end.
+    /// its end. Given a pumped `backend` (a database opened async) it owes a step after every
+    /// record it serves and after every step that delivered, and parks only once a step has found
+    /// the backend holding nothing (ASYNC1 D2d §2.3): every request it submits is submitted serving
+    /// a record, so none is left in the backend with no one to step it.
     #[turso_macros::atoll_entry]
-    fn run(self: &Arc<Self>, k: usize) {
+    fn run(self: &Arc<Self>, k: usize, backend: Option<Arc<dyn IO>>) {
+        let place = crate::io::ReadyPlace::default();
+        let mut pump = backend.map(|io| Pump {
+            io,
+            place: &place,
+            waker: pump_waker(Arc::downgrade(self)),
+            owed: false,
+            registered: false,
+        });
         let mut from = 0;
         loop {
             #[cfg(test)]
@@ -1230,14 +1266,19 @@ impl Dispatch {
                     let _ = hold.recv();
                 }
             }
-            match self.bits.take(&mut from) {
+            let empty = match self.bits.take(&mut from) {
                 Taken::Record { record, wake } => {
                     // Woken first: the bits put back are served beside this one, not after it.
                     if let Some(k) = wake {
                         self.unpark(k);
                     }
                     self.serve_bit(record);
-                    continue;
+                    #[cfg(test)]
+                    self.note_turn(Turn::Served);
+                    if let Some(pump) = &mut pump {
+                        pump.owed = true;
+                    }
+                    false
                 }
                 // Not idle: this thread looks again, at once.
                 Taken::Retry { wake } => {
@@ -1247,8 +1288,21 @@ impl Dispatch {
                     continue;
                 }
                 Taken::Stopped => break,
-                Taken::Empty => {}
+                Taken::Empty => true,
+            };
+            // One step per pass while one is owed, so a step comes between any two records served
+            // and a record between any two steps.
+            if let Some(pump) = pump.as_mut().filter(|pump| pump.owed) {
+                pump.step();
+                #[cfg(test)]
+                self.note_turn(Turn::Stepped);
+                continue;
             }
+            if !empty {
+                continue;
+            }
+            #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+            self.pause_at_before_idle(pump.as_mut());
             // Idle only on a root with no child bit and no stop: one set since the take fails it,
             // and one set after it takes this thread's idle bit and unparks it.
             if self.bits.idle(k) {
@@ -1264,6 +1318,9 @@ impl Dispatch {
                 }
             }
         }
+        if let Some(pump) = &mut pump {
+            pump.withdraw();
+        }
         #[cfg(test)]
         {
             self.exited.store(true, Order::Release);
@@ -1276,8 +1333,14 @@ impl Dispatch {
 
     /// Starts IO thread `k` for `dispatch`: marked a database's IO thread for its life, so it waits
     /// on the file system for what is queued to it and on nothing it would deliver (a close, an
-    /// executor's wait, a request), and its handle set before its first look at the bits.
-    pub(super) fn spawn(dispatch: &Arc<Self>, k: usize) -> Result<crate::thread::JoinHandle<()>> {
+    /// executor's wait, a request), and its handle set before its first look at the bits. Given the
+    /// database's `backend` when it is pumped and the database was opened async, which the thread
+    /// steps.
+    pub(super) fn spawn(
+        dispatch: &Arc<Self>,
+        k: usize,
+        backend: Option<Arc<dyn IO>>,
+    ) -> Result<crate::thread::JoinHandle<()>> {
         #[cfg(test)]
         if FAIL_SPAWN.with(|f| f.get() == Some(k)) {
             FAIL_SPAWN.with(|f| f.set(None));
@@ -1292,7 +1355,7 @@ impl Dispatch {
                 crate::io::serve_on_this_thread_for_life();
                 let set = mine.threads[k].set(crate::thread::current());
                 debug_assert!(set.is_ok(), "an IO thread started twice");
-                mine.run(k);
+                mine.run(k, backend);
             })
             .map_err(|e| {
                 crate::LimboError::InternalError(format!(
@@ -1966,6 +2029,61 @@ impl Dispatch {
         rx
     }
 
+    /// Pauses the IO thread the next time its take finds no bit and it owes no step, before it
+    /// marks itself idle, having withdrawn its registration with a pumped backend first if
+    /// `withdrawn`: a note once it is there, and the sender whose send or drop lets it go.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn pause_before_idle(
+        &self,
+        withdrawn: bool,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (at, there) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        self.notes.lock().before_idle = Some((withdrawn, at, held));
+        (there, release)
+    }
+
+    /// The IO thread at its pause before idle, if a test set one: its registration withdrawn if
+    /// asked, then it waits there for the test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    fn pause_at_before_idle(&self, pump: Option<&mut Pump<'_>>) {
+        let pause = self.notes.lock().before_idle.take();
+        if let Some((withdrawn, at, held)) = pause {
+            if let Some(pump) = pump.filter(|_| withdrawn) {
+                pump.withdraw();
+            }
+            let _ = at.send(());
+            let _ = held.recv();
+        }
+    }
+
+    /// Sets the pump's bit, as the backend's wake does: the IO thread then owes a step.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn wake_pump(&self) {
+        if let Some(k) = self.bits.set(PUMP) {
+            self.unpark(k);
+        }
+    }
+
+    /// Starts recording the IO thread's turns, from none.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn record_turns(&self) {
+        self.notes.lock().turns = Some(Vec::new());
+    }
+
+    /// The turns recorded since [`record_turns`](Self::record_turns), which goes on.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn turns(&self) -> Vec<Turn> {
+        self.notes.lock().turns.clone().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn note_turn(&self, turn: Turn) {
+        if let Some(turns) = &mut self.notes.lock().turns {
+            turns.push(turn);
+        }
+    }
+
     /// The records at rest, by count.
     #[cfg(test)]
     pub(super) fn at_rest(&self) -> usize {
@@ -2011,6 +2129,71 @@ crate::thread::thread_local! {
 
 fn closed() -> CompletionError {
     CompletionError::Aborted
+}
+
+/// What an IO thread over a pumped backend keeps for its life (ASYNC1 D2d §2.3): the backend, the
+/// place its registration there is kept under, borrowed so it cannot move while the thread runs,
+/// and the waker it registers.
+struct Pump<'a> {
+    io: Arc<dyn IO>,
+    place: &'a crate::io::ReadyPlace,
+    waker: std::task::Waker,
+    /// A record was served, the backend woke the thread, or the last step delivered: the thread
+    /// steps before it may park.
+    owed: bool,
+    /// A step found the backend holding nothing and registered the waker, which the backend may
+    /// still hold: a submission takes it as it wakes it.
+    registered: bool,
+}
+
+impl Pump<'_> {
+    /// One step, made as a blocking host (the IO thread serves): owed again after a delivery,
+    /// which may leave more to deliver; owed nothing, and registered, once the backend holds
+    /// nothing. A step that fails has lost the means to retire what the backend holds, and ends
+    /// the process (DESIGN.md 22.11).
+    fn step(&mut self) {
+        match self.io.try_step(self.place.key(), &self.waker) {
+            Ok(Stepped::Delivered) => {}
+            Ok(Stepped::Empty) => {
+                self.owed = false;
+                self.registered = true;
+            }
+            // Refused at open (`refuse_a_backend_that_would_poll`).
+            Ok(Stepped::Unsaid) => {
+                unreachable!("a backend that says what its steps find answered Unsaid")
+            }
+            Err(_) => crate::io::stepping_failed("a database's IO thread"),
+        }
+    }
+
+    /// Its registration taken back, if the backend may still hold it: at the thread's end, before
+    /// its place goes.
+    fn withdraw(&mut self) {
+        if self.registered {
+            self.io.withdraw(self.place.key());
+            self.registered = false;
+        }
+    }
+}
+
+/// The waker an IO thread registers with its pumped backend: a wake sets [`PUMP`] as any
+/// producer's set does, so a wake between the thread's look and its park fails its `idle`, and one
+/// after takes its idle bit and unparks it.
+fn pump_waker(dispatch: Weak<Dispatch>) -> std::task::Waker {
+    struct Wake(Weak<Dispatch>);
+    impl std::task::Wake for Wake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            if let Some(dispatch) = self.0.upgrade() {
+                if let Some(k) = dispatch.bits.set(PUMP) {
+                    dispatch.unpark(k);
+                }
+            }
+        }
+    }
+    std::task::Waker::from(std::sync::Arc::new(Wake(dispatch)))
 }
 
 #[cfg(all(test, atoll_loom))]

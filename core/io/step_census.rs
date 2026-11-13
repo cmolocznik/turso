@@ -61,6 +61,12 @@ const STEPS: &[(&str, &str, &str)] = &[
         "the counting IO forwards its embedder's step that says what it found",
     ),
     (
+        "core/storage/atoll/requests/dispatch.rs",
+        "step",
+        "a database's IO thread over its pumped backend: a step owed after each record it serves \
+         and each step that delivered, and a park once a step finds the backend empty",
+    ),
+    (
         "sdk-kit/src/rsapi.rs",
         "run_io",
         "the host's pump: one step at its request",

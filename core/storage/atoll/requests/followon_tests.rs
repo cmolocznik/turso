@@ -749,7 +749,7 @@ fn a_stop_ends_an_io_thread_parked_idle() {
     let dispatch = Arc::new(super::Dispatch::new(&requests, Shape::default()));
     let idled = dispatch.on_idle();
     let exit = dispatch.on_exit();
-    let thread = super::Dispatch::spawn(&dispatch, 0).unwrap();
+    let thread = super::Dispatch::spawn(&dispatch, 0, None).unwrap();
     let idle = idled.recv_timeout(BOUND).is_ok();
     dispatch.stop();
     let exited = exit.recv_timeout(BOUND).is_ok();
@@ -1102,4 +1102,141 @@ fn a_durable_metadata_write_needs_no_sync() {
         weak.upgrade().is_none(),
         "the dispatch left after its owners"
     );
+}
+
+/// D2d §6.1 test 2, the chain's follow-on, over CrashIO on files that do not write durably
+/// (memory-deferred writes durably, so it makes no sync), in a database opened async: a metadata
+/// write made by the test thread outside any frame while the IO thread is held before its idle with
+/// its registration withdrawn. The test steps the backend once, as the write's caller would, which
+/// delivers the write, whose retirement makes its sync into the record; then it steps nothing. At
+/// the IO thread's next idle the sync has landed, the chain has ended and nothing is counted
+/// (mutant `owed-only-for-queued`, which owes no step after a chain's record: the sync is left in
+/// the backend there).
+#[test]
+fn the_io_thread_drives_a_metadata_writes_sync_no_one_steps() {
+    let seen = a_metadata_writes_sync_seen_from_the_io_threads_idle(true);
+    assert!(
+        seen.reached,
+        "the IO thread never reached its pause before idle"
+    );
+    assert_eq!(
+        seen.after_step,
+        (false, 0, 1),
+        "(the wait told, in flight, counted) once the write was delivered, its sync not yet made"
+    );
+    assert!(seen.idled, "the IO thread's idle note");
+    assert_eq!(
+        seen.at_idle,
+        (true, None, 0, seen.at_rest, 0),
+        "(the wait told, its error, requests counted, records at rest, in flight) at the IO \
+         thread's idle: the chain's sync left in the backend"
+    );
+}
+
+/// D2d v1.2: the same metadata write in a database opened synchronously, whose callers, workers and
+/// close step the backend themselves: its IO thread serves the sync's record and steps nothing, so
+/// at its idle the sync is still in the backend, its record held and counted; the test's own steps
+/// then retire it (mutant `driver-in-every-database`: the IO thread steps whatever the database,
+/// and the sync has landed there).
+#[test]
+fn in_a_database_opened_synchronously_the_io_thread_steps_nothing() {
+    let seen = a_metadata_writes_sync_seen_from_the_io_threads_idle(false);
+    assert!(
+        seen.reached,
+        "the IO thread never reached its pause before idle"
+    );
+    assert_eq!(
+        seen.after_step,
+        (false, 0, 1),
+        "(the wait told, in flight, counted) once the write was delivered, its sync not yet made"
+    );
+    assert!(seen.idled, "the IO thread's idle note");
+    assert_eq!(
+        seen.at_idle,
+        (false, None, 1, seen.at_rest - 1, 1),
+        "(the wait told, its error, requests counted, records at rest, in flight) at the IO \
+         thread's idle: the IO thread stepped a synchronous database's backend"
+    );
+    assert_eq!(
+        seen.after_cleanup,
+        (true, None, 0, seen.at_rest, 0),
+        "(the wait told, its error, requests counted, records at rest, in flight) once the test \
+         stepped the sync"
+    );
+}
+
+/// What a metadata write's chain shows: (the wait told, its error, requests counted, records at
+/// rest, requests in the backend).
+type ChainSeen = (bool, Option<CompletionError>, usize, usize, usize);
+
+/// What [`a_metadata_writes_sync_seen_from_the_io_threads_idle`] saw.
+struct SeenFromIdle {
+    /// The records at rest before the write.
+    at_rest: usize,
+    /// The IO thread reached its pause before idle.
+    reached: bool,
+    /// (The wait told, in flight, counted) once the test's step delivered the write.
+    after_step: (bool, usize, usize),
+    /// The IO thread's idle note came.
+    idled: bool,
+    /// The chain at that idle, before the test steps anything more.
+    at_idle: ChainSeen,
+    /// The chain once the test has stepped what was left to its end.
+    after_cleanup: ChainSeen,
+}
+
+/// A metadata write over CrashIO on files that do not write durably, in a database opened async or
+/// synchronously, made while the IO thread is held before its idle (its registration withdrawn),
+/// its write delivered by the test's one step; what the IO thread's next idle finds, and what is
+/// left once the test steps the rest.
+fn a_metadata_writes_sync_seen_from_the_io_threads_idle(opened_async: bool) -> SeenFromIdle {
+    let crash = Arc::new(CrashIO::new(0));
+    crash.set_durable_writes(false);
+    let counted = if opened_async {
+        counted_async_for_test(crash.clone(), 16, 1)
+    } else {
+        counted_for_test(crash.clone())
+    };
+    let io: Arc<dyn IO> = counted.clone();
+    let cache = cache(&counted, "/db/followon-driven");
+    let frame = dirty_page(&cache, &io);
+    let requests = counted.requests().clone();
+    let at_rest = requests.records_at_rest();
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle_unregistered(&requests);
+    let reached = held.is_some();
+    let wait = cache
+        .write_for(&frame, 1)
+        .unwrap()
+        .expect("a write started");
+    crash.step().unwrap();
+    let after_step = (wait.finished(), crash.in_flight(), requests.outstanding());
+    let idle = requests.on_io_idle();
+    drop(held);
+    let idled = idle.recv_timeout(BOUND).is_ok();
+    let chain = || {
+        (
+            wait.finished(),
+            wait.get_error(),
+            requests.outstanding(),
+            requests.records_at_rest(),
+            crash.in_flight(),
+        )
+    };
+    let at_idle = chain();
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let after_cleanup = chain();
+    cache.end_cut(1, std::slice::from_ref(&frame));
+    drop((wait, frame, cache));
+    requests.drain(&*io);
+    drop((io, counted, requests));
+    SeenFromIdle {
+        at_rest,
+        reached,
+        after_step,
+        idled,
+        at_idle,
+        after_cleanup,
+    }
 }

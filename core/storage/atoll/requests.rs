@@ -20,6 +20,8 @@ mod dispatch;
 use dispatch::Dispatch;
 #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
 pub(super) use dispatch::SlotPause;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(super) use dispatch::Turn;
 pub(super) use dispatch::{
     Chain, FrameOwner, FrameRefused, Held, LogWork, OpensFile, Place, Shape, Source,
 };
@@ -361,6 +363,35 @@ impl Requests {
         self.dispatch().hold_next_take()
     }
 
+    /// Pauses the IO thread the next time it finds no bit and owes no step, before it marks itself
+    /// idle, its pumped backend's registration withdrawn first if `withdrawn`: a note once there,
+    /// and the sender that lets it go (ASYNC1 D2d §6.1).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn pause_io_before_idle(
+        &self,
+        withdrawn: bool,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.dispatch().pause_before_idle(withdrawn)
+    }
+
+    /// Wakes the IO thread as its pumped backend's wake does: it then owes a step.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn wake_io_pump(&self) {
+        self.dispatch().wake_pump()
+    }
+
+    /// Starts recording the IO thread's turns.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn record_io_turns(&self) {
+        self.dispatch().record_turns()
+    }
+
+    /// The IO thread's turns recorded so far.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn io_turns(&self) -> Vec<Turn> {
+        self.dispatch().turns()
+    }
+
     /// Whether a request made on this thread is queued.
     #[cfg(test)]
     pub(super) fn queues_here(&self) -> bool {
@@ -411,6 +442,16 @@ impl Counted {
                 dispatch::MOST_THREADS
             )));
         }
+        // A pumped backend delivers only inside a step, under its own exclusion: a second IO
+        // thread would add no parallelism, and with one, in a database opened async, every request
+        // an IO thread took is that thread's to step (ASYNC1 D2d §2.1).
+        let pumped = io.delivery() == Delivery::Pumped;
+        if pumped && shape.io_threads != 1 {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} IO threads over a pumped backend: it takes 1, as only its steps deliver",
+                shape.io_threads
+            )));
+        }
         if shape.meta_reads > dispatch::MOST_RECORDS - dispatch::QUEUED {
             return Err(LimboError::InvalidArgument(format!(
                 "{} metadata read records: a database takes at most {}",
@@ -444,8 +485,15 @@ impl Counted {
         });
         let set = requests.dispatch.set(dispatch.clone());
         assert!(set.is_ok(), "one Counted per database's requests");
+        // The IO thread steps a pumped backend only in a database opened async, whose frames step
+        // nothing (ASYNC1 D2d v1.2). One opened synchronously keeps its pumping as it was: its
+        // callers' waits and runners, its executor's workers and close's drain step the backend,
+        // and with them the IO thread's submissions move. Nothing steps it while no one does: a
+        // request whose wait was cancelled stays the backend's, and counted, until a step retires
+        // it.
+        let driven = pumped && shape.opened_async;
         for k in 0..dispatch.io_threads() {
-            let handle = Dispatch::spawn(&dispatch, k)?;
+            let handle = Dispatch::spawn(&dispatch, k, driven.then(|| io.clone()))?;
             requests.io_threads.lock().push(handle);
         }
         Ok(Self { io, requests })

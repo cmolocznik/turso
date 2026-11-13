@@ -52,6 +52,12 @@ impl MemoryYieldIO {
             pending: Arc::new(Mutex::new(Pending::default())),
         }
     }
+
+    /// The waiters registered and not yet woken or withdrawn, for a test's count.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn registered(&self) -> usize {
+        self.pending.lock().ready.len()
+    }
 }
 
 impl Default for MemoryYieldIO {

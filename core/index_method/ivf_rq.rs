@@ -137,9 +137,18 @@ pub static PROBE_BY_PRODUCT: AtomicUsize = AtomicUsize::new(0);
 /// A process-wide rerank switch for measurement sweeps: 1 reranks, 2 answers from the 7-bit
 /// estimates; zero leaves the index's own `rerank`.
 pub static RERANK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
-/// How many times the rows an unfiltered query asks for its round screens before it stops probing
-/// (measured: see the sweep in the commit that set it).
-const COVER: usize = 0;
+/// How many times the rows an unfiltered query asks for its round screens before it stops probing,
+/// at an index of [`COVER_ROWS`] rows; an index of `n` rows screens `COVER * (n / COVER_ROWS) ^
+/// COVER_GROWTH` times. Measured on the cognition store's stream (its dense windows over 100 real
+/// queries, recall of each query's exact top 50 and reserved-class nearest, chosen on the 50 even
+/// queries as the least cover whose recall reached 0.99): 32 at 34,411 rows (0.9945), 64 at 99,998
+/// (0.9913), 128 at 250,000 (0.9902), the growth between them 0.65 and 0.70. Reported on the 50 odd
+/// queries: 0.9903, 0.9877, 0.9825.
+const COVER: f64 = 32.0;
+/// The index size [`COVER`] was measured at.
+const COVER_ROWS: f64 = 34_411.0;
+/// How the cover grows with the index: the larger of the two measured steps.
+const COVER_GROWTH: f64 = 0.70;
 /// A process-wide cover for measurement sweeps ([`COVER`]); zero leaves the index's own.
 pub static COVER_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// Whether statements maintain the index, for measurement: off, the work their writes make due is
@@ -3216,6 +3225,10 @@ struct Query {
     scanned: std::cell::Cell<usize>,
     cover: usize,
     reserve: VecDeque<i64>,
+    /// The partitions the round probed before its reserve, and the live ones, from which the first
+    /// covering probe estimates the index's rows; `cover` is set then, zero until.
+    first_probes: usize,
+    live_partitions: usize,
 }
 
 impl Query {
@@ -4033,6 +4046,8 @@ impl IndexMethodCursor for IvfRqCursor {
                 scanned: std::cell::Cell::new(0),
                 cover: 0,
                 reserve: VecDeque::new(),
+                first_probes: 0,
+                live_partitions: 0,
             });
             self.filter = filtered.then(|| Filter { limit, round: 0, probed_all: false, whole: false, reach: f64::INFINITY, given: HashSet::new(), accepted: BinaryHeap::new() });
             self.search = match self.held_redo() {
@@ -4258,11 +4273,11 @@ impl IvfRqCursor {
             query.reserve.clear();
             query.cover = 0;
             if self.filter.is_none() && !probed_all {
-                let cover = match COVER_OVERRIDE.load(Ordering::Relaxed) {
-                    0 => COVER,
-                    n => n,
-                };
-                query.cover = query.wanted.saturating_mul(cover);
+                // A sweep's cover is fixed; the index's own is set at the first covering probe, once
+                // the first probes show how many rows a partition holds.
+                query.cover = query.wanted.saturating_mul(COVER_OVERRIDE.load(Ordering::Relaxed));
+                query.first_probes = ranked.len();
+                query.live_partitions = probeable;
                 let first: FxHashSet<i64> = ranked.iter().map(|(_, p)| *p).collect();
                 query.reserve = self
                     .model
@@ -4550,6 +4565,15 @@ impl IvfRqCursor {
     /// nearest of its reserve.
     fn covering_probe(&mut self) -> Option<i64> {
         let query = self.query.as_mut()?;
+        if query.reserve.is_empty() {
+            return None;
+        }
+        if query.cover == 0 {
+            // The index's rows, from the rows its first probes held per partition.
+            let rows = query.scanned.get() as f64 * query.live_partitions as f64 / query.first_probes.max(1) as f64;
+            let cover = COVER * (rows / COVER_ROWS).max(1.0).powf(COVER_GROWTH);
+            query.cover = (query.wanted as f64 * cover).ceil() as usize;
+        }
         if query.scanned.get() >= query.cover {
             return None;
         }
@@ -6492,6 +6516,8 @@ mod tests {
                 scanned: std::cell::Cell::new(0),
                 cover: 0,
                 reserve: VecDeque::new(),
+                first_probes: 0,
+                live_partitions: 0,
         }
     }
 

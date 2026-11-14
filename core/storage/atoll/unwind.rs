@@ -865,6 +865,11 @@ mod tests {
         ),
         (
             "sql/mode/tests.rs",
+            "an_owed_rollback_is_settled_at_a_step_entry_in_each_of_two_transactions",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
             "an_owed_endings_kept_wait_is_judged_before_its_next_serve",
             "child",
         ),
@@ -1203,7 +1208,9 @@ mod tests {
     ];
 
     /// Plain data the facade passes in or out, which code outside Atoll may name: it holds no
-    /// Atoll state, so its methods are no entries.
+    /// Atoll state, so its methods are no entries. `OwedFlag` shares one bool with a transaction's
+    /// slot, which the slot writes under its lock: it reaches no owner of the engine's, no
+    /// transaction and nothing a statement has part-changed, and it can only read the bool.
     const PLAIN: &[&str] = &[
         "AtollConfig",
         "Begin",
@@ -1212,6 +1219,7 @@ mod tests {
         "GuardKey",
         "Guarded",
         "LogConfig",
+        "OwedFlag",
         "NO_PAGE_CAP",
         "PAGE",
         "Probed",

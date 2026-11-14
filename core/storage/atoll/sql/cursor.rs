@@ -86,8 +86,9 @@ macro_rules! done {
 pub struct TxnSlot {
     slot: Mutex<Slot>,
     /// Whether `slot.owed` holds a rollback: written under the lock with it, read without the lock
-    /// by a statement step's entry and by a kept probe.
-    owing: AtomicBool,
+    /// by a kept probe, and by a statement step's entry through the connection's `OwedFlag`, which
+    /// shares it.
+    owing: Arc<AtomicBool>,
     conn: Arc<crate::storage::atoll::buffer::Conn>,
 }
 
@@ -104,7 +105,7 @@ impl TxnSlot {
     pub fn new(txn: Option<Txn>) -> TxnCell {
         Arc::new(Self {
             slot: Mutex::new(Slot { txn, owed: None }),
-            owing: AtomicBool::new(false),
+            owing: Arc::new(AtomicBool::new(false)),
             conn: crate::storage::atoll::buffer::Conn::new(),
         })
     }
@@ -182,6 +183,11 @@ impl TxnSlot {
             slot: self.slot.try_lock()?,
             owing: &self.owing,
         })
+    }
+
+    /// The flag [`owes`](Self::owes) reads, shared, for the connection's `OwedFlag`.
+    pub(in crate::storage::atoll) fn owing(&self) -> Arc<AtomicBool> {
+        self.owing.clone()
     }
 
     /// Whether the transaction owes a statement rollback: one load.

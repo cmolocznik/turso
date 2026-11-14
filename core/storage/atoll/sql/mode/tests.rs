@@ -11153,6 +11153,137 @@ mod in_frames {
                 );
             }
 
+            /// The connection's owed flag is its transaction slot's own: an already-open statement's
+            /// next step entry reads it set and settles the rollback a sibling's failure recorded, in a
+            /// first transaction, which commits, and again in a later one; and the flag is the slot's
+            /// as the connection is made and after each transaction (mutants `owes-always-false`,
+            /// `detached-flag`).
+            #[test]
+            fn an_owed_rollback_is_settled_at_a_step_entry_in_each_of_two_transactions() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_rollback_is_settled_at_a_step_entry_in_each_of_two_transactions"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-flag-two-transactions");
+                        let made = flag_is_the_slots(&conn);
+                        let first = a_readers_step_entry_settles(&io, &db, &conn, 0, "COMMIT");
+                        let after_first = flag_is_the_slots(&conn);
+                        let second = a_readers_step_entry_settles(&io, &db, &conn, 100, "ROLLBACK");
+                        let after_second = flag_is_the_slots(&conn);
+                        for (n, (settled, base)) in
+                            [(first, 0), (second, 100)].into_iter().enumerate()
+                        {
+                            let n = n + 1;
+                            assert!(settled.failed, "transaction {n}: the sibling did not fail");
+                            assert!(
+                                settled.recorded,
+                                "transaction {n}: no rollback owed after the sibling failed"
+                            );
+                            assert!(
+                                settled.settles > 0,
+                                "transaction {n}: the reader's step entry settled nothing"
+                            );
+                            assert_eq!(
+                                settled.rest,
+                                Ok((base + 2..=base + 5)
+                                    .map(|a| vec![Value::from_i64(a)])
+                                    .collect()),
+                                "transaction {n}: the reader after the settle"
+                            );
+                        }
+                        assert!(
+                            made,
+                            "the connection's owed flag is not its slot's as the connection is made"
+                        );
+                        assert!(
+                            after_first && after_second,
+                            "the connection's owed flag is not its slot's after a transaction: \
+                             ({after_first}, {after_second})"
+                        );
+                    },
+                );
+            }
+
+            /// What [`a_readers_step_entry_settles`] saw in one transaction.
+            struct Settled {
+                failed: bool,
+                recorded: bool,
+                settles: u64,
+                rest: std::result::Result<Vec<Vec<Value>>, String>,
+            }
+
+            /// In a transaction ended by `end`: rows `base + 1..=base + 5`, a reader of them stood on
+            /// its first row, then a sibling that fails on a duplicate key in frames, so its rollback
+            /// is owed; then the reader stepped on in frames, its step entry settling that rollback.
+            fn a_readers_step_entry_settles(
+                io: &Arc<dyn IO>,
+                db: &Database,
+                conn: &Arc<Connection>,
+                base: i64,
+                end: &str,
+            ) -> Settled {
+                conn.execute("BEGIN").unwrap();
+                let rows = (base + 1..=base + 5)
+                    .map(|a| format!("({a}, x'01')"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.execute(format!("INSERT INTO t VALUES {rows}"))
+                    .unwrap();
+                let mut reader = conn
+                    .prepare(format!("SELECT a FROM t WHERE a > {base} ORDER BY a"))
+                    .unwrap();
+                let mut failing = conn
+                    .prepare(format!(
+                        "INSERT INTO t SELECT a + 10, b FROM t WHERE a > {base} \
+                         UNION ALL SELECT {}, x'ff'",
+                        base + 1
+                    ))
+                    .unwrap();
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                for calls in 1..=64 {
+                    let held = held_io(db);
+                    let out = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        reader.step().unwrap()
+                    };
+                    let idle = atoll.io_idle_for_test();
+                    drop(held);
+                    match out {
+                        crate::StepResult::Row => break,
+                        crate::StepResult::IO => {
+                            let c = reader.pending_io_for_test().expect("its wait");
+                            assert!(waited(io, &c), "call {calls}: its wait never finished");
+                            assert!(retired(db), "call {calls}: a request outstanding");
+                            assert!(idled(&idle), "call {calls}: the IO thread never went idle");
+                        }
+                        other => panic!("call {calls}: {other:?}"),
+                    }
+                }
+                let failed = stepped_in_frames(io, db, conn, &mut failing, 64);
+                let recorded = owed(conn).is_some();
+                let before = settles();
+                let rest = stepped_in_frames(io, db, conn, &mut reader, 64);
+                let settles = settles() - before;
+                drop((reader, failing));
+                conn.execute(end).unwrap();
+                Settled {
+                    failed: failed.out.is_err(),
+                    recorded,
+                    settles,
+                    rest: rest.out,
+                }
+            }
+
+            /// Whether the connection's owed flag is its transaction slot's own.
+            fn flag_is_the_slots(conn: &Arc<Connection>) -> bool {
+                let ct = conn.atoll().expect("Atoll mode");
+                conn.atoll_owed
+                    .as_ref()
+                    .is_some_and(|flag| ct.owed_flag_is_its_for_test(flag))
+            }
+
             /// 6a: a settle's IO that fails. The statement's parked copy only woke it: the owed
             /// rollback's own copy of the completion is judged at the next settle, the rollback never
             /// stepped again; the statement fails with the IO's error, and its abort rolls the

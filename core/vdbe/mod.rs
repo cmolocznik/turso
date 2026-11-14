@@ -3047,7 +3047,7 @@ impl Program {
                 // A statement rollback the connection's Atoll transaction owes is finished here,
                 // at the top of the step, before any instruction and so before any operation's
                 // owner runs (R19, ASYNC1 D2e (iii-b)).
-                if program.connection.atoll().is_some_and(|a| a.owes()) {
+                if program.connection.atoll_owes() {
                     match program.settle_atoll(state, pager, waker) {
                         Some(result) => return result,
                         None => continue 'io_check,

@@ -1438,11 +1438,17 @@ impl ConnTxn {
         self.cell.settle()
     }
 
-    /// Whether the transaction owes a statement rollback: one load, for a statement step's entry.
-    #[inline]
+    /// The flag that says whether the transaction owes a statement rollback, for the connection to
+    /// read at each statement step's entry with no frame. Taken once, as the connection is made.
     #[turso_macros::atoll_entry]
-    pub fn owes(&self) -> bool {
-        self.cell.owes()
+    pub fn owed_flag(&self) -> OwedFlag {
+        OwedFlag(self.cell.owing())
+    }
+
+    /// Whether `flag` shares this transaction slot's flag, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn owed_flag_is_its_for_test(&self, flag: &OwedFlag) -> bool {
+        Arc::ptr_eq(&flag.0, &self.cell.owing())
     }
 
     /// The open transaction's slot and start, if the statement rollback it owes failed: what a
@@ -2248,6 +2254,23 @@ impl Drop for FacadeRead {
 
 fn outside() -> LimboError {
     LimboError::InternalError("an Atoll read or write outside any transaction".to_string())
+}
+
+/// Whether a connection's Atoll transaction owes a statement rollback (R19, ASYNC1 D2e (iii-b)):
+/// the transaction's slot sets it under its lock as the rollback becomes owed, and clears it as the
+/// rollback is finished or leaves with its transaction. This only reads it. It holds no
+/// transaction, guard or permit, and reading or dropping it drives, wakes and cleans up nothing.
+/// Set, its reader finishes the rollback through [`ConnTxn::settle`], an entry; clear, an
+/// operation's entry still tests the slot under its lock, which refuses it if a rollback is owed.
+pub struct OwedFlag(Arc<AtomicBool>);
+
+impl OwedFlag {
+    /// Whether the transaction owes a statement rollback: one Acquire load, which the slot's
+    /// Release store under its lock pairs with.
+    #[inline]
+    pub fn owes(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// An open transaction taken out of its connection to be ended ([`ConnTxn::take_to_end`]), with the

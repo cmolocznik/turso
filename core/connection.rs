@@ -507,6 +507,8 @@ pub struct Connection {
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// The main database's Atoll transaction, in Atoll mode (DESIGN.md §17).
     pub(crate) atoll: Option<crate::storage::atoll::sql::mode::ConnTxn>,
+    /// Whether `atoll` owes a statement rollback, read at each statement step's entry.
+    pub(crate) atoll_owed: Option<crate::storage::atoll::sql::mode::OwedFlag>,
     /// Who holds the end of the connection's transaction: nobody ([`Self::END_FREE`]), a statement
     /// that has begun to end it in Atoll mode ([`Self::END_ENDING`], `vdbe::EndingBegun`), whose
     /// commit or rollback is decided and is that statement's to finish whole as it steps, is reset
@@ -3236,6 +3238,15 @@ impl Connection {
 
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
+    }
+
+    /// Whether the connection's Atoll transaction owes a statement rollback; never outside Atoll
+    /// mode.
+    #[inline]
+    pub(crate) fn atoll_owes(&self) -> bool {
+        self.atoll_owed
+            .as_ref()
+            .is_some_and(crate::storage::atoll::sql::mode::OwedFlag::owes)
     }
 
     /// The main database's Atoll transaction, in Atoll mode (DESIGN.md §17).

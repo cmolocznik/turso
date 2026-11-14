@@ -3037,6 +3037,10 @@ impl Database {
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
+        let atoll = self
+            .atoll
+            .as_ref()
+            .map(|db| crate::storage::atoll::sql::mode::ConnTxn::new(db.clone()));
         let conn = Arc::new(Connection {
             db: self.clone(),
             context: context.value,
@@ -3079,10 +3083,10 @@ impl Database {
             #[cfg(feature = "test_helper")]
             test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
-            atoll: self
-                .atoll
+            atoll_owed: atoll
                 .as_ref()
-                .map(|db| crate::storage::atoll::sql::mode::ConnTxn::new(db.clone())),
+                .map(crate::storage::atoll::sql::mode::ConnTxn::owed_flag),
+            atoll,
             atoll_end: AtomicU8::new(Connection::END_FREE),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]

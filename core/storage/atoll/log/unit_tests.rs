@@ -874,11 +874,15 @@ fn a_unit_goes_quiet_before_its_count_goes_and_a_close_waits_for_the_count() {
     let sync = io.probe.oldest();
     let requests = log.segments.counted_io().requests().clone();
     let (seen, go) = log.segments.counted_io().pause_log_end_gap();
-    // The sync's last member rings a unit with nothing left to do: it ends quiet.
+    // The sync's last member rings a unit with nothing left to do: it ends quiet. Its observer
+    // rings the unit before the sync retires, so the IO thread is held until the sync has
+    // retired: the gap then counts the unit's own request alone, on any schedule.
+    let hold = requests.hold_io_thread();
     if let Some((c, _)) = &sync {
         c.complete(0);
         c.retire();
     }
+    drop(hold);
     let gap = seen.recv_timeout(SETTLE).ok();
     let mut closer = Closer::start(requests.clone(), dyn_io.clone(), || {});
     let first = closer.next();
@@ -2692,8 +2696,12 @@ fn a_slot_record_stays_held_until_the_backend_lets_go_of_its_delivered_read() {
     io.probe.clear();
     io.probe.hold_io_reads.store(true, Ordering::SeqCst);
     let mut back = ReadBack::default();
+    // The IO thread is held until the first poll has returned, so the poll returns the read's own
+    // request on any schedule: a read already delivered would return its retirement's wait.
+    let hold = requests.hold_io_thread();
     let first = in_frame(|| log.read_record(&mut back, 0, at, end));
     let read = queued_wait(&first);
+    drop(hold);
     let delivered = read_held_within(&io.probe);
     // Only the first read held: a later one is never held, so the one let-go below leaves no read
     // owned.

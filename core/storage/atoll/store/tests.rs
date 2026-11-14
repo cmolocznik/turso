@@ -905,6 +905,11 @@ impl Held {
     fn oldest(&self) -> Option<(Completion, i32)> {
         self.queue.lock().pop_front()
     }
+
+    /// Whether a request is held for the test to answer.
+    fn holds(&self) -> bool {
+        !self.queue.lock().is_empty()
+    }
 }
 
 /// A [`MemoryIO`] whose held data files ([`HELD_FROM`] on, class 0) hold their requests while
@@ -1124,6 +1129,7 @@ fn an_erasure_batch_is_a_run_of_slots_its_requests_held_to_the_flight_limit_unti
 /// P2-CP-U1; mutants: the flight unbounded, a place let go at the answer).
 #[test]
 fn a_checkpoints_file_syncs_hold_their_places_to_the_flight_limit_until_retired() {
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
     let held = Arc::new(Held::default());
     let db = Db::open_on(Arc::new(HeldIO {
         inner: Arc::new(MemoryIO::new()),
@@ -1154,13 +1160,15 @@ fn a_checkpoints_file_syncs_hold_their_places_to_the_flight_limit_until_retired(
                 if wait.finished() || answers.answer_oldest(&held, &wait) {
                     continue;
                 }
-                for _ in 0..1 << 16 {
-                    if wait.finished() {
-                        break;
-                    }
+                // The checkpoint's task, which an executor worker may step on its own thread, goes
+                // on until the wait finishes or holds a sync for the test to answer: waited for so,
+                // the memory backend stepped meanwhile, and stuck only once BOUND has passed.
+                let deadline = std::time::Instant::now() + BOUND;
+                while !wait.finished() && !held.holds() && std::time::Instant::now() < deadline {
                     db.io.step().unwrap();
+                    std::thread::yield_now();
                 }
-                if !wait.finished() {
+                if !wait.finished() && !answers.answer_oldest(&held, &wait) {
                     stuck = true;
                     break;
                 }
@@ -1178,7 +1186,9 @@ fn a_checkpoints_file_syncs_hold_their_places_to_the_flight_limit_until_retired(
     }
     let ended = cp.superblock().checkpoint != in_charge;
     let most = held.most();
-    drop(store);
+    // Checked once the wait and the database are gone: a panic unwinding through either ends the
+    // process.
+    drop((ticket, store));
     drop(db);
     assert_eq!(error, None);
     assert!(!stuck, "the checkpoint waited on what nothing advances");

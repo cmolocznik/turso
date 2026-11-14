@@ -91,6 +91,10 @@ struct Shared {
     /// Where a file's last drop on this ring says it parked, waiting for its requests, for a test.
     #[cfg(test)]
     closer_notes: Mutex<Option<std::sync::mpsc::Sender<&'static str>>>,
+    /// A gate the delivery thread waits at before its next pass, outside the ring's lock, for a
+    /// test: so the test's offer finds the lock free.
+    #[cfg(test)]
+    pass_gate: Mutex<Option<tests::Gate>>,
 }
 
 unsafe impl Send for Shared {}
@@ -636,6 +640,8 @@ impl Shared {
             injected_wait: std::sync::atomic::AtomicI32::new(0),
             #[cfg(test)]
             closer_notes: Mutex::new(None),
+            #[cfg(test)]
+            pass_gate: Mutex::new(tests::NEXT_GATE.with(|g| g.take())),
         });
         {
             let mut state = shared.state.lock();
@@ -990,6 +996,8 @@ fn deliver(shared: Arc<Shared>) {
     let _frame = DeliveryFrame;
     let mut batch = Vec::with_capacity(shared.pass);
     loop {
+        #[cfg(test)]
+        shared.wait_at_gate();
         let held = {
             let mut state = shared.state.lock();
             // SAFETY: holding `state` Mutex.
@@ -1041,6 +1049,19 @@ impl Drop for DeliveryFrame {
 }
 
 impl Shared {
+    /// Waits at the gate a test put before this pass, if any, holding no lock: it says it is there,
+    /// waits to be let through, at most [`tests::GATE_BOUND`], and says whether the test opened
+    /// the gate or the bound ran out.
+    #[cfg(test)]
+    fn wait_at_gate(&self) {
+        let gate = self.pass_gate.lock().take();
+        if let Some(gate) = gate {
+            let _ = gate.at.send(());
+            let opened = gate.open.recv_timeout(tests::GATE_BOUND).is_ok();
+            let _ = gate.passed.send(opened);
+        }
+    }
+
     /// The delivery thread's wait in the kernel: what is queued entered, and one completion waited
     /// for; with entering `held` for a test (RING-FD1 §7), only the completion, nothing entered.
     fn wait_for_one(&self, held: bool) -> std::io::Result<usize> {
@@ -1675,6 +1696,62 @@ mod tests {
     /// How long a test waits for a delivery before it calls the delivery lost: a delivery takes a
     /// read's latency, microseconds, so ten seconds is many thousand times it on a loaded machine.
     const BOUND: Duration = Duration::from_secs(10);
+
+    /// How long a delivery thread waits at a test's gate before it goes on regardless.
+    pub(super) const GATE_BOUND: Duration = BOUND;
+
+    /// The gate a ring's delivery thread waits at before a pass, outside the ring's lock.
+    pub(super) struct Gate {
+        pub(super) at: mpsc::Sender<()>,
+        pub(super) open: mpsc::Receiver<()>,
+        /// Whether the thread went through because the test opened the gate, not because its
+        /// bound ran out.
+        pub(super) passed: mpsc::Sender<bool>,
+    }
+
+    /// A test's side of a gate.
+    struct GateHandle {
+        at: mpsc::Receiver<()>,
+        open: mpsc::Sender<()>,
+        passed: mpsc::Receiver<bool>,
+    }
+
+    impl GateHandle {
+        /// Whether the delivery thread came to the gate. If it did, it waits there, outside the
+        /// ring's lock, until the gate opens.
+        fn reached(&self) -> bool {
+            self.at.recv_timeout(BOUND).is_ok()
+        }
+
+        fn open(&self) {
+            let _ = self.open.send(());
+        }
+
+        /// Whether the delivery thread went through the gate because it was opened, and not
+        /// because its bound ran out.
+        fn opened(&self) -> bool {
+            self.passed.recv_timeout(BOUND) == Ok(true)
+        }
+    }
+
+    fn gate() -> (Gate, GateHandle) {
+        let (at, at_rx) = mpsc::channel();
+        let (open_tx, open) = mpsc::channel();
+        let (passed, passed_rx) = mpsc::channel();
+        (
+            Gate { at, open, passed },
+            GateHandle {
+                at: at_rx,
+                open: open_tx,
+                passed: passed_rx,
+            },
+        )
+    }
+
+    std::thread_local! {
+        /// The gate the next ring made on this thread puts before its delivery thread's first pass.
+        pub(super) static NEXT_GATE: Cell<Option<Gate>> = const { Cell::new(None) };
+    }
 
     fn file_of(dir: &tempfile::TempDir, io: &UringIO, len: usize) -> Arc<dyn File> {
         let path = dir.path().join("f");
@@ -2846,6 +2923,25 @@ mod tests {
     }
 
     impl UringIO {
+        /// A ring held as [`held_for_test`](UringIO::held_for_test) holds it, its delivery thread
+        /// waiting at a gate before its first pass.
+        fn gated_for_test(entries: u32) -> (Self, GateHandle) {
+            let (gate, handle) = gate();
+            NEXT_GATE.with(|g| g.set(Some(gate)));
+            (Self::held_for_test(entries).unwrap(), handle)
+        }
+
+        /// Puts a gate before the delivery thread's next pass, and writes the ring's eventfd so the
+        /// thread leaves its wait and comes to it.
+        fn gate_next_pass_for_test(&self) -> GateHandle {
+            let (gate, handle) = gate();
+            *self.shared.pass_gate.lock() = Some(gate);
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: an 8-byte write from a live buffer to the eventfd the ring holds open.
+            unsafe { libc::write(self.shared.eventfd.as_raw_fd(), one.as_ptr().cast(), 8) };
+            handle
+        }
+
         /// Enters exactly `n` of the queued entries while entering is held: the test's one-shot entry.
         fn enter_once_for_test(&self, n: u32) -> usize {
             let _state = self.shared.state.lock();
@@ -3145,9 +3241,16 @@ mod tests {
         ring.hold_flush_for_test(false);
         ring.release_entry_for_test();
         let delivered = finished_within(&over);
+        // The delivery thread at a gate before its next pass, outside the ring's lock, through the
+        // one offer, and let through before the offered read's delivery, which it makes (#5557).
+        let gate = ring.gate_next_pass_for_test();
+        let outside = gate.reached();
         let c = read();
-        let free = (file.try_pread_now(0, &c), finished_within(&c));
+        let taken = file.try_pread_now(0, &c);
+        gate.open();
+        let free = (taken, finished_within(&c));
         drop((file, ring));
+        let opened = gate.opened();
         assert_eq!(
             [held, full, behind, beside],
             [(false, false, true); 4],
@@ -3162,10 +3265,18 @@ mod tests {
              kernel took the queue"
         );
         assert!(delivered, "the overflow's read never finished");
+        assert!(
+            outside,
+            "the delivery thread never waited at its gate, outside the ring's lock"
+        );
         assert_eq!(
             free,
             (true, true),
             "(taken, delivered) with its lock free and room"
+        );
+        assert!(
+            opened,
+            "the delivery thread went past its gate without the test opening it"
         );
     }
 
@@ -3174,12 +3285,15 @@ mod tests {
     /// the ring once the caller has let go of its own, and its bytes in the file once entering is
     /// let go (mutant `offered-write-unkept`: the ring keeps no hold on the buffer). The test keeps
     /// a hold of its own on the buffer to the write's delivery, so that no write, a mutant's
-    /// included, reads freed memory; the ring's hold is the one besides it.
+    /// included, reads freed memory; the ring's hold is the one besides it. The delivery thread
+    /// waits at a gate before its first pass, outside the ring's lock, through the offer and the
+    /// snapshot, so the lock is free when the offer tries it (#5556).
     #[test]
     fn the_ring_offer_writes_a_buffer_it_keeps_until_its_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let path = filled(&dir, "w", b'O', 4096);
-        let ring = UringIO::held_for_test(4).unwrap();
+        let (ring, gate) = UringIO::gated_for_test(4);
+        let outside = gate.reached();
         let file = ring_file(&ring, &path);
         let buffer = Arc::new(crate::Buffer::new_temporary(4096));
         buffer.as_mut_slice().fill(b'W');
@@ -3194,10 +3308,16 @@ mod tests {
             ring.counts_for_test(),
             ring.pending_for_test(),
         );
+        gate.open();
         ring.release_entry_for_test();
         let delivered = finished_within(&c);
         let bytes = std::fs::read(&path).unwrap();
         drop((c, safety, file, ring));
+        let opened = gate.opened();
+        assert!(
+            outside,
+            "the delivery thread never waited at its gate, outside the ring's lock"
+        );
         assert!(taken, "the offered write was not taken");
         assert_eq!(
             in_flight,
@@ -3211,6 +3331,10 @@ mod tests {
             bytes.iter().all(|&b| b == b'W'),
             "the offered write's bytes: {:?}",
             &bytes[..8]
+        );
+        assert!(
+            opened,
+            "the delivery thread went past its gate without the test opening it"
         );
     }
 

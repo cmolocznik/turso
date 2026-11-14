@@ -2401,7 +2401,7 @@ impl FtsCursor {
             .ok_or_else(|| invalid("an object with field, should and must"))?;
         if let Some(key) = object
             .keys()
-            .find(|key| !matches!(key.as_str(), "field" | "should" | "must"))
+            .find(|key| !matches!(key.as_str(), "field" | "should" | "must" | "phrase"))
         {
             return Err(invalid(&format!("unknown key '{key}'")));
         }
@@ -2483,6 +2483,47 @@ impl FtsCursor {
             .chain(&should)
             .map(|t| Term::from_field_text(field, t))
             .collect();
+        // `phrase`, `[[position, term], ..]`: the document must carry the terms at those positions
+        // relative to one another. It only admits: it adds nothing to a score, which stays the sum
+        // of the `must` and `should` terms' scores.
+        let mut clauses = clauses;
+        if let Some(phrase) = object.get("phrase") {
+            let pairs = phrase
+                .as_array()
+                .ok_or_else(|| invalid("phrase is an array of [position, term] pairs"))?
+                .iter()
+                .map(|pair| {
+                    let pair = pair.as_array().filter(|pair| pair.len() == 2);
+                    let position = pair.and_then(|pair| pair[0].as_u64()).and_then(|p| usize::try_from(p).ok());
+                    let term = pair.and_then(|pair| pair[1].as_str());
+                    match (position, term) {
+                        (Some(position), Some(term)) => Ok((position, Term::from_field_text(field, term))),
+                        _ => Err(invalid("phrase is an array of [position, term] pairs")),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            match pairs.len() {
+                0 => return Err(invalid("a phrase names a term")),
+                1 => clauses.push((
+                    tantivy::query::Occur::Must,
+                    Box::new(tantivy::query::BoostQuery::new(
+                        Box::new(tantivy::query::TermQuery::new(pairs[0].1.clone(), IndexRecordOption::Basic)),
+                        0.0,
+                    )),
+                )),
+                _ => {
+                    let first = pairs.iter().map(|(position, _)| *position).min().unwrap_or(0);
+                    let pairs = pairs.into_iter().map(|(position, term)| (position - first, term)).collect();
+                    clauses.push((
+                        tantivy::query::Occur::Must,
+                        Box::new(tantivy::query::BoostQuery::new(
+                            Box::new(tantivy::query::PhraseQuery::new_with_offset(pairs)),
+                            0.0,
+                        )),
+                    ));
+                }
+            }
+        }
         Ok((Box::new(tantivy::query::BooleanQuery::new(clauses)), order))
     }
 

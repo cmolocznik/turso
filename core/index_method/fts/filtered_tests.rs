@@ -655,6 +655,53 @@ fn filtered_top_k_equals_the_exact_oracle_over_the_admitted_set() {
     }
 }
 
+/// A `phrase` admits only the documents carrying its terms at its relative
+/// positions, wherever a gap a dropped token left lies between them, and adds
+/// nothing to a score: every admitted document scores exactly as the same
+/// query without the phrase scores it, over random corpora.
+#[test]
+fn a_phrase_admits_by_position_and_leaves_the_score_alone() {
+    let (_dir, _db, conn) = open(false);
+    let mut rng = Rng(0x9a5e_1433 | 1);
+    let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+    for round in 0..3 {
+        let batch: Vec<(i64, Doc)> = (0..80)
+            .map(|i| (1 + round * 80 + i, random_doc(&mut rng)))
+            .collect();
+        conn.execute(insert_sql(&batch)).unwrap();
+        docs.extend(batch);
+    }
+    let filter = r#"{"all":[{"in":["closed",[0]]}]}"#;
+    let mut admitted_some = 0;
+    let mut refused_some = 0;
+    for _ in 0..40 {
+        let (a, b) = (rng.word(VOCAB), rng.word(VOCAB));
+        let gap = rng.below(2) as usize + 1;
+        let must = format!("[\"{}\",\"{}\"]", word(a), word(b));
+        let plain = run_filtered(&conn, &format!("{{\"must\":{must}}}"), filter, 1000);
+        let phrased = run_filtered(
+            &conn,
+            &format!("{{\"must\":{must},\"phrase\":[[3,\"{}\"],[{},\"{}\"]]}}", word(a), 3 + gap, word(b)),
+            filter,
+            1000,
+        );
+        // The oracle: a document carrying `a` and, `gap` words on, `b`.
+        let carries = |doc: &Doc| doc.words.windows(gap + 1).any(|w| w[0] == a && w[gap] == b);
+        let mut want: Vec<i64> = docs.iter().filter(|(_, d)| d.closed == 0 && carries(d)).map(|(id, _)| *id).collect();
+        let mut got: Vec<i64> = phrased.iter().map(|(_, id)| *id).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want, "phrase {a} +{gap} {b}");
+        let plain: StdHashMap<i64, f64> = plain.into_iter().map(|(score, id)| (id, score)).collect();
+        for (score, id) in &phrased {
+            assert_eq!(plain[id].to_bits(), score.to_bits(), "doc {id}: the phrase moved its score");
+        }
+        admitted_some += usize::from(!got.is_empty());
+        refused_some += usize::from(got.len() < plain.len());
+    }
+    assert!(admitted_some >= 5 && refused_some >= 5, "admitted {admitted_some}, refused {refused_some}");
+}
+
 /// The same filters read again and again while the index changes under them:
 /// after every insert, delete, update and merge, and from a second connection
 /// whose view is the same committed segments, each answer and population

@@ -137,6 +137,11 @@ pub static PROBE_BY_PRODUCT: AtomicUsize = AtomicUsize::new(0);
 /// A process-wide rerank switch for measurement sweeps: 1 reranks, 2 answers from the 7-bit
 /// estimates; zero leaves the index's own `rerank`.
 pub static RERANK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+/// How many times the rows an unfiltered query asks for its round screens before it stops probing
+/// (measured: see the sweep in the commit that set it).
+const COVER: usize = 0;
+/// A process-wide cover for measurement sweeps ([`COVER`]); zero leaves the index's own.
+pub static COVER_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// Whether statements maintain the index, for measurement: off, the work their writes make due is
 /// left to OPTIMIZE INDEX.
 pub static UPKEEP: AtomicBool = AtomicBool::new(true);
@@ -3205,6 +3210,12 @@ struct Query {
     /// the end of its screens, kept to be reused from probe to probe.
     screens: Vec<Screen>,
     screened: Vec<(f64, usize)>,
+    /// The entries the round has screened, and how many an unfiltered round screens before it stops
+    /// probing: `cover` times the rows it asks for. The partitions past its first `nprobes`, nearest
+    /// first, wait in `reserve` until the probed ones hold too few.
+    scanned: std::cell::Cell<usize>,
+    cover: usize,
+    reserve: VecDeque<i64>,
 }
 
 impl Query {
@@ -4019,6 +4030,9 @@ impl IndexMethodCursor for IvfRqCursor {
                 results: BinaryHeap::new(),
                 screens: Vec::new(),
                 screened: Vec::new(),
+                scanned: std::cell::Cell::new(0),
+                cover: 0,
+                reserve: VecDeque::new(),
             });
             self.filter = filtered.then(|| Filter { limit, round: 0, probed_all: false, whole: false, reach: f64::INFINITY, given: HashSet::new(), accepted: BinaryHeap::new() });
             self.search = match self.held_redo() {
@@ -4234,7 +4248,30 @@ impl IvfRqCursor {
                 _ => nprobes.saturating_mul(widen).min(probeable),
             };
             probed_all = take == probeable;
-            let ranked = self.model.probes(&query.vector, take, PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0, Some(&mut query.centres));
+            let by_product = PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0;
+            let ranked = self.model.probes(&query.vector, take, by_product, Some(&mut query.centres));
+            // An unfiltered round covers its ask: past its first probes it goes on, nearest first,
+            // until it has screened `cover` times the rows it asks for. A large LIMIT thereby reaches
+            // as far from the query as the rows it asks for lie, where a fixed probe count would
+            // leave the farther ones out and give back the nearest of too few.
+            query.scanned.set(0);
+            query.reserve.clear();
+            query.cover = 0;
+            if self.filter.is_none() && !probed_all {
+                let cover = match COVER_OVERRIDE.load(Ordering::Relaxed) {
+                    0 => COVER,
+                    n => n,
+                };
+                query.cover = query.wanted.saturating_mul(cover);
+                let first: FxHashSet<i64> = ranked.iter().map(|(_, p)| *p).collect();
+                query.reserve = self
+                    .model
+                    .probes(&query.vector, probeable, by_product, None)
+                    .into_iter()
+                    .map(|(_, p)| p)
+                    .filter(|p| !first.contains(p) && self.model.states[*p as usize] != State::Retired)
+                    .collect();
+            }
             // A retired partition holds no block, but under MVCC a writer coding against a
             // model older than its retirement can still have left a tail entry there, which
             // maintenance moves out; until it does, the query reads it. A WAL writer codes
@@ -4489,7 +4526,7 @@ impl IvfRqCursor {
     /// must be read from pages; with none left, the rerank.
     fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
         let dims = self.query.as_ref().map_or(0, |q| q.rotated.len());
-        let mut next = probes.pop_front().map(|p| (p, self.held(p)));
+        let mut next = probes.pop_front().or_else(|| self.covering_probe()).map(|p| (p, self.held(p)));
         while let Some((partition, held)) = next.take() {
             #[cfg(test)]
             PROBES.with(|count| count.set(count.get() + 1));
@@ -4502,8 +4539,21 @@ impl IvfRqCursor {
                 ahead.prefetch(dims);
             }
             self.score_held(partition, &rows, &blocks)?;
+            if next.is_none() {
+                next = self.covering_probe().map(|p| (p, self.held(p)));
+            }
         }
         Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None, redo: None })
+    }
+
+    /// The next partition an unfiltered round that has screened fewer than its cover probes: the
+    /// nearest of its reserve.
+    fn covering_probe(&mut self) -> Option<i64> {
+        let query = self.query.as_mut()?;
+        if query.scanned.get() >= query.cover {
+            return None;
+        }
+        query.reserve.pop_front()
     }
 
     /// The rows with redo rows held under another snapshot, when they serve this cursor's.
@@ -5901,6 +5951,7 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
 /// bar started on their way to the cache.
 fn screen_block(query: &Query, payload: &[u8], centre: f64, screens: &mut Vec<Screen>) -> Result<()> {
     let count = block_count(payload)?;
+    query.scanned.set(query.scanned.get() + count);
     let layout = Layout::new(count, query.rotated.len() / 8);
     if payload.len() != layout.len() {
         return Err(*error("block length differs from its count"));
@@ -6438,6 +6489,9 @@ mod tests {
             results: BinaryHeap::new(),
             screens: Vec::new(),
             screened: Vec::new(),
+                scanned: std::cell::Cell::new(0),
+                cover: 0,
+                reserve: VecDeque::new(),
         }
     }
 
@@ -9077,6 +9131,42 @@ mod tests {
         conn.execute(format!("INSERT INTO f VALUES {}", values.join(","))).unwrap();
         conn.execute("CREATE INDEX f_ivf ON f USING ivf_rq (e) WITH (nprobes = 16, refine = 4)").unwrap();
         (db, conn, rows)
+    }
+
+    /// An unfiltered query covers its ask: past its own probe count it goes on probing, nearest
+    /// partition first, until it has screened [`COVER`] times the rows it asks for, so a LIMIT larger
+    /// than its first partitions hold answers the exact nearest; a small LIMIT stops long before
+    /// every partition.
+    #[test]
+    fn an_unfiltered_query_probes_until_it_has_screened_its_cover() {
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-cover-{mvcc}.db"), mvcc);
+            conn.execute("CREATE TABLE f(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+            let mut state = 101;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, 16))).collect();
+            let values: Vec<String> = rows.iter().map(|(id, v)| format!("({id}, {})", literal(v))).collect();
+            conn.execute(format!("INSERT INTO f VALUES {}", values.join(","))).unwrap();
+            conn.execute("CREATE INDEX f_ivf ON f USING ivf_rq (e) WITH (nprobes = 1, refine = 4)").unwrap();
+            let live = stored(&conn).live().len();
+            assert!(live > 8, "mvcc={mvcc}: {live} partitions");
+            for limit in [200usize, 1] {
+                let q = random(&mut state, 16);
+                let mut exact: Vec<(f64, i64)> = rows.iter().map(|(id, v)| (dot(&q, v), *id)).collect();
+                exact.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                let want: Vec<i64> = exact.iter().take(limit).map(|(_, id)| *id).collect();
+                let before = PROBES.with(|c| c.get());
+                let got = ids(&conn, &format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM f ORDER BY distance LIMIT {limit}", literal(&q)));
+                let probed = PROBES.with(|c| c.get()) - before;
+                if limit == 200 {
+                    // 200 rows times the cover is past the table's 3,000: every partition is probed.
+                    assert_eq!(got, want, "mvcc={mvcc}: the covered query's answer");
+                    assert!(probed >= live, "mvcc={mvcc}: {probed} of {live} partitions probed");
+                } else {
+                    assert_eq!(got.len(), 1, "mvcc={mvcc}");
+                    assert!(probed < live, "mvcc={mvcc}: a LIMIT 1 query probed all {live} partitions");
+                }
+            }
+        }
     }
 
     /// The ids of the ten rows nearest `q` among those whose id `keep` accepts.

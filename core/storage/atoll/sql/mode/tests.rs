@@ -10405,6 +10405,305 @@ mod in_frames {
                 );
             }
 
+            /// The wait a commit's ending keeps in `Step::Owed` is the one its call returned through
+            /// its top, and its next call judges that wait before its top admits the call.
+            /// - Its first call returns the read of the rollback's first spilled part: kept, and
+            ///   returned again by a call while it is pending, the rollback not stepped.
+            /// - With that read landed, the pages written out and evicted, and another connection's
+            ///   scan holding its place in the pool's shortage queue, the next call's put-back loads
+            ///   its leaf under scarce memory and comes short behind it: the top returns its turn's
+            ///   wait, unfinished, in place of the rollback's yield, kept, and returned again while
+            ///   pending, the rollback not stepped. The scan's reset lets its place go.
+            /// - Once that wait is done and every read fails, the next call keeps the read it
+            ///   returns; failed, the call after makes the commit the transaction's rollback with
+            ///   that failure, the statement rollback never stepped again.
+            /// The calls up to that read's return run in frames, the IO thread held for each; the
+            /// last, outside one, where the whole rollback is finished in place (D3's).
+            fn an_owed_endings_kept_wait_is_judged_before_its_next_call(serve: bool) {
+                use crate::storage::atoll::sql::mode::{
+                    Ending, ENDING_OWED_RAW, ENDING_OWED_STEPS,
+                };
+                let path = if serve {
+                    "/db/owed-ending-wait-serve"
+                } else {
+                    "/db/owed-ending-wait-step"
+                };
+                let (crash, io, db, conn) = crashing(path, if serve { 713 } else { 712 });
+                let other = db.connect(ConnectOpts::new()).unwrap();
+                let ct = conn.atoll().expect("Atoll mode");
+                // A committed table the other connection scans, loading its leaves.
+                conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b BLOB)")
+                    .unwrap();
+                conn.execute("BEGIN").unwrap();
+                for a in 1..=200 {
+                    conn.execute(format!("INSERT INTO src VALUES ({a}, zeroblob(2048))"))
+                        .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+                let src = tree(&conn, "src");
+                let pool = db.atoll.as_ref().unwrap().atoll().pool().clone();
+                conn.execute("BEGIN").unwrap();
+                conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                    .unwrap();
+                let after_a = command(&conn);
+                big(&conn, 100, 100);
+                let _ = in_frame(&io, &db, || {
+                    ct.rollback_statement(after_a).map(IOResult::Done)
+                })
+                .unwrap();
+                let recorded = owed(&conn);
+                let mut ending = ct.end(true).expect("a transaction to end");
+                // The commit pauses before its first commit step: none of it runs in the frames.
+                let pause = crate::io::Completion::new_wait();
+                crate::storage::atoll::testing::ENDING_PAUSE
+                    .with(|p| *p.borrow_mut() = Some(pause.clone()));
+                let call = |ending: &mut Ending| {
+                    if serve {
+                        ending.serve()
+                    } else {
+                        ending.step()
+                    }
+                };
+                let returned = |out: &crate::Result<IOResult<()>>| match out {
+                    Ok(IOResult::IO(IOCompletions(c))) => Some(c.clone()),
+                    _ => None,
+                };
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                let steps = || ENDING_OWED_STEPS.with(|n| n.get());
+                // A call in a frame with the IO thread held, then a call again while its wait is
+                // pending: (what the first returned, the raw completion the rollback returned
+                // before its top, what the ending kept, whether the second returned the same wait
+                // with the rollback not stepped).
+                let held_calls = |ending: &mut Ending| {
+                    ENDING_OWED_RAW.with(|r| *r.borrow_mut() = None);
+                    let held = held_io(&db);
+                    let (first, raw, kept, again, stepped) = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        let first = call(ending);
+                        let raw = ENDING_OWED_RAW.with(|r| r.borrow_mut().take());
+                        let kept = ending.owed_wait_for_test();
+                        let before = steps();
+                        let again = call(ending);
+                        (first, raw, kept, again, steps() - before)
+                    };
+                    let idle = atoll.io_idle_for_test();
+                    drop(held);
+                    let wait = returned(&first);
+                    let kept = matches!((&kept, &wait), (Some(k), Some(w)) if k.ptr_eq(w));
+                    let same = matches!(
+                        (&returned(&again), &wait),
+                        (Some(a), Some(w)) if a.ptr_eq(w)
+                    );
+                    // The top's own wait in place of the rollback's: the rollback's an explicit
+                    // yield, with no identity, and the top's a wait of its own, still pending.
+                    let substituted = matches!(
+                        (&wait, &raw),
+                        (Some(w), Some(r))
+                            if r.is_explicit_yield()
+                                && r.addr().is_none()
+                                && w.addr().is_some()
+                                && !w.finished()
+                    );
+                    (wait, idle, kept, same && stepped == 0, substituted)
+                };
+                // A: the first spilled part's read.
+                let (read_a, idle_a, kept_a, pending_a, _) = held_calls(&mut ending);
+                let landed_a = read_a
+                    .as_ref()
+                    .is_some_and(|c| waited(&io, c) && c.get_error().is_none());
+                let quiet_a = retired(&db) && idled(&idle_a);
+                drop(read_a);
+                // B: the pages written out and evicted, outside the frames; the other connection's
+                // scan stopped short with its place in the queue; then the next put-back's load
+                // claimed under scarce memory, which comes short behind it.
+                let written =
+                    crate::storage::atoll::sql::mode::full_checkpoint(db.atoll.as_ref().unwrap())
+                        .map_err(|e| e.to_string());
+                chill(&db);
+                let mut scan = other
+                    .prepare("SELECT count(*), sum(length(b)) FROM src")
+                    .unwrap();
+                let mut holding = false;
+                for _ in 0..10_000 {
+                    let out = crate::storage::atoll::buffer::scarce(|| {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        scan.step()
+                    });
+                    holding = scan
+                        .atoll_cursor_for_test(src)
+                        .and_then(|(_, bare, _)| bare)
+                        .is_some_and(SqlCursor::shortage_queued_for_test)
+                        && pool.shortage_len() > 0;
+                    if holding {
+                        break;
+                    }
+                    match out {
+                        Ok(crate::StepResult::IO | crate::StepResult::Yield) => {
+                            if let Some(c) = scan.pending_io_for_test() {
+                                let _ = waited(&io, &c);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let (turn_b, idle_b, kept_b, pending_b, substituted_b) =
+                    crate::storage::atoll::buffer::scarce(|| held_calls(&mut ending));
+                let queued_b = ending.shortage_queued();
+                // The scan's reset ends its read and lets its place go: the turn comes.
+                scan.reset().unwrap();
+                drop(scan);
+                let reserved_b = turn_b
+                    .as_ref()
+                    .is_some_and(|w| waited(&io, w) && w.get_error().is_none());
+                let quiet_b = retired(&db) && idled(&idle_b);
+                drop(turn_b);
+                let middle_phase = format!("{ending:?}");
+                // C: every read failing: the next calls return the ending's own reservation's
+                // yields while it advances, then a read of the rollback's, kept.
+                reads_fail(&crash, None);
+                let (mut read_c, mut kept_c, mut held_c, mut idle_c) = (None, false, false, None);
+                for _ in 0..64 {
+                    let held = held_io(&db);
+                    let out = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        call(&mut ending)
+                    };
+                    let idle = atoll.io_idle_for_test();
+                    // Sampled with the IO thread still held: the read cannot have landed yet.
+                    let pending = returned(&out).is_some_and(|c| !c.finished());
+                    drop(held);
+                    match returned(&out) {
+                        Some(c) if c.is_explicit_yield() => {}
+                        Some(c) => {
+                            kept_c = ending.owed_wait_for_test().is_some_and(|k| k.ptr_eq(&c));
+                            held_c = pending;
+                            read_c = Some(c);
+                            idle_c = Some(idle);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                let failed_c = read_c.as_ref().is_some_and(|c| {
+                    c.addr().is_some() && waited(&io, c) && c.get_error().is_some()
+                });
+                let quiet_c = retired(&db) && idle_c.as_ref().is_some_and(idled);
+                drop(read_c);
+                clear_faults(&crash);
+                let before = steps();
+                let last = call(&mut ending)
+                    .map(|r| r.is_io())
+                    .map_err(|e| e.to_string());
+                let steps_after_failure = steps() - before;
+                let last_phase = format!("{ending:?}");
+                pause.complete(0);
+                crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+                let finished = ending.finish().map_err(|e| e.to_string());
+                drop(ending);
+                let after = (owed(&conn), failure_of(&db));
+                let left = other
+                    .prepare("SELECT count(*) FROM t")
+                    .and_then(|mut s| s.run_collect_rows())
+                    .map_err(|e| e.to_string());
+                drop((other, conn));
+                assert!(recorded.is_some(), "nothing owed after the record");
+                assert!(kept_a, "the ending did not keep the wait its call returned");
+                assert!(
+                    pending_a,
+                    "the owed rollback was stepped while its kept wait was pending, or the wait \
+                     changed"
+                );
+                assert!(landed_a, "the first part's read did not land");
+                assert!(quiet_a, "the first part's request");
+                assert_eq!(written, Ok(()), "the pages written out");
+                assert!(
+                    holding,
+                    "the other connection's scan never held a place in the queue"
+                );
+                assert!(
+                    substituted_b && queued_b,
+                    "the call that came short behind the scan did not return its top's pending \
+                     turn in place of the rollback's yield"
+                );
+                assert!(kept_b, "the ending did not keep the wait its call returned");
+                assert!(
+                    pending_b,
+                    "the owed rollback was stepped while its kept wait was pending, or the wait \
+                     changed"
+                );
+                assert!(reserved_b, "the top's reservation did not finish");
+                assert!(quiet_b, "the calls that came short");
+                assert!(
+                    middle_phase.contains("rolling a statement back"),
+                    "the ending left its owed rollback before its read failed: {middle_phase}"
+                );
+                assert!(kept_c, "the ending did not keep the wait its call returned");
+                assert!(
+                    held_c,
+                    "the call's read was not pending with the IO thread held"
+                );
+                assert!(failed_c, "the kept read did not fail");
+                assert!(quiet_c, "the failing read's request");
+                assert_eq!(
+                    steps_after_failure, 0,
+                    "the owed rollback was stepped again after its kept wait failed"
+                );
+                assert!(
+                    !last_phase.contains("rolling a statement back"),
+                    "the commit did not become the transaction's rollback: {last:?}, {last_phase}"
+                );
+                // The commit's failure is reported once. A step that finishes the whole rollback
+                // in place returns it, the ending then done and its finish clean; one that returns
+                // IO leaves it to the finish. A serve never takes the ending's outcome: the
+                // finish reports it.
+                let outcome = match (&last, &finished) {
+                    (Err(e), Ok(())) if !serve && last_phase.contains("done") => Some(e),
+                    (Ok(_), Err(e)) => Some(e),
+                    _ => None,
+                };
+                assert!(
+                    outcome.is_some_and(|e| e.contains("I/O error (read)")),
+                    "the commit's outcome was not its kept wait's failure, once: {last:?}, \
+                     {finished:?}"
+                );
+                assert_eq!(
+                    after,
+                    (None, None),
+                    "after the transaction's whole rollback"
+                );
+                assert_eq!(
+                    left,
+                    Ok(vec![vec![Value::from_i64(0)]]),
+                    "rows after the whole rollback"
+                );
+            }
+
+            /// [`an_owed_endings_kept_wait_is_judged_before_its_next_call`] through `Ending::step`
+            /// (mutants `step-keeps-nothing`, `step-judges-nothing`).
+            #[test]
+            fn an_owed_endings_kept_wait_is_judged_before_its_next_step() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_endings_kept_wait_is_judged_before_its_next_step"
+                    ),
+                    || an_owed_endings_kept_wait_is_judged_before_its_next_call(false),
+                );
+            }
+
+            /// [`an_owed_endings_kept_wait_is_judged_before_its_next_call`] through `Ending::serve`
+            /// (mutants `serve-keeps-nothing`, `serve-judges-nothing`).
+            #[test]
+            fn an_owed_endings_kept_wait_is_judged_before_its_next_serve() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_endings_kept_wait_is_judged_before_its_next_serve"
+                    ),
+                    || an_owed_endings_kept_wait_is_judged_before_its_next_call(true),
+                );
+            }
+
             /// A rollback ending taking a rollback owed (facade level, outside a frame: the ending is
             /// finished in place, D3's): the owed rollback, stepped once in a frame, is dropped with
             /// what it held, and the whole rollback undoes every statement.

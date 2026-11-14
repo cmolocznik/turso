@@ -688,6 +688,13 @@ crate::thread::thread_local! {
     /// The parked settle waits on this thread that came back failed and were dropped by their
     /// statement, the failure left to the owed rollback's own copy (ASYNC1 D2e (iii-b)).
     pub(crate) static SETTLE_WAITS_DROPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The calls of a commit's ending on this thread into the statement rollback it owed
+    /// (`Ending::step_owed`), for a test to see none after its kept wait failed.
+    pub(crate) static ENDING_OWED_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The completion the last of those calls returned for IO, before its top saw it, for a test
+    /// to tell it from the one the top returned in its place.
+    pub(crate) static ENDING_OWED_RAW: std::cell::RefCell<Option<crate::io::Completion>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone, Copy)]
@@ -2320,8 +2327,17 @@ impl Ending {
                 publish();
             }
         });
+        let Some(owed) = owed else {
+            return Self {
+                db,
+                step: Step::Commit(commit),
+                published: false,
+                owner: crate::storage::atoll::buffer::Owner::of(conn),
+                _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+            };
+        };
         let mut owner = crate::storage::atoll::buffer::Owner::of(conn);
-        let step = match owed.map(|o| o.into_parts()) {
+        let step = match Some(owed).map(|o| o.into_parts()) {
             None => Step::Commit(commit),
             // Its top goes on as the ending's, its keeps with it; its place in the shortage queue,
             // if it had one, `take_to_end` ended, and its next call starts afresh.
@@ -2379,6 +2395,16 @@ impl Ending {
 
     #[turso_macros::atoll_entry]
     pub fn step(&mut self) -> Result<IOResult<()>> {
+        if matches!(self.step, Step::Owed { .. }) {
+            return self.step_while_owed();
+        }
+        crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::step_owned)
+    }
+
+    /// [`step`](Self::step) in [`Step::Owed`]: its wait judged before the call, and kept after it.
+    #[cold]
+    #[inline(never)]
+    fn step_while_owed(&mut self) -> Result<IOResult<()>> {
         if let Some(io) = self.judge_owed_wait() {
             return Ok(IOResult::IO(io));
         }
@@ -2408,6 +2434,15 @@ impl Ending {
         None
     }
 
+    /// The wait an ending in [`Step::Owed`] keeps from its last call, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn owed_wait_for_test(&self) -> Option<Completion> {
+        match &self.step {
+            Step::Owed { waiting, .. } => waiting.clone(),
+            _ => None,
+        }
+    }
+
     /// Keeps, in [`Step::Owed`], the completion the step returned through its top: the wait that
     /// stands, which the top may have put in place of the rollback's own.
     fn keep_owed_wait(&mut self, out: &Result<IOResult<()>>) {
@@ -2432,6 +2467,8 @@ impl Ending {
 
     /// The statement rollback the transaction owed, one call, under the ending's top.
     fn step_owed(&mut self) -> Result<IOResult<()>> {
+        #[cfg(test)]
+        ENDING_OWED_STEPS.with(|n| n.set(n.get() + 1));
         let Step::Owed {
             rollback, commit, ..
         } = &mut self.step
@@ -2446,6 +2483,10 @@ impl Ending {
             .atoll()
             .transactions()
             .rollback_to(self.db.versions(), txn, rollback);
+        #[cfg(test)]
+        if let Ok(IOResult::IO(IOCompletions(c))) = &stepped {
+            ENDING_OWED_RAW.with(|r| *r.borrow_mut() = Some(c.clone()));
+        }
         match stepped {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => {
@@ -2494,6 +2535,16 @@ impl Ending {
     /// the failure is kept in the ending for that statement (`Step::Failed`).
     #[turso_macros::atoll_entry]
     pub fn serve(&mut self) -> Result<IOResult<()>> {
+        if matches!(self.step, Step::Owed { .. }) {
+            return self.serve_while_owed();
+        }
+        crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::serve_owned)
+    }
+
+    /// [`serve`](Self::serve) in [`Step::Owed`]: its wait judged before the call, and kept after it.
+    #[cold]
+    #[inline(never)]
+    fn serve_while_owed(&mut self) -> Result<IOResult<()>> {
         if let Some(io) = self.judge_owed_wait() {
             return Ok(IOResult::IO(io));
         }

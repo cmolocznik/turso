@@ -822,6 +822,76 @@ fn a_probes_look_is_refused_while_its_transaction_owes_a_statement_rollback() {
     );
 }
 
+/// An entry refused while its transaction owes a statement rollback is refused with that rollback's
+/// own error through either conversion a caller's `?` makes, to the error and to the boxed error:
+/// a rollback under way refuses as one its call did not finish first, and one that failed refuses
+/// with its failure (mutants `refusal-error-replaced`, `boxed-refusal-error-replaced`).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_refused_entrys_error_is_its_owed_rollbacks_through_either_conversion() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_refused_entrys_error_is_its_owed_rollbacks_through_either_conversion"
+        ),
+        || {
+            use crate::storage::atoll::sql::cursor::OWED_FAIL_NEXT;
+            let db = Db::open();
+            let cell = db.begin();
+            let n = cell
+                .lock_for_test()
+                .as_ref()
+                .expect("an open transaction")
+                .command();
+            let owing = cell.lock_for_test().owe(n, &db.db, cell.conn());
+            let refused = |cell: &TxnCell| {
+                let plain = cell
+                    .enter()
+                    .map(drop)
+                    .map_err(|r| LimboError::from(r).to_string());
+                let boxed = cell
+                    .enter()
+                    .map(drop)
+                    .map_err(|r| Box::<LimboError>::from(r).to_string());
+                (plain, boxed)
+            };
+            let rolling = refused(&cell);
+            // The owed rollback's next step fails, as injected: the rollback is failed, and kept.
+            OWED_FAIL_NEXT.with(|f| f.set(true));
+            let settled = cell.settle().map(|r| r.is_io()).map_err(|e| e.to_string());
+            let failed = refused(&cell);
+            drop(cell);
+            assert_eq!(owing, Some(Owing::Fresh), "the rollback recorded");
+            let under_way = "an operation met a statement rollback its call did not finish first";
+            assert!(
+                rolling.0.as_ref().is_err_and(|e| e.contains(under_way)),
+                "a refused entry's error, while its rollback is under way: {:?}",
+                rolling.0
+            );
+            assert!(
+                rolling.1.as_ref().is_err_and(|e| e.contains(under_way)),
+                "a refused entry's boxed error, while its rollback is under way: {:?}",
+                rolling.1
+            );
+            let injected = "injected statement rollback failure";
+            assert!(
+                settled.as_ref().is_err_and(|e| e.contains(injected)),
+                "the injected failure: {settled:?}"
+            );
+            assert!(
+                failed.0.as_ref().is_err_and(|e| e.contains(injected)),
+                "a refused entry's error, once its rollback failed: {:?}",
+                failed.0
+            );
+            assert!(
+                failed.1.as_ref().is_err_and(|e| e.contains(injected)),
+                "a refused entry's boxed error, once its rollback failed: {:?}",
+                failed.1
+            );
+        },
+    );
+}
+
 /// A tombstone the probe finds answers the rowid read absent only where the statement sees it:
 /// under read committed, a delete committed after the statement began is a tombstone the probe
 /// passes and the read reads past, to the row the statement sees.

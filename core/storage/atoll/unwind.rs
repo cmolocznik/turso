@@ -859,6 +859,21 @@ mod tests {
             "child",
         ),
         (
+            "sql/mode/tests.rs",
+            "an_owed_endings_kept_wait_is_judged_before_its_next_step",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_owed_endings_kept_wait_is_judged_before_its_next_serve",
+            "child",
+        ),
+        (
+            "sql/cursor/tests.rs",
+            "a_refused_entrys_error_is_its_owed_rollbacks_through_either_conversion",
+            "child",
+        ),
+        (
             "btree/tests.rs",
             "an_abandoned_pages_free_that_comes_short_goes_to_the_checkpointer_its_shortage_forgotten",
             "child",

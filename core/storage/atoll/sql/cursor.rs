@@ -118,10 +118,10 @@ impl TxnSlot {
     /// statement rollback, which the top of the connection's call finishes first
     /// ([`settle`](Self::settle)); one that failed refuses with its failure.
     #[inline]
-    pub(in crate::storage::atoll) fn enter(&self) -> Result<Entered<'_>> {
+    pub(in crate::storage::atoll) fn enter(&self) -> std::result::Result<Entered<'_>, Refused<'_>> {
         let slot = self.slot.lock();
-        if let Some(owed) = slot.owed.as_deref() {
-            return Err(owed.refusal());
+        if slot.owed.is_some() {
+            return Err(Refused(slot));
         }
         Ok(Entered(slot))
     }
@@ -129,13 +129,17 @@ impl TxnSlot {
     /// [`enter`](Self::enter) for a synchronous form at the top of a call: a rollback owed is
     /// finished first, driven to its end here outside a cooperative frame. In one, where such a
     /// form never meets one, a rollback owed is an error naming `site`, never a park.
+    #[inline]
     pub(in crate::storage::atoll) fn enter_now(&self, site: &'static str) -> Result<Entered<'_>> {
-        self.settle_now(site)?;
-        self.enter()
+        if self.owes() {
+            self.settle_now(site)?;
+        }
+        Ok(self.enter()?)
     }
 
     /// [`settle`](Self::settle) for a synchronous form at the top of a call, as
     /// [`enter_now`](Self::enter_now) settles.
+    #[inline]
     pub(in crate::storage::atoll) fn settle_now(&self, site: &'static str) -> Result<()> {
         match self.settle()? {
             IOResult::Done(()) => Ok(()),
@@ -159,7 +163,9 @@ impl TxnSlot {
         let mut slot = self.slot.lock();
         let txn = slot.txn.take()?;
         let owed = slot.owed.take();
-        self.owing.store(false, AtomicOrdering::Release);
+        if owed.is_some() {
+            self.owing.store(false, AtomicOrdering::Release);
+        }
         Some((txn, owed))
     }
 
@@ -188,10 +194,18 @@ impl TxnSlot {
     /// call of the connection, where none of its operations runs. In a cooperative frame, one
     /// step, returning the IO it waits for; outside one, driven to its end here. Refused inside an
     /// operation: its shortage would wait for its own caller (ASYNC1 D2e (iii-b)).
+    #[inline]
     pub(in crate::storage::atoll) fn settle(&self) -> Result<IOResult<()>> {
         if !self.owes() {
             return Ok(IOResult::Done(()));
         }
+        self.settle_owed()
+    }
+
+    /// [`settle`](Self::settle) with a statement rollback owed.
+    #[cold]
+    #[inline(never)]
+    fn settle_owed(&self) -> Result<IOResult<()>> {
         if crate::storage::atoll::buffer::owner_installed() {
             return Err(LimboError::InternalError(
                 "a statement rollback owed would be finished inside an operation of its connection"
@@ -235,6 +249,31 @@ impl TxnSlot {
 
 /// The transaction once entered: nothing owed in it, and nothing can be recorded while it is held.
 pub(in crate::storage::atoll) struct Entered<'a>(MutexGuard<'a, Slot>);
+
+/// An entry refused while the transaction owes a statement rollback, still holding the slot: its
+/// error is made under that lock as it reaches a caller that returns it.
+pub(in crate::storage::atoll) struct Refused<'a>(MutexGuard<'a, Slot>);
+
+impl From<Refused<'_>> for LimboError {
+    #[cold]
+    #[inline(never)]
+    fn from(refused: Refused<'_>) -> Self {
+        refused
+            .0
+            .owed
+            .as_deref()
+            .expect("an entry refused under the guard that found a statement rollback owed")
+            .refusal()
+    }
+}
+
+impl From<Refused<'_>> for Box<LimboError> {
+    #[cold]
+    #[inline(never)]
+    fn from(refused: Refused<'_>) -> Self {
+        Box::new(refused.into())
+    }
+}
 
 impl std::ops::Deref for Entered<'_> {
     type Target = Option<Txn>;
@@ -407,6 +446,8 @@ impl OwedRollback {
     }
 
     /// The error an operation that meets it is refused with.
+    #[cold]
+    #[inline(never)]
     fn refusal(&self) -> LimboError {
         match &self.state {
             Owed::Failed(e) => e.clone(),

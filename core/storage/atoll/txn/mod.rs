@@ -577,6 +577,11 @@ impl Commit {
         self.txn.take()
     }
 
+    /// The transaction it commits, while it holds it: before its transaction has ended.
+    pub fn txn_mut(&mut self) -> Option<&mut Txn> {
+        self.txn.as_mut()
+    }
+
     /// Once the commit is done, the trees whose creation a statement rollback undid: each on its
     /// list, the Commit appended before them.
     pub fn abandoned(&self) -> &[PageId] {

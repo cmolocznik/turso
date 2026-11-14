@@ -679,6 +679,11 @@ pub(crate) struct Owner {
     tenure: Option<Box<Tenure>>,
     conn: Option<Arc<Conn>>,
     keeps: Keeps,
+    /// Whether it is the top of a statement rollback its transaction owes (ASYNC1 D2e (iii-b)),
+    /// whose shortage must never wait for a running operation of its own connection: in a test
+    /// build, that wait is an error at the place it would begin.
+    #[cfg(test)]
+    serves_owed: bool,
 }
 
 /// What an operation's top keeps between its calls (ASYNC1 D2e §2.2b): at most one reference in a
@@ -777,7 +782,15 @@ impl Owner {
             tenure: None,
             conn: Some(conn),
             keeps: Keeps::default(),
+            #[cfg(test)]
+            serves_owed: false,
         }
+    }
+
+    /// Marks it the top of a statement rollback its transaction owes, or no longer, for a test.
+    #[cfg(test)]
+    pub(crate) fn set_serves_owed(&mut self, serves: bool) {
+        self.serves_owed = serves;
     }
 
     /// Runs one call of the operation `op` as this owner's. A call that came short reserves the
@@ -877,7 +890,21 @@ impl Owner {
                     released.let_go(&short.pool);
                     place
                 }
-                Revoked::Running(signal) => return Ok(IOResult::IO(IOCompletions(signal))),
+                Revoked::Running(signal) => {
+                    // An owed statement rollback is finished only where no operation of its
+                    // connection runs (ASYNC1 D2e (iii-b)): waiting for one would be waiting for
+                    // its own caller, whose call returns only once this one does.
+                    #[cfg(test)]
+                    if self.serves_owed {
+                        OWED_WAITED_ON_RUNNING.with(|n| n.set(n.get() + 1));
+                        return Err(crate::LimboError::InternalError(
+                            "an owed rollback's shortage waited for its own connection's running \
+                             operation"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(IOResult::IO(IOCompletions(signal)));
+                }
                 Revoked::None => queue.join(turn, self.conn.clone()),
             },
             None => queue.join(turn, self.conn.clone()),
@@ -1148,6 +1175,19 @@ pub(super) fn owned() -> bool {
     OWNER.with(|o| !o.get().is_null())
 }
 
+/// Whether an operation's owner runs on this thread now: a statement rollback its transaction owes
+/// is never finished inside one (ASYNC1 D2e (iii-b)).
+pub(crate) fn owner_installed() -> bool {
+    owned()
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The shortages of an owed statement rollback's top that met a running operation of its own
+    /// connection on this thread, each refused (ASYNC1 D2e (iii-b)).
+    pub(crate) static OWED_WAITED_ON_RUNNING: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Whether the claim running on this thread runs for an owner, which keeps the page it loads.
 pub(super) fn keeping() -> bool {
     owned()
@@ -1249,6 +1289,14 @@ pub(crate) fn gate_closed<T>(pool: &Arc<BufferPool>) -> IOResult<T> {
         GATE.with(|g| *g.borrow_mut() = Some(pool.clone()));
     }
     IOResult::IO(IOCompletions(Completion::new_yield()))
+}
+
+/// Forgets what a claim or a change of the running operation recorded as it came short or met a
+/// closed gate, for a caller that drops the yield it was handed instead of returning it, and goes
+/// on: its top then reserves nothing and waits for no gate on behalf of a demand no one has.
+pub(crate) fn forget_short() {
+    SHORT.with(|s| s.borrow_mut().take());
+    GATE.with(|g| g.borrow_mut().take());
 }
 
 /// Records that the running operation came short of a frame of `class` for `purpose`, and

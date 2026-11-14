@@ -68,8 +68,11 @@ pub use memory::MIN_BUDGET;
 #[cfg(test)]
 pub(crate) use shortage::scarce;
 pub(crate) use shortage::unowned;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(crate) use shortage::OWED_WAITED_ON_RUNNING;
 pub(crate) use shortage::{
-    cancel as cancel_shortage, gate_closed, keep_meta, kept_page, Conn, Owner,
+    cancel as cancel_shortage, forget_short, gate_closed, keep_meta, kept_page, owner_installed,
+    Conn, Owner,
 };
 pub(crate) use upkeep::{scope as upkeep_scope, Upkeep};
 

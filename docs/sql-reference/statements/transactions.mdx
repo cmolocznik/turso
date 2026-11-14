@@ -88,7 +88,7 @@ INSERT INTO accounts (name, balance) VALUES ('Alice', 500); -- fails: duplicate 
 COMMIT; -- Alice with balance 1000 is committed
 ```
 
-A few failures cannot be undone statement-by-statement (for example running out of space mid-write); those roll back the whole transaction, and a later COMMIT reports that no transaction is active.
+A few failures cannot be undone statement-by-statement (for example running out of space mid-write); those roll back the whole transaction, and a later COMMIT reports that no transaction is active. A failure while undoing a failed statement (for example an I/O error reading back what it wrote) also rolls back the whole transaction, as in SQLite.
 
 ## Implicit Transactions
 

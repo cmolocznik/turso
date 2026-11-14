@@ -20,7 +20,7 @@
 //! again. Writes wait on other transactions, so they come back to the VDBE.
 
 use super::catalog::{self, Catalog, Entry, Layout, System};
-use super::cursor::{AtollCursor, TxnCell};
+use super::cursor::{AtollCursor, OwedRollback, TxnCell};
 use super::header::{Field, Header};
 use super::key;
 use super::lifecycle::Destroy;
@@ -682,6 +682,12 @@ crate::thread::thread_local! {
     /// The commits told on this thread of a failure their driver saw (`Ending::met`), for a test
     /// to see that its schedule reached the driver.
     pub(crate) static COMMITS_MET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The statement step entries on this thread that settled a statement rollback owed
+    /// (ASYNC1 D2e (iii-b)).
+    pub(crate) static SETTLES_AT_STEP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The parked settle waits on this thread that came back failed and were dropped by their
+    /// statement, the failure left to the owed rollback's own copy (ASYNC1 D2e (iii-b)).
+    pub(crate) static SETTLE_WAITS_DROPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy)]
@@ -943,7 +949,7 @@ impl ConnTxn {
     /// `max` of it.
     #[turso_macros::atoll_entry]
     pub fn check_pages(&self, max: usize) -> Result<Vec<String>> {
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter_now("check_pages")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         self.db.check_pages(txn, max)
     }
@@ -982,6 +988,12 @@ impl ConnTxn {
                 "a schema reparse inside another on one connection".to_string(),
             ));
         }
+        // Its begin runs inside `drive_for`'s top, where a statement rollback owed is refused:
+        // finished first, here (ASYNC1 D2e (iii-b)).
+        if let Err(e) = self.cell.settle_now("pin") {
+            self.pinned.store(false, Ordering::Release);
+            return Err(e);
+        }
         self.pin_began.store(!self.is_open(), Ordering::Release);
         let io = self.db.io().clone();
         drive_for(self.cell.conn(), &io, || self.begin(Begin::Read)).inspect_err(|_| {
@@ -1009,7 +1021,7 @@ impl ConnTxn {
     /// deferred transaction's first read begins it.
     #[turso_macros::atoll_entry]
     pub fn open_savepoint(&self, name: String, starts_transaction: bool, deferred_fk: isize) {
-        let at = self.cell.lock().as_ref().map_or(0, Txn::command);
+        let at = self.cell.observe().as_ref().map_or(0, Txn::command);
         self.savepoints.lock().push(Savepoint {
             name,
             at,
@@ -1085,7 +1097,7 @@ impl ConnTxn {
     /// Whether a transaction is open.
     #[turso_macros::atoll_entry]
     pub fn is_open(&self) -> bool {
-        self.cell.lock().is_some()
+        self.cell.observe().is_some()
     }
 
     /// Whether a schema reparse holds the transaction ([`pin`](Self::pin)).
@@ -1097,7 +1109,7 @@ impl ConnTxn {
     /// Whether the open transaction has written.
     #[turso_macros::atoll_entry]
     pub fn wrote(&self) -> bool {
-        self.cell.lock().as_ref().is_some_and(Txn::wrote)
+        self.cell.observe().as_ref().is_some_and(Txn::wrote)
     }
 
     /// A cursor over the tree whose id Turso holds as the root page `root`, as OpenRead and
@@ -1142,8 +1154,10 @@ impl ConnTxn {
     /// The snapshot timestamp of the open transaction's current statement, once it has one.
     #[turso_macros::atoll_entry]
     pub fn snapshot(&self) -> Option<u64> {
+        // Observed: every transaction here is begun at snapshot isolation, whose snapshot a
+        // statement rollback never moves (ASYNC1 D2e (iii-b)).
         self.cell
-            .lock()
+            .observe()
             .as_ref()
             .filter(|txn| txn.snapped())
             .map(Txn::snapshot)
@@ -1181,7 +1195,7 @@ impl ConnTxn {
             // the checkpoint goes on at the next step, whoever takes it.
             self.db.atoll().checkpointer().step_due(txns).map(|_| ())?;
         }
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter()?;
         let began = guard.is_none();
         if began {
             let begun = match wants {
@@ -1357,7 +1371,7 @@ impl ConnTxn {
     /// Gives up a pending exclusive take, as a statement that stops waiting for it does (R15).
     #[turso_macros::atoll_entry]
     pub fn give_up(&self) {
-        if let Some(txn) = self.cell.lock().as_mut() {
+        if let Some(txn) = self.cell.observe().as_mut() {
             self.db.atoll().transactions().give_up(txn);
         }
         *self.taking.lock() = None;
@@ -1368,37 +1382,67 @@ impl ConnTxn {
     /// to if it fails (R18).
     #[turso_macros::atoll_entry]
     pub fn start_statement(&self) -> Result<Statement> {
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter_now("start_statement")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let n = txn.command();
         self.db.atoll().transactions().statement(txn)?;
         Ok(n)
     }
 
-    /// Rolls the open transaction back to where it stood after statement `n`, driven to its end
-    /// here, at the synchronous sites that roll a statement back (R19), and forgets the header
-    /// fields written since.
+    /// Rolls the open transaction back to where it stood after statement `n` (R19): recorded in
+    /// the transaction as the rollback it owes, which the top of the connection's next call
+    /// finishes before anything else ([`TxnSlot::settle`]); outside a cooperative frame finished
+    /// here, in place, as a blocking host does (ASYNC1 D2e (iii-b)). What the connection kept of
+    /// the statements rolled back (the header fields they wrote, a header write under way, the
+    /// trees they destroyed) is forgotten now, and every cache of what they changed is told, once,
+    /// when the rollback is first owed: nothing reads the transaction until it is finished.
     #[turso_macros::atoll_entry]
     pub fn rollback_statement(&self, n: Statement) -> Result<()> {
-        let mut guard = self.cell.lock();
-        let Some(txn) = guard.as_mut() else {
+        {
+            let mut slot = self.cell.observe();
+            let Some(owing) = slot.owe(n, &self.db, self.cell.conn()) else {
+                return Ok(());
+            };
+            if owing != super::cursor::Owing::Failed {
+                self.written.lock().retain(|(s, _, _)| *s <= n);
+                *self.setting.lock() = None;
+                self.changes.destroyed(|list| list.retain(|(_, s)| *s <= n));
+            }
+            if owing == super::cursor::Owing::Fresh {
+                self.changes.rolled_back();
+                // It may undo a catalog or header write the transaction read.
+                self.db.catalog().note_change();
+                self.db.header().note_change();
+            }
+        }
+        if crate::storage::atoll::cooperative::inside() {
             return Ok(());
-        };
-        let mut op = crate::storage::atoll::txn::rollback::Rollback::after(n);
-        let (db, io) = (&self.db, self.db.io());
-        drive_for(self.cell.conn(), io, || {
-            db.atoll()
-                .transactions()
-                .rollback_to(db.versions(), txn, &mut op)
-        })?;
-        self.written.lock().retain(|(s, _, _)| *s <= n);
-        *self.setting.lock() = None;
-        self.changes.destroyed(|list| list.retain(|(_, s)| *s <= n));
-        self.changes.rolled_back();
-        // It may have undone a catalog or header write the transaction read.
-        self.db.catalog().note_change();
-        self.db.header().note_change();
-        Ok(())
+        }
+        match self.cell.settle()? {
+            IOResult::Done(()) => Ok(()),
+            IOResult::IO(_) => unreachable!("a settle outside a cooperative frame returned IO"),
+        }
+    }
+
+    /// Finishes the statement rollback the transaction owes, at the top of a call of the
+    /// connection ([`TxnSlot::settle`]): a statement step's entry, before its first instruction.
+    #[turso_macros::atoll_entry]
+    pub fn settle(&self) -> Result<IOResult<()>> {
+        self.cell.settle()
+    }
+
+    /// Whether the transaction owes a statement rollback: one load, for a statement step's entry.
+    #[inline]
+    #[turso_macros::atoll_entry]
+    pub fn owes(&self) -> bool {
+        self.cell.owes()
+    }
+
+    /// The open transaction's slot and start, if the statement rollback it owes failed: what a
+    /// statement that met the failure marks, so its abort rolls that transaction back whole.
+    #[turso_macros::atoll_entry]
+    pub fn owed_failure(&self) -> Option<(u16, u64)> {
+        self.cell.observe().failed_in()
     }
 
     /// The ending of the open transaction: its commit, or its rollback. `None` with none open, or
@@ -1422,11 +1466,14 @@ impl ConnTxn {
             return None;
         }
         self.served.store(false, Ordering::Release);
-        let (txn, written, stamped) = self.take_to_end()?;
+        let (txn, written, stamped, owed) = self.take_to_end()?;
         let conn = self.cell.conn().clone();
         Some(if commit {
-            Ending::commit(self.db.clone(), conn, txn, written, stamped, publish)
+            Ending::commit(self.db.clone(), conn, txn, written, stamped, publish, owed)
         } else {
+            // The whole rollback undoes all a statement rollback owed would have, from wherever
+            // it stopped: undo is idempotent.
+            drop(owed);
             self.changes.rolled_back();
             Ending::rollback(self.db.clone(), conn, txn)
         })
@@ -1436,7 +1483,7 @@ impl ConnTxn {
     /// header and the trees it stamped; the connection's part of it let go.
     fn take_to_end(&self) -> Option<EndedTxn> {
         self.savepoints.lock().clear();
-        let txn = self.cell.lock().take()?;
+        let (txn, owed) = self.cell.take()?;
         self.changes.destroyed(Vec::clear);
         let written = std::mem::take(&mut *self.written.lock());
         let stamped: Vec<_> = std::mem::take(&mut *self.stamped.lock())
@@ -1449,7 +1496,7 @@ impl ConnTxn {
         // No sibling cursor keeps the gate, `R` or a protected set past the transaction it served
         // (DESIGN.md 9.1.3, *Revoking an inactive tenure*).
         crate::storage::atoll::buffer::cancel_shortage(self.db.atoll().pool(), self.cell.conn());
-        Some((txn, written, stamped))
+        Some((txn, written, stamped, owed))
     }
 
     /// Ends the open read begun for siblings (`served`) by letting its slot and snapshot go: it
@@ -1464,10 +1511,11 @@ impl ConnTxn {
         if self.pinned.load(Ordering::Acquire) || !self.served.swap(false, Ordering::AcqRel) {
             return false;
         }
-        if !self.cell.lock().as_ref().is_some_and(|txn| !txn.wrote()) {
+        if !self.cell.observe().as_ref().is_some_and(|txn| !txn.wrote()) {
             return false;
         }
-        let Some((txn, _, _)) = self.take_to_end() else {
+        // Only with no changes, so a statement rollback owed has nothing to undo.
+        let Some((txn, _, _, _owed)) = self.take_to_end() else {
             return false;
         };
         self.changes.rolled_back();
@@ -1522,7 +1570,7 @@ impl ConnTxn {
     /// for its siblings at its end does (DESIGN.md §17). Done at once with a transaction open.
     #[turso_macros::atoll_entry]
     pub fn serve_sibling(&self) -> Result<IOResult<()>> {
-        if self.cell.lock().is_some() {
+        if self.cell.observe().is_some() {
             return Ok(IOResult::Done(()));
         }
         if let Some(ending) = self.ending.lock().as_mut() {
@@ -1554,7 +1602,7 @@ impl ConnTxn {
     /// here, for a blocking host.
     #[turso_macros::atoll_entry]
     pub fn schema_cookie(&self) -> Result<u32> {
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter_now("schema_cookie")?;
         match guard.as_mut() {
             None => Ok(self.db.header().committed(Field::SchemaCookie)),
             Some(txn) => self.field_in(txn, Field::SchemaCookie),
@@ -1571,7 +1619,7 @@ impl ConnTxn {
             if !crate::storage::atoll::cooperative::inside() {
                 return self.schema_cookie().map(IOResult::Done);
             }
-            if let Some(word) = self.field_known(Field::SchemaCookie) {
+            if let Some(word) = self.field_known(Field::SchemaCookie)? {
                 return Ok(IOResult::Done(word));
             }
         }
@@ -1586,7 +1634,7 @@ impl ConnTxn {
     /// blocking host.
     #[turso_macros::atoll_entry]
     pub fn header(&self) -> Result<DatabaseHeader> {
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter_now("header")?;
         let mut words = [0u32; 7];
         for field in Field::ALL {
             words[field as usize - 1] = match guard.as_mut() {
@@ -1609,7 +1657,7 @@ impl ConnTxn {
             if !crate::storage::atoll::cooperative::inside() {
                 return self.header().map(IOResult::Done);
             }
-            if let Some(header) = self.header_known() {
+            if let Some(header) = self.header_known()? {
                 return Ok(IOResult::Done(header));
             }
         }
@@ -1668,26 +1716,29 @@ impl ConnTxn {
 
     /// Header field `field` known without a read: committed outside a transaction, else as this
     /// transaction read it while the header counts no change.
-    fn field_known(&self, field: Field) -> Option<u32> {
-        let guard = self.cell.lock();
+    fn field_known(&self, field: Field) -> Result<Option<u32>> {
+        let guard = self.cell.enter()?;
         let Some(txn) = guard.as_ref() else {
-            return Some(self.db.header().committed(field));
+            return Ok(Some(self.db.header().committed(field)));
         };
-        self.known_at(txn, field, self.db.header().changes())
+        Ok(self.known_at(txn, field, self.db.header().changes()))
     }
 
     /// The header known without a read, as [`field_known`](Self::field_known) knows each field.
-    fn header_known(&self) -> Option<DatabaseHeader> {
-        let guard = self.cell.lock();
+    fn header_known(&self) -> Result<Option<DatabaseHeader>> {
+        let guard = self.cell.enter()?;
         let mut words = [0u32; 7];
         let changes = self.db.header().changes();
         for field in Field::ALL {
             words[field as usize - 1] = match guard.as_ref() {
                 None => self.db.header().committed(field),
-                Some(txn) => self.known_at(txn, field, changes)?,
+                Some(txn) => match self.known_at(txn, field, changes) {
+                    Some(word) => word,
+                    None => return Ok(None),
+                },
             };
         }
-        Some(header_of(&words))
+        Ok(Some(header_of(&words)))
     }
 
     /// Header field `field` as `txn` read it, while the header counts `changes`.
@@ -1708,10 +1759,10 @@ impl ConnTxn {
         fresh: ReadAt,
         step: impl Fn(&Self, Option<&mut Txn>, &mut ReadAt) -> Result<IOResult<T>>,
     ) -> Result<IOResult<T>> {
-        let txn = self.cell.lock().as_ref().map(|t| (t.slot(), t.start()));
+        let txn = self.cell.enter()?.as_ref().map(|t| (t.slot(), t.start()));
         let FacadeRead { owner, at, .. } = FacadeRead::kept(read, self.cell.conn(), txn, fresh);
         let out = drive_or_io(owner, self.db.io(), || {
-            let mut guard = self.cell.lock();
+            let mut guard = self.cell.enter()?;
             step(self, guard.as_mut(), at)
         });
         FacadeRead::settle(read, out)
@@ -1825,7 +1876,7 @@ impl ConnTxn {
             let value = new[field as usize - 1];
             let (_, op, waiting) = setting
                 .get_or_insert_with(|| (field, Header::put_op(field, value), Waiting::default()));
-            let mut guard = self.cell.lock();
+            let mut guard = self.cell.enter()?;
             let txn = guard.as_mut().ok_or_else(outside)?;
             let w = done!(self.db.header().write(
                 self.db.atoll().transactions(),
@@ -1897,7 +1948,7 @@ impl ConnTxn {
             }
         }
         loop {
-            let mut guard = self.cell.lock();
+            let mut guard = self.cell.enter()?;
             let txn = guard.as_mut().ok_or_else(outside)?;
             let w = done!(if clear {
                 self.db.clear(txn, &mut op.destroy)
@@ -1924,7 +1975,7 @@ impl ConnTxn {
     /// The rows tree `id` holds as the current statement reads them.
     fn count_rows(&self, id: u64) -> Result<u64> {
         let entry = {
-            let mut guard = self.cell.lock();
+            let mut guard = self.cell.enter_now("count_rows")?;
             let txn = guard.as_mut().ok_or_else(outside)?;
             let mut get = Get::new(&catalog::key(id));
             let db = &self.db;
@@ -1961,7 +2012,7 @@ impl ConnTxn {
             match count.at {
                 CountAt::Resolving => {
                     let entry = {
-                        let mut guard = self.cell.lock();
+                        let mut guard = self.cell.enter()?;
                         let txn = guard.as_mut().ok_or_else(outside)?;
                         let out = row_in_kept(
                             &self.db,
@@ -2016,7 +2067,7 @@ impl ConnTxn {
             write: None,
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         });
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter()?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let root = match op.root {
             Some(root) => root,
@@ -2194,7 +2245,12 @@ fn outside() -> LimboError {
 
 /// An open transaction taken out of its connection to be ended ([`ConnTxn::take_to_end`]), with the
 /// header fields it wrote and the stamps of the trees it wrote.
-type EndedTxn = (Txn, Vec<(Statement, Field, u32)>, Vec<super::trees::Stamp>);
+type EndedTxn = (
+    Txn,
+    Vec<(Statement, Field, u32)>,
+    Vec<super::trees::Stamp>,
+    Option<Box<OwedRollback>>,
+);
 
 /// A transaction's commit or rollback, then the drain of the trees it abandoned. Step it until
 /// done. Never abandoned: dropped unfinished, it is driven to its end where it drops (R19).
@@ -2214,6 +2270,14 @@ pub struct Ending {
 // every commit.
 #[allow(clippy::large_enum_variant)]
 enum Step {
+    /// A statement rollback the transaction owed, finished before its commit (R19, ASYNC1 D2e
+    /// (iii-b)): the rollback, the completion the ending's last step returned while it was in this
+    /// step, until the next step has judged it, and the commit to step once it is done.
+    Owed {
+        rollback: Box<crate::storage::atoll::txn::rollback::Rollback>,
+        waiting: Option<Completion>,
+        commit: Commit,
+    },
     Commit(Commit),
     /// A rollback, with the failure of the commit it replaces: a commit that failed before it
     /// published rolls its transaction back, and its failure is then the ending's outcome.
@@ -2232,7 +2296,9 @@ enum Step {
 impl Ending {
     /// Commits `txn`: once it is published, its header fields `written` and the stamps of the
     /// trees it wrote are raised to its commit timestamp, and `publish` runs, before it releases
-    /// the write gate.
+    /// the write gate. A statement rollback `txn` owes is finished first, its top the ending's own
+    /// (ASYNC1 D2e (iii-b)); one that failed makes the commit the transaction's rollback, its
+    /// failure the outcome.
     fn commit(
         db: Arc<AtollDb>,
         conn: Arc<crate::storage::atoll::buffer::Conn>,
@@ -2240,11 +2306,12 @@ impl Ending {
         written: Vec<(Statement, Field, u32)>,
         stamped: Vec<super::trees::Stamp>,
         publish: Option<Box<dyn FnOnce() + Send>>,
+        owed: Option<Box<OwedRollback>>,
     ) -> Self {
         #[cfg(test)]
         crate::storage::atoll::testing::ending_made();
         let published = db.clone();
-        let commit = Commit::new(txn).on_published(move |ts| {
+        let mut commit = Commit::new(txn).on_published(move |ts| {
             for (_, field, value) in written {
                 published.header().publish(field, ts, value);
             }
@@ -2253,11 +2320,33 @@ impl Ending {
                 publish();
             }
         });
+        let mut owner = crate::storage::atoll::buffer::Owner::of(conn);
+        let step = match owed.map(|o| o.into_parts()) {
+            None => Step::Commit(commit),
+            // Its top goes on as the ending's, its keeps with it; its place in the shortage queue,
+            // if it had one, `take_to_end` ended, and its next call starts afresh.
+            Some(Ok((rollback, top, waiting))) => {
+                owner = top;
+                Step::Owed {
+                    rollback: Box::new(rollback),
+                    waiting,
+                    commit,
+                }
+            }
+            Some(Err(failure)) => Step::Rollback(
+                Abort::new(
+                    commit
+                        .take_txn()
+                        .expect("a commit not begun holds its transaction"),
+                ),
+                Some(failure),
+            ),
+        };
         Self {
             db,
-            step: Step::Commit(commit),
+            step,
             published: false,
-            owner: crate::storage::atoll::buffer::Owner::of(conn),
+            owner,
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
@@ -2290,7 +2379,88 @@ impl Ending {
 
     #[turso_macros::atoll_entry]
     pub fn step(&mut self) -> Result<IOResult<()>> {
-        crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::step_owned)
+        if let Some(io) = self.judge_owed_wait() {
+            return Ok(IOResult::IO(io));
+        }
+        let out =
+            crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::step_owned);
+        self.keep_owed_wait(&out);
+        out
+    }
+
+    /// In [`Step::Owed`], the completion the ending's last step returned, judged before its top
+    /// admits another call: unfinished, the same wait; failed, the commit becomes the
+    /// transaction's rollback with that failure, the statement rollback never stepped again;
+    /// finished cleanly, let go.
+    fn judge_owed_wait(&mut self) -> Option<IOCompletions> {
+        let Step::Owed { waiting, .. } = &mut self.step else {
+            return None;
+        };
+        let failure = match waiting.take() {
+            None => return None,
+            Some(c) if !c.finished() => {
+                *waiting = Some(c.clone());
+                return Some(IOCompletions(c));
+            }
+            Some(c) => c.get_error()?,
+        };
+        self.owed_failed(LimboError::CompletionError(failure));
+        None
+    }
+
+    /// Keeps, in [`Step::Owed`], the completion the step returned through its top: the wait that
+    /// stands, which the top may have put in place of the rollback's own.
+    fn keep_owed_wait(&mut self, out: &Result<IOResult<()>>) {
+        if let (Step::Owed { waiting, .. }, Ok(IOResult::IO(IOCompletions(c)))) =
+            (&mut self.step, out)
+        {
+            *waiting = Some(c.clone());
+        }
+    }
+
+    /// The statement rollback the transaction owed failed: the commit becomes the transaction's
+    /// rollback, the failure its outcome, as a commit that fails before it publishes does.
+    fn owed_failed(&mut self, failure: LimboError) {
+        let Step::Owed { commit, .. } = &mut self.step else {
+            unreachable!("an owed rollback's failure in another step")
+        };
+        let txn = commit
+            .take_txn()
+            .expect("a commit not begun holds its transaction");
+        self.step = Step::Rollback(Abort::new(txn), Some(failure));
+    }
+
+    /// The statement rollback the transaction owed, one call, under the ending's top.
+    fn step_owed(&mut self) -> Result<IOResult<()>> {
+        let Step::Owed {
+            rollback, commit, ..
+        } = &mut self.step
+        else {
+            unreachable!("an owed rollback's step in another step")
+        };
+        let txn = commit
+            .txn_mut()
+            .expect("a commit not begun holds its transaction");
+        let stepped = self
+            .db
+            .atoll()
+            .transactions()
+            .rollback_to(self.db.versions(), txn, rollback);
+        match stepped {
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(())) => {
+                let Step::Owed { commit, .. } = std::mem::replace(&mut self.step, Step::Done)
+                else {
+                    unreachable!("the step just matched")
+                };
+                self.step = Step::Commit(commit);
+                Ok(IOResult::Done(()))
+            }
+            Err(failure) => {
+                self.owed_failed(failure);
+                Ok(IOResult::Done(()))
+            }
+        }
     }
 
     /// An IO the ending waited on failed, its commit published (DESIGN.md §17): the commit stands,
@@ -2324,10 +2494,23 @@ impl Ending {
     /// the failure is kept in the ending for that statement (`Step::Failed`).
     #[turso_macros::atoll_entry]
     pub fn serve(&mut self) -> Result<IOResult<()>> {
-        crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::serve_owned)
+        if let Some(io) = self.judge_owed_wait() {
+            return Ok(IOResult::IO(io));
+        }
+        let out = crate::storage::atoll::buffer::Owner::call_in(
+            self,
+            |e| &mut e.owner,
+            Self::serve_owned,
+        );
+        self.keep_owed_wait(&out);
+        out
     }
 
     fn serve_owned(&mut self) -> Result<IOResult<()>> {
+        // The statement rollback owed is the transaction's own step, before it is over.
+        if matches!(self.step, Step::Owed { .. }) {
+            done!(self.step_owed());
+        }
         if matches!(&self.step, Step::Commit(op) if !op.ended()) {
             done!(self.step_commit_end());
         }
@@ -2449,6 +2632,7 @@ impl Ending {
     fn step_owned(&mut self) -> Result<IOResult<()>> {
         loop {
             match &mut self.step {
+                Step::Owed { .. } => done!(self.step_owed()),
                 Step::Commit(_) => done!(self.step_commit()),
                 Step::Rollback(..) => done!(self.step_rollback()),
                 Step::Drain => {
@@ -2542,6 +2726,8 @@ impl Ending {
                 self.step = Step::Failed(failure);
             }
             Step::Drain | Step::Checkpoint(_) => self.step = Step::Failed(failure),
+            // The owed statement rollback's wait failed: it is never stepped again.
+            Step::Owed { .. } => self.owed_failed(failure),
             Step::Commit(_) | Step::Failed(_) | Step::Done => {}
         }
     }
@@ -2551,6 +2737,7 @@ impl std::fmt::Debug for Ending {
     #[turso_macros::atoll_entry]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let step = match self.step {
+            Step::Owed { .. } => "rolling a statement back",
             Step::Commit(_) => "committing",
             Step::Rollback(..) => "rolling back",
             Step::Drain => "draining",
@@ -2879,7 +3066,7 @@ impl SqlCursor {
 
     fn open_inner(&mut self, opening: Opening) -> Result<IOResult<()>> {
         let taken_up = {
-            let mut guard = self.cell.lock();
+            let mut guard = self.cell.enter()?;
             let txn = guard.as_mut().ok_or_else(outside)?;
             if self.changes.destroyed_in(self.id, txn.command()) {
                 drop(guard);
@@ -2944,7 +3131,7 @@ impl SqlCursor {
     }
 
     fn entry_inner(&mut self) -> Result<IOResult<(Entry, bool, Near)>> {
-        let mut guard = self.cell.lock();
+        let mut guard = self.cell.enter()?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let (row, near) = done!(row_in_kept(
             &self.db,
@@ -3007,6 +3194,14 @@ impl SqlCursor {
         self.resolving.as_ref().map(|r| r.keeps_for_test())
     }
 
+    /// Whether its tree cursor's operation holds a memory-shortage tenure, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn shortage_queued_for_test(&self) -> bool {
+        self.open
+            .as_deref()
+            .is_some_and(AtollCursor::shortage_queued)
+    }
+
     /// Its tree cursor's address, if it holds one, for a test to see it reused.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(in crate::storage::atoll) fn tree_cursor_for_test(&self) -> Option<usize> {
@@ -3044,7 +3239,7 @@ impl SqlCursor {
             match self.waiting.judge(&self.db, &self.waits, w)? {
                 Judged::Done => {
                     if self.id == SCHEMA_ID {
-                        if let Some(txn) = self.cell.lock().as_mut() {
+                        if let Some(txn) = self.cell.enter()?.as_mut() {
                             txn.wrote_schema();
                         }
                     }

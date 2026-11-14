@@ -1079,7 +1079,7 @@ fn catalogued_in(ct: &crate::storage::atoll::sql::mode::ConnTxn, id: u64) -> boo
     use crate::storage::atoll::sql::catalog::key;
     use crate::storage::atoll::txn::versioned::Get;
     let db = ct.db();
-    let mut guard = ct.cell.lock();
+    let mut guard = ct.cell.lock_for_test();
     let txn = guard.as_mut().expect("an open transaction");
     let mut get = Get::new(&key(id));
     drive(db.io(), || {
@@ -6952,6 +6952,7 @@ fn a_commit_told_of_its_drivers_failure_before_it_ended_rolls_back() {
             Vec::new(),
             Vec::new(),
             None,
+            None,
         );
         ending.met(crate::LimboError::InternalError(
             "the log failed under an admission".to_string(),
@@ -7077,6 +7078,7 @@ fn a_commit_whose_admission_its_driver_sees_fail(seed: u64, fail: bool, by_drop:
             txn,
             Vec::new(),
             Vec::new(),
+            None,
             None,
         );
         let first = format!("{:?}", ending.step().map(|r| r.is_io()));
@@ -7494,7 +7496,7 @@ mod in_frames {
             let idle = atoll.io_idle_for_test();
             drop(held);
             assert!(
-                ct.cell.try_lock().is_some(),
+                ct.cell.try_lock_for_test().is_some(),
                 "call {calls}: a guard of the transaction held across the return"
             );
             match out {
@@ -9741,6 +9743,2023 @@ mod in_frames {
                 );
             }
         }
+
+        // ------------------- a statement's rollback owed by its transaction (ASYNC1 D2e (iii-b))
+
+        mod owing {
+            use super::*;
+            use crate::storage::atoll::sql::cursor::{OWED_FAILED, OWED_STEPS};
+            use crate::storage::atoll::sql::mode::SETTLES_AT_STEP;
+
+            /// A database opened async whose log spills a large statement's changes in parts, so a
+            /// rollback of it reads them back from the log, with a table `t`.
+            fn spilling(path: &str) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>) {
+                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                let mut cfg = config();
+                cfg.log.buffer_bytes = 32 << 10;
+                cfg.log.chunk_bytes = 8 << 10;
+                cfg.log_budget = Some(16 << 20);
+                let db =
+                    crate::storage::atoll::requests::opened_async(|| open_with(&io, path, cfg));
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                    .unwrap();
+                (io, db, conn)
+            }
+
+            /// Inserts rows `from..from + n` of 2 KiB each, outside any frame: enough to spill.
+            fn big(conn: &Arc<Connection>, from: i64, n: i64) {
+                let values = (from..from + n)
+                    .map(|a| format!("({a}, zeroblob(2048))"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.execute(format!("INSERT INTO t VALUES {values}"))
+                    .unwrap();
+            }
+
+            /// The rollback the connection's transaction owes: its serial, and whether it failed.
+            fn owed(conn: &Arc<Connection>) -> Option<(u64, bool)> {
+                let ct = conn.atoll().expect("Atoll mode");
+                let slot = ct.cell.lock_for_test();
+                slot.owed_for_test()
+                    .map(|o| (o.serial_for_test(), o.failed()))
+            }
+
+            /// The steps owed rollbacks took on this thread so far.
+            fn steps() -> u64 {
+                OWED_STEPS.with(|n| n.get())
+            }
+
+            /// The step entries on this thread that settled a rollback owed so far.
+            fn settles() -> u64 {
+                SETTLES_AT_STEP.with(|n| n.get())
+            }
+
+            /// The open transaction's current statement number.
+            fn command(conn: &Arc<Connection>) -> u32 {
+                let ct = conn.atoll().expect("Atoll mode");
+                let slot = ct.cell.lock_for_test();
+                slot.as_ref().expect("an open transaction").command()
+            }
+
+            /// What a statement stepped in frames came to: its rows or its error, and at each return
+            /// for IO the serial of the rollback owed then.
+            struct Stepped {
+                out: std::result::Result<Vec<Vec<Value>>, String>,
+                owed_at_io: Vec<Option<u64>>,
+            }
+
+            /// Steps `stmt` in test frames until it is done or fails, at most `bound` calls, each
+            /// return for IO waited for outside the frame in I6's order.
+            fn stepped_in_frames(
+                io: &Arc<dyn IO>,
+                db: &Database,
+                conn: &Arc<Connection>,
+                stmt: &mut crate::Statement,
+                bound: usize,
+            ) -> Stepped {
+                stepped_in_frames_keeping(io, db, conn, stmt, bound, None)
+            }
+
+            /// [`stepped_in_frames`], stopped at the first return for IO at which the transaction
+            /// owes a rollback other than the one whose serial is `kept`: its result is then an
+            /// error naming the two.
+            fn stepped_in_frames_keeping(
+                io: &Arc<dyn IO>,
+                db: &Database,
+                conn: &Arc<Connection>,
+                stmt: &mut crate::Statement,
+                bound: usize,
+                kept: Option<u64>,
+            ) -> Stepped {
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                let (mut rows, mut owed_at_io) = (Vec::new(), Vec::new());
+                for calls in 1..=bound {
+                    let held = held_io(db);
+                    let stepped = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        stmt.step()
+                    };
+                    let idle = atoll.io_idle_for_test();
+                    drop(held);
+                    match stepped {
+                        Err(e) => {
+                            return Stepped {
+                                out: Err(e.to_string()),
+                                owed_at_io,
+                            }
+                        }
+                        Ok(crate::StepResult::Row) => {
+                            rows.push(stmt.row().unwrap().get_values().cloned().collect())
+                        }
+                        Ok(crate::StepResult::Done) => {
+                            return Stepped {
+                                out: Ok(rows),
+                                owed_at_io,
+                            }
+                        }
+                        Ok(crate::StepResult::Yield) => {}
+                        Ok(crate::StepResult::IO) => {
+                            let now = owed(conn).map(|(serial, _)| serial);
+                            owed_at_io.push(now);
+                            let c = stmt.pending_io_for_test().expect("the statement's wait");
+                            assert!(waited(io, &c), "call {calls}: its wait never finished");
+                            assert!(retired(db), "call {calls}: a request outstanding");
+                            assert!(idled(&idle), "call {calls}: the IO thread never went idle");
+                            if let (Some(kept), Some(now)) = (kept, now) {
+                                if now != kept {
+                                    return Stepped {
+                                        out: Err(format!(
+                                            "the owed rollback was made anew at a return: {kept} \
+                                             then {now} at call {calls}"
+                                        )),
+                                        owed_at_io,
+                                    };
+                                }
+                            }
+                        }
+                        Ok(other) => panic!("call {calls}: {other:?}"),
+                    }
+                }
+                panic!("the statement did not finish within {bound} calls");
+            }
+
+            /// A statement that fails on UNIQUE in a frame, in an explicit transaction, records its
+            /// rollback and does no undo work there: the transaction owes it. The statement's own
+            /// error is what it returns. The next statement's step entry finishes the rollback, and
+            /// that statement reads the transaction as rolled back (mutant `abort-parks`, the abort
+            /// finishing the rollback in place: it steps it).
+            #[test]
+            fn an_abort_in_a_frame_owes_its_rollback_and_the_next_statement_finishes_it() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_abort_in_a_frame_owes_its_rollback_and_the_next_statement_finishes_it"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-abort");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        // Prepared before the record, so that no preparation finishes it.
+                        let mut failing = conn
+                            .prepare(
+                                "INSERT INTO t SELECT a + 10, b FROM t UNION ALL SELECT 1, x'ff'",
+                            )
+                            .unwrap();
+                        let mut count = conn.prepare("SELECT count(*), sum(a) FROM t").unwrap();
+                        let (steps_before, settles_before) = (steps(), settles());
+                        let failed = stepped_in_frames(&io, &db, &conn, &mut failing, 64);
+                        let recorded = (owed(&conn), steps() - steps_before);
+                        let counted = stepped_in_frames(&io, &db, &conn, &mut count, 64);
+                        let after = (owed(&conn), settles() - settles_before);
+                        drop((failing, count));
+                        conn.execute("COMMIT").unwrap();
+                        let committed = rows(&conn, "SELECT count(*), sum(a) FROM t");
+                        assert!(
+                            failed
+                                .out
+                                .as_ref()
+                                .is_err_and(|e| e.contains("UNIQUE") || e.contains("PRIMARY KEY")),
+                            "the failing statement's own error: {:?}",
+                            failed.out
+                        );
+                        assert!(
+                            recorded.0.is_some_and(|(_, failed)| !failed),
+                            "no rollback owed after an abort in a frame: {:?}",
+                            recorded.0
+                        );
+                        assert_eq!(recorded.1, 0, "the abort stepped its rollback");
+                        assert_eq!(
+                            counted.out,
+                            Ok(vec![vec![Value::from_i64(3), Value::from_i64(6)]]),
+                            "the next statement's read"
+                        );
+                        assert!(
+                            after.1 > 0,
+                            "the next statement's step entry settled nothing"
+                        );
+                        assert_eq!(
+                            after.0, None,
+                            "a rollback still owed after the next statement"
+                        );
+                        assert_eq!(
+                            committed,
+                            vec![vec![Value::from_i64(3), Value::from_i64(6)]],
+                            "the rows committed"
+                        );
+                    },
+                );
+            }
+
+            /// A ROLLBACK TO in a frame over a savepoint whose statements spilled parts records the
+            /// rollback and returns Done with no IO; the next statement's step entry finishes it,
+            /// returning IO while the same owed rollback, its serial, is kept, and the statement reads
+            /// the rows before the savepoint. A second ROLLBACK TO the same savepoint after new writes
+            /// records a rollback anew (mutant `owed-fresh`, a new rollback made at each settle).
+            #[test]
+            fn a_rollback_to_in_a_frame_is_owed_and_one_to_the_same_savepoint_after_new_writes_is_owed_again(
+            ) {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_rollback_to_in_a_frame_is_owed_and_one_to_the_same_savepoint_after_new_writes_is_owed_again"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-rollback-to");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let mut rounds = Vec::new();
+                        for round in 0..2 {
+                            if round == 1 {
+                                big(&conn, 1000, 100);
+                                back.reset().unwrap();
+                                count.reset().unwrap();
+                            }
+                            let before = steps();
+                            let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                            let recorded = (owed(&conn), steps() - before, rolled.owed_at_io.len());
+                            let kept = recorded.0.map(|(serial, _)| serial);
+                            let counted =
+                                stepped_in_frames_keeping(&io, &db, &conn, &mut count, 100_000, kept);
+                            // Checked here, at the return it changed at: a rollback made anew at
+                            // each settle may never finish.
+                            assert!(
+                                !counted.out.as_ref().is_err_and(|e| e.contains("made anew")),
+                                "round {round}: {:?}",
+                                counted.out
+                            );
+                            rounds.push((rolled.out, recorded, counted.out, counted.owed_at_io, owed(&conn)));
+                        }
+                        drop((back, count));
+                        conn.execute("COMMIT").unwrap();
+                        let committed = rows(&conn, "SELECT count(*) FROM t");
+                        let mut serials = Vec::new();
+                        for (round, (rolled, recorded, counted, owed_at_io, after)) in
+                            rounds.into_iter().enumerate()
+                        {
+                            assert_eq!(rolled, Ok(vec![]), "round {round}: the ROLLBACK TO");
+                            let serial = recorded
+                                .0
+                                .filter(|(_, failed)| !failed)
+                                .map(|(serial, _)| serial)
+                                .unwrap_or_else(|| panic!("round {round}: ROLLBACK TO owed nothing"));
+                            assert_eq!(recorded.1, 0, "round {round}: the ROLLBACK TO stepped its rollback");
+                            assert_eq!(recorded.2, 0, "round {round}: the ROLLBACK TO returned IO");
+                            assert!(
+                                owed_at_io.contains(&Some(serial)),
+                                "round {round}: the next statement never returned IO with the rollback owed: {owed_at_io:?}"
+                            );
+                            assert!(
+                                owed_at_io.iter().flatten().all(|s| *s == serial),
+                                "round {round}: the owed rollback was made anew at a return: {serial} then {owed_at_io:?}"
+                            );
+                            assert_eq!(
+                                counted,
+                                Ok(vec![vec![Value::from_i64(3)]]),
+                                "round {round}: the next statement's count"
+                            );
+                            assert_eq!(after, None, "round {round}: a rollback still owed");
+                            serials.push(serial);
+                        }
+                        assert_ne!(serials[0], serials[1], "the second ROLLBACK TO owed nothing new");
+                        assert_eq!(committed, vec![vec![Value::from_i64(3)]], "the rows committed");
+                    },
+                );
+            }
+
+            /// The merge of a rollback recorded while another is owed, from part-way: one owed to a
+            /// later statement, stepped once so its walk has begun, is restarted at an earlier target,
+            /// and one owed to an earlier statement keeps its progress when a later target is
+            /// recorded; either way the rows are the earlier target's (mutant `merge-keeps-later`).
+            #[test]
+            fn a_rollback_recorded_while_another_is_owed_keeps_the_earlier_target_from_part_way() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_rollback_recorded_while_another_is_owed_keeps_the_earlier_target_from_part_way"
+                    ),
+                    || {
+                        let mut seen = Vec::new();
+                        for (case, path) in [(0, "/db/owed-merge-restart"), (1, "/db/owed-merge-keep")] {
+                            let (io, db, conn) = spilling(path);
+                            let ct = conn.atoll().expect("Atoll mode");
+                            conn.execute("BEGIN").unwrap();
+                            conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                                .unwrap();
+                            let after_a = command(&conn);
+                            big(&conn, 100, 100);
+                            let after_b = command(&conn);
+                            big(&conn, 1000, 100);
+                            let (first, second) = if case == 0 {
+                                (after_b, after_a)
+                            } else {
+                                (after_a, after_b)
+                            };
+                            let _ = in_frame(&io, &db, || ct.rollback_statement(first).map(IOResult::Done))
+                                .unwrap();
+                            let serial = owed(&conn).map(|(s, _)| s);
+                            // Settled in frames until it has put a key back and still waits: part-way.
+                            let put_back = || {
+                                let slot = ct.cell.lock_for_test();
+                                slot.owed_for_test().map(|o| o.put_back_for_test())
+                            };
+                            let mut stepped = false;
+                            for _ in 0..64 {
+                                stepped = in_frame(&io, &db, || ct.settle()).unwrap().is_io();
+                                if !stepped || put_back().is_some_and(|n| n > 0) {
+                                    break;
+                                }
+                            }
+                            let begun = put_back();
+                            let _ = in_frame(&io, &db, || ct.rollback_statement(second).map(IOResult::Done))
+                                .unwrap();
+                            let merged = owed(&conn).map(|(s, _)| s);
+                            assert!(!ct.settle().unwrap().is_io(), "a settle outside a frame returned IO");
+                            let left = owed(&conn);
+                            let counted = rows(&conn, "SELECT count(*) FROM t");
+                            conn.execute("ROLLBACK").unwrap();
+                            drop(conn);
+                            drop(db);
+                            seen.push((case, serial, stepped, begun, merged, left, counted));
+                        }
+                        for (case, serial, stepped_io, begun, merged, left, counted) in seen {
+                            let what = if case == 0 { "restart" } else { "keep" };
+                            assert!(serial.is_some(), "{what}: nothing owed after the first record");
+                            assert!(stepped_io, "{what}: the first settle did not return IO part-way");
+                            assert!(
+                                begun.is_some_and(|n| n > 0),
+                                "{what}: the owed rollback had put no key back before the merge: {begun:?}"
+                            );
+                            if case == 0 {
+                                assert!(
+                                    merged.is_some() && merged != serial,
+                                    "restart: an earlier target did not restart the owed rollback: {serial:?} then {merged:?}"
+                                );
+                            } else {
+                                assert_eq!(merged, serial, "keep: a later target replaced the owed rollback");
+                            }
+                            assert_eq!(left, None, "{what}: a rollback still owed");
+                            assert_eq!(
+                                counted,
+                                vec![vec![Value::from_i64(3)]],
+                                "{what}: a merged rollback kept rows after the earlier target"
+                            );
+                        }
+                    },
+                );
+            }
+
+            /// A cursor's cached value through a recorded rollback, at the facade (a `SqlCursor`
+            /// called directly, not through a statement's step): it stands on row 1 and reads it; a failing UPDATE in frames writes row 1, waits on a cold leaf, and the
+            /// cursor reads the new value; the UPDATE then fails, its rollback recorded. The cursor's
+            /// next read, its epoch behind, catches up and is refused while the rollback is owed;
+            /// settled, the same read gives the value from before the UPDATE (mutant
+            /// `record-no-bump`, no counter told at the record: the cursor answers from its cache).
+            #[test]
+            fn a_cursors_cached_value_catches_up_through_a_recorded_rollback() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_cursors_cached_value_catches_up_through_a_recorded_rollback"
+                    ),
+                    || {
+                        use crate::types::{SeekKey, SeekOp};
+                        let (io, db, conn) = deferred("/db/owed-cached");
+                        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                            .unwrap();
+                        conn.execute("CREATE UNIQUE INDEX tb ON t (b)").unwrap();
+                        conn.execute("BEGIN").unwrap();
+                        for a in 1..=1000 {
+                            conn.execute(format!(
+                                "INSERT INTO t VALUES ({a}, printf('%0120d', {a}))"
+                            ))
+                            .unwrap();
+                        }
+                        conn.execute("COMMIT").unwrap();
+                        checkpointed(&conn);
+                        let id = tree(&conn, "t");
+                        conn.execute("BEGIN").unwrap();
+                        rows(&conn, "SELECT count(*) FROM t");
+                        // One pass: row 1 written, then row 900's cold leaf waited for, then its
+                        // write breaks the UNIQUE index on b.
+                        let mut update = conn
+                            .prepare("UPDATE t SET b = x'0b0b' WHERE a IN (1, 900)")
+                            .unwrap();
+                        let ct = conn.atoll().expect("Atoll mode");
+                        let mut cursor =
+                            SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                        crate::storage::atoll::drive(&io, || cursor.finish_open().map_err(|e| *e))
+                            .unwrap();
+                        crate::storage::atoll::drive(&io, || {
+                            cursor
+                                .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })
+                                .map_err(|e| *e)
+                        })
+                        .unwrap();
+                        let payload = |c: &mut SqlCursor| {
+                            crate::storage::atoll::drive(&io, || {
+                                c.record_payload()
+                                    .map(|r| r.map(|p| p.map(<[u8]>::to_vec)))
+                                    .map_err(|e| *e)
+                            })
+                        };
+                        let original = payload(&mut cursor).unwrap();
+                        chill(&db);
+                        let atoll = db.atoll.as_ref().unwrap().atoll();
+                        let (mut while_waiting, mut failed) = (None, None);
+                        for calls in 1..=64 {
+                            let held = held_io(&db);
+                            let stepped = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                update.step()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            match stepped {
+                                Err(e) => {
+                                    failed = Some(e.to_string());
+                                    break;
+                                }
+                                Ok(crate::StepResult::IO) => {
+                                    let c = update.pending_io_for_test().expect("its wait");
+                                    assert!(
+                                        waited(&io, &c),
+                                        "call {calls}: its wait never finished"
+                                    );
+                                    assert!(retired(&db), "call {calls}: a request outstanding");
+                                    assert!(
+                                        idled(&idle),
+                                        "call {calls}: the IO thread never went idle"
+                                    );
+                                    let now = payload(&mut cursor).unwrap();
+                                    if now != original {
+                                        while_waiting = Some(now);
+                                    }
+                                }
+                                Ok(other) => panic!("call {calls}: {other:?}"),
+                            }
+                        }
+                        let recorded = owed(&conn);
+                        let refused = payload(&mut cursor).map_err(|e| e.to_string());
+                        let moved =
+                            crate::storage::atoll::drive(&io, || cursor.next().map_err(|e| *e))
+                                .map_err(|e| e.to_string());
+                        assert!(
+                            !ct.settle().unwrap().is_io(),
+                            "a settle outside a frame returned IO"
+                        );
+                        crate::storage::atoll::drive(&io, || {
+                            cursor
+                                .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })
+                                .map_err(|e| *e)
+                        })
+                        .unwrap();
+                        let settled = payload(&mut cursor).unwrap();
+                        drop((cursor, update));
+                        conn.execute("ROLLBACK").unwrap();
+                        assert!(
+                            failed
+                                .as_deref()
+                                .is_some_and(|e| e.contains("UNIQUE") || e.contains("PRIMARY KEY")),
+                            "the UPDATE's own error: {failed:?}"
+                        );
+                        assert!(
+                            while_waiting.as_ref().is_some_and(|w| *w != original),
+                            "the cursor never read the UPDATE's value while it waited"
+                        );
+                        assert!(
+                            recorded.is_some_and(|(_, f)| !f),
+                            "no rollback owed after the UPDATE failed"
+                        );
+                        match &refused {
+                            Ok(read) if read == &original => {}
+                            Ok(read) => panic!(
+                                "a reader saw a rolled-back statement's value: {:?} (before {:?})",
+                                read, original
+                            ),
+                            Err(e) => assert!(
+                                e.contains("did not finish first"),
+                                "the cursor's read after the record: {e}"
+                            ),
+                        }
+                        assert!(
+                            refused.is_err(),
+                            "the cursor's read after the record was answered while the rollback was owed"
+                        );
+                        assert!(
+                            moved
+                                .as_ref()
+                                .is_err_and(|e| e.contains("did not finish first")),
+                            "the cursor's move after the record: {moved:?}"
+                        );
+                        assert_eq!(settled, original, "the row after the rollback was settled");
+                    },
+                );
+            }
+
+            /// After a rollback is recorded, an operation entering the transaction is refused and reads
+            /// nothing until a call's top settles it; settling inside an operation's owner is refused
+            /// too (mutant `enter-admits-owed`, an entry handed the transaction with a rollback owed).
+            #[test]
+            fn an_operation_meeting_an_owed_rollback_is_refused_and_settling_inside_one_is_too() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_operation_meeting_an_owed_rollback_is_refused_and_settling_inside_one_is_too"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-refused");
+                        let id = tree(&conn, "t");
+                        let ct = conn.atoll().expect("Atoll mode");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        let after_a = command(&conn);
+                        big(&conn, 100, 100);
+                        let _ = in_frame(&io, &db, || ct.rollback_statement(after_a).map(IOResult::Done))
+                            .unwrap();
+                        let recorded = owed(&conn);
+                        let mut cursor =
+                            SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                        let opened = crate::storage::atoll::drive(&io, || cursor.finish_open().map_err(|e| *e))
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        let counted = crate::storage::atoll::drive(&io, || cursor.count().map_err(|e| *e))
+                            .map_err(|e| e.to_string());
+                        drop(cursor);
+                        let mut top = crate::storage::atoll::buffer::Owner::new();
+                        let nested = top
+                            .call(|| Ok(IOResult::Done(ct.cell.settle().map(|r| r.is_io()))))
+                            .unwrap();
+                        drop(top);
+                        assert!(!ct.settle().unwrap().is_io(), "a settle outside a frame returned IO");
+                        let after = rows(&conn, "SELECT count(*) FROM t");
+                        conn.execute("ROLLBACK").unwrap();
+                        assert!(recorded.is_some(), "nothing owed after the record");
+                        assert!(
+                            opened.as_ref().is_err_and(|e| e.contains("did not finish first"))
+                                || counted.as_ref().is_err_and(|e| e.contains("did not finish first")),
+                            "an operation read a transaction owing a rollback: open {opened:?}, count {counted:?}"
+                        );
+                        match nested {
+                            IOResult::Done(Err(e)) => assert!(
+                                e.to_string().contains("inside an operation"),
+                                "a settle inside an operation: {e}"
+                            ),
+                            IOResult::Done(Ok(io)) => panic!("a settle inside an operation ran (io {io})"),
+                            IOResult::IO(_) => panic!("a settle inside an operation returned IO"),
+                        }
+                        assert_eq!(after, vec![vec![Value::from_i64(3)]], "the rows once settled");
+                    },
+                );
+            }
+
+            /// A commit's ending taking a rollback owed (facade level: a COMMIT statement settles at
+            /// its step entry): its first steps, in frames, return IO in `Step::Owed`, finishing the
+            /// rollback under its own top before the commit, which publishes only the rows before
+            /// the rolled-back statements (mutant `commit-skips-owed`).
+            #[test]
+            fn a_commits_ending_finishes_a_rollback_owed_before_it_publishes() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_commits_ending_finishes_a_rollback_owed_before_it_publishes"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-commit-ending");
+                        let other = db.connect(ConnectOpts::new()).unwrap();
+                        let ct = conn.atoll().expect("Atoll mode");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        let after_a = command(&conn);
+                        big(&conn, 100, 100);
+                        let _ = in_frame(&io, &db, || {
+                            ct.rollback_statement(after_a).map(IOResult::Done)
+                        })
+                        .unwrap();
+                        let recorded = owed(&conn);
+                        let mut ending = ct.end(true).expect("a transaction to end");
+                        // The commit paused before its first step, so its log work, which a frame
+                        // of this test database refuses without a worker, runs outside the frames.
+                        let pause = crate::io::Completion::new_wait();
+                        crate::storage::atoll::testing::ENDING_PAUSE
+                            .with(|p| *p.borrow_mut() = Some(pause.clone()));
+                        let atoll = db.atoll.as_ref().unwrap().atoll();
+                        let mut phases = Vec::new();
+                        for calls in 1..=100_000 {
+                            let phase = format!("{ending:?}");
+                            let held = held_io(&db);
+                            let out = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                ending.step().unwrap()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            match out {
+                                IOResult::Done(()) => panic!("the ending finished in a frame"),
+                                IOResult::IO(_) if format!("{ending:?}").contains("committing") => {
+                                    break
+                                }
+                                IOResult::IO(IOCompletions(c)) => {
+                                    phases.push(phase);
+                                    assert!(
+                                        waited(&io, &c),
+                                        "call {calls}: its wait never finished"
+                                    );
+                                    assert!(retired(&db), "call {calls}: a request outstanding");
+                                    assert!(
+                                        idled(&idle),
+                                        "call {calls}: the IO thread never went idle"
+                                    );
+                                }
+                            }
+                            assert!(calls < 100_000, "the owed rollback did not finish");
+                        }
+                        pause.complete(0);
+                        crate::storage::atoll::testing::ENDING_PAUSE
+                            .with(|p| *p.borrow_mut() = None);
+                        ending.finish().unwrap();
+                        drop(ending);
+                        let read = rows(&other, "SELECT count(*), sum(a) FROM t");
+                        drop((other, conn));
+                        assert!(recorded.is_some(), "nothing owed after the record");
+                        assert!(
+                            phases
+                                .first()
+                                .is_some_and(|p| p.contains("rolling a statement back")),
+                            "the ending's first return was not in its owed rollback: {phases:?}"
+                        );
+                        assert_eq!(
+                            read,
+                            vec![vec![Value::from_i64(3), Value::from_i64(6)]],
+                            "a commit published a rolled-back statement's rows"
+                        );
+                    },
+                );
+            }
+
+            /// A rollback ending taking a rollback owed (facade level, outside a frame: the ending is
+            /// finished in place, D3's): the owed rollback, stepped once in a frame, is dropped with
+            /// what it held, and the whole rollback undoes every statement.
+            #[test]
+            fn a_rollback_ending_drops_a_rollback_owed_and_rolls_back_whole() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_rollback_ending_drops_a_rollback_owed_and_rolls_back_whole"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-rollback-ending");
+                        let other = db.connect(ConnectOpts::new()).unwrap();
+                        let ct = conn.atoll().expect("Atoll mode");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        let after_a = command(&conn);
+                        big(&conn, 100, 100);
+                        let _ = in_frame(&io, &db, || {
+                            ct.rollback_statement(after_a).map(IOResult::Done)
+                        })
+                        .unwrap();
+                        let stepped = in_frame(&io, &db, || ct.settle()).unwrap();
+                        let keeps = {
+                            let slot = ct.cell.lock_for_test();
+                            slot.owed_for_test().and_then(|o| o.keeps_for_test())
+                        };
+                        let before = keeps.map(|k| kept_now(&db, k));
+                        ct.end(false)
+                            .expect("a transaction to end")
+                            .finish()
+                            .unwrap();
+                        let after = keeps.map(|k| kept_now(&db, k));
+                        let left = owed(&conn);
+                        let all_retired = retired(&db);
+                        let read = rows(&other, "SELECT count(*) FROM t");
+                        drop((other, conn));
+                        assert!(
+                            stepped.is_io(),
+                            "the owed rollback's first settle did not return IO"
+                        );
+                        if let (Some(k), Some(b), Some(a)) = (keeps, before, after) {
+                            if k.0.is_some() || k.1.is_some() {
+                                let_go("the owed rollback's top", k, b, a);
+                            }
+                        }
+                        assert_eq!(left, None, "the rollback ending left a rollback owed");
+                        assert!(all_retired, "a request of the dropped rollback outstanding");
+                        assert_eq!(
+                            read,
+                            vec![vec![Value::from_i64(0)]],
+                            "rows after the whole rollback"
+                        );
+                    },
+                );
+            }
+
+            /// The calls of `.method(` in the production code of `file`, each with the function it is
+            /// in.
+            fn method_sites(file: &std::path::Path, method: &str) -> Vec<String> {
+                use crate::storage::atoll::testing::code_of;
+                let code = code_of(&std::fs::read_to_string(file).unwrap());
+                let mut out = Vec::new();
+                let mut within = String::new();
+                for line in super::super::super::production_of(&code).lines() {
+                    let words: Vec<&str> = line
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    if let Some(i) = words.iter().position(|w| *w == "fn") {
+                        if let Some(name) = words.get(i + 1) {
+                            let t = line.trim_start();
+                            if t.starts_with("fn ")
+                                || t.starts_with("pub")
+                                || t.starts_with("unsafe fn")
+                            {
+                                within = name.to_string();
+                            }
+                        }
+                    }
+                    if line.contains(&format!(".{method}(")) {
+                        out.push(within.clone());
+                    }
+                }
+                out
+            }
+
+            /// The census of the ways into a connection's transaction (ASYNC1 D2e (iii-b)): the slot
+            /// has no `Deref` to its lock, and the callers of `observe`, `enter_now`, `settle` and
+            /// `settle_now` are exactly the reviewed lists, each with its reason in the design.
+            #[test]
+            fn every_way_into_the_transaction_is_reviewed() {
+                use crate::storage::atoll::testing::atoll_dir;
+                let sql = atoll_dir().join("sql");
+                let vdbe = atoll_dir().join("../../vdbe/mod.rs");
+                let mut found: std::collections::BTreeMap<
+                    &str,
+                    std::collections::BTreeSet<String>,
+                > = Default::default();
+                for method in ["observe", "enter_now", "settle", "settle_now"] {
+                    let set = found.entry(method).or_default();
+                    for file in ["cursor.rs", "mode.rs"] {
+                        for within in method_sites(&sql.join(file), method) {
+                            set.insert(format!("{file}:{within}"));
+                        }
+                    }
+                    for within in method_sites(&vdbe, method) {
+                        set.insert(format!("vdbe/mod.rs:{within}"));
+                    }
+                }
+                let want = |list: &[&str]| -> std::collections::BTreeSet<String> {
+                    list.iter().map(|s| s.to_string()).collect()
+                };
+                // Reading only what an owed rollback leaves as it is, or changing what it does not
+                // touch: open or not, changes or not, the snapshot (snapshot isolation), the
+                // statement number, a pending gate take, the failure's identity, and the record.
+                assert_eq!(
+                    found["observe"],
+                    want(&[
+                        "cursor.rs:lock_for_test",
+                        "mode.rs:end_served",
+                        "mode.rs:give_up",
+                        "mode.rs:is_open",
+                        "mode.rs:open_savepoint",
+                        "mode.rs:owed_failure",
+                        "mode.rs:rollback_statement",
+                        "mode.rs:serve_sibling",
+                        "mode.rs:snapshot",
+                        "mode.rs:wrote",
+                    ]),
+                    "the callers of observe"
+                );
+                // Synchronous forms at a call's top.
+                assert_eq!(
+                    found["enter_now"],
+                    want(&[
+                        "mode.rs:check_pages",
+                        "mode.rs:count_rows",
+                        "mode.rs:header",
+                        "mode.rs:schema_cookie",
+                        "mode.rs:start_statement",
+                    ]),
+                    "the callers of enter_now"
+                );
+                // Where no operation's owner runs: a statement step's entry, the record outside a
+                // frame, the facade's settle, and the synchronous forms.
+                assert_eq!(
+                    found["settle"],
+                    want(&[
+                        "cursor.rs:settle_now",
+                        "mode.rs:rollback_statement",
+                        "mode.rs:settle",
+                        "vdbe/mod.rs:settle_atoll",
+                    ]),
+                    "the callers of settle"
+                );
+                assert_eq!(
+                    found["settle_now"],
+                    want(&["cursor.rs:enter_now", "mode.rs:pin"]),
+                    "the callers of settle_now"
+                );
+                let cursor = std::fs::read_to_string(sql.join("cursor.rs")).unwrap();
+                assert!(
+                    !cursor.contains("Deref for TxnSlot"),
+                    "the slot derefs to its lock again"
+                );
+            }
+
+            /// [`spilling`] over a `CrashIO`, for faults on one file.
+            fn crashing(
+                path: &str,
+                seed: u64,
+            ) -> (
+                Arc<crate::io::crash::CrashIO>,
+                Arc<dyn IO>,
+                Arc<Database>,
+                Arc<Connection>,
+            ) {
+                let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+                let io: Arc<dyn IO> = crash.clone();
+                let mut cfg = config();
+                cfg.log.buffer_bytes = 32 << 10;
+                cfg.log.chunk_bytes = 8 << 10;
+                cfg.log_budget = Some(16 << 20);
+                let db =
+                    crate::storage::atoll::requests::opened_async(|| open_with(&io, path, cfg));
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                    .unwrap();
+                (crash, io, db, conn)
+            }
+
+            /// Every read of `path`'s log fails from now on, or of every file with `None`.
+            fn reads_fail(crash: &crate::io::crash::CrashIO, log_of: Option<&str>) {
+                let file = log_of.map(|path| format!("{path}.log.{:016x}", 0));
+                crash.set_faults_on(file.as_deref());
+                crash.set_faults(crate::io::crash::Faults {
+                    read: 1.0,
+                    write: 0.0,
+                    sync: 0.0,
+                    short_write: 0.0,
+                });
+            }
+
+            /// Steps `stmt` outside any frame until it is done or fails, its IO stepped in place.
+            fn stepped_outside(
+                stmt: &mut crate::Statement,
+            ) -> std::result::Result<Vec<Vec<Value>>, String> {
+                stepped_outside_within(stmt, 1_000_000)
+            }
+
+            /// [`stepped_outside`] within `bound` steps.
+            fn stepped_outside_within(
+                stmt: &mut crate::Statement,
+                bound: usize,
+            ) -> std::result::Result<Vec<Vec<Value>>, String> {
+                let mut rows = Vec::new();
+                for _ in 0..bound {
+                    match stmt.step() {
+                        Err(e) => return Err(e.to_string()),
+                        Ok(crate::StepResult::Row) => {
+                            rows.push(stmt.row().unwrap().get_values().cloned().collect())
+                        }
+                        Ok(crate::StepResult::Done) => return Ok(rows),
+                        Ok(crate::StepResult::IO | crate::StepResult::Yield) => {
+                            let _ = stmt._io().step();
+                        }
+                        Ok(other) => return Err(format!("{other:?}")),
+                    }
+                }
+                Err(format!("NO PROGRESS: the statement did not finish within {bound} steps outside a frame"))
+            }
+
+            /// Steps `stmt` in a frame until it returns IO on a completion that then fails: the
+            /// rollback owed then, and the steps owed rollbacks had taken by the failure.
+            fn parked_on_a_failure(
+                io: &Arc<dyn IO>,
+                db: &Database,
+                conn: &Arc<Connection>,
+                stmt: &mut crate::Statement,
+            ) -> (Option<(u64, bool)>, u64) {
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                for calls in 1..=64 {
+                    let held = held_io(db);
+                    let out = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        stmt.step()
+                    };
+                    let idle = atoll.io_idle_for_test();
+                    drop(held);
+                    match out {
+                        Ok(crate::StepResult::IO) => {
+                            let c = stmt.pending_io_for_test().expect("its wait");
+                            assert!(waited(io, &c), "call {calls}: its wait never finished");
+                            assert!(retired(db), "call {calls}: a request outstanding");
+                            assert!(idled(&idle), "call {calls}: the IO thread never went idle");
+                            if c.get_error().is_some() {
+                                return (owed(conn), steps());
+                            }
+                        }
+                        other => panic!("call {calls}: {other:?} before a wait failed"),
+                    }
+                }
+                panic!("no wait failed within 64 calls");
+            }
+
+            /// The database's failure, if a transaction was left where it stood.
+            fn failure_of(db: &Database) -> Option<String> {
+                db.atoll
+                    .as_ref()
+                    .unwrap()
+                    .atoll()
+                    .transactions()
+                    .failure()
+                    .map(|e| e.to_string())
+            }
+
+            /// The large abort of test 1: an UPDATE of committed rows across leaves, failing on UNIQUE
+            /// at its last row in frames, records its rollback in its abort. Its changes are small, so
+            /// no write of it needs the log's preparer in a frame (a dependency before (v)). The pages
+            /// it changed are then written out and evicted outside the frames. The next statement's
+            /// step entry finishes the rollback, returning IO while the same owed rollback, its serial,
+            /// is kept, and that statement reads the rows from before the UPDATE.
+            #[test]
+            fn a_large_abort_in_a_frame_owes_its_rollback_and_the_next_step_finishes_it_through_io()
+            {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_large_abort_in_a_frame_owes_its_rollback_and_the_next_step_finishes_it_through_io"
+                    ),
+                    || {
+                        let (io, db, conn) = deferred("/db/owed-large-abort");
+                        conn.execute("CREATE TABLE u (a INTEGER PRIMARY KEY, c INTEGER UNIQUE)")
+                            .unwrap();
+                        conn.execute("BEGIN").unwrap();
+                        for a in 1..=150 {
+                            conn.execute(format!("INSERT INTO u VALUES ({a}, {a})")).unwrap();
+                        }
+                        conn.execute("COMMIT").unwrap();
+                        checkpointed(&conn);
+                        conn.execute("BEGIN").unwrap();
+                        rows(&conn, "SELECT count(*) FROM u");
+                        let mut failing = conn
+                            .prepare("UPDATE u SET c = CASE WHEN a = 150 THEN 10001 ELSE a + 10000 END")
+                            .unwrap();
+                        let mut count = conn.prepare("SELECT count(*), sum(c) FROM u").unwrap();
+                        chill(&db);
+                        let before = steps();
+                        let failed = stepped_in_frames(&io, &db, &conn, &mut failing, 100_000);
+                        let recorded = (owed(&conn), steps() - before);
+                        // Written out and evicted outside the frames, the rollback still owed: the
+                        // checkpoint does not enter the transaction.
+                        crate::storage::atoll::sql::mode::full_checkpoint(db.atoll.as_ref().unwrap())
+                            .unwrap();
+                        chill(&db);
+                        let still = owed(&conn);
+                        let counted = stepped_in_frames(&io, &db, &conn, &mut count, 100_000);
+                        let after = owed(&conn);
+                        drop((failing, count));
+                        conn.execute("ROLLBACK").unwrap();
+                        assert!(
+                            failed
+                                .out
+                                .as_ref()
+                                .is_err_and(|e| e.contains("UNIQUE")),
+                            "the failing statement's own error: {:?}",
+                            failed.out
+                        );
+                        let serial = recorded
+                            .0
+                            .filter(|(_, f)| !f)
+                            .map(|(s, _)| s)
+                            .expect("no rollback owed after the abort in a frame");
+                        assert_eq!(recorded.1, 0, "the abort stepped its rollback");
+                        assert_eq!(still, recorded.0, "the checkpoint finished or replaced the owed rollback");
+                        assert!(
+                            counted.owed_at_io.contains(&Some(serial)),
+                            "the next statement never returned IO with the rollback owed: {:?}",
+                            counted.owed_at_io
+                        );
+                        assert!(
+                            counted.owed_at_io.iter().flatten().all(|s| *s == serial),
+                            "the owed rollback was made anew at a return: {serial} then {:?}",
+                            counted.owed_at_io
+                        );
+                        assert_eq!(
+                            counted.out,
+                            Ok(vec![vec![Value::from_i64(150), Value::from_i64(11325)]]),
+                            "the next statement's count and sum"
+                        );
+                        assert_eq!(after, None, "a rollback still owed");
+                    },
+                );
+            }
+
+            /// An already-open statement, standing on a row, stepped again after a sibling's failure
+            /// recorded its rollback: its step entry settles the rollback, and its cursor reads on as
+            /// rolled back (the SQL route of an open cursor; mutant `no-step-settle`, its move then
+            /// refused).
+            #[test]
+            fn an_open_statements_next_step_settles_a_recorded_rollback_and_reads_on() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_open_statements_next_step_settles_a_recorded_rollback_and_reads_on"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-open-reader");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute(
+                            "INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03'), (4, x'04'), (5, x'05')",
+                        )
+                        .unwrap();
+                        let mut reader = conn.prepare("SELECT a FROM t ORDER BY a").unwrap();
+                        let mut failing = conn
+                            .prepare(
+                                "INSERT INTO t SELECT a + 10, b FROM t UNION ALL SELECT 1, x'ff'",
+                            )
+                            .unwrap();
+                        let atoll = db.atoll.as_ref().unwrap().atoll();
+                        let mut first = None;
+                        for calls in 1..=64 {
+                            let held = held_io(&db);
+                            let out = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                reader.step().unwrap()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            match out {
+                                crate::StepResult::Row => {
+                                    first = Some(
+                                        reader
+                                            .row()
+                                            .unwrap()
+                                            .get_values()
+                                            .cloned()
+                                            .collect::<Vec<_>>(),
+                                    );
+                                    break;
+                                }
+                                crate::StepResult::IO => {
+                                    let c = reader.pending_io_for_test().expect("its wait");
+                                    assert!(
+                                        waited(&io, &c),
+                                        "call {calls}: its wait never finished"
+                                    );
+                                    assert!(retired(&db), "call {calls}: a request outstanding");
+                                    assert!(
+                                        idled(&idle),
+                                        "call {calls}: the IO thread never went idle"
+                                    );
+                                }
+                                other => panic!("call {calls}: {other:?}"),
+                            }
+                        }
+                        let failed = stepped_in_frames(&io, &db, &conn, &mut failing, 64);
+                        let recorded = owed(&conn);
+                        let settles_before = settles();
+                        let rest = stepped_in_frames(&io, &db, &conn, &mut reader, 64);
+                        let settled = settles() - settles_before;
+                        drop((reader, failing));
+                        conn.execute("ROLLBACK").unwrap();
+                        assert_eq!(
+                            first,
+                            Some(vec![Value::from_i64(1)]),
+                            "the reader's first row"
+                        );
+                        assert!(
+                            failed.out.is_err(),
+                            "the sibling did not fail: {:?}",
+                            failed.out
+                        );
+                        assert!(
+                            recorded.is_some(),
+                            "no rollback owed after the sibling failed"
+                        );
+                        assert!(settled > 0, "the reader's step entry settled nothing");
+                        assert_eq!(
+                            rest.out,
+                            Ok((2..=5).map(|a| vec![Value::from_i64(a)]).collect()),
+                            "a statement after an aborted one was refused, not finished, or read the rolled-back rows"
+                        );
+                    },
+                );
+            }
+
+            /// 6a: a settle's IO that fails. The statement's parked copy only woke it: the owed
+            /// rollback's own copy of the completion is judged at the next settle, the rollback never
+            /// stepped again; the statement fails with the IO's error, and its abort rolls the
+            /// transaction back whole, outside a frame (D3's ending), the database not abandoned
+            /// (mutant `failure-misrouted` is 6g's; this asserts the drop branch reached).
+            #[test]
+            fn a_settles_failed_io_fails_its_statement_and_rolls_back_whole() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_settles_failed_io_fails_its_statement_and_rolls_back_whole"
+                    ),
+                    || {
+                        use crate::storage::atoll::sql::mode::SETTLE_WAITS_DROPPED;
+                        let path = "/db/owed-failed-io";
+                        let (crash, io, db, conn) = crashing(path, 703);
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        reads_fail(&crash, Some(path));
+                        let (at_failure, steps_at_failure) =
+                            parked_on_a_failure(&io, &db, &conn, &mut count);
+                        clear_faults(&crash);
+                        let dropped = SETTLE_WAITS_DROPPED.with(|n| n.get());
+                        let failed_before = OWED_FAILED.with(|n| n.get());
+                        let met = stepped_outside(&mut count);
+                        let after = (
+                            SETTLE_WAITS_DROPPED.with(|n| n.get()) - dropped,
+                            OWED_FAILED.with(|n| n.get()) - failed_before,
+                            steps() - steps_at_failure,
+                            owed(&conn),
+                            conn.get_auto_commit(),
+                            failure_of(&db),
+                        );
+                        drop((back, count));
+                        let left = rows(&conn, "SELECT count(*) FROM t");
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(
+                            at_failure.is_some_and(|(_, f)| !f),
+                            "the rollback was not still owed and rolling at the failed wait: {at_failure:?}"
+                        );
+                        assert!(
+                            met.is_err(),
+                            "the statement that met the failure did not fail: {met:?}"
+                        );
+                        assert_eq!(
+                            after.0, 1,
+                            "the failed settle wait was not dropped by its statement"
+                        );
+                        assert_eq!(after.1, 1, "the owed rollback did not fail");
+                        assert_eq!(
+                            after.2, 0,
+                            "the rollback was stepped again after its wait failed"
+                        );
+                        assert_eq!(after.3, None, "the failed rollback still in the slot");
+                        assert!(
+                            after.4,
+                            "a transaction whose statement rollback failed stayed open"
+                        );
+                        assert_eq!(after.5, None, "the database was abandoned");
+                        assert_eq!(
+                            left,
+                            vec![vec![Value::from_i64(0)]],
+                            "rows after the whole rollback"
+                        );
+                    },
+                );
+            }
+
+            /// 6b: a failed rollback met by a facade call outside any statement stays in the slot:
+            /// the synchronous form returns the failure, and so does a second; between and after, the
+            /// slot holds the failure with the same transaction, the database not abandoned, and an
+            /// unrelated statement's reset leaves it. A statement then meets it, fails, and rolls the
+            /// transaction back whole, outside a frame (D3's ending). The failure here comes through
+            /// the completion the rollback waited on in place (read faults), so the database is not
+            /// abandoned; the immediate kind is 6e's (mutant `failed-owed-forgotten` too).
+            #[test]
+            fn a_failed_rollback_met_by_a_facade_call_stays_until_a_statement_meets_it() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_failed_rollback_met_by_a_facade_call_stays_until_a_statement_meets_it"
+                    ),
+                    || {
+                        let path = "/db/owed-facade-failure";
+                        let (crash, io, db, conn) = crashing(path, 707);
+                        let ct = conn.atoll().expect("Atoll mode");
+                        let mut unrelated = conn.prepare("SELECT 1").unwrap();
+                        let mut meet = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        let identity = {
+                            let slot = ct.cell.lock_for_test();
+                            let txn = slot.as_ref().expect("an open transaction");
+                            (txn.slot(), txn.start())
+                        };
+                        reads_fail(&crash, Some(path));
+                        let first = ct.schema_cookie().map_err(|e| e.to_string());
+                        clear_faults(&crash);
+                        let kept = |ct: &crate::storage::atoll::sql::mode::ConnTxn| {
+                            let slot = ct.cell.lock_for_test();
+                            (
+                                slot.as_ref().map(|t| (t.slot(), t.start())),
+                                slot.owed_for_test().map(|o| o.failed()),
+                            )
+                        };
+                        let after_first = (kept(ct), failure_of(&db));
+                        let second = ct.schema_cookie().map_err(|e| e.to_string());
+                        let after_second = (kept(ct), failure_of(&db));
+                        unrelated.reset().unwrap();
+                        let after_reset = kept(ct);
+                        let met = stepped_outside(&mut meet);
+                        let after = (owed(&conn), conn.get_auto_commit(), failure_of(&db));
+                        drop((unrelated, meet, back));
+                        let left = rows(&conn, "SELECT count(*) FROM t");
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(
+                            first.is_err(),
+                            "the facade call that met the failure: {first:?}"
+                        );
+                        assert_eq!(
+                            second, first,
+                            "a second facade call did not return the same failure"
+                        );
+                        assert_eq!(
+                            after_first,
+                            ((Some(identity), Some(true)), None),
+                            "after the first call, the slot's transaction and failure, and the database"
+                        );
+                        assert_eq!(
+                            after_second,
+                            ((Some(identity), Some(true)), None),
+                            "a transaction whose statement rollback failed was read again"
+                        );
+                        assert_eq!(
+                            after_reset,
+                            (Some(identity), Some(true)),
+                            "an unrelated reset decided the failure"
+                        );
+                        assert!(met.is_err(), "the statement that met the failure: {met:?}");
+                        assert_eq!(
+                            after,
+                            (None, true, None),
+                            "after the meeting statement's whole rollback"
+                        );
+                        assert_eq!(
+                            left,
+                            vec![vec![Value::from_i64(0)]],
+                            "rows after the whole rollback"
+                        );
+                    },
+                );
+            }
+
+            /// 6c: a COMMIT, and in a second run a ROLLBACK, meeting a failed rollback left by a
+            /// facade call: each reports the failure, nothing is published, and its transaction is
+            /// rolled back whole, outside a frame (D3's ending).
+            #[test]
+            fn a_commit_or_a_rollback_meeting_a_failed_rollback_rolls_back_whole() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_commit_or_a_rollback_meeting_a_failed_rollback_rolls_back_whole"
+                    ),
+                    || {
+                        let mut seen = Vec::new();
+                        for (sql, path, seed) in [
+                            ("COMMIT", "/db/owed-commit-meets", 708),
+                            ("ROLLBACK", "/db/owed-rollback-meets", 709),
+                        ] {
+                            let (crash, io, db, conn) = crashing(path, seed);
+                            let other = db.connect(ConnectOpts::new()).unwrap();
+                            let ct = conn.atoll().expect("Atoll mode");
+                            let mut end = conn.prepare(sql).unwrap();
+                            conn.execute("BEGIN").unwrap();
+                            conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                                .unwrap();
+                            conn.execute("SAVEPOINT sp").unwrap();
+                            big(&conn, 100, 100);
+                            let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                            let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                            reads_fail(&crash, Some(path));
+                            let facade = ct.schema_cookie().map_err(|e| e.to_string());
+                            clear_faults(&crash);
+                            let ended = stepped_outside(&mut end);
+                            let after = (owed(&conn), conn.get_auto_commit(), failure_of(&db));
+                            drop((end, back));
+                            let published = rows(&other, "SELECT count(*) FROM t");
+                            seen.push((sql, rolled.out, facade, ended, after, published));
+                        }
+                        for (sql, rolled, facade, ended, after, published) in seen {
+                            assert_eq!(rolled, Ok(vec![]), "{sql}: the ROLLBACK TO");
+                            assert!(
+                                facade.is_err(),
+                                "{sql}: the facade call did not meet the failure"
+                            );
+                            assert!(
+                                ended.is_err(),
+                                "{sql}: did not report the failure: {ended:?}"
+                            );
+                            assert_eq!(after, (None, true, None), "{sql}: its transaction after");
+                            assert_eq!(
+                                published,
+                                vec![vec![Value::from_i64(0)]],
+                                "{sql}: rows published"
+                            );
+                        }
+                    },
+                );
+            }
+
+            /// 6d: a blocking host's statement that fails after its changes spilled, its rollback's
+            /// read-back failing: its abort settles in place and fails, the error goes where it goes
+            /// today, and the abort's final check rolls the transaction back whole, whose own
+            /// read-back fails too, so the database is abandoned, as today.
+            #[test]
+            fn a_blocking_hosts_failed_statement_rollback_rolls_back_whole() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_blocking_hosts_failed_statement_rollback_rolls_back_whole"
+                    ),
+                    || {
+                        let path = "/db/owed-blocking-failure";
+                        let (crash, _io, db, conn) = crashing(path, 710);
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        let values = (100..200)
+                            .map(|a| format!("({a}, zeroblob(2048))"))
+                            .chain(std::iter::once("(1, x'ff')".to_string()))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let mut failing = conn
+                            .prepare(format!("INSERT INTO t VALUES {values}"))
+                            .unwrap();
+                        reads_fail(&crash, Some(path));
+                        let failed_before = OWED_FAILED.with(|n| n.get());
+                        let out = stepped_outside(&mut failing);
+                        let after = (
+                            OWED_FAILED.with(|n| n.get()) - failed_before,
+                            owed(&conn),
+                            conn.get_auto_commit(),
+                            failure_of(&db),
+                        );
+                        clear_faults(&crash);
+                        drop(failing);
+                        assert!(
+                            out.as_ref()
+                                .is_err_and(|e| e.contains("UNIQUE") || e.contains("PRIMARY KEY")),
+                            "the failing statement's own error was not what it returned: {out:?}"
+                        );
+                        assert_eq!(after.0, 1, "the statement rollback did not fail");
+                        assert_eq!(after.1, None, "the failed rollback still in the slot");
+                        assert!(
+                            after.2,
+                            "a transaction whose statement rollback failed stayed open"
+                        );
+                        assert!(
+                            after.3.is_some(),
+                            "the whole rollback's failure did not abandon the database"
+                        );
+                    },
+                );
+            }
+
+            /// 6i: the real immediate failure of `rollback_to`. A statement spills a part with the IO
+            /// thread held, so the part is in the log's buffer and not durable; the log then fails
+            /// (`fail_the_log`) as the IO thread writes it. The undo's wait for the part then fails in
+            /// the call (`Log::wait_durable` on a failed log). Settled in a frame, the failure comes
+            /// back from the call itself, with no return for IO before it, and the rollback is failed.
+            /// A statement then meets it, fails, and rolls back whole outside a frame. That rollback
+            /// needs the part too, so it fails and the database is abandoned, as today.
+            #[test]
+            fn a_rollback_whose_failed_log_cannot_give_back_a_part_fails_in_its_call() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_rollback_whose_failed_log_cannot_give_back_a_part_fails_in_its_call"
+                    ),
+                    || {
+                        let path = "/db/owed-failed-log";
+                        let (crash, io, db, conn) = crashing(path, 711);
+                        let ct = conn.atoll().expect("Atoll mode");
+                        let mut meet = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        let log = ct.db().atoll().log();
+                        let hold = held_io(&db);
+                        big(&conn, 100, 12);
+                        let last_part = {
+                            let slot = ct.cell.lock_for_test();
+                            let txn = slot.as_ref().expect("an open transaction");
+                            txn.changes().parts().last().map(|p| p.lsn)
+                        };
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        // The log fails with the transaction open, its last part not durable.
+                        fail_the_log(&crash, path);
+                        drop(hold);
+                        let mut wait = crate::storage::atoll::log::LogWait::default();
+                        drop(log.wait_durable(&mut wait, log.end()));
+                        drop(wait);
+                        while crash.in_flight() > 0 {
+                            if crash.step().is_err() {
+                                break;
+                            }
+                        }
+                        let log_failed = (log.failure().is_some(), log.durable());
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        let failed_before = OWED_FAILED.with(|n| n.get());
+                        let mut first_io = None;
+                        let mut settled = None;
+                        for calls in 1..=64 {
+                            match in_frame(&io, &db, || ct.settle()) {
+                                Ok(IOResult::IO(_)) => first_io = first_io.or(Some(calls)),
+                                Ok(IOResult::Done(())) => {
+                                    settled = Some(Ok(calls));
+                                    break;
+                                }
+                                Err(e) => {
+                                    settled = Some(Err((
+                                        matches!(e, crate::LimboError::CompletionError(_)),
+                                        e.to_string(),
+                                    )));
+                                    break;
+                                }
+                            }
+                        }
+                        let failed = (OWED_FAILED.with(|n| n.get()) - failed_before, owed(&conn));
+                        clear_faults(&crash);
+                        let met = stepped_outside(&mut meet);
+                        let after = (owed(&conn), conn.get_auto_commit(), failure_of(&db));
+                        drop((meet, back));
+                        assert!(
+                            last_part.is_some_and(|lsn| log_failed.0 && log_failed.1 < lsn),
+                            "the log did not fail with the statement's part not durable: part \
+                             {last_part:?}, failed and durable {log_failed:?}"
+                        );
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(
+                            matches!(&settled, Some(Err((true, _)))),
+                            "the settle did not fail with the log's failure: {settled:?}"
+                        );
+                        assert_eq!(
+                            first_io, None,
+                            "the failure came through a completion, not the call"
+                        );
+                        assert!(
+                            failed.0 == 1 && failed.1.is_some_and(|(_, f)| f),
+                            "the rollback not failed after its call failed: {failed:?}"
+                        );
+                        assert!(met.is_err(), "the statement that met the failure: {met:?}");
+                        assert_eq!(
+                            (after.0, after.1),
+                            (None, true),
+                            "after the meeting statement's whole rollback"
+                        );
+                        assert!(
+                            after.2.is_some(),
+                            "the whole rollback's failure did not abandon the database"
+                        );
+                    },
+                );
+            }
+
+            /// 6e: a failure of a kind no error branch of the abort rolls back for, injected (the one
+            /// synthetic failure: no real fault makes `undo` return an `InternalError`). A read-only
+            /// statement of an explicit transaction meets it at its step entry, outside a frame: it
+            /// fails with it, and its abort's final check rolls the transaction back whole (mutant
+            /// `failed-not-whole`).
+            #[test]
+            fn an_injected_failure_kept_by_its_errors_kind_still_rolls_back_whole() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_injected_failure_kept_by_its_errors_kind_still_rolls_back_whole"
+                    ),
+                    || {
+                        use crate::storage::atoll::sql::cursor::OWED_FAIL_NEXT;
+                        let (io, db, conn) = spilling("/db/owed-injected");
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        let failed_before = OWED_FAILED.with(|n| n.get());
+                        OWED_FAIL_NEXT.with(|f| f.set(true));
+                        let met = stepped_outside(&mut count);
+                        let after = (
+                            OWED_FAILED.with(|n| n.get()) - failed_before,
+                            owed(&conn),
+                            conn.get_auto_commit(),
+                            failure_of(&db),
+                        );
+                        drop((back, count));
+                        let left = conn
+                            .prepare("SELECT count(*) FROM t")
+                            .and_then(|mut s| s.run_collect_rows())
+                            .map_err(|e| e.to_string());
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(
+                            met.as_ref()
+                                .is_err_and(|e| e.contains("injected statement rollback failure")),
+                            "the statement that met the failure: {met:?}"
+                        );
+                        assert_eq!(after.0, 1, "the owed rollback did not fail");
+                        assert!(
+                            after.2,
+                            "a transaction whose statement rollback failed stayed open"
+                        );
+                        assert_eq!(after.1, None, "the failed rollback still in the slot");
+                        assert_eq!(after.3, None, "the database was abandoned");
+                        assert_eq!(
+                            left,
+                            Ok(vec![vec![Value::from_i64(0)]]),
+                            "rows after the whole rollback"
+                        );
+                    },
+                );
+            }
+
+            /// 6f: a settle's IO that fails, its statement then reset, which takes its pending IO as it
+            /// takes any: the owed rollback, still holding its own failed copy, is not stepped past it;
+            /// the next statement makes it failed, fails, and rolls back whole, outside a frame (mutant
+            /// `wait-unjudged`: the rollback stepped again after its wait failed).
+            #[test]
+            fn a_failed_settle_wait_consumed_by_a_reset_is_judged_by_its_rollback() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_failed_settle_wait_consumed_by_a_reset_is_judged_by_its_rollback"
+                    ),
+                    || {
+                        let path = "/db/owed-failed-reset";
+                        let (crash, io, db, conn) = crashing(path, 704);
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let mut first = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let mut next = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        reads_fail(&crash, Some(path));
+                        let (at_failure, steps_at_failure) =
+                            parked_on_a_failure(&io, &db, &conn, &mut first);
+                        // The reset takes the pending IO and reports its failure, as today.
+                        let reset = first.reset().map_err(|e| e.to_string());
+                        clear_faults(&crash);
+                        let after_reset = {
+                            let ct = conn.atoll().unwrap();
+                            let slot = ct.cell.lock_for_test();
+                            slot.owed_for_test()
+                                .map(|o| (o.failed(), o.waiting_for_test().map(|w| w.1)))
+                        };
+                        let steps_after_reset = steps();
+                        let met = stepped_outside(&mut next);
+                        let after = (
+                            steps() - steps_at_failure,
+                            owed(&conn),
+                            conn.get_auto_commit(),
+                        );
+                        drop((back, first, next));
+                        let left = rows(&conn, "SELECT count(*) FROM t");
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(
+                            at_failure.is_some_and(|(_, f)| !f),
+                            "nothing owed at the failure: {at_failure:?}"
+                        );
+                        assert!(
+                            reset.is_err(),
+                            "the reset did not report its pending IO's failure: {reset:?}"
+                        );
+                        assert_eq!(
+                            after_reset,
+                            Some((false, Some(true))),
+                            "after the reset, the rollback not still rolling with its own failed wait"
+                        );
+                        assert_eq!(
+                            steps_after_reset, steps_at_failure,
+                            "the reset stepped the rollback"
+                        );
+                        assert!(
+                            met.is_err(),
+                            "the next statement did not meet the failure: {met:?}"
+                        );
+                        assert_eq!(
+                            after.0, 0,
+                            "a rollback was stepped again after its wait failed"
+                        );
+                        assert_eq!(after.1, None, "the failed rollback still in the slot");
+                        assert!(
+                            after.2,
+                            "a transaction whose statement rollback failed stayed open"
+                        );
+                        assert_eq!(
+                            left,
+                            vec![vec![Value::from_i64(0)]],
+                            "rows after the whole rollback"
+                        );
+                    },
+                );
+            }
+
+            /// 6g (addendum 1): an old settle wait that failed, and a later transaction's own owed
+            /// rollback. Reader A parks at its step entry's settle before any instruction; its wait
+            /// fails; B meets the failure and T1 is rolled back whole; T2 then records its own owed
+            /// rollback. A, stepped again, drops its old failed copy unapplied: T2's rollback is never
+            /// failed and finishes, and A reads T2 (mutant `failure-misrouted`).
+            #[test]
+            fn an_old_failed_settle_wait_never_fails_a_later_transactions_rollback() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_old_failed_settle_wait_never_fails_a_later_transactions_rollback"
+                    ),
+                    || {
+                        use crate::storage::atoll::sql::mode::SETTLE_WAITS_DROPPED;
+                        let path = "/db/owed-old-wait";
+                        let (crash, io, db, conn) = crashing(path, 705);
+                        let mut reader = conn
+                            .prepare("SELECT count(*), sum(length(b)) FROM t")
+                            .unwrap();
+                        let mut other = conn.prepare("SELECT 1").unwrap();
+                        let mut witness = conn
+                            .prepare("SELECT count(*), sum(length(b)) FROM t")
+                            .unwrap();
+                        let mut failing = conn
+                            .prepare(
+                                "INSERT INTO t SELECT a + 10, b FROM t UNION ALL SELECT 1, x'ff'",
+                            )
+                            .unwrap();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        let first = owed(&conn);
+                        reads_fail(&crash, Some(path));
+                        let (at_failure, _) = parked_on_a_failure(&io, &db, &conn, &mut reader);
+                        let reader_pc = reader.pc_for_test();
+                        clear_faults(&crash);
+                        let met = stepped_outside(&mut other);
+                        let t1 = (
+                            conn.get_auto_commit(),
+                            failure_of(&db),
+                            rows(&conn, "SELECT count(*) FROM t"),
+                        );
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute(
+                            "INSERT INTO t VALUES (1, x'02'), (2, x'02'), (3, x'02'), (4, x'02'), (5, x'02')",
+                        )
+                        .unwrap();
+                        let t2_failed = stepped_in_frames(&io, &db, &conn, &mut failing, 64);
+                        let second = owed(&conn);
+                        let (dropped, failed_before) = (
+                            SETTLE_WAITS_DROPPED.with(|n| n.get()),
+                            OWED_FAILED.with(|n| n.get()),
+                        );
+                        let read = stepped_in_frames(&io, &db, &conn, &mut reader, 100_000);
+                        let after = (
+                            SETTLE_WAITS_DROPPED.with(|n| n.get()) - dropped,
+                            OWED_FAILED.with(|n| n.get()) - failed_before,
+                            owed(&conn),
+                        );
+                        let carried = match &read.out {
+                            Ok(_) => None,
+                            Err(e) => {
+                                eprintln!("6g: reader A failed after T1's whole rollback: {e}; the oracle is carried by C");
+                                Some(stepped_in_frames(&io, &db, &conn, &mut witness, 100_000).out)
+                            }
+                        };
+                        drop((reader, other, witness, failing, back));
+                        // T2 is still open unless a failure rolled it back whole.
+                        if !conn.get_auto_commit() {
+                            conn.execute("ROLLBACK").unwrap();
+                        }
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        let first = first.expect("T1 owed nothing");
+                        assert_eq!(
+                            reader_pc, 0,
+                            "reader A ran an instruction before its settle parked"
+                        );
+                        assert!(
+                            at_failure.is_some_and(|(s, f)| s == first.0 && !f),
+                            "T1's rollback at the failure: {at_failure:?}"
+                        );
+                        assert!(met.is_err(), "B did not meet T1's failure: {met:?}");
+                        assert_eq!(
+                            t1,
+                            (true, None, vec![vec![Value::from_i64(0)]]),
+                            "T1 after B's whole rollback"
+                        );
+                        assert!(
+                            t2_failed.out.is_err(),
+                            "T2's failing statement did not fail"
+                        );
+                        let second = second.expect("T2 owed nothing");
+                        assert!(
+                            second.0 != first.0 && !second.1,
+                            "T2's own owed rollback: {second:?}"
+                        );
+                        assert_eq!(after.0, 1, "reader A's old failed copy was not dropped");
+                        assert_eq!(after.1, 0, "an old settle wait's failure marked a later transaction's rollback failed");
+                        assert_eq!(after.2, None, "T2's rollback still owed");
+                        let want = Ok(vec![vec![Value::from_i64(5), Value::from_i64(5)]]);
+                        match carried {
+                            None => assert_eq!(read.out, want, "reader A's result in T2"),
+                            Some(c) => assert_eq!(c, want, "witness C's result in T2"),
+                        }
+                    },
+                );
+            }
+
+            /// 6h (#5370, #5375): an old settle wait that finished cleanly while another call finished
+            /// its rollback leaves the statement's later ordinary IO errors to the statement, whether the
+            /// wait was left parked or taken by its caller (`take_io_completions`, for async state
+            /// machines): its next read parks in a frame as an ordinary wait, which fails, and the
+            /// statement's next step outside the frame fails with that read's error, never dropping
+            /// it as a settle's. The failure's cleanup runs outside a frame, the whole rollback's
+            /// ending D3's (mutant `settle-mark-unqualified`: the failure swallowed as a settle's).
+            #[test]
+            fn an_old_settle_wait_finished_elsewhere_leaves_later_io_errors_to_its_statement() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_old_settle_wait_finished_elsewhere_leaves_later_io_errors_to_its_statement"
+                    ),
+                    || {
+                        let mut seen = Vec::new();
+                        for (taken, path) in [(false, "/db/owed-old-clean-parked"), (true, "/db/owed-old-clean-taken")] {
+                            let (crash, io, db, conn) = crashing(path, 706);
+                            conn.execute("CREATE TABLE src (a INTEGER PRIMARY KEY, b BLOB)")
+                                .unwrap();
+                            conn.execute("BEGIN").unwrap();
+                            for a in 1..=200 {
+                                conn.execute(format!("INSERT INTO src VALUES ({a}, zeroblob(2048))"))
+                                    .unwrap();
+                            }
+                            conn.execute("COMMIT").unwrap();
+                            checkpointed(&conn);
+                            let mut reader = conn.prepare("SELECT sum(length(b)) FROM src").unwrap();
+                            let mut other = conn.prepare("SELECT 1").unwrap();
+                            conn.execute("BEGIN").unwrap();
+                            conn.execute("INSERT INTO t VALUES (1, x'01')").unwrap();
+                            conn.execute("SAVEPOINT sp").unwrap();
+                            big(&conn, 100, 100);
+                            let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                            let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                            let atoll = db.atoll.as_ref().unwrap().atoll();
+                            // A's first step parks on the settle's IO, which finishes cleanly.
+                            let held = held_io(&db);
+                            let parked = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                reader.step().unwrap()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            let c = reader.pending_io_for_test();
+                            let waited_ok = c.as_ref().is_some_and(|c| waited(&io, c) && c.get_error().is_none());
+                            let quiet = retired(&db) && idled(&idle);
+                            if taken {
+                                // Its caller takes the wait to await it, as an async state machine does.
+                                drop(reader.take_io_completions());
+                            }
+                            // Another call finishes the rollback.
+                            let finished_elsewhere = stepped_outside(&mut other);
+                            let left = owed(&conn);
+                            chill(&db);
+                            // Reads of the 4 KiB class's file, where the table's pages lie, fail.
+                            crash.set_faults_on(Some(&format!("{path}.c0.0")));
+                            crash.set_faults(crate::io::crash::Faults {
+                                read: 1.0,
+                                write: 0.0,
+                                sync: 0.0,
+                                short_write: 0.0,
+                            });
+                            // The next read parks in a frame as an ordinary wait, which fails.
+                            let held = held_io(&db);
+                            let ordinary = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                reader.step()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            let ordinary = ordinary
+                                .map(|s| matches!(s, crate::StepResult::IO))
+                                .map_err(|e| e.to_string());
+                            let wait = reader.pending_io_for_test();
+                            let wait_failed = wait
+                                .as_ref()
+                                .is_some_and(|c| waited(&io, c) && c.get_error().is_some());
+                            drop(wait);
+                            let ordinary_quiet = retired(&db) && idled(&idle);
+                            let owed_at_read = owed(&conn);
+                            let dropped_before = crate::storage::atoll::sql::mode::SETTLE_WAITS_DROPPED
+                                .with(|n| n.get());
+                            let read = stepped_outside_within(&mut reader, 10_000);
+                            let dropped = crate::storage::atoll::sql::mode::SETTLE_WAITS_DROPPED
+                                .with(|n| n.get())
+                                - dropped_before;
+                            clear_faults(&crash);
+                            drop((reader, other, back));
+                            seen.push((
+                                taken,
+                                rolled.out,
+                                parked,
+                                waited_ok,
+                                quiet,
+                                finished_elsewhere,
+                                left,
+                                (ordinary, wait_failed, ordinary_quiet, owed_at_read),
+                                read,
+                                dropped,
+                            ));
+                        }
+                        for (taken, rolled, parked, waited_ok, quiet, finished_elsewhere, left, at_read, read, dropped) in seen {
+                            let what = if taken { "taken" } else { "parked" };
+                            assert_eq!(rolled, Ok(vec![]), "{what}: the ROLLBACK TO");
+                            assert!(matches!(parked, crate::StepResult::IO), "{what}: A did not park on the settle: {parked:?}");
+                            assert!(waited_ok, "{what}: the settle's wait did not finish cleanly");
+                            assert!(quiet, "{what}: the settle's request");
+                            assert!(finished_elsewhere.is_ok(), "{what}: the other call: {finished_elsewhere:?}");
+                            assert_eq!(left, None, "{what}: the rollback still owed after the other call");
+                            assert_eq!(at_read.0, Ok(true), "{what}: the read did not park in the frame");
+                            assert!(at_read.1, "{what}: the read's wait did not fail");
+                            assert!(at_read.2, "{what}: the read's request");
+                            assert_eq!(at_read.3, None, "{what}: a rollback owed at the read");
+                            assert_eq!(
+                                dropped, 0,
+                                "{what}: an ordinary IO error after an old settle wait was swallowed as a settle's"
+                            );
+                            assert!(
+                                read.as_ref().is_err_and(|e| e.contains("I/O error (read)")),
+                                "{what}: the statement's read did not fail with the fault it met: {read:?}"
+                            );
+                        }
+                    },
+                );
+            }
+
+            /// 7 (IIIB-OWN1): a sibling suspended in the shortage queue, a ROLLBACK TO recorded, and an
+            /// undo that comes short. Reader R stops short under scarce memory in frames, its own
+            /// cursor's top holding a tenure; ROLLBACK TO records the rollback; R stepped again in
+            /// frames under scarce memory has its step entry settle the rollback, whose undo comes
+            /// short and takes R's place, finishes, and R completes with the rows before the savepoint.
+            /// The self-wait of v1's shape fails at the test build's check in `reserve`, never at a
+            /// bound (mutant `settle-nested`).
+            #[test]
+            fn a_suspended_siblings_place_is_taken_by_an_owed_rollback_that_comes_short() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_suspended_siblings_place_is_taken_by_an_owed_rollback_that_comes_short"
+                    ),
+                    || {
+                        use crate::storage::atoll::buffer::{scarce, OWED_WAITED_ON_RUNNING};
+                        let (io, db, conn) = spilling("/db/owed-shortage");
+                        let id = tree(&conn, "t");
+                        let pool = db.atoll.as_ref().unwrap().atoll().pool().clone();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        // Twice the pool: its pages are written back and evicted, so the reader's
+                        // scan and the undo load them, each claim coming short under scarce memory.
+                        let n =
+                            (2 * crate::storage::atoll::buffer::MIN_DB_BUDGET / 2048 + 64) as i64;
+                        let mut from = 100;
+                        while from < 100 + n {
+                            big(&conn, from, 500.min(100 + n - from));
+                            from += 500;
+                        }
+                        // Written out and evicted outside the frames: a frame never writes a page in
+                        // place, so every page the framed steps evict is clean.
+                        crate::storage::atoll::sql::mode::full_checkpoint(
+                            db.atoll.as_ref().unwrap(),
+                        )
+                        .unwrap();
+                        chill(&db);
+                        let mut reader = conn
+                            .prepare("SELECT count(*), sum(length(b)) FROM t")
+                            .unwrap();
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let pump = |c: &crate::Completion| {
+                            for _ in 0..2000 {
+                                if c.finished() {
+                                    return;
+                                }
+                                let _ = io.step();
+                                std::thread::sleep(std::time::Duration::from_micros(100));
+                            }
+                        };
+                        // R stops short, its own cursor's top queued.
+                        let mut suspended = false;
+                        for _ in 0..10_000 {
+                            let out = scarce(|| {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                reader.step()
+                            })
+                            .unwrap();
+                            let queued = reader
+                                .atoll_cursor_for_test(id)
+                                .and_then(|(_, bare, _)| bare)
+                                .is_some_and(SqlCursor::shortage_queued_for_test);
+                            if queued && pool.shortage_len() > 0 {
+                                suspended = true;
+                                break;
+                            }
+                            match out {
+                                crate::StepResult::IO | crate::StepResult::Yield => {
+                                    if let Some(c) = reader.pending_io_for_test() {
+                                        pump(&c);
+                                    }
+                                }
+                                other => panic!("R did not stop short: {other:?}"),
+                            }
+                        }
+                        assert!(
+                            suspended,
+                            "R never stopped short with its own place in the queue"
+                        );
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        let recorded = owed(&conn);
+                        let (refused_before, settles_before) =
+                            (OWED_WAITED_ON_RUNNING.with(|n| n.get()), settles());
+                        let mut took = false;
+                        let mut rows_read = None;
+                        for calls in 1..=200_000 {
+                            let out = scarce(|| {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                reader.step()
+                            });
+                            let owed_queued = {
+                                let ct = conn.atoll().unwrap();
+                                let slot = ct.cell.lock_for_test();
+                                slot.owed_for_test()
+                                    .and_then(|o| o.waiting_for_test())
+                                    .is_some_and(|w| w.2)
+                            };
+                            took |= owed_queued && pool.shortage_len() == 1;
+                            match out {
+                                Err(e) => panic!("call {calls}: R failed: {e}"),
+                                Ok(crate::StepResult::Row) => {
+                                    rows_read = Some(
+                                        reader
+                                            .row()
+                                            .unwrap()
+                                            .get_values()
+                                            .cloned()
+                                            .collect::<Vec<_>>(),
+                                    );
+                                }
+                                Ok(crate::StepResult::Done) => break,
+                                Ok(crate::StepResult::IO | crate::StepResult::Yield) => {
+                                    if let Some(c) = reader.pending_io_for_test() {
+                                        pump(&c);
+                                    }
+                                }
+                                Ok(other) => panic!("call {calls}: {other:?}"),
+                            }
+                            assert!(calls < 200_000, "a statement's step owing a rollback made no progress in {calls} calls");
+                        }
+                        let after = (
+                            OWED_WAITED_ON_RUNNING.with(|n| n.get()) - refused_before,
+                            settles() - settles_before,
+                            owed(&conn),
+                        );
+                        drop((reader, back));
+                        conn.execute("ROLLBACK").unwrap();
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(recorded.is_some(), "the ROLLBACK TO owed nothing");
+                        assert_eq!(after.0, 0, "an owed rollback's shortage met its own connection's running operation");
+                        assert!(after.1 > 0, "R's step entry settled nothing");
+                        assert!(
+                            took,
+                            "the owed rollback's undo never came short in R's place"
+                        );
+                        assert_eq!(after.2, None, "a rollback still owed");
+                        assert_eq!(
+                            rows_read,
+                            Some(vec![Value::from_i64(3), Value::from_i64(3)]),
+                            "R's rows"
+                        );
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -9790,11 +11809,6 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "mode.rs",
-        "rollback_statement",
-        "slice (iii): a statement's rollback",
-    ),
-    (
-        "mode.rs",
         "field_in",
         "blocking hosts only: the header's synchronous forms",
     ),
@@ -9821,7 +11835,9 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
     ("mode.rs", "drive_to_end", "D3: an ending's finish and drop"),
 ];
 
-/// The facade's reads converted in slice (i): each returns what it waits for, and drives nothing.
+/// The facade's reads converted in slice (i), and the sites slices (ii) and (iii) converted: each
+/// returns what it waits for, and drives nothing. `settle` waits in place outside a frame as
+/// `drive_or_io` does, over the owed rollback's own top (ASYNC1 D2e (iii-b)).
 const CONVERTED: &[&str] = &[
     "schema_cookie_in",
     "header_in",
@@ -9843,6 +11859,7 @@ const CONVERTED: &[&str] = &[
     "finish_open",
     "reopened",
     "count_step",
+    "settle",
 ];
 
 /// A file's production code: up to its inline test module, which by the house layout comes last.

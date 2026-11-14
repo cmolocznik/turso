@@ -1150,6 +1150,11 @@ struct PendingIO {
     completions: IOCompletions,
     // One is outside any aligned Register box. Nonzero also gives Option<PendingIO> its empty value.
     key: crate::io::WakerKey,
+    /// Whether it is the wait of a statement rollback the Atoll transaction owes, settled at the
+    /// step's entry: that rollback judges its own copy of the completion, and this one only wakes
+    /// the statement (ASYNC1 D2e (iii-b)). It goes wherever the wait goes: taken, consumed or
+    /// replaced, the mark goes with it.
+    settle: bool,
 }
 
 pub struct ProgramState {
@@ -1340,6 +1345,9 @@ pub struct ProgramState {
     /// Whether this statement's Transaction opcode left a take of Atoll's write gate waiting,
     /// which it gives up if it stops waiting (R15).
     pub(crate) atoll_taking: bool,
+    /// The Atoll transaction (its slot and start) whose owed statement rollback this statement
+    /// found failed: its abort rolls that transaction back whole (R19, ASYNC1 D2e (iii-b)).
+    pub(crate) atoll_met_failure: Option<(u16, u64)>,
     /// In Atoll mode, this statement's hold on the end of its connection's transaction, from the
     /// ending's start to the end of the commit's finishing (`Connection::atoll_end`).
     pub(crate) atoll_ending_begun: Option<EndingBegun>,
@@ -1479,6 +1487,7 @@ impl ProgramState {
             uses_subjournal: false,
             atoll_statement: None,
             atoll_taking: false,
+            atoll_met_failure: None,
             atoll_ending_begun: None,
             atoll_commit_failure: None,
             atoll_create: None,
@@ -1698,6 +1707,7 @@ impl ProgramState {
         self.uses_subjournal = false;
         self.atoll_statement = None;
         self.atoll_taking = false;
+        self.atoll_met_failure = None;
         if self.atoll_create.is_some() {
             self.atoll_create = None;
         }
@@ -2003,6 +2013,21 @@ impl ProgramState {
         self.io_completions = Some(pending);
     }
 
+    /// [`set_pending_io`](Self::set_pending_io) for the wait of a statement rollback the Atoll
+    /// transaction owes, settled at the step's entry ([`PendingIO::settle`]).
+    fn set_pending_settle_io(&mut self, io: IOCompletions, waker: Option<&Waker>) {
+        self.set_pending_io(io, waker);
+        self.io_completions
+            .as_mut()
+            .expect("the wait just parked")
+            .settle = true;
+    }
+
+    /// Whether the parked wait is a settle's ([`PendingIO::settle`]).
+    fn pending_is_settle(&self) -> bool {
+        self.io_completions.as_ref().is_some_and(|p| p.settle)
+    }
+
     fn set_pending_io_waker(&mut self, waker: Option<&Waker>) {
         let key = waker.map(|_| self.io_waker_key());
         self.io_completions
@@ -2240,9 +2265,18 @@ impl ProgramState {
             EndStatement::RollbackSavepoint => {
                 // Rollback pager/MVCC savepoint if one was opened.
                 let pager_err = if let Some(atoll) = connection.atoll() {
-                    // Driven to its end here, a synchronous site (R19).
+                    // Owed by the transaction in a cooperative frame, finished at the top of the
+                    // connection's next call; finished here outside one (R19, ASYNC1 D2e
+                    // (iii-b)). One that failed here is this statement's to have met: its abort
+                    // rolls the transaction back whole.
                     match self.atoll_statement {
-                        Some(n) => atoll.rollback_statement(n).err(),
+                        Some(n) => {
+                            let failed = atoll.rollback_statement(n).err();
+                            if failed.is_some() {
+                                self.atoll_met_failure = atoll.owed_failure();
+                            }
+                            failed
+                        }
                         None => None,
                     }
                 } else if let Some(mv_store) = connection.mv_store().as_ref() {
@@ -3010,6 +3044,15 @@ impl Program {
                         None => continue 'io_check,
                     }
                 }
+                // A statement rollback the connection's Atoll transaction owes is finished here,
+                // at the top of the step, before any instruction and so before any operation's
+                // owner runs (R19, ASYNC1 D2e (iii-b)).
+                if program.connection.atoll().is_some_and(|a| a.owes()) {
+                    match program.settle_atoll(state, pager, waker) {
+                        Some(result) => return result,
+                        None => continue 'io_check,
+                    }
+                }
                 // Another statement of the connection is ending its transaction, which this one
                 // was reading (no root statement starts meanwhile): it reads on in a view of its
                 // own (DESIGN.md §17).
@@ -3146,6 +3189,16 @@ impl Program {
             return Some(ProgramStep::IO);
         }
         if let Some(err) = io.get_error() {
+            // A settle's wait: the failure is the owed statement rollback's, which judges its own
+            // copy of the completion at the next settle; this copy only woke the statement
+            // (ASYNC1 D2e (iii-b)).
+            if state.pending_is_settle() {
+                tracing::debug!("an owed statement rollback's wait failed: {err}");
+                #[cfg(test)]
+                crate::storage::atoll::sql::mode::SETTLE_WAITS_DROPPED.with(|n| n.set(n.get() + 1));
+                state.io_completions = None;
+                return None;
+            }
             if pager.is_checkpointing() {
                 // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
                 // so that abort() knows not to try to rollback the transaction, because the transaction
@@ -3181,6 +3234,38 @@ impl Program {
         }
         state.io_completions = None;
         None
+    }
+
+    /// The statement rollback the connection's Atoll transaction owes, stepped at this statement's
+    /// entry (ASYNC1 D2e (iii-b)): its IO parked as the settle's, a failure this statement's to
+    /// have met. None means the loop starts over, the rollback finished or its IO done inline.
+    #[cold]
+    #[inline(never)]
+    fn settle_atoll(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        let atoll = self.connection.atoll()?;
+        #[cfg(test)]
+        crate::storage::atoll::sql::mode::SETTLES_AT_STEP.with(|n| n.set(n.get() + 1));
+        match atoll.settle() {
+            Ok(IOResult::Done(())) => None,
+            // A yield stores no wait.
+            Ok(IOResult::IO(io)) if io.is_explicit_yield() => self.park_on_io(state, io, waker),
+            Ok(IOResult::IO(io)) => {
+                state.set_pending_settle_io(io, waker);
+                if !state.pending_io().expect("just parked").finished() {
+                    return Some(ProgramStep::IO);
+                }
+                None
+            }
+            Err(err) => {
+                state.atoll_met_failure = atoll.owed_failure();
+                self.fail_step(state, pager, err)
+            }
+        }
     }
 
     /// A statement reading the connection's transaction when another statement of the connection
@@ -4655,6 +4740,18 @@ impl Program {
                 }
             }
         }
+        // A statement that met a failed statement rollback its Atoll transaction owed ends that
+        // transaction whole, whatever its error's kind and whatever helper statements of the
+        // connection are alive (R19; SQLite's sqlite3VdbeHalt rolls everything back when a
+        // statement journal cannot be played back). Only that transaction, still holding the
+        // failure: an abort whose statement did not meet it, a reset's or a drop's, decides
+        // nothing about it, and a mark never reaches a later transaction.
+        if let Some(met) = state.atoll_met_failure.take() {
+            if self.connection.atoll().and_then(|a| a.owed_failure()) == Some(met) {
+                self.rollback_current_txn(pager);
+                self.connection.clear_deferred_foreign_key_violations();
+            }
+        }
         if state.uses_subjournal {
             pager.stop_use_subjournal();
             state.uses_subjournal = false;
@@ -5150,6 +5247,7 @@ impl PendingIO {
         Self {
             completions,
             key: Self::UNREGISTERED,
+            settle: false,
         }
     }
 
@@ -5385,9 +5483,10 @@ mod pending_io_waiter_tests {
         let state_bytes = std::mem::size_of::<ProgramState>();
         let register_bytes = std::mem::size_of::<Register>();
         eprintln!("STATEMENT_WAIT_LAYOUT completion={completion_bytes} IOCompletions={io_bytes} PendingIO={pending_bytes} Slot={slot_bytes} ProgramState={state_bytes} Register={register_bytes}");
+        // A pending wait is its completions, its waker's key and whether it is a settle's.
         assert_eq!(
             (completion_bytes, io_bytes, pending_bytes, slot_bytes),
-            (word, word, 2 * word, 2 * word)
+            (word, word, 3 * word, 3 * word)
         );
     }
 

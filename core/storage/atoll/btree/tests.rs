@@ -246,6 +246,100 @@ fn step_checkpoint(
     }
 }
 
+/// A free of an abandoned page whose claim comes short, inside an operation's owner, goes to the
+/// checkpointer, and the claim's shortage record is forgotten: the operation finishes, its owner
+/// holding no tenure; the checkpoint then frees the page. A shortage the operation returns, its
+/// cold root's load, still reaches its owner (ASYNC1 D2e (iii-b), the `free_abandoned` fix;
+/// mutant `short-not-forgotten`: the owner finishes with a shortage recorded).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn an_abandoned_pages_free_that_comes_short_goes_to_the_checkpointer_its_shortage_forgotten() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_abandoned_pages_free_that_comes_short_goes_to_the_checkpointer_its_shortage_forgotten"
+        ),
+        || {
+            use crate::storage::atoll::buffer::{scarce, Owner};
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = open(&io, MIN_DB_BUDGET, 1);
+            let run = drive_runner(&io);
+            let tree = create(&io, &db, &run, false);
+            checkpoint(&db, &run);
+            db.pool().evict_all_clean();
+            // A page never read in: its free claims a frame for it.
+            let pid = run_to(&run, || db.store().allocate(class(0)));
+            let mut owner = Owner::new();
+            let returned = scarce(|| owner.call(|| tree.stored(b"k").map(|r| r.map(|_| ()))));
+            let reserved = owner.queued();
+            drop(owner);
+            let mut owner = Owner::new();
+            let freed = scarce(|| {
+                owner.call(|| {
+                    tree.free_abandoned(vec![pid])?;
+                    Ok(IOResult::Done(()))
+                })
+            });
+            let after = (owner.queued(), db.store().orphans().contains(&pid));
+            drop(owner);
+            checkpoint(&db, &run);
+            let entry = run_to(&run, || db.store().entry(pid));
+            drop(tree);
+            drop(db);
+            assert!(
+                matches!(returned, Ok(IOResult::IO(_))),
+                "the cold root's load did not come short"
+            );
+            assert!(reserved, "a shortage the operation returned did not reach its owner");
+            assert!(matches!(freed, Ok(IOResult::Done(()))), "the free's operation: {freed:?}");
+            assert_eq!(
+                after,
+                (false, true),
+                "after the free: whether the owner holds a tenure, whether the page went to the checkpointer"
+            );
+            assert_eq!(entry, FREE, "the checkpoint did not free the page");
+        },
+    );
+}
+
+/// A change refused by a closed gate whose yield is dropped while the operation goes on, as
+/// `free_abandoned` drops a free's, leaves no gate record once forgotten: the owner finishes,
+/// waiting for no gate. A refusal the operation returns still makes its owner wait for the gate
+/// (here open: a yield). No path of `free_abandoned` sets the record in the current source; the
+/// forgetting is for any that does (mutant `gate-not-forgotten`).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_dropped_gate_refusal_is_forgotten_and_a_returned_one_reaches_its_owner() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_dropped_gate_refusal_is_forgotten_and_a_returned_one_reaches_its_owner"
+        ),
+        || {
+            use crate::storage::atoll::buffer::{forget_short, gate_closed, Owner};
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = open(&io, MIN_DB_BUDGET, 1);
+            let mut owner = Owner::new();
+            let dropped = owner.call(|| {
+                let _ = gate_closed::<()>(db.pool());
+                forget_short();
+                Ok(IOResult::Done(()))
+            });
+            let returned = owner.call(|| Ok(gate_closed::<()>(db.pool())));
+            drop(owner);
+            drop(db);
+            assert!(
+                matches!(dropped, Ok(IOResult::Done(()))),
+                "a dropped refusal: {dropped:?}"
+            );
+            assert!(
+                matches!(returned, Ok(IOResult::IO(_))),
+                "a returned refusal did not reach its owner: {returned:?}"
+            );
+        },
+    );
+}
+
 #[test]
 fn a_tree_holds_what_a_sorted_map_holds_through_puts_removes_merges_and_eviction() {
     holds_what_a_sorted_map_holds(false);

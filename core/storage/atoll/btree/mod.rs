@@ -952,6 +952,9 @@ impl Tree {
         let mut pids = pids.into_iter();
         while let Some(pid) = pids.next() {
             if let IOResult::IO(_) = self.pool.free_unreferenced(pid)? {
+                // Freed later, by the checkpointer: a shortage its claim recorded is no demand of
+                // the operation running, which goes on.
+                crate::storage::atoll::buffer::forget_short();
                 self.store.orphaned(pid);
                 pids.for_each(|p| self.store.orphaned(p));
                 break;

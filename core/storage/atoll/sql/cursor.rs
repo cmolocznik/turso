@@ -27,16 +27,17 @@ use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
 use crate::storage::atoll::btree::{Cursor, Kept, Mode, Near, Outcome, Put, Remove, Seek};
 use crate::storage::atoll::buffer::Owner;
-use crate::storage::atoll::locks::Mutex;
+use crate::storage::atoll::locks::{Mutex, MutexGuard};
 use crate::storage::atoll::txn::versioned::{
     Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp, HEADER,
 };
 use crate::storage::atoll::txn::Txn;
 use crate::storage::btree::BTreeKey;
+use crate::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use crate::sync::Arc;
 use crate::types::{
-    IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult, ValueBlob,
-    ValueRef,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult,
+    ValueBlob, ValueRef,
 };
 use crate::{LimboError, Result};
 use std::borrow::Cow;
@@ -76,19 +77,34 @@ macro_rules! done {
     };
 }
 
-/// The transaction a connection's cursors read in, none between transactions, and the
-/// connection's identity, which the memory-shortage tenures of its operations carry (DESIGN.md
-/// 9.1.3, *Revoking an inactive tenure*).
+/// The transaction a connection's cursors read in, none between transactions, the statement
+/// rollback it owes, if any (R19), and the connection's identity, which the memory-shortage
+/// tenures of its operations carry (DESIGN.md 9.1.3, *Revoking an inactive tenure*). The
+/// transaction is reached only through [`enter`](Self::enter), [`enter_now`](Self::enter_now),
+/// [`observe`](Self::observe) and [`take`](Self::take); a rollback it owes is finished by
+/// [`settle`](Self::settle), at the top of the connection's next call (ASYNC1 D2e (iii-b)).
 pub struct TxnSlot {
-    txn: Mutex<Option<Txn>>,
+    slot: Mutex<Slot>,
+    /// Whether `slot.owed` holds a rollback: written under the lock with it, read without the lock
+    /// by a statement step's entry and by a kept probe.
+    owing: AtomicBool,
     conn: Arc<crate::storage::atoll::buffer::Conn>,
+}
+
+/// The transaction and the statement rollback it owes, under one lock.
+struct Slot {
+    txn: Option<Txn>,
+    /// The statement rollback the transaction owes (R19): recorded where a statement's rollback
+    /// was not run to its end, finished at the top of the connection's next call.
+    owed: Option<Box<OwedRollback>>,
 }
 
 impl TxnSlot {
     /// A connection's slot, holding `txn`.
     pub fn new(txn: Option<Txn>) -> TxnCell {
         Arc::new(Self {
-            txn: Mutex::new(txn),
+            slot: Mutex::new(Slot { txn, owed: None }),
+            owing: AtomicBool::new(false),
             conn: crate::storage::atoll::buffer::Conn::new(),
         })
     }
@@ -97,14 +113,446 @@ impl TxnSlot {
     pub(in crate::storage::atoll) fn conn(&self) -> &Arc<crate::storage::atoll::buffer::Conn> {
         &self.conn
     }
+
+    /// The transaction, for an operation that reads or changes its data. Refused while it owes a
+    /// statement rollback, which the top of the connection's call finishes first
+    /// ([`settle`](Self::settle)); one that failed refuses with its failure.
+    #[inline]
+    pub(in crate::storage::atoll) fn enter(&self) -> Result<Entered<'_>> {
+        let slot = self.slot.lock();
+        if let Some(owed) = slot.owed.as_deref() {
+            return Err(owed.refusal());
+        }
+        Ok(Entered(slot))
+    }
+
+    /// [`enter`](Self::enter) for a synchronous form at the top of a call: a rollback owed is
+    /// finished first, driven to its end here outside a cooperative frame. In one, where such a
+    /// form never meets one, a rollback owed is an error naming `site`, never a park.
+    pub(in crate::storage::atoll) fn enter_now(&self, site: &'static str) -> Result<Entered<'_>> {
+        self.settle_now(site)?;
+        self.enter()
+    }
+
+    /// [`settle`](Self::settle) for a synchronous form at the top of a call, as
+    /// [`enter_now`](Self::enter_now) settles.
+    pub(in crate::storage::atoll) fn settle_now(&self, site: &'static str) -> Result<()> {
+        match self.settle()? {
+            IOResult::Done(()) => Ok(()),
+            IOResult::IO(_) => Err(LimboError::InternalError(format!(
+                "{site}: a synchronous form met a statement rollback owed in a cooperative frame"
+            ))),
+        }
+    }
+
+    /// The transaction as it stands, a statement rollback maybe owed in it: for what reads only
+    /// what that rollback leaves as it is, or changes what it does not touch.
+    pub(in crate::storage::atoll) fn observe(&self) -> Observed<'_> {
+        Observed {
+            slot: self.slot.lock(),
+            owing: &self.owing,
+        }
+    }
+
+    /// Takes the transaction out to end it, with the statement rollback it owes.
+    pub(in crate::storage::atoll) fn take(&self) -> Option<(Txn, Option<Box<OwedRollback>>)> {
+        let mut slot = self.slot.lock();
+        let txn = slot.txn.take()?;
+        let owed = slot.owed.take();
+        self.owing.store(false, AtomicOrdering::Release);
+        Some((txn, owed))
+    }
+
+    /// The slot as it stands, for a test that sets up or ends the transaction directly.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn lock_for_test(&self) -> Observed<'_> {
+        self.observe()
+    }
+
+    /// [`lock_for_test`](Self::lock_for_test) if the slot is free.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn try_lock_for_test(&self) -> Option<Observed<'_>> {
+        Some(Observed {
+            slot: self.slot.try_lock()?,
+            owing: &self.owing,
+        })
+    }
+
+    /// Whether the transaction owes a statement rollback: one load.
+    #[inline]
+    pub(in crate::storage::atoll) fn owes(&self) -> bool {
+        self.owing.load(AtomicOrdering::Acquire)
+    }
+
+    /// Finishes the statement rollback the transaction owes, under its own top, at the top of a
+    /// call of the connection, where none of its operations runs. In a cooperative frame, one
+    /// step, returning the IO it waits for; outside one, driven to its end here. Refused inside an
+    /// operation: its shortage would wait for its own caller (ASYNC1 D2e (iii-b)).
+    pub(in crate::storage::atoll) fn settle(&self) -> Result<IOResult<()>> {
+        if !self.owes() {
+            return Ok(IOResult::Done(()));
+        }
+        if crate::storage::atoll::buffer::owner_installed() {
+            return Err(LimboError::InternalError(
+                "a statement rollback owed would be finished inside an operation of its connection"
+                    .to_string(),
+            ));
+        }
+        let inside = crate::storage::atoll::cooperative::inside();
+        loop {
+            let (out, io) = {
+                let mut slot = self.slot.lock();
+                let Slot { txn, owed } = &mut *slot;
+                let Some(o) = owed.as_deref_mut() else {
+                    return Ok(IOResult::Done(()));
+                };
+                let txn = txn
+                    .as_mut()
+                    .expect("a statement rollback owed with no transaction");
+                let io = o.io();
+                let out = o.step(txn);
+                if let Ok(IOResult::Done(())) = out {
+                    *owed = None;
+                    self.owing.store(false, AtomicOrdering::Release);
+                }
+                (out, io)
+            };
+            match out {
+                Ok(IOResult::IO(IOCompletions(c))) if !inside => {
+                    // Waited for here, as `drive_over` waits; the rollback judges the completion
+                    // at its next step.
+                    if c.finished() {
+                        crate::storage::atoll::park::yield_now();
+                    } else if let Some(io) = io {
+                        crate::storage::atoll::park::wait(io.as_ref(), &c);
+                    }
+                }
+                out => return out,
+            }
+        }
+    }
 }
 
-impl std::ops::Deref for TxnSlot {
-    type Target = Mutex<Option<Txn>>;
+/// The transaction once entered: nothing owed in it, and nothing can be recorded while it is held.
+pub(in crate::storage::atoll) struct Entered<'a>(MutexGuard<'a, Slot>);
+
+impl std::ops::Deref for Entered<'_> {
+    type Target = Option<Txn>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0.txn
+    }
+}
+
+impl std::ops::DerefMut for Entered<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.txn
+    }
+}
+
+/// The transaction as it stands, a statement rollback maybe owed in it ([`TxnSlot::observe`]).
+pub(in crate::storage::atoll) struct Observed<'a> {
+    slot: MutexGuard<'a, Slot>,
+    owing: &'a AtomicBool,
+}
+
+impl std::ops::Deref for Observed<'_> {
+    type Target = Option<Txn>;
 
     fn deref(&self) -> &Self::Target {
-        &self.txn
+        &self.slot.txn
     }
+}
+
+impl std::ops::DerefMut for Observed<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slot.txn
+    }
+}
+
+/// What recording a statement rollback did with the one owed before ([`Observed::owe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::atoll) enum Owing {
+    /// None was owed: this one is.
+    Fresh,
+    /// One owed to the same or an earlier statement stays, its progress with it.
+    Kept,
+    /// One owed to a later statement was dropped, and this one, to the earlier, made.
+    Restarted,
+    /// One whose rollback failed stays, failed.
+    Failed,
+}
+
+impl Observed<'_> {
+    /// Records in the open transaction a rollback to after statement `n`, owed until the top of
+    /// the connection's next call finishes it; with one owed already, the earlier point is kept
+    /// (DESIGN.md: one rollback owed per transaction at most). `None` with no transaction open.
+    pub(in crate::storage::atoll) fn owe(
+        &mut self,
+        n: crate::storage::atoll::txn::Statement,
+        db: &Arc<AtollDb>,
+        conn: &Arc<crate::storage::atoll::buffer::Conn>,
+    ) -> Option<Owing> {
+        let txn = self.slot.txn.as_ref()?;
+        crate::turso_assert!(
+            n <= txn.command(),
+            "a statement rollback owed to a statement not yet run"
+        );
+        let owing = match self.slot.owed.as_deref() {
+            None => Owing::Fresh,
+            Some(owed) if owed.failed() => return Some(Owing::Failed),
+            Some(owed) if owed.to().is_some_and(|to| to <= n) => return Some(Owing::Kept),
+            Some(_) => Owing::Restarted,
+        };
+        self.slot.owed = Some(Box::new(OwedRollback::new(n, db.clone(), conn.clone())));
+        self.owing.store(true, AtomicOrdering::Release);
+        Some(owing)
+    }
+
+    /// The statement rollback the transaction owes, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn owed_for_test(&self) -> Option<&OwedRollback> {
+        self.slot.owed.as_deref()
+    }
+
+    /// Whether the rollback owed failed, and the transaction's identity: what a statement that met
+    /// it marks ([`OwedRollback::failed`]).
+    pub(in crate::storage::atoll) fn failed_in(&self) -> Option<(u16, u64)> {
+        let txn = self.slot.txn.as_ref()?;
+        self.slot
+            .owed
+            .as_deref()
+            .filter(|o| o.failed())
+            .map(|_| (txn.slot(), txn.start()))
+    }
+}
+
+/// A statement rollback its transaction owes (R19, ASYNC1 D2e (iii-b)): recorded where a
+/// statement's rollback was not run to its end, finished at the top of the connection's next call,
+/// under its own top, which keeps its tenure and pages across its returns. It owns the completion
+/// its last step returned and judges it before it steps again, as a driver does: a statement's
+/// copy of that completion only wakes the statement.
+pub(in crate::storage::atoll) struct OwedRollback {
+    state: Owed,
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    serial: u64,
+    /// Dropped last (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+enum Owed {
+    /// Under way: the rollback, its top, and the completion its last step returned until a step
+    /// has looked at it.
+    Rolling {
+        rollback: crate::storage::atoll::txn::rollback::Rollback,
+        owner: Owner,
+        waiting: Option<crate::io::Completion>,
+        db: Arc<AtollDb>,
+    },
+    /// Its rollback failed: the transaction refuses every operation until it ends.
+    Failed(LimboError),
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The steps owed statement rollbacks took on this thread: each a call of `rollback_to`.
+    pub(crate) static OWED_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The owed statement rollbacks that failed on this thread.
+    pub(crate) static OWED_FAILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether the next step of an owed statement rollback on this thread fails, as injected by a
+    /// test: the one synthetic failure, of a kind no real fault makes `undo` return.
+    pub(crate) static OWED_FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The serials owed statement rollbacks are made with, for tests to tell them apart.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+static OWED_SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl OwedRollback {
+    fn new(
+        n: crate::storage::atoll::txn::Statement,
+        db: Arc<AtollDb>,
+        conn: Arc<crate::storage::atoll::buffer::Conn>,
+    ) -> Self {
+        #[allow(unused_mut)]
+        let mut owner = Owner::of(conn);
+        #[cfg(test)]
+        owner.set_serves_owed(true);
+        Self {
+            state: Owed::Rolling {
+                rollback: crate::storage::atoll::txn::rollback::Rollback::after(n),
+                owner,
+                waiting: None,
+                db,
+            },
+            #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+            serial: OWED_SERIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+        }
+    }
+
+    /// The last statement it keeps; none once it failed.
+    fn to(&self) -> Option<crate::storage::atoll::txn::Statement> {
+        match &self.state {
+            Owed::Rolling { rollback, .. } => Some(rollback.to()),
+            Owed::Failed(_) => None,
+        }
+    }
+
+    /// Whether its rollback failed.
+    pub(in crate::storage::atoll) fn failed(&self) -> bool {
+        matches!(self.state, Owed::Failed(_))
+    }
+
+    /// The error an operation that meets it is refused with.
+    fn refusal(&self) -> LimboError {
+        match &self.state {
+            Owed::Failed(e) => e.clone(),
+            Owed::Rolling { .. } => LimboError::InternalError(
+                "an operation met a statement rollback its call did not finish first".to_string(),
+            ),
+        }
+    }
+
+    fn io(&self) -> Option<Arc<dyn crate::io::IO>> {
+        match &self.state {
+            Owed::Rolling { db, .. } => Some(db.io().clone()),
+            Owed::Failed(_) => None,
+        }
+    }
+
+    /// One step: its last completion judged first (unfinished, the same wait; failed, the rollback
+    /// over and never stepped again; finished, cleared), then one call of the rollback over its own
+    /// top.
+    fn step(&mut self, txn: &mut Txn) -> Result<IOResult<()>> {
+        let Owed::Rolling {
+            rollback,
+            owner,
+            waiting,
+            db,
+        } = &mut self.state
+        else {
+            return Err(self.refusal());
+        };
+        let judged = match waiting.as_ref() {
+            Some(c) if !c.finished() => return Ok(IOResult::IO(IOCompletions(c.clone()))),
+            Some(c) => c.get_error().map(LimboError::CompletionError),
+            None => None,
+        };
+        *waiting = None;
+        #[cfg(test)]
+        let judged = judged.or_else(|| {
+            OWED_FAIL_NEXT
+                .with(|f| f.replace(false))
+                .then(|| LimboError::InternalError("injected statement rollback failure".into()))
+        });
+        let out = match judged {
+            Some(e) => Err(e),
+            None => {
+                #[cfg(test)]
+                OWED_STEPS.with(|n| n.set(n.get() + 1));
+                owner.call(|| {
+                    db.atoll()
+                        .transactions()
+                        .rollback_to(db.versions(), txn, rollback)
+                })
+            }
+        };
+        match out {
+            Ok(IOResult::IO(IOCompletions(c))) => {
+                *waiting = Some(c.clone());
+                Ok(IOResult::IO(IOCompletions(c)))
+            }
+            Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
+            Err(e) => {
+                #[cfg(test)]
+                OWED_FAILED.with(|n| n.set(n.get() + 1));
+                self.state = Owed::Failed(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// Its rollback, top and wait, for a commit's ending to finish it as its own first step; its
+    /// failure, if it failed.
+    pub(in crate::storage::atoll) fn into_parts(
+        mut self,
+    ) -> std::result::Result<
+        (
+            crate::storage::atoll::txn::rollback::Rollback,
+            Owner,
+            Option<crate::io::Completion>,
+        ),
+        LimboError,
+    > {
+        let handed = LimboError::InternalError("a statement rollback handed over".to_string());
+        match std::mem::replace(&mut self.state, Owed::Failed(handed)) {
+            Owed::Rolling {
+                rollback,
+                owner,
+                waiting,
+                ..
+            } => {
+                #[cfg(test)]
+                let owner = {
+                    let mut owner = owner;
+                    owner.set_serves_owed(false);
+                    owner
+                };
+                Ok((rollback, owner, waiting))
+            }
+            Owed::Failed(e) => Err(e),
+        }
+    }
+
+    /// Its serial, for a test to see it kept across returns or made anew.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn serial_for_test(&self) -> u64 {
+        self.serial
+    }
+
+    /// Whether it waits on a completion that has not finished, and whether its top holds a
+    /// tenure, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn waiting_for_test(&self) -> Option<(bool, bool, bool)> {
+        match &self.state {
+            Owed::Rolling { waiting, owner, .. } => Some((
+                waiting.as_ref().is_some_and(|c| !c.finished()),
+                waiting.as_ref().is_some_and(|c| c.get_error().is_some()),
+                owner.queued(),
+            )),
+            Owed::Failed(_) => None,
+        }
+    }
+
+    /// The keys its rollback put back so far, for a test to see it part-way.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn put_back_for_test(&self) -> u64 {
+        match &self.state {
+            Owed::Rolling { rollback, .. } => rollback.put_back(),
+            Owed::Failed(_) => 0,
+        }
+    }
+
+    /// The frame and metadata page its top keeps, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn keeps_for_test(
+        &self,
+    ) -> Option<(Option<u32>, Option<crate::storage::atoll::meta::MetaId>)> {
+        match &self.state {
+            Owed::Rolling { owner, .. } => Some((owner.kept_frame(), owner.kept_meta())),
+            Owed::Failed(_) => None,
+        }
+    }
+}
+
+/// An owed rollback's state the transaction held, its top's tenure and keeps let go inside a frame
+/// (DESIGN.md 22.11).
+impl Drop for OwedRollback {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {}
 }
 
 /// A connection's [`TxnSlot`], shared with its cursors.
@@ -353,7 +801,7 @@ impl AtollCursor {
     }
 
     fn step_unseen(&mut self, first: bool) -> Result<IOResult<()>> {
-        let mut guard = self.txn.lock();
+        let mut guard = self.txn.enter()?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
         let moved = if first {
@@ -472,7 +920,7 @@ impl AtollCursor {
     }
 
     fn step(&mut self, to: Move<'_>) -> Result<IOResult<bool>> {
-        let mut guard = self.txn.lock();
+        let mut guard = self.txn.enter()?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
         let moved = match to {
@@ -525,7 +973,7 @@ impl AtollCursor {
             return Ok(IOResult::Done(()));
         }
         let batched = {
-            let mut guard = self.txn.lock();
+            let mut guard = self.txn.enter()?;
             let txn = guard.as_mut().ok_or_else(outside)?;
             self.tree
                 .next_batched(self.db.atoll().transactions(), txn, &mut self.cursor)
@@ -692,6 +1140,11 @@ impl AtollCursor {
         let Some(kept) = self.kept.as_ref().filter(|_| self.probed == key) else {
             return Ok(false);
         };
+        // The look was taken before any statement rollback the transaction owes now, which may
+        // change its leaf: refused as an entry is (ASYNC1 D2e (iii-b)).
+        if self.txn.owes() {
+            drop(self.txn.enter()?);
+        }
         if !self.tree.tree().holds_kept(kept) {
             return Ok(false);
         }
@@ -704,7 +1157,7 @@ impl AtollCursor {
                         .unwrap_or(&[]),
                 )
                 .ok_or_else(|| LimboError::Corrupt("a version header does not decode".into()))?;
-                let mut guard = self.txn.lock();
+                let mut guard = self.txn.enter()?;
                 let txn = guard.as_mut().ok_or_else(outside)?;
                 v.deleted && self.db.atoll().transactions().visible(txn, v.slot, v.ts)
             }
@@ -966,7 +1419,7 @@ impl AtollCursor {
                 .filter(|_| self.probed == k)
                 .or_else(|| self.cursor.kept_at(&k));
             self.writing = Some(if self.plain {
-                let guard = self.txn.lock();
+                let guard = self.txn.enter()?;
                 let txn = guard.as_ref().ok_or_else(outside)?;
                 Writing::PlainPut(self.tree.plain_put(txn, k, entry, mode), mode)
             } else {
@@ -994,7 +1447,7 @@ impl AtollCursor {
         &mut self,
         key: &[u8],
     ) -> Result<IOResult<crate::storage::atoll::txn::versioned::Probe>> {
-        let mut lock = self.txn.lock();
+        let mut lock = self.txn.enter()?;
         let txn = lock.as_mut().ok_or_else(outside)?;
         let near = self.cursor.near();
         self.kept = None;
@@ -1066,7 +1519,7 @@ impl AtollCursor {
     }
 
     fn guard_step(&mut self, prefix: &[u8], guarded: Guarded) -> Result<IOResult<Guard>> {
-        let mut lock = self.txn.lock();
+        let mut lock = self.txn.enter()?;
         let txn = lock.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
         let g = self.guarding.get_or_insert_with(|| Guarding {
@@ -1148,7 +1601,7 @@ impl AtollCursor {
     }
 
     fn write(&mut self) -> Result<IOResult<Write>> {
-        let mut guard = self.txn.lock();
+        let mut guard = self.txn.enter()?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
         // A chunk of changes a plain write filled goes to the log before the next changes

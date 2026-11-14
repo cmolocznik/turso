@@ -863,6 +863,12 @@ impl Statement {
             })
     }
 
+    /// The instruction the statement stands at, for a test to see it ran none.
+    #[cfg(test)]
+    pub(crate) fn pc_for_test(&self) -> u64 {
+        self.state.pc as u64
+    }
+
     /// The pending completion, for tests that count this statement's waiter registrations.
     #[cfg(test)]
     pub(crate) fn pending_io_for_test(&self) -> Option<crate::Completion> {

@@ -79,6 +79,9 @@ pub struct Rollback {
     log_wait: LogWait,
     /// Its read-back of the parts it walks, one at a time, through the log's open segments.
     back: ReadBack,
+    /// The keys it put back so far, for a test to see it part-way.
+    #[cfg(test)]
+    put_back: u64,
 }
 
 impl Rollback {
@@ -93,6 +96,8 @@ impl Rollback {
             working: None,
             log_wait: LogWait::default(),
             back: ReadBack::default(),
+            #[cfg(test)]
+            put_back: 0,
         }
     }
 
@@ -105,6 +110,12 @@ impl Rollback {
     #[cfg(test)]
     pub fn reading_back(&self) -> bool {
         self.back.reading()
+    }
+
+    /// The keys it put back so far.
+    #[cfg(test)]
+    pub fn put_back(&self) -> u64 {
+        self.put_back
     }
 }
 
@@ -225,14 +236,26 @@ pub fn undo(
                 }
                 // Changed since the look: look again.
                 IOResult::Done(Outcome::Changed) => Step::Look,
-                IOResult::Done(_) => Step::Next,
+                IOResult::Done(_) => {
+                    #[cfg(test)]
+                    {
+                        op.put_back += 1;
+                    }
+                    Step::Next
+                }
             },
             Step::Remove(mut remove) => match tree.tree().remove(&mut remove)? {
                 IOResult::IO(io) => {
                     op.working = Some(Working::Entry(Step::Remove(remove)));
                     return Ok(IOResult::IO(io));
                 }
-                IOResult::Done(true) => Step::Next,
+                IOResult::Done(true) => {
+                    #[cfg(test)]
+                    {
+                        op.put_back += 1;
+                    }
+                    Step::Next
+                }
                 IOResult::Done(false) => Step::Look,
             },
             Step::Next => {

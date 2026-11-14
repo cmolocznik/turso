@@ -5918,7 +5918,8 @@ pub fn op_savepoint(
         }
         SavepointOp::RollbackTo => {
             let deferred_fk_snapshot = if let Some(atoll) = conn.atoll() {
-                // Driven to its end here, a synchronous site (R19).
+                // Owed by the transaction in a cooperative frame, finished at the top of the
+                // connection's next call; finished here outside one (R19, ASYNC1 D2e (iii-b)).
                 atoll.rollback_to_savepoint(name)?
             } else if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {

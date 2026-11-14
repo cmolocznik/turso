@@ -46,7 +46,7 @@ impl Db {
     }
 
     fn commit(&self, cell: &TxnCell) {
-        let mut op = Commit::new(cell.lock().take().unwrap());
+        let mut op = Commit::new(cell.lock_for_test().take().unwrap());
         run(&self.io, || self.db.atoll().transactions().commit(&mut op));
     }
 
@@ -54,7 +54,7 @@ impl Db {
     fn tree(&self, layout: Layout, rows: &[(Vec<u8>, Vec<Value>)]) -> Entry {
         let cell = self.begin();
         let root = {
-            let mut guard = cell.lock();
+            let mut guard = cell.lock_for_test();
             let txn = guard.as_mut().unwrap();
             let root = run(&self.io, || {
                 self.db.create_tree(txn, SizeClass::new(0).unwrap())
@@ -417,7 +417,7 @@ fn a_cursor_sees_its_own_transactions_rows_and_no_open_ones() {
     );
     let writer = db.begin();
     {
-        let mut guard = writer.lock();
+        let mut guard = writer.lock_for_test();
         let txn = guard.as_mut().unwrap();
         let a = db.db.atoll();
         let tree = VersionedTree::open(
@@ -591,7 +591,7 @@ fn the_creating_statement_writes_plainly_and_a_rollback_abandons_the_tree_whole(
     for plain in [true, false] {
         let cell = db.begin();
         let root = {
-            let mut guard = cell.lock();
+            let mut guard = cell.lock_for_test();
             let txn = guard.as_mut().unwrap();
             let root = run(&db.io, || {
                 db.db.create_tree(txn, SizeClass::new(0).unwrap())
@@ -620,7 +620,7 @@ fn the_creating_statement_writes_plainly_and_a_rollback_abandons_the_tree_whole(
             100,
             "plain {plain}: its own rows"
         );
-        let txn = cell.lock().take().unwrap();
+        let txn = cell.lock_for_test().take().unwrap();
         let mut abort = crate::storage::atoll::txn::Abort::new(txn);
         let txns = db.db.atoll().transactions();
         run(&db.io, || txns.rollback(db.db.versions(), &mut abort));
@@ -777,6 +777,51 @@ fn a_probes_look_answers_only_its_key_while_its_leaf_is_unchanged() {
     assert_eq!(db.entries(entry.root), 5);
 }
 
+/// A probe's look is not answered from while its transaction owes a statement rollback, which may
+/// change its leaf: the rowid read is refused as an entry is (ASYNC1 D2e (iii-b); mutant
+/// `probe-ignores-owed`). Settled, the read answers from the tree.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_probes_look_is_refused_while_its_transaction_owes_a_statement_rollback() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_probes_look_is_refused_while_its_transaction_owes_a_statement_rollback"
+        ),
+        || {
+            let db = Db::open();
+            let rows: Vec<_> = (1..=3)
+                .map(|r| (key::rowid(r).to_vec(), vec![Value::from_i64(r)]))
+                .collect();
+            let entry = db.tree(Layout::Table, &rows);
+            let cell = db.begin();
+            let mut c = db.on(&cell, entry, None);
+            assert_eq!(probe_of(&mut c, &db.io, 4), Probe::Absent);
+            let n = cell
+                .lock_for_test()
+                .as_ref()
+                .expect("an open transaction")
+                .command();
+            let owing = cell.lock_for_test().owe(n, &db.db, cell.conn());
+            let refused = drive(&db.io, || {
+                c.seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true })
+            })
+            .map_err(|e| e.to_string());
+            let settled = cell.settle().map(|r| r.is_io()).map_err(|e| e.to_string());
+            let read = rowid_read(&mut c, &db.io, 4);
+            assert_eq!(owing, Some(Owing::Fresh), "the rollback recorded");
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.contains("did not finish first")),
+                "a kept probe answered while a rollback was owed: {refused:?}"
+            );
+            assert_eq!(settled, Ok(false), "the settle outside a frame");
+            assert_eq!(read, SeekResult::NotFound, "the read once settled");
+        },
+    );
+}
+
 /// A tombstone the probe finds answers the rowid read absent only where the statement sees it:
 /// under read committed, a delete committed after the statement began is a tombstone the probe
 /// passes and the read reads past, to the row the statement sees.
@@ -829,7 +874,7 @@ fn an_insert_that_splits_nothing_allocates_nothing() {
         written(&mut c, &db.io, &table_key(r, &records[r as usize]));
     }
     let room = || {
-        let guard = cell.lock();
+        let guard = cell.lock_for_test();
         let changes = guard.as_ref().unwrap().changes();
         (changes.memory(), changes.parts().len())
     };

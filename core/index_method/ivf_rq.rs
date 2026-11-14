@@ -9167,12 +9167,11 @@ mod tests {
     fn an_unfiltered_query_probes_until_it_has_screened_its_cover() {
         for mvcc in [false, true] {
             let (_db, conn) = database(&format!("ivf-rq-cover-{mvcc}.db"), mvcc);
-            conn.execute("CREATE TABLE f(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
             let mut state = 101;
             let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, 16))).collect();
             let values: Vec<String> = rows.iter().map(|(id, v)| format!("({id}, {})", literal(v))).collect();
-            conn.execute(format!("INSERT INTO f VALUES {}", values.join(","))).unwrap();
-            conn.execute("CREATE INDEX f_ivf ON f USING ivf_rq (e) WITH (nprobes = 1, refine = 4)").unwrap();
+            conn.execute(format!("INSERT INTO v VALUES {}", values.join(","))).unwrap();
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1, refine = 4)").unwrap();
             let live = stored(&conn).live().len();
             assert!(live > 8, "mvcc={mvcc}: {live} partitions");
             for limit in [200usize, 1] {
@@ -9181,7 +9180,7 @@ mod tests {
                 exact.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
                 let want: Vec<i64> = exact.iter().take(limit).map(|(_, id)| *id).collect();
                 let before = PROBES.with(|c| c.get());
-                let got = ids(&conn, &format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM f ORDER BY distance LIMIT {limit}", literal(&q)));
+                let got = ids(&conn, &format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT {limit}", literal(&q)));
                 let probed = PROBES.with(|c| c.get()) - before;
                 if limit == 200 {
                     // 200 rows times the cover is past the table's 3,000: every partition is probed.

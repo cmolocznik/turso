@@ -699,6 +699,63 @@ struct FtsShared {
     /// The admitted population a filtered query last counted, by segment set
     /// and filter, for the population query that follows it.
     population: Mutex<Option<((SearcherKey, String), FilteredPopulation)>>,
+    /// What filters admitted of committed segments, by segment and filter.
+    admitted: Mutex<AdmittedCache>,
+}
+
+/// What a filter admits of one segment, with the sums over it a query reads.
+pub(crate) struct AdmittedSegment {
+    pub(crate) bits: filter::DocBits,
+    /// Per searched field, the admitted documents' field norms summed: the
+    /// field's token count in BM25's statistics.
+    pub(crate) tokens: Vec<(Field, u64)>,
+    /// The admitted documents' `sum_field` values, summed as 256-bit wrapping
+    /// little-endian limbs.
+    pub(crate) sum: Option<[u64; 4]>,
+}
+
+/// A segment as a filter's admission reads it: its id, its document count
+/// and its dead documents.
+type AdmittedKey = ((SegmentId, u32, BTreeSet<u32>), String);
+
+/// The bytes the admitted sets of an index are kept in. A filter admits a set
+/// of every segment it reads, so a query under a filter it has read before
+/// reads the set and its sums instead of evaluating the filter over every
+/// document and summing every admitted document's field norms and values
+/// again: work in proportion to the index, where the rest of a query is in
+/// proportion to its terms' postings.
+const ADMITTED_CACHE_BYTES: usize = 64 << 20;
+
+/// Admitted sets, least recently used first.
+#[derive(Default)]
+struct AdmittedCache {
+    entries: std::collections::VecDeque<(AdmittedKey, Arc<AdmittedSegment>, usize)>,
+    bytes: usize,
+}
+
+impl AdmittedCache {
+    fn get(&mut self, key: &AdmittedKey) -> Option<Arc<AdmittedSegment>> {
+        let at = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let entry = self.entries.remove(at)?;
+        let found = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(found)
+    }
+
+    fn put(&mut self, key: AdmittedKey, value: Arc<AdmittedSegment>) {
+        let bytes = value.bits.bytes() + key.1.len() + key.0 .2.len() * 16 + 64;
+        if bytes > ADMITTED_CACHE_BYTES {
+            return;
+        }
+        self.bytes += bytes;
+        self.entries.push_back((key, value, bytes));
+        while self.bytes > ADMITTED_CACHE_BYTES {
+            let Some((_, _, freed)) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= freed;
+        }
+    }
 }
 
 /// A filtered query's admitted population: its document count and, where the
@@ -2048,7 +2105,7 @@ impl FtsCursor {
                 let parser = self.selected_parser(&fields)?;
                 (parse_bounded_query(&parser, &query_str)?, None)
             };
-        let admitted = self.admitted_sets(&filter)?;
+        let admitted = self.admitted_sets(&filter_text, &filter)?;
         let searcher = self
             .searcher
             .as_ref()
@@ -2061,9 +2118,9 @@ impl FtsCursor {
             }
         });
         let statistics =
-            filter::FilteredStatistics::count(readers, &admitted, &self.default_fields, &terms)?;
+            filter::FilteredStatistics::count(readers, &admitted, &terms)?;
         let limit = bounded_query_limit(Some(limit), statistics.documents);
-        let population = self.population_of(readers, &admitted)?;
+        let population = Self::population_of(&admitted, self.sum_field.is_some());
         self.remember_population(&filter_text, population);
         if limit == 0 {
             return Ok(false);
@@ -2097,7 +2154,8 @@ impl FtsCursor {
         let mut best: std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>> =
             std::collections::BinaryHeap::with_capacity(limit + 1);
         let mut near: Vec<FilteredHit> = Vec::new();
-        for (segment_ord, (reader, bits)) in readers.iter().zip(&admitted).enumerate() {
+        for (segment_ord, (reader, admitted)) in readers.iter().zip(&admitted).enumerate() {
+            let bits = &admitted.bits;
             if bits.count() == 0 {
                 continue;
             }
@@ -2248,8 +2306,13 @@ impl FtsCursor {
         filter::Filter::parse(text, &columns, self.interval_field.is_some())
     }
 
-    /// The documents of each visible segment the filter admits.
-    fn admitted_sets(&self, filter: &filter::Filter) -> Result<Vec<filter::DocBits>> {
+    /// What the filter (`filter`, parsed from `filter_text`) admits of each
+    /// visible segment, with the sums over it. A committed segment's is read
+    /// from the index's admitted sets where a query under the same filter
+    /// kept it, and kept for the next; a view holding this connection's own
+    /// unpublished documents or tombstones is evaluated afresh, as it is no
+    /// other connection's.
+    fn admitted_sets(&self, filter_text: &str, filter: &filter::Filter) -> Result<Vec<Arc<AdmittedSegment>>> {
         let searcher = self
             .searcher
             .as_ref()
@@ -2257,11 +2320,68 @@ impl FtsCursor {
         let interval_column = self
             .interval_field
             .map(|field| self.schema.get_field_name(field).to_string());
+        let cacheable = self.view_is_cacheable();
         searcher
             .segment_readers()
             .iter()
-            .map(|reader| filter::admitted(filter, reader, interval_column.as_deref()))
+            .map(|reader| {
+                let key = cacheable
+                    .then(|| {
+                        let id = reader.segment_id();
+                        self.segments
+                            .iter()
+                            .find(|segment| segment.id() == id)
+                            .map(|segment| ((id, segment.descriptor.max_doc, segment.deleted.clone()), filter_text.to_string()))
+                    })
+                    .flatten();
+                if let Some(found) = key.as_ref().and_then(|key| self.shared.admitted.lock().get(key)) {
+                    return Ok(found);
+                }
+                let bits = filter::admitted(filter, reader, interval_column.as_deref())?;
+                let admitted = Arc::new(self.admitted_sums(reader, bits)?);
+                if let Some(key) = key {
+                    self.shared.admitted.lock().put(key, admitted.clone());
+                }
+                Ok(admitted)
+            })
             .collect()
+    }
+
+    /// The sums a query reads over a segment's admitted documents: each
+    /// searched field's field norms, and the `sum_field` values where the
+    /// index has one.
+    fn admitted_sums(&self, reader: &SegmentReader, bits: filter::DocBits) -> Result<AdmittedSegment> {
+        let map = |e: tantivy::TantivyError| LimboError::InternalError(format!("FTS admitted sums: {e}"));
+        let mut tokens = Vec::with_capacity(self.default_fields.len());
+        for &field in &self.default_fields {
+            let norms = reader.get_fieldnorms_reader(field).map_err(map)?;
+            tokens.push((field, bits.docs().map(|doc| u64::from(norms.fieldnorm(doc))).sum()));
+        }
+        let sum = match self.sum_field {
+            None => None,
+            Some(limbs) => {
+                let columns = limbs
+                    .iter()
+                    .map(|field| {
+                        reader
+                            .fast_fields()
+                            .u64(self.schema.get_field_name(*field))
+                            .map_err(|e| LimboError::InternalError(format!("FTS sum column: {e}")))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut sum = [0u64; 4];
+                for doc in bits.docs() {
+                    let mut carry = 0u128;
+                    for (limb, column) in sum.iter_mut().zip(&columns) {
+                        let total = u128::from(*limb) + u128::from(column.first(doc).unwrap_or(0)) + carry;
+                        *limb = total as u64;
+                        carry = total >> 64;
+                    }
+                }
+                Some(sum)
+            }
+        };
+        Ok(AdmittedSegment { bits, tokens, sum })
     }
 
     /// Pre-analyzed terms, used verbatim (never re-tokenized):
@@ -2368,41 +2488,22 @@ impl FtsCursor {
 
     /// The admitted population: its document count and, where the index has
     /// a `sum_field`, the little-endian 256-bit wrapping sum of the admitted
-    /// documents' values.
-    fn population_of(
-        &self,
-        readers: &[SegmentReader],
-        admitted: &[filter::DocBits],
-    ) -> Result<FilteredPopulation> {
+    /// documents' values, each segment's sum added as its documents' were.
+    fn population_of(admitted: &[Arc<AdmittedSegment>], has_sum: bool) -> FilteredPopulation {
         let mut documents = 0u64;
         let mut sum = [0u64; 4];
-        let mut has_sum = false;
-        for (reader, bits) in readers.iter().zip(admitted) {
-            documents += bits.count();
-            let Some(limbs) = self.sum_field else {
-                continue;
-            };
-            has_sum = true;
-            let columns = limbs
-                .iter()
-                .map(|field| {
-                    reader
-                        .fast_fields()
-                        .u64(self.schema.get_field_name(*field))
-                        .map_err(|e| LimboError::InternalError(format!("FTS sum column: {e}")))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for doc in bits.docs() {
+        for segment in admitted {
+            documents += segment.bits.count();
+            if let Some(limbs) = &segment.sum {
                 let mut carry = 0u128;
-                for (limb, column) in sum.iter_mut().zip(&columns) {
-                    let total =
-                        u128::from(*limb) + u128::from(column.first(doc).unwrap_or(0)) + carry;
-                    *limb = total as u64;
-                    carry = total >> 64;
+                for (total, limb) in sum.iter_mut().zip(limbs) {
+                    let added = u128::from(*total) + u128::from(*limb) + carry;
+                    *total = added as u64;
+                    carry = added >> 64;
                 }
             }
         }
-        Ok(FilteredPopulation {
+        FilteredPopulation {
             documents,
             sum: has_sum.then(|| {
                 let mut bytes = [0u8; 32];
@@ -2411,7 +2512,7 @@ impl FtsCursor {
                 }
                 bytes
             }),
-        })
+        }
     }
 
     /// Keep a filter's population for a population query that follows on the
@@ -2521,12 +2622,8 @@ impl FtsCursor {
             Some(population) => population,
             None => {
                 let filter = self.parse_filter(&filter_text)?;
-                let admitted = self.admitted_sets(&filter)?;
-                let searcher = self
-                    .searcher
-                    .as_ref()
-                    .expect("FTS searcher initialized by query_start");
-                let population = self.population_of(searcher.segment_readers(), &admitted)?;
+                let admitted = self.admitted_sets(&filter_text, &filter)?;
+                let population = Self::population_of(&admitted, self.sum_field.is_some());
                 self.remember_population(&filter_text, population);
                 population
             }

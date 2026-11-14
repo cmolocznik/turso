@@ -655,6 +655,71 @@ fn filtered_top_k_equals_the_exact_oracle_over_the_admitted_set() {
     }
 }
 
+/// The same filters read again and again while the index changes under them:
+/// after every insert, delete, update and merge, and from a second connection
+/// whose view is the same committed segments, each answer and population
+/// equals the exact oracle, so an admitted set kept for one view is never read
+/// for another. The second read of each filter in a view is read from the
+/// admitted sets the first kept.
+#[test]
+fn a_filter_read_again_answers_its_own_view_after_every_change() {
+    for mvcc in [false, true] {
+        let mut rng = Rng(0x5eed_a5e7 | 1);
+        let (_dir, db, conn) = open(mvcc);
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        let filters: Vec<F> = (0..4).map(|_| random_filter(&mut rng, 0)).collect();
+        let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+        let mut next_id = 1i64;
+        let mut reads = 0;
+        for round in 0..6 {
+            let batch: Vec<(i64, Doc)> = (0..50)
+                .map(|_| {
+                    let id = next_id;
+                    next_id += 1;
+                    (id, random_doc(&mut rng))
+                })
+                .collect();
+            conn.execute(insert_sql(&batch)).unwrap();
+            docs.extend(batch);
+            for read in 0..2 {
+                let ids: Vec<i64> = docs.keys().copied().collect();
+                // The second read of the round follows deletes and updates of
+                // documents the first read admitted.
+                if read == 1 {
+                    for _ in 0..6 {
+                        let id = ids[rng.below(ids.len() as u64) as usize];
+                        if rng.below(2) == 0 {
+                            conn.execute(format!("DELETE FROM docs WHERE id = {id}")).unwrap();
+                            docs.remove(&id);
+                        } else if let Some(doc) = docs.get_mut(&id) {
+                            let shape = 1 + rng.below(5) as i64;
+                            conn.execute(format!("UPDATE docs SET closed = 1, shape = {shape} WHERE id = {id}")).unwrap();
+                            doc.closed = 1;
+                            doc.shape = Some(shape);
+                        }
+                    }
+                    if round == 3 {
+                        conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+                    }
+                }
+                for filter in &filters {
+                    let terms: Vec<usize> = (0..2).map(|_| rng.word(VOCAB)).collect();
+                    for (name, reader) in [("writer", &conn), ("other", &other)] {
+                        for again in 0..2 {
+                            let context = format!("mvcc={mvcc} round={round} read={read} {name} again={again} filter={}", filter.json());
+                            assert_eq!(population(reader, &filter.json()), oracle_population(&docs, filter), "{context}: population");
+                            let got = filtered(reader, &terms, &filter.json(), 10);
+                            assert_agrees(&docs, &got, &oracle(&docs, filter, &terms), 10, &context);
+                            reads += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(reads, 6 * 2 * 4 * 2 * 2);
+    }
+}
+
 /// Statistics are counted over the admitted set, not the index: the same
 /// document scores differently when the filter changes which other documents
 /// count, exactly as the oracle says.

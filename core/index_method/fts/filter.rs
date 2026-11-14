@@ -210,6 +210,11 @@ impl DocBits {
         }
     }
 
+    /// The bytes the set holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.words.len() * 8
+    }
+
     pub(crate) fn count(&self) -> u64 {
         self.words
             .iter()
@@ -418,10 +423,11 @@ pub(crate) struct FilteredStatistics {
 }
 
 impl FilteredStatistics {
+    /// The statistics over each segment's admitted documents, its field
+    /// norms already summed with the set (`AdmittedSegment::tokens`).
     pub(crate) fn count(
         readers: &[SegmentReader],
-        admitted: &[DocBits],
-        fields: &[Field],
+        admitted: &[crate::sync::Arc<super::AdmittedSegment>],
         terms: &[Term],
     ) -> Result<Self> {
         let map =
@@ -429,11 +435,10 @@ impl FilteredStatistics {
         let mut documents = 0;
         let mut tokens: HashMap<Field, u64> = HashMap::default();
         let mut doc_freqs: HashMap<Term, u64> = terms.iter().map(|t| (t.clone(), 0)).collect();
-        for (reader, bits) in readers.iter().zip(admitted) {
+        for (reader, segment) in readers.iter().zip(admitted) {
+            let bits = &segment.bits;
             documents += bits.count();
-            for &field in fields {
-                let norms = reader.get_fieldnorms_reader(field).map_err(map)?;
-                let sum: u64 = bits.docs().map(|doc| u64::from(norms.fieldnorm(doc))).sum();
+            for &(field, sum) in &segment.tokens {
                 *tokens.entry(field).or_default() += sum;
             }
             for term in terms {

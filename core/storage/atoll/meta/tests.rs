@@ -1870,12 +1870,10 @@ fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submis
     let (release, held) = mpsc::channel::<()>();
     {
         let steps = steps.clone();
-        let held = std::sync::Mutex::new(held);
+        let held = crate::storage::atoll::locks::Mutex::new(held);
         crash.on_step(Some(Arc::new(move || {
             steps.fetch_add(1, Ordering::Relaxed);
-            if let Ok(held) = held.lock() {
-                let _ = held.recv_timeout(BOUND);
-            }
+            let _ = held.lock().recv_timeout(BOUND);
             Ok(())
         })));
     }

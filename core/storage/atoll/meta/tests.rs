@@ -1804,7 +1804,9 @@ fn a_miss_waiting_on_the_read_credits_steps_the_backend_that_gives_one_back() {
 /// A miss waiting on the read credits while the credit's owner is paused before it submits its
 /// read, the backend holding nothing: the miss's wait looks at the backend once, finds it empty and
 /// parks registered, taking no further step; the owner's submission wakes it, its steps bring that
-/// read in, and the read's retirement gives it the credit (the auditor's #4583).
+/// read in, and the read's retirement gives it the credit (the auditor's #4583). Its steps after the
+/// submission wait for the owner's get to return, so that get finds its read still in flight (the
+/// auditor's #5498).
 #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
 #[test]
 fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submission() {
@@ -1861,8 +1863,26 @@ fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submis
         std::thread::yield_now();
     }
     let parked = (crash.registered(), steps.load(Ordering::Relaxed));
+    // The waiter's steps from here wait for the owner's get to return: a read brought in before
+    // that get looks at its page again would serve the page at once, and the get would return no
+    // wait. Held only after the sample above, so a wait that kept stepping the empty backend is
+    // still seen there.
+    let (release, held) = mpsc::channel::<()>();
+    {
+        let steps = steps.clone();
+        let held = std::sync::Mutex::new(held);
+        crash.on_step(Some(Arc::new(move || {
+            steps.fetch_add(1, Ordering::Relaxed);
+            if let Ok(held) = held.lock() {
+                let _ = held.recv_timeout(BOUND);
+            }
+            Ok(())
+        })));
+    }
     let _ = go_tx.send(());
     let submitted = owner.join().unwrap_or(false);
+    // Every step held is let go, and every later one goes on at once.
+    drop(release);
     let woken = done_rx.recv_timeout(BOUND).is_ok();
     // A wake lost would leave the waiter parked: its wait finished here so it can be joined, the
     // failure kept for the assertion.

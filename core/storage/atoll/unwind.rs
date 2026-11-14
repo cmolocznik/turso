@@ -870,6 +870,141 @@ mod tests {
         ),
         (
             "sql/mode/tests.rs",
+            "a_fresh_pin_waits_for_a_slot_owns_its_view_and_a_host_ends_it_after_the_frame",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_in_an_open_transaction_owns_nothing_and_leaves_it_open",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_is_refused_while_another_is_registered_and_the_first_finishes",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_stale_hold_aborts_before_it_changes_a_later_pin",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_begin_failing_after_its_install_leaves_the_view_owned_and_its_release_ends_it",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_lets_go_of_its_reads_and_statements_before_its_pin",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_deferred_release_after_a_failed_begin_leaves_its_error_with_the_reparse",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_pin_past_the_last_id_is_refused",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_pin_clear_dropped_unconsumed_aborts",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_statement_beside_a_live_internal_helper_still_waits_for_an_owned_pin",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_host_on_another_thread_completes_a_frames_owed_release",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "another_statement_waits_on_the_pins_phase_through_each_phase",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_unrelated_statement_inside_a_reparse_step_waits_for_its_owned_pin",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_pin_cancelled_while_settling_leaves_the_owed_rollback_and_the_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_pin_cancelled_while_waiting_for_a_slot_withdraws_its_wait",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reader_past_its_entry_reads_on_across_a_pin_that_owns_nothing",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_release_whose_ending_fails_publishes_before_the_wake_and_clears_once",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_discarded_at_its_cookie_or_its_build_leaves_its_view_to_a_host",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_failing_at_its_kept_cookie_lets_go_of_the_read_before_its_pin",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_settle_meeting_an_ending_elsewhere_returns_its_wait",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "the_host_completer_in_a_frame_aborts",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "the_owed_flag_stays_set_between_a_pins_take_and_its_clear",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_pin_owning_nothing_released_beside_an_owed_rollback_leaves_the_flag_set",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_host_meeting_an_ending_elsewhere_parks_on_it_and_goes_on",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "the_views_ending_in_a_frame_aborts",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "another_begin_meeting_the_pin_installed_waits_on_that_phase",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_close_leaves_the_view_a_reparse_began_after_its_look",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
             "an_owed_endings_kept_wait_is_judged_before_its_next_serve",
             "child",
         ),
@@ -1210,7 +1345,10 @@ mod tests {
     /// Plain data the facade passes in or out, which code outside Atoll may name: it holds no
     /// Atoll state, so its methods are no entries. `OwedFlag` shares one bool with a transaction's
     /// slot, which the slot writes under its lock: it reaches no owner of the engine's, no
-    /// transaction and nothing a statement has part-changed, and it can only read the bool.
+    /// transaction and nothing a statement has part-changed, and it can only read the bool. A
+    /// reparse's `PinHold`, `PinAt` and `PinPermit` are ids and a phase, and a pin's release hands
+    /// out `ReleaseStep`, an error, a flag and `PinClear`, an id whose drop unconsumed is a broken
+    /// invariant: the registration they name lives in the transaction's slot (ASYNC1 D2e (iii-c)).
     const PLAIN: &[&str] = &[
         "AtollConfig",
         "Begin",
@@ -1221,6 +1359,11 @@ mod tests {
         "LogConfig",
         "OwedFlag",
         "NO_PAGE_CAP",
+        "PinAt",
+        "PinClear",
+        "PinHold",
+        "PinPermit",
+        "ReleaseStep",
         "PAGE",
         "Probed",
         "SCHEMA_ID",

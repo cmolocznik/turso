@@ -7713,12 +7713,12 @@ mod in_frames {
                 // after its take is its one read of the set.
                 let ct = reading(&io, &conn);
                 crate::storage::atoll::drive(&io, || {
-                    ct.begin_reading(Begin::Write { schema: true }, &[], &mut None)
+                    ct.begin_reading(Begin::Write { schema: true }, &[], &mut None, None)
                 })
                 .unwrap();
                 chill(&db);
                 let framed = in_frames_chilled(&io, &db, ct, |read| {
-                    ct.begin_reading(Begin::Write { schema: true }, &reads, read)
+                    ct.begin_reading(Begin::Write { schema: true }, &reads, read, None)
                 });
                 assert!(
                     !framed.value,
@@ -10820,11 +10820,14 @@ mod in_frames {
                 };
                 // Reading only what an owed rollback leaves as it is, or changing what it does not
                 // touch: open or not, changes or not, the snapshot (snapshot isolation), the
-                // statement number, a pending gate take, the failure's identity, and the record.
+                // statement number, a pending gate take, the failure's identity, the record, and a
+                // nested statement's admission, which reads the pin's registration alone (ASYNC1
+                // D2e (iii-c), #5665).
                 assert_eq!(
                     found["observe"],
                     want(&[
                         "cursor.rs:lock_for_test",
+                        "mode.rs:admits_nested",
                         "mode.rs:end_served",
                         "mode.rs:give_up",
                         "mode.rs:is_open",
@@ -10850,20 +10853,22 @@ mod in_frames {
                     "the callers of enter_now"
                 );
                 // Where no operation's owner runs: a statement step's entry, the record outside a
-                // frame, the facade's settle, and the synchronous forms.
+                // frame, the facade's settle (a pin's release first, ASYNC1 D2e (iii-c)), the
+                // synchronous forms, and a reparse's pin before its begin.
                 assert_eq!(
                     found["settle"],
                     want(&[
-                        "cursor.rs:settle_now",
+                        "mode.rs:pin_in",
                         "mode.rs:rollback_statement",
                         "mode.rs:settle",
+                        "mode.rs:settle_now",
                         "vdbe/mod.rs:settle_atoll",
                     ]),
                     "the callers of settle"
                 );
                 assert_eq!(
                     found["settle_now"],
-                    want(&["cursor.rs:enter_now", "mode.rs:pin"]),
+                    want(&["mode.rs:enter_now"]),
                     "the callers of settle_now"
                 );
                 let cursor = std::fs::read_to_string(sql.join("cursor.rs")).unwrap();
@@ -12191,6 +12196,2222 @@ mod in_frames {
             }
         }
     }
+
+    // ------------------------------------------ a reparse's pin in a frame (ASYNC1 D2e (iii-c))
+
+    mod pinning {
+        use super::*;
+        use crate::connection::{ReparseSchemaState, REPARSE_EVENTS};
+        use crate::storage::atoll::cooperative::Frame;
+        use crate::storage::atoll::sql::cursor::{PinPhase, ViewId};
+        use crate::storage::atoll::sql::mode::{
+            ConnTxn, PinClear, PinHold, PIN_ENDINGS, PIN_FAILS_AFTER_INSTALL,
+        };
+        use crate::types::{IOCompletions, IOResult};
+        use crate::TransactionState;
+
+        type Pin = (u64, PinPhase, Option<ViewId>, bool);
+
+        /// What a reparse stepped in frames came to, and where it stood and its pin at each return
+        /// for IO.
+        type Reparsed = (
+            std::result::Result<(), String>,
+            Vec<(&'static str, Option<Pin>)>,
+        );
+
+        /// A database opened async with `slots` transaction slots, and a table `t` of two rows.
+        fn slotted(path: &str, slots: usize) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let mut cfg = config();
+            cfg.txn.slots = slots;
+            let db = crate::storage::atoll::requests::opened_async(|| open_with(&io, path, cfg));
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+                .unwrap();
+            // A begin with no slot free waits, as a statement's does under a busy timeout.
+            conn.set_busy_timeout(std::time::Duration::from_secs(30));
+            (io, db, conn)
+        }
+
+        /// Evicts every page nothing holds, once every request has retired: a checkpoint's page
+        /// writes finish on the IO thread, and a page still being written back is not yet clean, so
+        /// it would stay resident however busy the machine is.
+        fn cold(db: &Database) {
+            assert!(
+                retired(db),
+                "a request still outstanding before the eviction"
+            );
+            chill(db);
+        }
+
+        fn ct(conn: &Arc<Connection>) -> &ConnTxn {
+            conn.atoll().expect("Atoll mode")
+        }
+
+        fn pin_of(conn: &Arc<Connection>) -> Option<Pin> {
+            ct(conn).cell.pin_for_test()
+        }
+
+        /// The open transaction's view, if one is open.
+        fn view_of(conn: &Arc<Connection>) -> Option<ViewId> {
+            let slot = ct(conn).cell.lock_for_test();
+            slot.as_ref().map(|t| (t.slot(), t.start()))
+        }
+
+        /// `n` connections, each holding a transaction slot in an explicit read.
+        fn occupy(db: &Arc<Database>, n: usize) -> Vec<Arc<Connection>> {
+            (0..n)
+                .map(|_| {
+                    let c = db.connect(ConnectOpts::new()).unwrap();
+                    c.execute("BEGIN").unwrap();
+                    rows(&c, "SELECT count(*) FROM t");
+                    c
+                })
+                .collect()
+        }
+
+        /// One call of the reparse in a test frame.
+        fn once(
+            conn: &Arc<Connection>,
+            state: &mut ReparseSchemaState,
+        ) -> crate::types::IOResultOr<()> {
+            let _frame = Frame::enter();
+            conn.reparse_schema_nonblock(state)
+        }
+
+        /// [`once`] with the database's IO thread held before its idle while the call runs, so a
+        /// read the call queues is still waiting when it returns, however fast the IO thread is.
+        fn once_held(
+            db: &Database,
+            conn: &Arc<Connection>,
+            state: &mut ReparseSchemaState,
+        ) -> crate::types::IOResultOr<()> {
+            let held = held_io(db);
+            let out = once(conn, state);
+            drop(held);
+            out
+        }
+
+        /// Steps the reparse in test frames until it is done or fails, at most `bound` calls, each
+        /// return for IO waited for outside the frame: where it stood and its pin at each return.
+        fn in_frames(
+            io: &Arc<dyn IO>,
+            db: &Database,
+            conn: &Arc<Connection>,
+            state: &mut ReparseSchemaState,
+            bound: usize,
+        ) -> Reparsed {
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            let mut at_io = Vec::new();
+            for calls in 1..=bound {
+                let held = held_io(db);
+                let out = once(conn, state);
+                let idle = atoll.io_idle_for_test();
+                drop(held);
+                match out {
+                    Err(e) => return (Err(e.to_string()), at_io),
+                    Ok(IOResult::Done(())) => return (Ok(()), at_io),
+                    Ok(IOResult::IO(IOCompletions(c))) => {
+                        at_io.push((state.stage_for_test(), pin_of(conn)));
+                        assert!(waited(io, &c), "call {calls}: its wait never finished");
+                        assert!(retired(db), "call {calls}: a request still outstanding");
+                        assert!(idled(&idle), "call {calls}: the IO thread never went idle");
+                    }
+                }
+            }
+            panic!("the reparse did not finish within {bound} calls");
+        }
+
+        /// Proofs 1 and 13: with every slot taken, the pin's begin waits for one in a frame,
+        /// registered and owning nothing yet; once a slot is let go it begins its own view and
+        /// owns it, the cold cookie and the build go on in frames in that one view, and the
+        /// release in the frame is owed to a host. A statement's step outside any frame then
+        /// completes it: the view ended, the pin gone, the owed flag down and the connection's
+        /// state published (mutant `owned-recomputed`, ownership taken from whether a
+        /// transaction is open after the install).
+        #[test]
+        fn a_fresh_pin_waits_for_a_slot_owns_its_view_and_a_host_ends_it_after_the_frame() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_fresh_pin_waits_for_a_slot_owns_its_view_and_a_host_ends_it_after_the_frame"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-fresh", 2);
+                    checkpointed(&conn);
+                    let others = occupy(&db, 2);
+                    let mut state = ReparseSchemaState::default();
+                    let first = once(&conn, &mut state);
+                    let Ok(IOResult::IO(IOCompletions(slot))) = first else {
+                        panic!("the pin's begin did not wait for a slot: {first:?}");
+                    };
+                    assert_eq!(state.stage_for_test(), "pin");
+                    let (id, phase, view, owned) = pin_of(&conn).expect("the pin registered");
+                    assert_eq!(
+                        (phase, view, owned),
+                        (PinPhase::Beginning, None, false),
+                        "the pin waiting for a slot"
+                    );
+                    assert!(!slot.finished(), "the slot's wait was already finished");
+                    others[0].execute("COMMIT").unwrap();
+                    assert!(waited(&io, &slot), "the slot's wait never finished");
+                    cold(&db);
+                    let (out, at_io) = in_frames(&io, &db, &conn, &mut state, 64);
+                    // What the frames left, read before the host's step and asserted after it.
+                    let held_owned = at_io
+                        .iter()
+                        .filter_map(|(_, p)| *p)
+                        .any(|p| p.1 == PinPhase::Held && p.3);
+                    let left = pin_of(&conn);
+                    let open_view = view_of(&conn);
+                    let owed_flag = ct(&conn).cell.owes();
+                    let endings = PIN_ENDINGS.with(|n| n.get());
+                    // A host's step entry, as a statement's outside any frame calls it; then what it
+                    // left, before any statement could end a view itself.
+                    let settled = ct(&conn).settle();
+                    let ended = PIN_ENDINGS.with(|n| n.get()) - endings;
+                    let after = (
+                        pin_of(&conn),
+                        ct(&conn).is_pinned(),
+                        ct(&conn).cell.owes(),
+                        ct(&conn).is_open(),
+                        conn.get_tx_state(),
+                    );
+                    let read = rows(&conn, "SELECT count(*) FROM t");
+                    drop(others);
+                    out.unwrap();
+                    assert!(held_owned, "the reparse did not own the view it began: {at_io:?}");
+                    let (id_after, phase, view, _) = left.expect("the release owed");
+                    assert_eq!(id_after, id, "another registration");
+                    assert_eq!(
+                        phase,
+                        PinPhase::ReleaseOwed,
+                        "the release in a frame was not owed to a host"
+                    );
+                    let view = view.expect("the pin's view");
+                    assert!(
+                        at_io.iter().any(|(stage, _)| stage.starts_with("cookie")),
+                        "the cold cookie never returned IO: {at_io:?}"
+                    );
+                    assert!(
+                        at_io
+                            .iter()
+                            .filter_map(|(_, p)| p.and_then(|p| p.2))
+                            .all(|v| v == view),
+                        "the view changed across the returns: {at_io:?}"
+                    );
+                    assert_eq!(open_view, Some(view), "the owned view not kept open");
+                    assert!(owed_flag, "the owed release left the owed flag down");
+                    assert!(matches!(settled, Ok(IOResult::Done(()))), "the host's settle: {settled:?}");
+                    assert_eq!(ended, 1, "the host did not end the pin's view once");
+                    let (pin, pinned, owes, open, tx_state) = after;
+                    assert!(!open, "the pin's owned view was left open");
+                    assert!(pin.is_none(), "the pin still registered");
+                    assert!(!pinned, "the pin's mirror still set");
+                    assert!(!owes, "the owed flag still set");
+                    assert_eq!(tx_state, TransactionState::None);
+                    assert_eq!(read, vec![vec![Value::from_i64(2)]]);
+                },
+            );
+        }
+
+        /// Proof 2: a reparse in the caller's open transaction runs whole in frames, owns no
+        /// view, and leaves the caller's transaction open in the view it had, its state as it was.
+        #[test]
+        fn a_reparse_in_an_open_transaction_owns_nothing_and_leaves_it_open() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_reparse_in_an_open_transaction_owns_nothing_and_leaves_it_open"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-caller", 4);
+                    conn.execute("BEGIN").unwrap();
+                    rows(&conn, "SELECT count(*) FROM t");
+                    let view = view_of(&conn).expect("the caller's transaction");
+                    let tx_state = conn.get_tx_state();
+                    let mut state = ReparseSchemaState::default();
+                    let (out, at_io) = in_frames(&io, &db, &conn, &mut state, 64);
+                    out.unwrap();
+                    assert!(
+                        at_io.iter().filter_map(|(_, p)| *p).all(|p| !p.3),
+                        "the reparse owned the caller's view: {at_io:?}"
+                    );
+                    assert!(
+                        at_io
+                            .iter()
+                            .filter_map(|(_, p)| p.and_then(|p| p.2))
+                            .all(|v| v == view),
+                        "the reparse read in another view: {at_io:?}"
+                    );
+                    assert!(pin_of(&conn).is_none(), "the pin still registered");
+                    assert_eq!(
+                        view_of(&conn),
+                        Some(view),
+                        "the caller's transaction did not go on"
+                    );
+                    assert_eq!(conn.get_tx_state(), tx_state);
+                    conn.execute("COMMIT").unwrap();
+                },
+            );
+        }
+
+        /// Proof 3: a second reparse while the first is registered is refused, at the pin and again
+        /// at the cookie, each refused hold owning nothing; the first keeps its registration and
+        /// finishes (mutant `refusal-releases`, a refusal clearing the registration it met).
+        #[test]
+        fn a_reparse_is_refused_while_another_is_registered_and_the_first_finishes() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_reparse_is_refused_while_another_is_registered_and_the_first_finishes"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-recursion", 2);
+                    checkpointed(&conn);
+                    let others = occupy(&db, 2);
+                    let mut first = ReparseSchemaState::default();
+                    let Ok(IOResult::IO(IOCompletions(slot))) = once(&conn, &mut first) else {
+                        panic!("the first pin did not wait for a slot");
+                    };
+                    let id = pin_of(&conn).expect("the first registered").0;
+                    for at in ["pin", "cookie"] {
+                        let mut second = ReparseSchemaState::default();
+                        let refused = once(&conn, &mut second);
+                        let err = refused.expect_err("a second reparse was admitted");
+                        assert!(
+                            err.to_string().contains("inside another"),
+                            "{at}: the second's error: {err}"
+                        );
+                        assert_eq!(
+                            second.stage_for_test(),
+                            "start",
+                            "{at}: the refused one kept a state"
+                        );
+                        drop(second);
+                        assert_eq!(
+                            pin_of(&conn).map(|p| p.0),
+                            Some(id),
+                            "{at}: a refused reparse released the pending one"
+                        );
+                        if at == "pin" {
+                            others[0].execute("COMMIT").unwrap();
+                            assert!(waited(&io, &slot), "the slot's wait never finished");
+                            cold(&db);
+                            // On to the cold cookie's return.
+                            loop {
+                                match once_held(&db, &conn, &mut first).unwrap() {
+                                    IOResult::IO(IOCompletions(c)) => {
+                                        let stage = first.stage_for_test();
+                                        assert!(waited(&io, &c), "a wait never finished");
+                                        if stage.starts_with("cookie") {
+                                            break;
+                                        }
+                                    }
+                                    IOResult::Done(()) => {
+                                        panic!("the first finished before its cookie")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let (out, _) = in_frames(&io, &db, &conn, &mut first, 64);
+                    out.unwrap();
+                    rows(&conn, "SELECT 1");
+                    assert!(pin_of(&conn).is_none(), "the first's pin still registered");
+                    drop(others);
+                },
+            );
+        }
+
+        /// Proof 4, in a child: a hold of a released pin, forged, released while a later pin is
+        /// registered, ends the process at the stale-hold assertion before it changes anything
+        /// (mutant `stale-release`: without the assertion the child goes on to another end).
+        #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+        #[test]
+        fn a_stale_hold_aborts_before_it_changes_a_later_pin() {
+            use crate::storage::atoll::testing::in_child;
+            let ended = in_child(
+                concat!(
+                    module_path!(),
+                    "::a_stale_hold_aborts_before_it_changes_a_later_pin"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-stale", 4);
+                    let atoll = ct(&conn);
+                    let mut a = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut a), Ok(IOResult::Done(()))));
+                    let id_a = a.id_for_test().expect("A's id");
+                    conn.finish_release(atoll.release_pin(&mut a)).unwrap();
+                    let mut b = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut b), Ok(IOResult::Done(()))));
+                    let mut forged = PinHold::forged_for_test(id_a);
+                    let _ = conn.finish_release(atoll.release_pin(&mut forged));
+                    eprintln!("the forged release returned");
+                },
+            );
+            if let Some(ended) = ended {
+                assert!(
+                    ended.aborted
+                        && ended.stderr.contains("a stale hold released a later pin")
+                        && !ended.stderr.contains("the forged release returned"),
+                    "the child did not end at the stale-hold assertion (aborted {}, code {:?}): {}",
+                    ended.aborted,
+                    ended.code,
+                    ended.stderr
+                );
+            }
+        }
+
+        /// Proof 6: the pin's own begin failing after it installed its view returns its error, the
+        /// registration still owning that view; the reparse's release then ends it outside the
+        /// frame, its state published (mutant `install-error-forgets`, the install not recorded).
+        #[test]
+        fn a_begin_failing_after_its_install_leaves_the_view_owned_and_its_release_ends_it() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_begin_failing_after_its_install_leaves_the_view_owned_and_its_release_ends_it"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-install", 4);
+                    let atoll = ct(&conn);
+                    let mut hold = PinHold::new();
+                    PIN_FAILS_AFTER_INSTALL.with(|f| f.set(true));
+                    let err = {
+                        let _frame = Frame::enter();
+                        atoll.pin_in(&mut hold)
+                    }
+                    .expect_err("the injected failure");
+                    assert!(err.to_string().contains("injected failure after a pin's install"), "{err}");
+                    let (_, phase, view, owned) = pin_of(&conn).expect("the pin registered");
+                    assert_eq!(phase, PinPhase::Failed);
+                    assert!(
+                        owned && view.is_some() && view == view_of(&conn),
+                        "a view the pin's begin installed was left unowned: {view:?} {owned}"
+                    );
+                    let released = conn.finish_release(atoll.release_pin(&mut hold));
+                    assert!(
+                        released.as_ref().is_err_and(|e| e.to_string().contains("injected failure")),
+                        "the release did not carry the pin's own error: {released:?}"
+                    );
+                    assert!(!atoll.is_open(), "a view the pin's begin installed was left open");
+                    assert!(pin_of(&conn).is_none(), "the pin still registered");
+                    assert_eq!(conn.get_tx_state(), TransactionState::None);
+                },
+            );
+        }
+
+        /// Proof 8, and the order of what a reparse lets go of outside any frame: an error injected
+        /// at the cookie's first step (no read yet) releases the pin; one injected in the build lets
+        /// go of its statements before the pin; a finished build too. Each leaves no registration
+        /// and, the view the pin's own, no transaction, the state published; each error is the
+        /// reparse's own. The labels mark the code's order (structural, #5658): at a finished
+        /// build its statement holders are already empty, so this is no live-statement witness;
+        /// the kept cookie read's control is the next test's.
+        #[test]
+        fn a_reparse_lets_go_of_its_reads_and_statements_before_its_pin() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_reparse_lets_go_of_its_reads_and_statements_before_its_pin"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-order", 4);
+                    for (fails, words, order) in [
+                        // Its first visit, before any read: nothing to let go but the pin.
+                        (
+                            Some("cookie"),
+                            Some("injected failure at the cookie"),
+                            &["pin"][..],
+                        ),
+                        (
+                            Some("building"),
+                            Some("injected failure in the build"),
+                            &["statements", "pin"][..],
+                        ),
+                        (None, None, &["statements", "pin"][..]),
+                    ] {
+                        REPARSE_EVENTS.with(|e| e.borrow_mut().clear());
+                        crate::connection::REPARSE_FAILS_AT.with(|f| f.set(fails));
+                        let mut state = ReparseSchemaState::default();
+                        let out = conn.reparse_schema_nonblock(&mut state);
+                        let events = REPARSE_EVENTS.with(|e| e.borrow().clone());
+                        match words {
+                            Some(words) => assert!(
+                                out.as_ref().is_err_and(|e| e.to_string().contains(words)),
+                                "{fails:?}: not the reparse's own error: {out:?}"
+                            ),
+                            None => assert!(
+                                matches!(out, Ok(IOResult::Done(()))),
+                                "the reparse did not finish: {out:?}"
+                            ),
+                        }
+                        assert_eq!(
+                            events, order,
+                            "{fails:?}: what the reparse let go of, in order"
+                        );
+                        assert_eq!(state.stage_for_test(), "start", "{fails:?}: a state kept");
+                        assert!(
+                            pin_of(&conn).is_none(),
+                            "{fails:?}: the pin still registered"
+                        );
+                        assert!(!ct(&conn).is_open(), "{fails:?}: the pin's view left open");
+                        assert_eq!(conn.get_tx_state(), TransactionState::None, "{fails:?}");
+                    }
+                },
+            );
+        }
+
+        /// The deferred release's error policy (#5654): a pin whose own begin failed in a frame
+        /// returns that error to its reparse, its release owed; the host that completes the
+        /// release later meets only the ending's outcome, here none, and the view is ended.
+        #[test]
+        fn a_deferred_release_after_a_failed_begin_leaves_its_error_with_the_reparse() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_deferred_release_after_a_failed_begin_leaves_its_error_with_the_reparse"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-deferred-error", 4);
+                    PIN_FAILS_AFTER_INSTALL.with(|f| f.set(true));
+                    let mut state = ReparseSchemaState::default();
+                    let out = once(&conn, &mut state);
+                    assert!(
+                        out.as_ref().is_err_and(|e| e
+                            .to_string()
+                            .contains("injected failure after a pin's install")),
+                        "the reparse's own error: {out:?}"
+                    );
+                    let (_, phase, _, owned) = pin_of(&conn).expect("the release owed");
+                    assert_eq!((phase, owned), (PinPhase::ReleaseOwed, true));
+                    let cookie = conn.read_current_schema_cookie();
+                    assert!(
+                        cookie.is_ok(),
+                        "the completing host met the reparse's error: {cookie:?}"
+                    );
+                    assert!(pin_of(&conn).is_none(), "the pin still registered");
+                    assert!(!ct(&conn).is_open(), "the pin's view left open");
+                    assert_eq!(conn.get_tx_state(), TransactionState::None);
+                },
+            );
+        }
+
+        /// The admission composed with a live internal helper (#5665): a helper statement marks
+        /// its connection nested for its whole life, and a nested statement begins no
+        /// transaction, so it must still meet a pin that owns its view. With a fresh pin held and
+        /// an internal helper alive, an unrelated statement stepped in a frame waits on the pin's
+        /// unfinished phase wait instead of reading in its view; a statement carrying the pin's
+        /// permit reads on (mutant `nested-unadmitted`, no admission on the nested path).
+        #[test]
+        fn a_statement_beside_a_live_internal_helper_still_waits_for_an_owned_pin() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_statement_beside_a_live_internal_helper_still_waits_for_an_owned_pin"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-nested", 4);
+                    let atoll = ct(&conn);
+                    let mut hold = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    let (_, phase, _, owned) = pin_of(&conn).expect("the pin registered");
+                    assert_eq!(
+                        (phase, owned),
+                        (PinPhase::Held, true),
+                        "a fresh pin holding its view"
+                    );
+                    let helper = conn.prepare_internal("SELECT 1").unwrap();
+                    assert!(
+                        conn.is_nested_stmt(),
+                        "the helper did not mark its connection nested"
+                    );
+                    let mut unrelated = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let stepped = {
+                        let _frame = Frame::enter();
+                        unrelated.step()
+                    };
+                    let waited_on = unrelated.pending_io_for_test();
+                    let signal = ct(&conn).cell.pin_signal_for_test();
+                    let on_signal = match (&waited_on, &signal) {
+                        (Some(w), Some(s)) => Some((w.ptr_eq(s), w.finished())),
+                        _ => None,
+                    };
+                    let mut permitted = crate::connection::permitted(
+                        conn.prepare("SELECT count(*) FROM t").unwrap(),
+                        atoll.permit(&hold),
+                    );
+                    let read = {
+                        let _frame = Frame::enter();
+                        permitted.step()
+                    };
+                    drop((unrelated, permitted, helper));
+                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    assert!(
+                        matches!(stepped, Ok(crate::StepResult::IO)),
+                        "a statement beside a live helper read in a view the pin owns: {stepped:?}"
+                    );
+                    assert_eq!(
+                        on_signal,
+                        Some((true, false)),
+                        "the statement's wait was not the pin's unfinished phase wait"
+                    );
+                    assert!(
+                        matches!(read, Ok(crate::StepResult::Row)),
+                        "the permitted statement did not read on: {read:?}"
+                    );
+                },
+            );
+        }
+
+        /// #5658's real read control: the cookie returns IO in a frame with its read kept; a
+        /// failure injected at the cookie's next step then lets go of that read before the pin is
+        /// released, and ends the pin's owned view. The reparse's error is its own.
+        #[test]
+        fn a_reparse_failing_at_its_kept_cookie_lets_go_of_the_read_before_its_pin() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_reparse_failing_at_its_kept_cookie_lets_go_of_the_read_before_its_pin"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-kept-cookie", 4);
+                    checkpointed(&conn);
+                    cold(&db);
+                    let mut state = ReparseSchemaState::default();
+                    let kept = loop {
+                        match once_held(&db, &conn, &mut state) {
+                            Ok(IOResult::IO(IOCompletions(c))) => {
+                                let stage = state.stage_for_test();
+                                assert!(waited(&io, &c), "a wait never finished");
+                                if stage == "cookie kept" {
+                                    break true;
+                                }
+                                if stage == "building" {
+                                    break false;
+                                }
+                            }
+                            other => panic!("the reparse ended before its cookie: {other:?}"),
+                        }
+                    };
+                    REPARSE_EVENTS.with(|e| e.borrow_mut().clear());
+                    crate::connection::REPARSE_FAILS_AT.with(|f| f.set(Some("cookie")));
+                    let out = once(&conn, &mut state);
+                    let events = REPARSE_EVENTS.with(|e| e.borrow().clone());
+                    crate::connection::REPARSE_FAILS_AT.with(|f| f.set(None));
+                    // Its owned view's release was owed in the frame: a host's step entry ends it.
+                    let settled = ct(&conn).settle();
+                    assert!(settled.is_ok(), "the host's settle: {settled:?}");
+                    assert!(kept, "the cold cookie never returned with its read kept");
+                    assert!(
+                        out.as_ref().is_err_and(|e| e
+                            .to_string()
+                            .contains("injected failure at the cookie")),
+                        "not the reparse's own error: {out:?}"
+                    );
+                    assert_eq!(
+                        events,
+                        ["cookie read", "pin"],
+                        "what the reparse let go of, in order"
+                    );
+                    assert!(pin_of(&conn).is_none(), "the pin still registered");
+                    assert!(!ct(&conn).is_open(), "the pin's view left open");
+                    assert_eq!(conn.get_tx_state(), TransactionState::None);
+                },
+            );
+        }
+
+        /// Proof 5: a pin cancelled while it settles a statement rollback its connection's
+        /// transaction owes leaves that rollback owed, the same one, and the transaction open in its
+        /// view, the pin's registration gone (mutant `settling-ends`, a cancelled settle ending the
+        /// view it found). The rollback is a ROLLBACK TO over parts spilled to the log, recorded in a
+        /// frame, so the pin's settle in a frame returns the IO of reading them back.
+        #[test]
+        fn a_pin_cancelled_while_settling_leaves_the_owed_rollback_and_the_transaction() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_pin_cancelled_while_settling_leaves_the_owed_rollback_and_the_transaction"
+                ),
+                || {
+                    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                    let mut cfg = config();
+                    cfg.log.buffer_bytes = 32 << 10;
+                    cfg.log.chunk_bytes = 8 << 10;
+                    cfg.log_budget = Some(16 << 20);
+                    let db = crate::storage::atoll::requests::opened_async(|| {
+                        open_with(&io, "/db/pin-settling", cfg)
+                    });
+                    let conn = db.connect(ConnectOpts::new()).unwrap();
+                    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                        .unwrap();
+                    conn.execute("BEGIN").unwrap();
+                    conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                        .unwrap();
+                    conn.execute("SAVEPOINT sp").unwrap();
+                    let values = (100..200)
+                        .map(|a| format!("({a}, zeroblob(2048))"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    conn.execute(format!("INSERT INTO t VALUES {values}"))
+                        .unwrap();
+                    // In a frame the ROLLBACK TO records its rollback, owed, and does no undo.
+                    let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                    let back_out = loop {
+                        let stepped = {
+                            let _frame = Frame::enter();
+                            back.step()
+                        };
+                        match stepped {
+                            Ok(crate::StepResult::Done) => break Ok(()),
+                            Ok(crate::StepResult::IO) => {
+                                let c = back.pending_io_for_test().expect("its wait");
+                                assert!(waited(&io, &c), "a wait never finished");
+                            }
+                            other => break Err(format!("{other:?}")),
+                        }
+                    };
+                    drop(back);
+                    let owed = || {
+                        let slot = ct(&conn).cell.lock_for_test();
+                        slot.owed_for_test().map(|o| o.serial_for_test())
+                    };
+                    let (before, view) = (owed(), view_of(&conn));
+                    let mut state = ReparseSchemaState::default();
+                    let first = once_held(&db, &conn, &mut state);
+                    let at = (state.stage_for_test(), pin_of(&conn).map(|p| p.1));
+                    drop(state);
+                    let after = (owed(), view_of(&conn), pin_of(&conn), ct(&conn).is_pinned());
+                    conn.execute("ROLLBACK").unwrap();
+                    assert_eq!(back_out, Ok(()), "the ROLLBACK TO in a frame");
+                    assert!(
+                        before.is_some(),
+                        "no rollback owed after the ROLLBACK TO in a frame"
+                    );
+                    assert!(
+                        matches!(first, Ok(IOResult::IO(_))),
+                        "the settle did not return IO: {first:?}"
+                    );
+                    assert_eq!(at, ("pin", Some(PinPhase::Settling)), "where the pin stood");
+                    assert_eq!(after.1, view, "the transaction ended at a cancelled settle");
+                    assert_eq!(after.0, before, "the owed rollback changed at the cancel");
+                    assert!(
+                        after.2.is_none() && !after.3,
+                        "the cancelled pin still registered"
+                    );
+                },
+            );
+        }
+
+        /// Proof 9 at `Beginning` (#5657): a pin cancelled while its begin waits for a slot under a
+        /// finite bound withdraws its own wait, the bound's start and its timer, so a later pin's
+        /// begin starts its bound afresh (mutant `pin-wait-kept`, the release leaving the wait).
+        #[test]
+        fn a_pin_cancelled_while_waiting_for_a_slot_withdraws_its_wait() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_pin_cancelled_while_waiting_for_a_slot_withdraws_its_wait"
+                ),
+                || {
+                    let (_io, db, conn) = slotted("/db/pin-cancel-begin", 2);
+                    let others = occupy(&db, 2);
+                    let mut state = ReparseSchemaState::default();
+                    let first = once(&conn, &mut state);
+                    let waiting = ct(&conn).pin_wait_for_test();
+                    drop(state);
+                    let cancelled = ct(&conn).pin_wait_for_test();
+                    let later = std::time::Instant::now();
+                    let mut again = ReparseSchemaState::default();
+                    let second = once(&conn, &mut again);
+                    let fresh = ct(&conn).pin_wait_for_test();
+                    drop(again);
+                    drop(others);
+                    assert!(
+                        matches!(first, Ok(IOResult::IO(_))),
+                        "the first begin did not wait: {first:?}"
+                    );
+                    assert!(
+                        waiting.0.is_some() && waiting.1,
+                        "the first begin's bound not under way: {waiting:?}"
+                    );
+                    assert_eq!(
+                        cancelled,
+                        (None, false),
+                        "a cancelled pin kept its begin wait or timer"
+                    );
+                    assert!(
+                        matches!(second, Ok(IOResult::IO(_))),
+                        "the second begin did not wait: {second:?}"
+                    );
+                    assert!(
+                        fresh.0.is_some_and(|since| since >= later),
+                        "the later begin's bound did not start afresh: {fresh:?}"
+                    );
+                },
+            );
+        }
+
+        /// Proof 9 at the cookie and in the build: a reparse discarded there, its owned view's
+        /// release owed in the frame, leaves the view for a host to end; once one has, no
+        /// registration and no transaction are left, and a later reparse finishes.
+        #[test]
+        fn a_reparse_discarded_at_its_cookie_or_its_build_leaves_its_view_to_a_host() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_reparse_discarded_at_its_cookie_or_its_build_leaves_its_view_to_a_host"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-discard", 4);
+                    for stop in ["cookie kept", "building"] {
+                        checkpointed(&conn);
+                        cold(&db);
+                        let mut state = ReparseSchemaState::default();
+                        let reached = loop {
+                            let stepped = once_held(&db, &conn, &mut state);
+                            match stepped {
+                                Ok(IOResult::IO(IOCompletions(c))) => {
+                                    assert!(waited(&io, &c), "{stop}: a wait never finished");
+                                    if state.stage_for_test() == stop {
+                                        break true;
+                                    }
+                                }
+                                Ok(IOResult::Done(())) => break false,
+                                Err(e) => panic!("{stop}: {e}"),
+                            }
+                        };
+                        {
+                            let _frame = Frame::enter();
+                            drop(state);
+                        }
+                        let owed = pin_of(&conn).map(|p| (p.1, p.3));
+                        let settled = ct(&conn).settle();
+                        assert!(settled.is_ok(), "{stop}: the host's settle: {settled:?}");
+                        let after = (pin_of(&conn), ct(&conn).is_open(), conn.get_tx_state());
+                        let mut later = ReparseSchemaState::default();
+                        let finished = conn.reparse_schema_nonblock(&mut later);
+                        assert!(reached, "{stop}: the reparse never returned there");
+                        assert_eq!(
+                            owed,
+                            Some((PinPhase::ReleaseOwed, true)),
+                            "{stop}: the release not owed"
+                        );
+                        assert_eq!(
+                            after,
+                            (None, false, TransactionState::None),
+                            "{stop}: what was left"
+                        );
+                        assert!(
+                            matches!(finished, Ok(IOResult::Done(()))),
+                            "{stop}: {finished:?}"
+                        );
+                    }
+                },
+            );
+        }
+
+        /// Proof 10's `Installed` clause (#5680): the pin's own begin lets its installing guard go
+        /// before the pin is `Held`, and in that span another thread's begin meets the pin
+        /// `Installed`: it gets that phase's own wait, unfinished, of the resource kind, which the
+        /// change to `Held` finishes; looking again it gets `Held`'s fresh wait, the view the pin's
+        /// own. The pin's thread is held at the span by a hook; everything ends before the
+        /// assertions.
+        #[test]
+        fn another_begin_meeting_the_pin_installed_waits_on_that_phase() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::another_begin_meeting_the_pin_installed_waits_on_that_phase"
+                ),
+                || {
+                    use crate::storage::atoll::sql::mode::Begin;
+                    let (_io, _db, conn) = slotted("/db/pin-installed", 4);
+                    let (at_span, reached) = std::sync::mpsc::channel::<()>();
+                    let (go, gone) = std::sync::mpsc::channel::<()>();
+                    let pin_conn = conn.clone();
+                    let pin = std::thread::spawn(move || {
+                        crate::race::at("pin.before_held", move || {
+                            let _ = at_span.send(());
+                            let _ = gone.recv_timeout(std::time::Duration::from_secs(20));
+                        });
+                        let mut hold = PinHold::new();
+                        let out = {
+                            let _frame = Frame::enter();
+                            ct(&pin_conn).pin_in(&mut hold)
+                        };
+                        (out.map(|io| matches!(io, IOResult::Done(()))), hold)
+                    });
+                    let in_span = reached
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .is_ok();
+                    let phase_in_span = pin_of(&conn).map(|p| (p.1, p.3));
+                    let look = || {
+                        let out = {
+                            let _frame = Frame::enter();
+                            ct(&conn).begin_reading(Begin::Read, &[], &mut None, None)
+                        };
+                        let signal = ct(&conn).cell.pin_signal_for_test();
+                        match out {
+                            Ok(IOResult::IO(IOCompletions(c))) => Some((
+                                c.finished(),
+                                signal.as_ref().is_some_and(|s| s.ptr_eq(&c)),
+                                c.is_explicit_yield(),
+                                c,
+                            )),
+                            _ => None,
+                        }
+                    };
+                    let installed = look();
+                    let _ = go.send(());
+                    let (pinned, mut hold) = pin.join().expect("the pin's thread");
+                    let finished_by_held = installed.as_ref().map(|l| l.3.finished());
+                    let held = look();
+                    let released = conn.finish_release(ct(&conn).release_pin(&mut hold));
+                    assert!(
+                        in_span,
+                        "the pin's thread never reached the span before Held"
+                    );
+                    assert_eq!(pinned.map_err(|e| e.to_string()), Ok(true), "the pin");
+                    assert_eq!(
+                        phase_in_span,
+                        Some((PinPhase::Installed, true)),
+                        "the pin was not Installed, owning its view, in the span"
+                    );
+                    let (finished, same, yielded, _) =
+                        installed.expect("another begin read in a view the reparse owns");
+                    assert!(
+                        !finished,
+                        "the Installed admission's wait was already finished"
+                    );
+                    assert!(same, "the Installed admission's wait was not that phase's");
+                    assert!(
+                        !yielded,
+                        "the Installed admission's wait is an explicit yield"
+                    );
+                    assert_eq!(
+                        finished_by_held,
+                        Some(true),
+                        "the change to Held did not finish it"
+                    );
+                    let (finished, same, _, _) =
+                        held.expect("another begin read in the view the pin holds");
+                    assert!(
+                        !finished && same,
+                        "the Held admission's wait was not Held's fresh one"
+                    );
+                    assert!(released.is_ok(), "the release: {released:?}");
+                    assert!(
+                        pin_of(&conn).is_none() && !ct(&conn).is_open(),
+                        "the pin or its view left"
+                    );
+                },
+            );
+        }
+
+        /// Proof 10 and A5: while the pin is registered, another begin of the connection gets the
+        /// pin's current phase wait, unfinished, of the resource kind, the same one until the
+        /// phase changes; a statement stepped in a frame waits on it, polled again the same; through
+        /// the pin's owned view and through its owed release each wait is a fresh unfinished one;
+        /// once a host has completed the release the statement reads (mutants
+        /// `admission-in-none-branch-only`, the look only where no transaction is open, and
+        /// `held-signal-reused`, a finished wait handed out: each fails at the direct look at the
+        /// returned wait, and the interpreter is not stepped on a finished one).
+        #[test]
+        fn another_statement_waits_on_the_pins_phase_through_each_phase() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::another_statement_waits_on_the_pins_phase_through_each_phase"
+                ),
+                || {
+                    use crate::storage::atoll::sql::mode::Begin;
+                    let (io, db, conn) = slotted("/db/pin-admission", 2);
+                    let others = occupy(&db, 2);
+                    let mut state = ReparseSchemaState::default();
+                    let Ok(IOResult::IO(IOCompletions(slot))) = once(&conn, &mut state) else {
+                        panic!("the pin's begin did not wait for a slot");
+                    };
+                    let mut reader = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    // The begin's own look, in a frame: the wait it returns, whether it was already
+                    // finished, and the pin's phase wait.
+                    let look = || {
+                        let out = {
+                            let _frame = Frame::enter();
+                            ct(&conn).begin_reading(Begin::Read, &[], &mut None, None)
+                        };
+                        let signal = ct(&conn).cell.pin_signal_for_test();
+                        match out {
+                            Ok(IOResult::IO(IOCompletions(c))) => {
+                                let finished = c.finished();
+                                let same = signal.as_ref().is_some_and(|s| s.ptr_eq(&c));
+                                Some((finished, same, c.is_explicit_yield(), c))
+                            }
+                            _ => None,
+                        }
+                    };
+                    let step = |reader: &mut crate::Statement| {
+                        let stepped = {
+                            let _frame = Frame::enter();
+                            reader.step()
+                        };
+                        (
+                            matches!(stepped, Ok(crate::StepResult::IO)),
+                            reader.pending_io_for_test(),
+                        )
+                    };
+                    let mut looks = Vec::new();
+                    let beginning = look();
+                    let mut polled_twice = None;
+                    if beginning.as_ref().is_some_and(|l| !l.0) {
+                        let (a, b) = (step(&mut reader), step(&mut reader));
+                        polled_twice = Some((
+                            a.0 && b.0,
+                            match (&a.1, &b.1, &beginning) {
+                                (Some(x), Some(y), Some(l)) => x.ptr_eq(y) && x.ptr_eq(&l.3),
+                                _ => false,
+                            },
+                        ));
+                    }
+                    looks.push(("beginning", beginning));
+                    others[0].execute("COMMIT").unwrap();
+                    assert!(waited(&io, &slot), "the slot's wait never finished");
+                    let (out, _) = in_frames(&io, &db, &conn, &mut state, 64);
+                    let owed = look();
+                    let owed_poll = owed
+                        .as_ref()
+                        .is_some_and(|l| !l.0)
+                        .then(|| step(&mut reader));
+                    looks.push(("release owed", owed));
+                    // A host completes the release; the statement then reads.
+                    let settled = ct(&conn).settle();
+                    let read = loop {
+                        let stepped = {
+                            let _frame = Frame::enter();
+                            reader.step()
+                        };
+                        match stepped {
+                            Ok(crate::StepResult::Row) => {
+                                break reader
+                                    .row()
+                                    .unwrap()
+                                    .get_values()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            }
+                            Ok(crate::StepResult::IO) => {
+                                let c = reader.pending_io_for_test().expect("its wait");
+                                assert!(waited(&io, &c), "the reader's wait never finished");
+                            }
+                            other => panic!("the reader: {other:?}"),
+                        }
+                    };
+                    drop(reader);
+                    drop(others);
+                    out.unwrap();
+                    assert!(settled.is_ok(), "the host's settle: {settled:?}");
+                    for (phase, l) in &looks {
+                        let (finished, same, yielded, _) = l.as_ref().unwrap_or_else(|| {
+                            panic!("{phase}: another begin read in a view the reparse owns")
+                        });
+                        assert!(
+                            !finished,
+                            "{phase}: the admission's wait was already finished"
+                        );
+                        assert!(
+                            same,
+                            "{phase}: the admission's wait was not the pin's phase wait"
+                        );
+                        assert!(
+                            !yielded,
+                            "{phase}: the admission's wait is an explicit yield"
+                        );
+                    }
+                    assert_eq!(
+                        polled_twice,
+                        Some((true, true)),
+                        "the statement polled twice in one phase did not wait on the same wait"
+                    );
+                    assert!(
+                        owed_poll.is_some_and(|(io, _)| io),
+                        "another statement read in a view the reparse's release owed"
+                    );
+                    assert_eq!(read, vec![Value::from_i64(2)], "the statement's row");
+                },
+            );
+        }
+
+        /// Proof 14 and A1: an explicit release whose view's ending fails, after the pin's own
+        /// begin had failed too, returns one error naming the original first; the view is gone,
+        /// so the connection's state is published before the clear's wake, which a hook at the wake
+        /// sees; the registration is cleared once, and a second release does nothing.
+        #[test]
+        fn a_release_whose_ending_fails_publishes_before_the_wake_and_clears_once() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_release_whose_ending_fails_publishes_before_the_wake_and_clears_once"
+                ),
+                || {
+                    use crate::storage::atoll::sql::cursor::PIN_CLEARS;
+                    use crate::storage::atoll::sql::mode::PIN_ENDINGS_FAIL_NEXT;
+                    let (_io, _db, conn) = slotted("/db/pin-ending-fails", 4);
+                    let atoll = ct(&conn);
+                    let mut hold = PinHold::new();
+                    PIN_FAILS_AFTER_INSTALL.with(|f| f.set(true));
+                    let original = atoll
+                        .pin_in(&mut hold)
+                        .expect_err("the injected begin failure");
+                    conn.set_tx_state(TransactionState::Read);
+                    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+                    let at_wake = seen.clone();
+                    let conn_at_wake = conn.clone();
+                    crate::race::at("pin.clear.before_wake", move || {
+                        at_wake.set(Some(conn_at_wake.get_tx_state()));
+                    });
+                    let clears = PIN_CLEARS.with(|n| n.get());
+                    PIN_ENDINGS_FAIL_NEXT.with(|f| f.set(true));
+                    let released = conn.finish_release(atoll.release_pin(&mut hold));
+                    let again = conn.finish_release(atoll.release_pin(&mut hold));
+                    let cleared = PIN_CLEARS.with(|n| n.get()) - clears;
+                    let message = released
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default();
+                    assert!(original
+                        .to_string()
+                        .contains("injected failure after a pin's install"));
+                    let (o, e) = (
+                        message.find("injected failure after a pin's install"),
+                        message.find("injected failure of a pin's ending"),
+                    );
+                    assert!(
+                        o.is_some() && e.is_some() && o < e,
+                        "the release's error does not name the original first, then the ending's: {message}"
+                    );
+                    assert_eq!(
+                        seen.get(),
+                        Some(TransactionState::None),
+                        "the state was not published before the wake"
+                    );
+                    assert_eq!(cleared, 1, "the registration was not cleared exactly once");
+                    assert!(again.is_ok(), "a second release did something: {again:?}");
+                    assert!(
+                        pin_of(&conn).is_none() && !atoll.is_open(),
+                        "the view or pin left"
+                    );
+                },
+            );
+        }
+
+        /// A2: while one call owns a pin's view's ending, held there on another thread, a second
+        /// settle returns that phase's wait, unfinished, not Done; once the owner has cleared the
+        /// pin the wait is finished and the next settle is Done (mutant `loser-returns-done`).
+        #[test]
+        fn a_settle_meeting_an_ending_elsewhere_returns_its_wait() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_settle_meeting_an_ending_elsewhere_returns_its_wait"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-loser", 4);
+                    let mut state = ReparseSchemaState::default();
+                    let (out, _) = in_frames(&io, &db, &conn, &mut state, 64);
+                    out.unwrap();
+                    let pause = crate::storage::atoll::notify::remote_wait();
+                    let (owner_pause, owner_conn) = (pause.clone(), conn.clone());
+                    let (entered, enter) = std::sync::mpsc::channel();
+                    let owner = std::thread::spawn(move || {
+                        crate::storage::atoll::testing::ENDING_PAUSE
+                            .with(|p| *p.borrow_mut() = Some(owner_pause));
+                        crate::race::at("pin.after_take", move || {
+                            let _ = entered.send(());
+                        });
+                        ct(&owner_conn).settle().map(|_| ())
+                    });
+                    let reached = enter
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .is_ok();
+                    let loser = ct(&conn).settle();
+                    let signal = ct(&conn).cell.pin_signal_for_test();
+                    let looked = match &loser {
+                        Ok(IOResult::IO(IOCompletions(c))) => Some((
+                            c.finished(),
+                            signal.as_ref().is_some_and(|s| s.ptr_eq(c)),
+                            c.clone(),
+                        )),
+                        _ => None,
+                    };
+                    crate::storage::atoll::notify::finish(&pause, Ok(0));
+                    let owned = owner.join().expect("the owner's thread");
+                    let finished = looked.as_ref().is_some_and(|l| waited(&io, &l.2));
+                    let next = ct(&conn).settle();
+                    assert!(reached, "the owner never reached its ending");
+                    assert!(owned.is_ok(), "the owner's ending: {owned:?}");
+                    let (was_finished, same, _) = looked
+                        .expect("the loser's settle returned Done while the release was ending");
+                    assert!(
+                        !was_finished && same,
+                        "the loser's wait was not the ending's unfinished wait"
+                    );
+                    assert!(finished, "the ending's wait never finished");
+                    assert!(
+                        matches!(next, Ok(IOResult::Done(()))),
+                        "after the ending: {next:?}"
+                    );
+                    assert!(pin_of(&conn).is_none(), "the pin still registered");
+                },
+            );
+        }
+
+        /// B1 case b: an owned pin's ending takes the transaction out with its owed rollback, if any,
+        /// and between that take and the clear the owed flag stays set by the pin's cause alone,
+        /// which a hook there sees; after the clear it is down (mutant `take-stores-false`).
+        #[test]
+        fn the_owed_flag_stays_set_between_a_pins_take_and_its_clear() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::the_owed_flag_stays_set_between_a_pins_take_and_its_clear"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-flag-take", 4);
+                    let atoll = ct(&conn);
+                    let mut hold = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+                    let (at_take, take_conn) = (seen.clone(), conn.clone());
+                    crate::race::at("pin.after_take", move || {
+                        at_take.set(Some(ct(&take_conn).cell.owes()));
+                    });
+                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    assert_eq!(
+                        seen.get(),
+                        Some(true),
+                        "the owed flag cleared while the pin's release was ending"
+                    );
+                    assert!(
+                        !atoll.cell.owes(),
+                        "the owed flag still set after the clear"
+                    );
+                },
+            );
+        }
+
+        /// B2's race witness, the pin not owning its view: a reader stepped in a frame reads the owed
+        /// flag down at its step's entry, and a hook there releases the pin, which clears at once;
+        /// the reader goes on in the caller's transaction and reads it whole.
+        #[test]
+        fn a_reader_past_its_entry_reads_on_across_a_pin_that_owns_nothing() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_reader_past_its_entry_reads_on_across_a_pin_that_owns_nothing"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-race", 4);
+                    conn.execute("BEGIN").unwrap();
+                    rows(&conn, "SELECT count(*) FROM t");
+                    let view = view_of(&conn);
+                    let atoll = ct(&conn);
+                    let hold = std::rc::Rc::new(std::cell::RefCell::new(PinHold::new()));
+                    assert!(matches!(
+                        atoll.pin_in(&mut hold.borrow_mut()),
+                        Ok(IOResult::Done(()))
+                    ));
+                    let mut reader = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let (release_hold, release_conn) = (hold, conn.clone());
+                    let released = std::rc::Rc::new(std::cell::Cell::new(false));
+                    let did = released.clone();
+                    crate::race::at("vdbe.owed_flag_read", move || {
+                        let step = ct(&release_conn).release_pin(&mut release_hold.borrow_mut());
+                        let _ = release_conn.finish_release(step);
+                        did.set(true);
+                    });
+                    let stepped = {
+                        let _frame = Frame::enter();
+                        reader.step()
+                    };
+                    let row = matches!(stepped, Ok(crate::StepResult::Row)).then(|| {
+                        reader
+                            .row()
+                            .unwrap()
+                            .get_values()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    });
+                    drop(reader);
+                    let after = (pin_of(&conn), view_of(&conn));
+                    conn.execute("COMMIT").unwrap();
+                    assert!(released.get(), "the hook never released the pin");
+                    assert_eq!(
+                        row,
+                        Some(vec![Value::from_i64(2)]),
+                        "the reader's row: {stepped:?}"
+                    );
+                    assert_eq!(
+                        after,
+                        (None, view),
+                        "the pin left, or the caller's view changed"
+                    );
+                },
+            );
+        }
+
+        /// B2 and C3, the pin owning its view: an unrelated statement stepped from inside the
+        /// reparse's own statement's step, on the same thread, waits on the pin's phase wait, while
+        /// the reparse's statements, carrying its permit, read on (mutants `owned-held-admits`, the
+        /// owned view admitting any statement, and `permit-by-thread`, admitting by the thread).
+        #[test]
+        fn an_unrelated_statement_inside_a_reparse_step_waits_for_its_owned_pin() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_unrelated_statement_inside_a_reparse_step_waits_for_its_owned_pin"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-inside", 4);
+                    let unrelated = std::rc::Rc::new(std::cell::RefCell::new(
+                        conn.prepare("SELECT count(*) FROM t").unwrap(),
+                    ));
+                    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+                    let (inner, record, inner_conn) =
+                        (unrelated.clone(), seen.clone(), conn.clone());
+                    crate::race::at("vdbe.owed_flag_read", move || {
+                        let pin = pin_of(&inner_conn);
+                        let stepped = inner.borrow_mut().step();
+                        *record.borrow_mut() =
+                            Some((pin, stepped.map(|r| matches!(r, crate::StepResult::IO))));
+                    });
+                    let mut state = ReparseSchemaState::default();
+                    let (out, _) = in_frames(&io, &db, &conn, &mut state, 64);
+                    rows(&conn, "SELECT 1");
+                    let seen = seen.borrow_mut().take();
+                    drop(unrelated);
+                    out.unwrap();
+                    let (pin, waited_on) = seen.expect("the hook never ran inside the reparse");
+                    assert!(
+                        pin.is_some_and(|p| p.3),
+                        "the hook did not run while the pin owned its view: {pin:?}"
+                    );
+                    assert!(
+                        matches!(waited_on, Ok(true)),
+                        "another statement read in a view the reparse owns: {waited_on:?}"
+                    );
+                },
+            );
+        }
+
+        /// C1.5, proof 19: a frame's release, owed, with its thread never stepping again, is
+        /// completed by a host on another thread whose synchronous form meets it: the view ended
+        /// once there, the state published before the clear's wake, no park, the committed cookie
+        /// read. With the ending failing, that host's call returns the failure and the pin is still
+        /// cleared once (mutant `sync-form-parks`, the form parking on the owed release, which a
+        /// hook at the park reports and the test then completes itself).
+        #[test]
+        fn a_host_on_another_thread_completes_a_frames_owed_release() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_host_on_another_thread_completes_a_frames_owed_release"
+                ),
+                || {
+                    for fails in [false, true] {
+                        let (io, db, conn) = slotted(
+                            if fails {
+                                "/db/pin-host-fails"
+                            } else {
+                                "/db/pin-host"
+                            },
+                            4,
+                        );
+                        let (x_conn, x_io, x_db) = (conn.clone(), io.clone(), db.clone());
+                        std::thread::spawn(move || {
+                            let mut state = ReparseSchemaState::default();
+                            in_frames(&x_io, &x_db, &x_conn, &mut state, 64).0
+                        })
+                        .join()
+                        .expect("thread X")
+                        .unwrap();
+                        let owed = pin_of(&conn).map(|p| p.1);
+                        // The state a host would publish over: not yet None.
+                        conn.set_tx_state(TransactionState::Read);
+                        let (y_conn, parked_tx) = (conn.clone(), std::sync::mpsc::channel::<()>());
+                        let (parked, parked_rx) = parked_tx;
+                        let y = std::thread::spawn(move || {
+                            use crate::storage::atoll::sql::cursor::PIN_CLEARS;
+                            use crate::storage::atoll::sql::mode::PIN_ENDINGS_FAIL_NEXT;
+                            PIN_ENDINGS_FAIL_NEXT.with(|f| f.set(fails));
+                            crate::race::at("pin.sync_park", move || {
+                                let _ = parked.send(());
+                            });
+                            let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+                            let (at_wake, wake_conn) = (seen.clone(), y_conn.clone());
+                            crate::race::at("pin.clear.before_wake", move || {
+                                at_wake.set(Some(wake_conn.get_tx_state()));
+                            });
+                            let (endings, clears) =
+                                (PIN_ENDINGS.with(|n| n.get()), PIN_CLEARS.with(|n| n.get()));
+                            let cookie = y_conn.read_current_schema_cookie();
+                            (
+                                cookie.map_err(|e| e.to_string()),
+                                PIN_ENDINGS.with(|n| n.get()) - endings,
+                                PIN_CLEARS.with(|n| n.get()) - clears,
+                                seen.get(),
+                            )
+                        });
+                        let parked_with_no_actor = parked_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .is_ok();
+                        if parked_with_no_actor {
+                            // Bounded cleanup: the test, a host, completes the release itself.
+                            let _ = ct(&conn).complete_owed_release_for_test();
+                        }
+                        let (cookie, endings, clears, at_wake) = y.join().expect("thread Y");
+                        assert!(
+                            !parked_with_no_actor,
+                            "a synchronous form parked on a release with no actor"
+                        );
+                        assert_eq!(
+                            owed,
+                            Some(PinPhase::ReleaseOwed),
+                            "the frame's release was not owed"
+                        );
+                        assert_eq!(endings, 1, "the view was not ended once on Y");
+                        assert_eq!(clears, 1, "the pin was not cleared once on Y");
+                        assert_eq!(
+                            at_wake,
+                            Some(TransactionState::None),
+                            "the state was not published before the wake"
+                        );
+                        if fails {
+                            assert!(
+                                cookie.as_ref().is_err_and(
+                                    |e| e.contains("injected failure of a pin's ending")
+                                ),
+                                "Y's call did not return the ending's failure: {cookie:?}"
+                            );
+                        } else {
+                            assert!(cookie.is_ok(), "Y's cookie: {cookie:?}");
+                        }
+                        assert!(
+                            pin_of(&conn).is_none() && !ct(&conn).is_open(),
+                            "the pin or its view left"
+                        );
+                    }
+                },
+            );
+        }
+
+        /// C1.5's loser variant: a host whose synchronous form meets an ending another thread owns,
+        /// held there, parks on that ending's wait, once, ending nothing itself, and goes on with the
+        /// committed cookie once the owner has cleared the pin.
+        #[test]
+        fn a_host_meeting_an_ending_elsewhere_parks_on_it_and_goes_on() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_host_meeting_an_ending_elsewhere_parks_on_it_and_goes_on"
+                ),
+                || {
+                    let (io, db, conn) = slotted("/db/pin-host-loser", 4);
+                    let mut state = ReparseSchemaState::default();
+                    let (out, _) = in_frames(&io, &db, &conn, &mut state, 64);
+                    out.unwrap();
+                    let pause = crate::storage::atoll::notify::remote_wait();
+                    let (owner_pause, owner_conn) = (pause.clone(), conn.clone());
+                    let (entered, enter) = std::sync::mpsc::channel();
+                    let owner = std::thread::spawn(move || {
+                        crate::storage::atoll::testing::ENDING_PAUSE
+                            .with(|p| *p.borrow_mut() = Some(owner_pause));
+                        crate::race::at("pin.after_take", move || {
+                            let _ = entered.send(());
+                        });
+                        ct(&owner_conn).settle().map(|_| ())
+                    });
+                    let reached = enter
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .is_ok();
+                    let (y_conn, (parked, parks)) =
+                        (conn.clone(), std::sync::mpsc::channel::<()>());
+                    let y = std::thread::spawn(move || {
+                        use crate::storage::atoll::sql::cursor::PIN_CLEARS;
+                        crate::race::at("pin.sync_park", move || {
+                            let _ = parked.send(());
+                        });
+                        let (endings, clears) =
+                            (PIN_ENDINGS.with(|n| n.get()), PIN_CLEARS.with(|n| n.get()));
+                        let cookie = y_conn
+                            .read_current_schema_cookie()
+                            .map_err(|e| e.to_string());
+                        (
+                            cookie,
+                            PIN_ENDINGS.with(|n| n.get()) - endings,
+                            PIN_CLEARS.with(|n| n.get()) - clears,
+                        )
+                    });
+                    let y_parked = parks
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .is_ok();
+                    crate::storage::atoll::notify::finish(&pause, Ok(0));
+                    let owned = owner.join().expect("the owner's thread");
+                    let (cookie, endings, clears) = y.join().expect("thread Y");
+                    assert!(reached, "the owner never reached its ending");
+                    assert!(owned.is_ok(), "the owner's ending: {owned:?}");
+                    assert!(
+                        y_parked,
+                        "the host did not park on the ending another call owned"
+                    );
+                    assert!(cookie.is_ok(), "the host's cookie: {cookie:?}");
+                    assert_eq!(
+                        (endings, clears),
+                        (0, 0),
+                        "the host ended or cleared the pin itself"
+                    );
+                    assert!(
+                        pin_of(&conn).is_none() && !ct(&conn).is_open(),
+                        "the pin or its view left"
+                    );
+                },
+            );
+        }
+
+        /// A4, the view's ending, in a child (#5673 B): ending a pin's owned view in a cooperative
+        /// frame ends the process at its assertion, before it takes anything; the same ending
+        /// outside a frame, of a pin moved to its ending by its release, finishes.
+        #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+        #[test]
+        fn the_views_ending_in_a_frame_aborts() {
+            use crate::storage::atoll::testing::in_child;
+            let ended = in_child(
+                concat!(module_path!(), "::the_views_ending_in_a_frame_aborts"),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-ending-frame", 4);
+                    let atoll = ct(&conn);
+                    // The control: an owned pin released outside any frame, its view ended there.
+                    let mut first = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut first), Ok(IOResult::Done(()))));
+                    conn.finish_release(atoll.release_pin(&mut first)).unwrap();
+                    assert!(
+                        !atoll.is_open() && pin_of(&conn).is_none(),
+                        "the control's view left"
+                    );
+                    // A second owned pin, its ending asked for in a frame.
+                    let mut second = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut second), Ok(IOResult::Done(()))));
+                    let id = second.id_for_test().expect("its id");
+                    let _frame = Frame::enter();
+                    let _ = atoll.end_for_pin_for_test(id, &conn);
+                    eprintln!("the ending returned in a frame");
+                },
+            );
+            if let Some(ended) = ended {
+                assert!(
+                    ended.aborted
+                        && ended.stderr.contains("view ended in a cooperative frame")
+                        && !ended.stderr.contains("the ending returned in a frame")
+                        && !ended.stderr.contains("the control's view left"),
+                    "the child did not end at the ending's frame assertion (aborted {}): {}",
+                    ended.aborted,
+                    ended.stderr
+                );
+            }
+        }
+
+        /// A4, in a child: the host completer called in a cooperative frame ends the process at its
+        /// assertion; the same call outside a frame, with nothing owed, returns.
+        #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+        #[test]
+        fn the_host_completer_in_a_frame_aborts() {
+            use crate::storage::atoll::testing::in_child;
+            let ended = in_child(
+                concat!(module_path!(), "::the_host_completer_in_a_frame_aborts"),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-completer-frame", 4);
+                    assert!(
+                        ct(&conn).complete_owed_release_for_test().is_ok(),
+                        "the control outside a frame"
+                    );
+                    let _frame = Frame::enter();
+                    let _ = ct(&conn).complete_owed_release_for_test();
+                    eprintln!("the completer returned in a frame");
+                },
+            );
+            if let Some(ended) = ended {
+                assert!(
+                    ended.aborted
+                        && ended
+                            .stderr
+                            .contains("owed release completed in a cooperative frame")
+                        && !ended.stderr.contains("the completer returned in a frame"),
+                    "the child did not end at the completer's frame assertion (aborted {}): {}",
+                    ended.aborted,
+                    ended.stderr
+                );
+            }
+        }
+
+        /// B1 case a: a pin that owns no view, released while a statement rollback its
+        /// connection's transaction owes remains, is cleared at once and leaves the owed flag set by
+        /// the rollback; the next statement's step entry settles that rollback, once (mutant
+        /// `nonowned-clear-stores-false`, the clear storing the flag down).
+        #[test]
+        fn a_pin_owning_nothing_released_beside_an_owed_rollback_leaves_the_flag_set() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_pin_owning_nothing_released_beside_an_owed_rollback_leaves_the_flag_set"
+                ),
+                || {
+                    use crate::storage::atoll::sql::mode::SETTLES_AT_STEP;
+                    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                    let mut cfg = config();
+                    cfg.log.buffer_bytes = 32 << 10;
+                    cfg.log.chunk_bytes = 8 << 10;
+                    cfg.log_budget = Some(16 << 20);
+                    let db = crate::storage::atoll::requests::opened_async(|| {
+                        open_with(&io, "/db/pin-beside-owed", cfg)
+                    });
+                    let conn = db.connect(ConnectOpts::new()).unwrap();
+                    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                        .unwrap();
+                    conn.execute("BEGIN").unwrap();
+                    conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                        .unwrap();
+                    conn.execute("SAVEPOINT sp").unwrap();
+                    let values = (100..200)
+                        .map(|a| format!("({a}, zeroblob(2048))"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    conn.execute(format!("INSERT INTO t VALUES {values}"))
+                        .unwrap();
+                    let atoll = ct(&conn);
+                    let mut hold = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    let owned = pin_of(&conn).map(|p| p.3);
+                    let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                    loop {
+                        let stepped = {
+                            let _frame = Frame::enter();
+                            back.step()
+                        };
+                        match stepped {
+                            Ok(crate::StepResult::Done) => break,
+                            Ok(crate::StepResult::IO) => {
+                                let c = back.pending_io_for_test().expect("its wait");
+                                assert!(waited(&io, &c), "a wait never finished");
+                            }
+                            other => panic!("the ROLLBACK TO: {other:?}"),
+                        }
+                    }
+                    drop(back);
+                    let owed_before = {
+                        let slot = atoll.cell.lock_for_test();
+                        slot.owed_for_test().is_some()
+                    };
+                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    let flag_after_release = atoll.cell.owes();
+                    let settles = SETTLES_AT_STEP.with(|n| n.get());
+                    let counted = (|| -> crate::Result<Vec<Vec<Value>>> {
+                        let mut stmt = conn.prepare("SELECT count(*) FROM t")?;
+                        let mut out = Vec::new();
+                        loop {
+                            match stmt.step()? {
+                                crate::StepResult::Row => {
+                                    out.push(stmt.row().unwrap().get_values().cloned().collect())
+                                }
+                                crate::StepResult::IO => stmt._io().step()?,
+                                crate::StepResult::Done => return Ok(out),
+                                _ => {}
+                            }
+                        }
+                    })();
+                    let settled = SETTLES_AT_STEP.with(|n| n.get()) - settles;
+                    let owed_after = {
+                        let slot = atoll.cell.lock_for_test();
+                        slot.owed_for_test().is_some()
+                    };
+                    let committed = conn.execute("COMMIT");
+                    if committed.is_err() {
+                        let _ = conn.execute("ROLLBACK");
+                    }
+                    assert_eq!(owned, Some(false), "the pin owned the caller's view");
+                    assert!(
+                        owed_before,
+                        "no rollback owed after the ROLLBACK TO in a frame"
+                    );
+                    assert!(
+                        flag_after_release,
+                        "the owed flag was cleared while the other cause remained"
+                    );
+                    assert_eq!(
+                        settled, 1,
+                        "the next statement's entry did not settle the rollback once"
+                    );
+                    assert!(
+                        !owed_after,
+                        "the rollback still owed after the next statement"
+                    );
+                    assert_eq!(
+                        counted.map_err(|e| e.to_string()),
+                        Ok(vec![vec![Value::from_i64(3)]]),
+                        "the rows after the rollback"
+                    );
+                    assert!(committed.is_ok(), "the commit: {committed:?}");
+                },
+            );
+        }
+
+        /// The census of a reparse's pin (C3, A4, #5632's binding conditions 3 and 4), over the
+        /// actual sources: the Atoll reparse takes and releases its pin by the resumable forms and
+        /// never by the synchronous ones; VACUUM's reparse takes no pin; every statement the
+        /// reparse prepares, in the build and in the helpers it calls, carries the permit; only
+        /// `permitted` gives a statement a permit; and the host completer and the view's ending
+        /// each begin by asserting they run outside every frame. Each rule reports a planted
+        /// counterexample of its own.
+        #[test]
+        fn the_reparse_census_rules_its_pin_its_prepares_and_its_hosts() {
+            use crate::storage::atoll::testing::{atoll_dir, code_of};
+            let core = atoll_dir().join("../..").canonicalize().unwrap();
+            let read = |path: &str| code_of(&std::fs::read_to_string(core.join(path)).unwrap());
+            let (connection, stats, mode) = (
+                read("connection.rs"),
+                read("stats.rs"),
+                read("storage/atoll/sql/mode.rs"),
+            );
+            let mut sources: Vec<(String, String)> = Vec::new();
+            for dir in ["", "vdbe", "storage", "translate"] {
+                let mut stack = vec![core.join(dir)];
+                while let Some(d) = stack.pop() {
+                    let Ok(entries) = std::fs::read_dir(&d) else {
+                        continue;
+                    };
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_dir() && !dir.is_empty() {
+                            stack.push(p);
+                        } else if p.extension().is_some_and(|x| x == "rs") {
+                            sources.push((
+                                p.display().to_string(),
+                                code_of(&std::fs::read_to_string(&p).unwrap()),
+                            ));
+                        }
+                    }
+                }
+            }
+            assert!(
+                pin_census(&connection, &stats, &mode, &sources).is_empty(),
+                "the reparse census:\n{}",
+                pin_census(&connection, &stats, &mode, &sources).join("\n")
+            );
+            // Planted counterexamples, one per rule.
+            let plant = |code: &str, within: &str, line: &str| {
+                let at = code.find(&format!("fn {within}(")).expect(within);
+                let body = at + code[at..].find('{').unwrap() + 1;
+                format!("{}\n{line}\n{}", &code[..body], &code[body..])
+            };
+            let planted = [
+                (
+                    "a synchronous pin",
+                    plant(&connection, "reparse_schema_atoll", "atoll.pin();"),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "a synchronous cookie",
+                    plant(
+                        &connection,
+                        "reparse_schema_atoll",
+                        "atoll.schema_cookie();",
+                    ),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "a pin in VACUUM's reparse",
+                    plant(
+                        &connection,
+                        "reparse_schema_with_cookie_keeping_sequences",
+                        "let _ = ReparsePin::new(self.clone());",
+                    ),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "a bare prepare in the build",
+                    plant(
+                        &connection,
+                        "drive_reparse_building",
+                        "let _ = self.prepare_internal(\"SELECT 1\");",
+                    ),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "a bare prepare in a sequence helper",
+                    plant(
+                        &connection,
+                        "read_sequence_watermark_row_nonblock",
+                        "let _ = self.prepare_internal(\"SELECT 1\");",
+                    ),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "a bare prepare in the stats refresh",
+                    connection.clone(),
+                    plant(
+                        &stats,
+                        "refresh_analyze_stats_permitted",
+                        "let _ = conn.prepare(\"SELECT 1\");",
+                    ),
+                    mode.clone(),
+                ),
+                (
+                    "a permit set elsewhere",
+                    plant(
+                        &connection,
+                        "finish_release",
+                        "stmt.set_atoll_pin_permit(None);",
+                    ),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "no permit to a sequence helper",
+                    without_permit(
+                        &connection,
+                        "drive_reparse_building",
+                        "read_seq_descriptor_row_nonblock(",
+                    ),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "no permit to sqlite_schema",
+                    without_permit(&connection, "init_reparse_building", "permitted("),
+                    stats.clone(),
+                    mode.clone(),
+                ),
+                (
+                    "the stats permit shadowed",
+                    connection.clone(),
+                    plant(
+                        &stats,
+                        "refresh_analyze_stats_permitted",
+                        "let permit: Option<crate::storage::atoll::sql::mode::PinPermit> = None;",
+                    ),
+                    mode.clone(),
+                ),
+                (
+                    "a completer without its assertion",
+                    connection.clone(),
+                    stats.clone(),
+                    unasserted(&mode, "complete_owed_release"),
+                ),
+                (
+                    "an ending without its assertion",
+                    connection.clone(),
+                    stats.clone(),
+                    unasserted(&mode, "end_for_pin"),
+                ),
+            ];
+            for (what, connection, stats, mode) in planted {
+                let mut sources = sources.clone();
+                for (path, code) in sources.iter_mut() {
+                    if *path == core.join("connection.rs").display().to_string() {
+                        *code = connection.clone();
+                    }
+                }
+                assert!(
+                    !pin_census(&connection, &stats, &mode, &sources).is_empty(),
+                    "the census did not report {what}"
+                );
+            }
+        }
+
+        /// `code` with the first whole-name call of `call` in `name` passing `None` for its last
+        /// argument, the permit: a planted counterexample.
+        fn without_permit(code: &str, name: &str, call: &str) -> String {
+            let at = code.find(&format!("fn {name}(")).expect(name);
+            let i = at
+                + code[at..]
+                    .match_indices(call)
+                    .find(|(k, _)| {
+                        !code[at..at + k]
+                            .chars()
+                            .last()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
+                    .expect(call)
+                    .0;
+            let rest = &code[i..];
+            let k = call.len() + rest[call.len()..].find("permit").expect("the permit");
+            let end = k + "permit".len();
+            format!("{}None{}", &code[..i + k], &code[i + end..])
+        }
+
+        /// The last argument of each whole-name call of `call` (`name(`) in `body`, trimmed.
+        fn last_arguments(body: &str, call: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for (i, _) in body.match_indices(call) {
+                if body[..i]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let open = i + call.len();
+                let (mut depth, mut start) = (0usize, open);
+                let mut args = Vec::new();
+                for (j, c) in body[open..].char_indices() {
+                    match c {
+                        '(' | '[' | '{' => depth += 1,
+                        ')' | ']' | '}' if depth > 0 => depth -= 1,
+                        ')' => {
+                            args.push(body[start..open + j].trim().to_string());
+                            break;
+                        }
+                        ',' if depth == 0 => {
+                            args.push(body[start..open + j].trim().to_string());
+                            start = open + j + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(last) = args.into_iter().rev().find(|a| !a.is_empty()) {
+                    out.push(last);
+                }
+            }
+            out
+        }
+
+        /// `code` with `name`'s frame assertion made vacuous: a planted counterexample.
+        fn unasserted(code: &str, name: &str) -> String {
+            let at = code.find(&format!("fn {name}(")).expect(name);
+            let i = at
+                + code[at..]
+                    .find("!crate::storage::atoll::cooperative::inside(),")
+                    .expect("its assertion");
+            format!(
+                "{}true,{}",
+                &code[..i],
+                &code[i + "!crate::storage::atoll::cooperative::inside(),".len()..]
+            )
+        }
+
+        /// The body of the first `fn name(` in `code`, braces matched.
+        fn body_of<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+            let at = code.find(&format!("fn {name}("))?;
+            let open = at + code[at..].find('{')?;
+            let mut depth = 0usize;
+            for (i, c) in code[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&code[open..=open + i]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        /// What breaks the reparse census's rules, by rule.
+        fn pin_census(
+            connection: &str,
+            stats: &str,
+            mode: &str,
+            sources: &[(String, String)],
+        ) -> Vec<String> {
+            let mut wrong = Vec::new();
+            let need = |wrong: &mut Vec<String>, code: &str, name: &str| {
+                let body = body_of(code, name);
+                if body.is_none() {
+                    wrong.push(format!("{name} is not there"));
+                }
+                body.unwrap_or("").to_string()
+            };
+            let atoll = need(&mut wrong, connection, "reparse_schema_atoll");
+            for call in ["pin_in(", "schema_cookie_in(", "pin.release()"] {
+                if !atoll.contains(call) {
+                    wrong.push(format!("reparse_schema_atoll does not call {call}"));
+                }
+            }
+            for call in [".pin()", ".unpin()", ".schema_cookie()"] {
+                if atoll.contains(call) {
+                    wrong.push(format!("reparse_schema_atoll calls {call}"));
+                }
+            }
+            let vacuum = need(
+                &mut wrong,
+                connection,
+                "reparse_schema_with_cookie_keeping_sequences",
+            );
+            for call in ["pin_in", "ReparsePin", "permitted("] {
+                if vacuum.contains(call) {
+                    wrong.push(format!("VACUUM's reparse names {call}"));
+                }
+            }
+            for (code, name) in [
+                (connection, "init_reparse_building"),
+                (connection, "drive_reparse_building"),
+                (connection, "read_seq_descriptor_row_nonblock"),
+                (connection, "read_sequence_watermark_row_nonblock"),
+                (stats, "refresh_analyze_stats_permitted"),
+            ] {
+                let body = need(&mut wrong, code, name);
+                let prepares =
+                    body.matches(".prepare(").count() + body.matches(".prepare_internal(").count();
+                let permitted = body
+                    .match_indices("permitted(")
+                    .filter(|(i, _)| {
+                        !body[..*i]
+                            .chars()
+                            .last()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
+                    .count();
+                if prepares == 0 || prepares != permitted {
+                    wrong.push(format!(
+                        "{name}: {prepares} prepares, {permitted} given the permit"
+                    ));
+                }
+            }
+            // The permit itself is what each of those passes on (#5673 A): every `permitted(` call
+            // and every reparse call of a helper takes the reparse's `permit` as its last argument,
+            // the build takes it from its pin, and nothing on the way rebinds it.
+            if !atoll.contains("self.init_reparse_building(cookie, None, pin.permit())") {
+                wrong.push("reparse_schema_atoll does not give the build its pin's permit".into());
+            }
+            let build = need(&mut wrong, connection, "drive_reparse_building");
+            if build
+                .matches("let permit = inner.pin.as_ref().and_then(ReparsePin::permit);")
+                .count()
+                != 1
+            {
+                wrong.push("drive_reparse_building does not take its permit from its pin".into());
+            }
+            for (code, name, calls) in [
+                (connection, "init_reparse_building", &["permitted("][..]),
+                (
+                    connection,
+                    "drive_reparse_building",
+                    &[
+                        "permitted(",
+                        "read_seq_descriptor_row_nonblock(",
+                        "read_sequence_watermark_row_nonblock(",
+                        "refresh_analyze_stats_permitted(",
+                    ][..],
+                ),
+                (
+                    connection,
+                    "read_seq_descriptor_row_nonblock",
+                    &["permitted("][..],
+                ),
+                (
+                    connection,
+                    "read_sequence_watermark_row_nonblock",
+                    &["permitted("][..],
+                ),
+                (
+                    stats,
+                    "refresh_analyze_stats_permitted",
+                    &["permitted("][..],
+                ),
+            ] {
+                let body = need(&mut wrong, code, name);
+                for call in calls {
+                    for last in last_arguments(&body, call) {
+                        if last != "permit" {
+                            wrong.push(format!("{name}: {call} passes {last:?}, not the permit"));
+                        }
+                    }
+                }
+                if name != "drive_reparse_building"
+                    && (body.contains("let permit") || body.contains("let mut permit"))
+                {
+                    wrong.push(format!("{name} rebinds the permit"));
+                }
+            }
+            for (path, code) in sources {
+                let mut rest = code.as_str();
+                while let Some(i) = rest.find("set_atoll_pin_permit(") {
+                    let before = &rest[..i];
+                    if before.trim_end().ends_with("fn") {
+                        rest = &rest[i + 1..];
+                        continue;
+                    }
+                    let within = before
+                        .rfind("fn ")
+                        .map(|f| {
+                            before[f + 3..]
+                                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .next()
+                                .unwrap_or("")
+                        })
+                        .unwrap_or("");
+                    if within != "permitted" && within != "set_atoll_pin_permit" {
+                        wrong.push(format!("{path}: {within} sets a permit"));
+                    }
+                    rest = &rest[i + 1..];
+                }
+            }
+            for name in ["complete_owed_release", "end_for_pin"] {
+                let body = need(&mut wrong, mode, name);
+                let first = body.trim_start_matches('{').trim_start();
+                if !first.starts_with(
+                    "assert!(\n            !crate::storage::atoll::cooperative::inside(),",
+                ) {
+                    wrong.push(format!(
+                        "{name} does not begin by asserting it is outside every frame"
+                    ));
+                }
+            }
+            wrong
+        }
+
+        /// #5690's real-caller witness: a close of a connection with no transaction reaches its end
+        /// of the Atoll transaction with the main slot empty, and the end looks at the pin; the
+        /// reparse driver, on another thread of the same connection, then registers its pin and
+        /// installs the view it owns, and the end goes on to its take while the pin is `Installed`.
+        /// The end must leave that view to the pin: the reparse then fails only because the
+        /// connection is closed, and the host ends the view in the release it left owed.
+        #[test]
+        fn a_close_leaves_the_view_a_reparse_began_after_its_look() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_close_leaves_the_view_a_reparse_began_after_its_look"
+                ),
+                || {
+                    use std::sync::mpsc::channel;
+                    use std::time::Duration;
+                    let (io, db, conn) = slotted("/db/pin-close-end", 4);
+                    let open_before = ct(&conn).is_open();
+                    let (at_look, looked) = channel::<bool>();
+                    let (go, gone) = channel::<()>();
+                    let (closed, close_done) = channel::<()>();
+                    let close_conn = conn.clone();
+                    let close = std::thread::spawn(move || {
+                        let c = close_conn.clone();
+                        crate::race::at("end.after_pinned_read", move || {
+                            let _ = at_look.send(ct(&c).is_open());
+                            let _ = gone.recv_timeout(Duration::from_secs(20));
+                        });
+                        let out = close_conn.close().map_err(|e| e.to_string());
+                        let _ = closed.send(());
+                        out
+                    });
+                    let open_at_look = looked.recv_timeout(Duration::from_secs(20)).ok();
+                    let phase_at_take = std::rc::Rc::new(std::cell::Cell::new(None));
+                    let (seen, c) = (phase_at_take.clone(), conn.clone());
+                    crate::race::at("pin.before_held", move || {
+                        seen.set(pin_of(&c).map(|p| (p.1, p.3)));
+                        let _ = go.send(());
+                        let _ = close_done.recv_timeout(Duration::from_secs(20));
+                    });
+                    let mut state = ReparseSchemaState::Start;
+                    let (reparsed, _) = in_frames(&io, &db, &conn, &mut state, 64);
+                    drop(state);
+                    let ran = close.join().expect("the close's thread");
+                    let owed = pin_of(&conn).map(|p| (p.1, p.3));
+                    let view_kept = !reparsed
+                        .as_ref()
+                        .is_err_and(|e| e.contains("the schema reparse's view changed"));
+                    // The host finishes the release the failed reparse left owed; a view taken from
+                    // under the pin leaves nothing for it to end.
+                    let settled = view_kept.then(|| ct(&conn).settle().map(|_| ()));
+                    let left = (pin_of(&conn).map(|p| (p.1, p.3)), ct(&conn).is_open());
+                    assert!(!open_before, "a transaction open before the close");
+                    assert_eq!(
+                        open_at_look,
+                        Some(false),
+                        "the close's end never looked at an empty main slot"
+                    );
+                    assert_eq!(
+                        phase_at_take.get(),
+                        Some((PinPhase::Installed, true)),
+                        "the pin was not Installed, owning its view, as the end went on"
+                    );
+                    assert_eq!(ran, Ok(()), "the close");
+                    assert!(view_kept, "the close took the view the reparse's pin owned");
+                    assert_eq!(
+                        owed,
+                        Some((PinPhase::ReleaseOwed, true)),
+                        "the failed reparse's release not owed (the reparse: {reparsed:?})"
+                    );
+                    assert!(
+                        matches!(settled, Some(Ok(()))),
+                        "the host's settle: {settled:?}"
+                    );
+                    assert_eq!(left, (None, false), "the pin or its view left");
+                },
+            );
+        }
+
+        /// Proof 15: the connection's pin ids used up refuse the next registration, and no id is
+        /// ever 0.
+        #[test]
+        fn a_pin_past_the_last_id_is_refused() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(module_path!(), "::a_pin_past_the_last_id_is_refused"),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-ids", 4);
+                    let atoll = ct(&conn);
+                    atoll.set_last_pin_for_test(u64::MAX - 1);
+                    let mut last = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut last), Ok(IOResult::Done(()))));
+                    assert_eq!(last.id_for_test(), Some(u64::MAX), "the last id");
+                    conn.finish_release(atoll.release_pin(&mut last)).unwrap();
+                    let mut past = PinHold::new();
+                    let err = atoll.pin_in(&mut past).expect_err("an id past the last");
+                    assert!(err.to_string().contains("ids are used up"), "{err}");
+                    assert!(!past.armed(), "a refused registration armed its hold");
+                    assert!(
+                        pin_of(&conn).is_none(),
+                        "a registration made past the last id"
+                    );
+                },
+            );
+        }
+
+        /// C2, in a child: a clear token dropped unconsumed ends the process at its assertion.
+        #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+        #[test]
+        fn a_pin_clear_dropped_unconsumed_aborts() {
+            use crate::storage::atoll::testing::in_child;
+            let ended = in_child(
+                concat!(module_path!(), "::a_pin_clear_dropped_unconsumed_aborts"),
+                || {
+                    drop(PinClear::forged_for_test(7));
+                    eprintln!("the unconsumed clear dropped");
+                },
+            );
+            // With no Atoll value alive the assertion's panic ends the child unclean, not by an
+            // abort; with one alive, an Atoll frame turns it into one.
+            if let Some(ended) = ended {
+                assert!(
+                    ended.code != Some(0)
+                        && ended.stderr.contains("a pin's clear was dropped unconsumed")
+                        && !ended.stderr.contains("the unconsumed clear dropped"),
+                    "the child did not end at the unconsumed-clear assertion (code {:?}, aborted {}): {}",
+                    ended.code,
+                    ended.aborted,
+                    ended.stderr
+                );
+            }
+        }
+    }
 }
 
 /// Every site in the SQL facade that drives an operation to its end, by the function it is in,
@@ -12229,11 +14450,6 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "mode.rs",
-        "pin",
-        "slice (iii): the reparse's pin, with its cookie read",
-    ),
-    (
-        "mode.rs",
         "read_since_snapshot",
         "outside a frame only, its own condition: in one, the read is kept",
     ),
@@ -12267,7 +14483,10 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
 
 /// The facade's reads converted in slice (i), and the sites slices (ii) and (iii) converted: each
 /// returns what it waits for, and drives nothing. `settle` waits in place outside a frame as
-/// `drive_or_io` does, over the owed rollback's own top (ASYNC1 D2e (iii-b)).
+/// `drive_or_io` does, over the owed rollback's own top (ASYNC1 D2e (iii-b)). A reparse's pin,
+/// its release and the step entry's look at it drive nothing in a frame (ASYNC1 D2e (iii-c)):
+/// outside one, their host helpers (`end_for_pin`, `complete_owed_release`) end the view, each
+/// asserting it is outside every frame.
 const CONVERTED: &[&str] = &[
     "schema_cookie_in",
     "header_in",
@@ -12290,6 +14509,9 @@ const CONVERTED: &[&str] = &[
     "reopened",
     "count_step",
     "settle",
+    "pin_in",
+    "release_pin",
+    "settle_pin",
 ];
 
 /// A file's production code: up to its inline test module, which by the house layout comes last.

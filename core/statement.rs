@@ -351,6 +351,16 @@ impl Statement {
         self.program.connection.set_mv_tx(mv_tx);
     }
 
+    /// Gives the statement the permit of the Atoll schema reparse that prepared it, kept across its
+    /// resets and repreparations: only [`crate::connection::permitted`] calls it (ASYNC1 D2e
+    /// (iii-c)).
+    pub(crate) fn set_atoll_pin_permit(
+        &mut self,
+        permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
+    ) {
+        self.state.atoll_pin_permit = permit;
+    }
+
     pub fn interrupt(&mut self) {
         self.state.interrupt();
     }

@@ -145,6 +145,16 @@ pub fn refresh_analyze_stats_nonblock(
     conn: &Arc<Connection>,
     st: &mut RefreshAnalyzeStatsState,
 ) -> IOResultOr<()> {
+    refresh_analyze_stats_permitted(conn, st, None)
+}
+
+/// [`refresh_analyze_stats_nonblock`] for an Atoll schema reparse: the statement it prepares
+/// carries the reparse's `permit` (ASYNC1 D2e (iii-c)).
+pub(crate) fn refresh_analyze_stats_permitted(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+    permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
+) -> IOResultOr<()> {
     loop {
         match st {
             RefreshAnalyzeStatsState::Start => {
@@ -162,7 +172,7 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
-                let mut stmt = conn.prepare(STATS_QUERY)?;
+                let mut stmt = crate::connection::permitted(conn.prepare(STATS_QUERY)?, permit);
                 stmt.set_mv_tx(mv_tx);
                 *st = RefreshAnalyzeStatsState::Running {
                     stmt: Box::new(stmt),

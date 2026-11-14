@@ -3141,6 +3141,11 @@ impl Database {
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
+        // Bound before the connection is handed out: a host meeting its Atoll transaction's owed
+        // pin release reaches the connection through it (ASYNC1 D2e (iii-c)).
+        if let Some(atoll) = conn.atoll.as_ref() {
+            atoll.bind(&conn);
+        }
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
         let builtin_syms = self.builtin_syms.read();

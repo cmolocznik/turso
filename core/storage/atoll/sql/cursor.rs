@@ -85,27 +85,170 @@ macro_rules! done {
 /// [`settle`](Self::settle), at the top of the connection's next call (ASYNC1 D2e (iii-b)).
 pub struct TxnSlot {
     slot: Mutex<Slot>,
-    /// Whether `slot.owed` holds a rollback: written under the lock with it, read without the lock
-    /// by a kept probe, and by a statement step's entry through the connection's `OwedFlag`, which
-    /// shares it.
+    /// Whether the connection's next call owes work before anything else: `slot.owed` holds a
+    /// rollback, or a schema reparse's pin owes the release of its view (`ReleaseOwed`, `Ending`).
+    /// Written under the lock, recomputed from both causes by every writer ([`Slot::owing`]), read
+    /// without the lock by a kept probe, and by a statement step's entry through the connection's
+    /// `OwedFlag`, which shares it.
     owing: Arc<AtomicBool>,
+    /// Whether a schema reparse's pin is registered (`slot.pin`): written under the lock with it,
+    /// read without it by the transaction's endings, which a pin refuses.
+    pinned: AtomicBool,
     conn: Arc<crate::storage::atoll::buffer::Conn>,
 }
 
-/// The transaction and the statement rollback it owes, under one lock.
+/// The transaction, the statement rollback it owes, and a schema reparse's pin, under one lock.
 struct Slot {
     txn: Option<Txn>,
     /// The statement rollback the transaction owes (R19): recorded where a statement's rollback
     /// was not run to its end, finished at the top of the connection's next call.
     owed: Option<Box<OwedRollback>>,
+    /// The schema reparse that holds a view of the connection, if one does (ASYNC1 D2e (iii-c)).
+    pin: Option<PinReg>,
+}
+
+impl Slot {
+    /// What the owed flag says: a rollback owed, or a pin's release owed or under way.
+    fn owing(&self) -> bool {
+        self.owed.is_some()
+            || self
+                .pin
+                .as_ref()
+                .is_some_and(|p| matches!(p.phase, PinPhase::ReleaseOwed | PinPhase::Ending))
+    }
+}
+
+impl Slot {
+    /// Moves pin `id` to `phase`, under the lock: the new phase's fresh wait put in place, the old
+    /// one handed back for the caller to finish once the lock is let go.
+    fn pin_phase_locked(&mut self, id: u64, phase: PinPhase) -> crate::io::Completion {
+        let pin = self.pin.as_mut().expect("a pin registered");
+        crate::turso_assert!(pin.id == id, "a pin moved by another's hold");
+        pin.phase = phase;
+        std::mem::replace(
+            &mut pin.signal,
+            crate::storage::atoll::notify::remote_wait(),
+        )
+    }
+
+    /// Clears pin `id`, under the lock: its wait handed back for the caller to finish once the lock
+    /// is let go.
+    fn clear_pin_locked(&mut self, id: u64) -> crate::io::Completion {
+        crate::turso_assert!(
+            self.pin.as_ref().is_some_and(|p| p.id == id),
+            "a pin cleared by another's hold"
+        );
+        self.pin.take().expect("the pin just checked").signal
+    }
+}
+
+/// A transaction's identity as a view: its slot and start.
+pub(in crate::storage::atoll) type ViewId = (u16, u64);
+
+/// Where a schema reparse's pin stands ([`PinReg`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::storage::atoll) enum PinPhase {
+    /// Registered; a statement rollback owed is being finished first.
+    Settling,
+    /// Its begin is under way.
+    Beginning,
+    /// Its own begin put the view in the slot; that begin has not yet returned.
+    Installed,
+    /// It holds its view.
+    Held,
+    /// Its begin or settle failed.
+    Failed,
+    /// Released in a cooperative frame, owning its view: the view's ending is owed to a host.
+    ReleaseOwed,
+    /// The view's ending is under way, by the one call that moved the phase here.
+    Ending,
+}
+
+/// A schema reparse's pin (ASYNC1 D2e (iii-c)): its id, a generation of its connection never 0 and
+/// never reused; the view it reads in, and whether its own begin installed that view; the one
+/// unfinished wait of its current phase, which what waits on the phase shares; and the error its
+/// begin or settle failed with.
+pub(in crate::storage::atoll) struct PinReg {
+    id: u64,
+    phase: PinPhase,
+    view: Option<ViewId>,
+    owned: bool,
+    signal: crate::io::Completion,
+    error: Option<LimboError>,
+}
+
+/// Who a begin is for, as its admission sees a pin ([`Entered::pin_admits`]).
+#[derive(Clone, Copy)]
+pub(in crate::storage::atoll) enum Admit {
+    /// A statement, with the permit its schema reparse gave it, if one did: the pin's id.
+    Statement(Option<u64>),
+    /// The pin's own begin, by its id.
+    Pin(u64),
+}
+
+/// What releasing a pin does ([`TxnSlot::release_pin`]).
+pub(in crate::storage::atoll) enum ReleasePath {
+    /// It owned no view: cleared.
+    Cleared,
+    /// It owns its view, released in a frame: the ending is owed to a host (`ReleaseOwed`).
+    Deferred,
+    /// It owns its view, released outside every frame: the caller ends it (`Ending`), the error
+    /// the pin's begin failed with, if it did, handed over.
+    Ending(Option<LimboError>),
+}
+
+/// A pin's release met at the top of a call ([`TxnSlot::release_met`]).
+pub(in crate::storage::atoll) enum ReleaseMet {
+    Nothing,
+    /// Owed to a host: the phase's wait.
+    Owed(crate::io::Completion),
+    /// Under way by another call: the phase's wait.
+    Ending(crate::io::Completion),
+}
+
+/// What taking over a pin's owed release found ([`TxnSlot::claim_owed_release`]).
+pub(in crate::storage::atoll) enum Claim {
+    Nothing,
+    /// This call moved it to `Ending` and owns the ending: the pin's id, and the error its begin
+    /// or settle failed with, which that step already returned to its reparse.
+    Mine(u64, Option<LimboError>),
+    /// Another call is ending it: the phase's wait.
+    Elsewhere(crate::io::Completion),
+}
+
+/// A wait finished once dropped, after the lock it was taken under: declared before the guard it
+/// outlives, so it drops after it on every path.
+#[derive(Default)]
+pub(in crate::storage::atoll) struct FinishAfter(Option<crate::io::Completion>);
+
+impl FinishAfter {
+    /// Holds `c` to finish once dropped.
+    pub(in crate::storage::atoll) fn set(&mut self, c: crate::io::Completion) {
+        crate::turso_assert!(self.0.is_none(), "two waits to finish after one lock");
+        self.0 = Some(c);
+    }
+}
+
+impl Drop for FinishAfter {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        if let Some(c) = self.0.take() {
+            crate::storage::atoll::notify::finish(&c, Ok(0));
+        }
+    }
 }
 
 impl TxnSlot {
     /// A connection's slot, holding `txn`.
     pub fn new(txn: Option<Txn>) -> TxnCell {
         Arc::new(Self {
-            slot: Mutex::new(Slot { txn, owed: None }),
+            slot: Mutex::new(Slot {
+                txn,
+                owed: None,
+                pin: None,
+            }),
             owing: Arc::new(AtomicBool::new(false)),
+            pinned: AtomicBool::new(false),
             conn: crate::storage::atoll::buffer::Conn::new(),
         })
     }
@@ -127,29 +270,6 @@ impl TxnSlot {
         Ok(Entered(slot))
     }
 
-    /// [`enter`](Self::enter) for a synchronous form at the top of a call: a rollback owed is
-    /// finished first, driven to its end here outside a cooperative frame. In one, where such a
-    /// form never meets one, a rollback owed is an error naming `site`, never a park.
-    #[inline]
-    pub(in crate::storage::atoll) fn enter_now(&self, site: &'static str) -> Result<Entered<'_>> {
-        if self.owes() {
-            self.settle_now(site)?;
-        }
-        Ok(self.enter()?)
-    }
-
-    /// [`settle`](Self::settle) for a synchronous form at the top of a call, as
-    /// [`enter_now`](Self::enter_now) settles.
-    #[inline]
-    pub(in crate::storage::atoll) fn settle_now(&self, site: &'static str) -> Result<()> {
-        match self.settle()? {
-            IOResult::Done(()) => Ok(()),
-            IOResult::IO(_) => Err(LimboError::InternalError(format!(
-                "{site}: a synchronous form met a statement rollback owed in a cooperative frame"
-            ))),
-        }
-    }
-
     /// The transaction as it stands, a statement rollback maybe owed in it: for what reads only
     /// what that rollback leaves as it is, or changes what it does not touch.
     pub(in crate::storage::atoll) fn observe(&self) -> Observed<'_> {
@@ -159,14 +279,18 @@ impl TxnSlot {
         }
     }
 
-    /// Takes the transaction out to end it, with the statement rollback it owes.
+    /// Takes the transaction out to end it, with the statement rollback it owes. None with none
+    /// open, or while it is the view a schema reparse's pin owns: that view is the pin's to end
+    /// ([`take_for_pin`](Self::take_for_pin)), and an end that looked at the pin before the pin
+    /// began it must not take it (#5690).
     pub(in crate::storage::atoll) fn take(&self) -> Option<(Txn, Option<Box<OwedRollback>>)> {
         let mut slot = self.slot.lock();
+        if slot.pin.as_ref().is_some_and(|pin| pin.owned) {
+            return None;
+        }
         let txn = slot.txn.take()?;
         let owed = slot.owed.take();
-        if owed.is_some() {
-            self.owing.store(false, AtomicOrdering::Release);
-        }
+        self.owing.store(slot.owing(), AtomicOrdering::Release);
         Some((txn, owed))
     }
 
@@ -196,6 +320,186 @@ impl TxnSlot {
         self.owing.load(AtomicOrdering::Acquire)
     }
 
+    /// Whether a schema reparse's pin is registered: one load.
+    #[inline]
+    pub(in crate::storage::atoll) fn pinned(&self) -> bool {
+        self.pinned.load(AtomicOrdering::Acquire)
+    }
+
+    /// Registers pin `id` (ASYNC1 D2e (iii-c)), `Settling`; refused, touching nothing, while one is
+    /// registered.
+    pub(in crate::storage::atoll) fn register_pin(&self, id: u64) -> Result<()> {
+        let mut slot = self.slot.lock();
+        if slot.pin.is_some() {
+            return Err(LimboError::InternalError(
+                "a schema reparse inside another on one connection".to_string(),
+            ));
+        }
+        slot.pin = Some(PinReg {
+            id,
+            phase: PinPhase::Settling,
+            view: None,
+            owned: false,
+            signal: crate::storage::atoll::notify::remote_wait(),
+            error: None,
+        });
+        self.pinned.store(true, AtomicOrdering::Release);
+        Ok(())
+    }
+
+    /// Moves pin `id` to `phase`: a fresh wait for the new phase, the old one finished once the
+    /// lock is let go.
+    pub(in crate::storage::atoll) fn pin_phase(&self, id: u64, phase: PinPhase) {
+        let mut after = FinishAfter::default();
+        let mut slot = self.slot.lock();
+        after.0 = Some(slot.pin_phase_locked(id, phase));
+        self.owing.store(slot.owing(), AtomicOrdering::Release);
+    }
+
+    /// Pin `id`'s begin or settle failed with `error`: `Failed`, its view and ownership as they
+    /// stand.
+    pub(in crate::storage::atoll) fn pin_failed(&self, id: u64, error: LimboError) {
+        let mut after = FinishAfter::default();
+        let mut slot = self.slot.lock();
+        after.0 = Some(slot.pin_phase_locked(id, PinPhase::Failed));
+        slot.pin.as_mut().expect("the pin just moved").error = Some(error);
+    }
+
+    /// Pin `id` holds its view: the one its own begin installed, or else the transaction already
+    /// open, recorded as not its own.
+    pub(in crate::storage::atoll) fn pin_held(&self, id: u64) {
+        let mut after = FinishAfter::default();
+        let mut slot = self.slot.lock();
+        let open = slot.txn.as_ref().map(|t| (t.slot(), t.start()));
+        let pin = slot.pin.as_mut().expect("a pin registered");
+        if pin.view.is_none() {
+            pin.view = open;
+            pin.owned = false;
+        }
+        after.0 = Some(slot.pin_phase_locked(id, PinPhase::Held));
+    }
+
+    /// Whether pin `id` is registered and the open transaction is its view: what each step of a
+    /// reparse checks before it reads.
+    pub(in crate::storage::atoll) fn pin_view_is(&self, id: u64) -> bool {
+        let slot = self.slot.lock();
+        let open = slot.txn.as_ref().map(|t| (t.slot(), t.start()));
+        slot.pin
+            .as_ref()
+            .is_some_and(|p| p.id == id && p.view.is_some() && p.view == open)
+    }
+
+    /// Releases pin `id` (ASYNC1 D2e (iii-c)): one that owns no view is cleared now; one that owns
+    /// its view is moved to `ReleaseOwed` in a cooperative frame, or to `Ending` outside every
+    /// frame for its caller to end. A release of another registration than `id`'s is a broken
+    /// invariant, refused before anything changes: a hold is unique and is disarmed by its release.
+    pub(in crate::storage::atoll) fn release_pin(&self, id: u64, in_frame: bool) -> ReleasePath {
+        let mut after = FinishAfter::default();
+        let mut slot = self.slot.lock();
+        crate::turso_assert!(
+            slot.pin.as_ref().is_some_and(|p| p.id == id),
+            "a stale hold released a later pin"
+        );
+        let pin = slot.pin.as_mut().expect("the pin just checked");
+        if !pin.owned || pin.view.is_none() {
+            after.0 = Some(slot.clear_pin_locked(id));
+            self.pinned.store(false, AtomicOrdering::Release);
+            self.owing.store(slot.owing(), AtomicOrdering::Release);
+            return ReleasePath::Cleared;
+        }
+        if in_frame {
+            after.0 = Some(slot.pin_phase_locked(id, PinPhase::ReleaseOwed));
+            self.owing.store(slot.owing(), AtomicOrdering::Release);
+            return ReleasePath::Deferred;
+        }
+        let error = pin.error.take();
+        after.0 = Some(slot.pin_phase_locked(id, PinPhase::Ending));
+        self.owing.store(slot.owing(), AtomicOrdering::Release);
+        ReleasePath::Ending(error)
+    }
+
+    /// A pin's release, as the top of a call meets it: owed to a host, under way elsewhere, or
+    /// neither.
+    pub(in crate::storage::atoll) fn release_met(&self) -> ReleaseMet {
+        let slot = self.slot.lock();
+        match slot.pin.as_ref() {
+            Some(p) if p.phase == PinPhase::ReleaseOwed => ReleaseMet::Owed(p.signal.clone()),
+            Some(p) if p.phase == PinPhase::Ending => ReleaseMet::Ending(p.signal.clone()),
+            _ => ReleaseMet::Nothing,
+        }
+    }
+
+    /// Takes over a pin's owed release, for a host to end its view: `ReleaseOwed` moved to
+    /// `Ending`, this call its one owner; or the wait of an ending another call owns.
+    pub(in crate::storage::atoll) fn claim_owed_release(&self) -> Claim {
+        let mut after = FinishAfter::default();
+        let mut slot = self.slot.lock();
+        let (id, phase, signal) = match slot.pin.as_ref() {
+            Some(p) => (p.id, p.phase, p.signal.clone()),
+            None => return Claim::Nothing,
+        };
+        match phase {
+            PinPhase::ReleaseOwed => {
+                let original = slot.pin.as_mut().expect("the pin just read").error.take();
+                after.0 = Some(slot.pin_phase_locked(id, PinPhase::Ending));
+                self.owing.store(slot.owing(), AtomicOrdering::Release);
+                Claim::Mine(id, original)
+            }
+            PinPhase::Ending => Claim::Elsewhere(signal),
+            _ => Claim::Nothing,
+        }
+    }
+
+    /// Takes the transaction of pin `id`, which is `Ending`, out to end it, with the statement
+    /// rollback it owes: the ending's take, which a pin's registration refuses to every other.
+    pub(in crate::storage::atoll) fn take_for_pin(
+        &self,
+        id: u64,
+    ) -> Option<(Txn, Option<Box<OwedRollback>>)> {
+        let mut slot = self.slot.lock();
+        crate::turso_assert!(
+            slot.pin
+                .as_ref()
+                .is_some_and(|p| p.id == id && p.phase == PinPhase::Ending),
+            "a pin's view taken to end outside its ending"
+        );
+        let txn = slot.txn.take()?;
+        let owed = slot.owed.take();
+        self.owing.store(slot.owing(), AtomicOrdering::Release);
+        Some((txn, owed))
+    }
+
+    /// Clears pin `id`, its release done: its wait finished once the lock is let go, which wakes
+    /// what waited on it.
+    pub(in crate::storage::atoll) fn clear_pin(&self, id: u64) {
+        let mut after = FinishAfter::default();
+        {
+            let mut slot = self.slot.lock();
+            after.0 = Some(slot.clear_pin_locked(id));
+            self.pinned.store(false, AtomicOrdering::Release);
+            self.owing.store(slot.owing(), AtomicOrdering::Release);
+        }
+        #[cfg(test)]
+        PIN_CLEARS.with(|n| n.set(n.get() + 1));
+        crate::race::point("pin.clear.before_wake");
+    }
+
+    /// The pin as it stands, for a test: its id, phase, view and ownership.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn pin_for_test(
+        &self,
+    ) -> Option<(u64, PinPhase, Option<ViewId>, bool)> {
+        let slot = self.slot.lock();
+        slot.pin.as_ref().map(|p| (p.id, p.phase, p.view, p.owned))
+    }
+
+    /// The current phase's wait, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn pin_signal_for_test(&self) -> Option<crate::io::Completion> {
+        let slot = self.slot.lock();
+        slot.pin.as_ref().map(|p| p.signal.clone())
+    }
+
     /// Finishes the statement rollback the transaction owes, under its own top, at the top of a
     /// call of the connection, where none of its operations runs. In a cooperative frame, one
     /// step, returning the IO it waits for; outside one, driven to its end here. Refused inside an
@@ -222,7 +526,7 @@ impl TxnSlot {
         loop {
             let (out, io) = {
                 let mut slot = self.slot.lock();
-                let Slot { txn, owed } = &mut *slot;
+                let Slot { txn, owed, .. } = &mut *slot;
                 let Some(o) = owed.as_deref_mut() else {
                     return Ok(IOResult::Done(()));
                 };
@@ -233,7 +537,7 @@ impl TxnSlot {
                 let out = o.step(txn);
                 if let Ok(IOResult::Done(())) = out {
                     *owed = None;
-                    self.owing.store(false, AtomicOrdering::Release);
+                    self.owing.store(slot.owing(), AtomicOrdering::Release);
                 }
                 (out, io)
             };
@@ -281,6 +585,50 @@ impl From<Refused<'_>> for Box<LimboError> {
     }
 }
 
+impl Entered<'_> {
+    /// The wait a begin waits on while a schema reparse's pin stands in its way, under the lock
+    /// the begin holds, before it looks at whether a transaction is open (ASYNC1 D2e (iii-c)):
+    /// none with no pin. A pin's own begin passes. While the pin owns its view, in any phase, only
+    /// a statement carrying its permit passes; while it does not, statements pass once it holds
+    /// the view (`Held`), and wait in every other phase.
+    #[inline]
+    pub(in crate::storage::atoll) fn pin_admits(
+        &self,
+        who: Admit,
+    ) -> Option<crate::io::Completion> {
+        let pin = self.0.pin.as_ref()?;
+        pin_refuses(pin, who)
+    }
+
+    /// Records, as pin `id`'s own begin installs `view` under this lock, that the pin owns it:
+    /// `Installed`, before the begin's fallible rest. The old phase's wait is handed back, to be
+    /// finished once the lock is let go.
+    pub(in crate::storage::atoll) fn pin_installed(
+        &mut self,
+        id: u64,
+        view: ViewId,
+    ) -> crate::io::Completion {
+        let pin = self.0.pin.as_mut().expect("a pin's own begin with no pin");
+        pin.view = Some(view);
+        pin.owned = true;
+        self.0.pin_phase_locked(id, PinPhase::Installed)
+    }
+}
+
+/// [`Entered::pin_admits`] with a pin registered.
+#[cold]
+#[inline(never)]
+fn pin_refuses(pin: &PinReg, who: Admit) -> Option<crate::io::Completion> {
+    let passes = match who {
+        Admit::Pin(id) => id == pin.id,
+        Admit::Statement(permit) if pin.owned => {
+            permit == Some(pin.id) && !matches!(pin.phase, PinPhase::ReleaseOwed | PinPhase::Ending)
+        }
+        Admit::Statement(_) => pin.phase == PinPhase::Held,
+    };
+    (!passes).then(|| pin.signal.clone())
+}
+
 impl std::ops::Deref for Entered<'_> {
     type Target = Option<Txn>;
 
@@ -301,6 +649,18 @@ impl std::ops::DerefMut for Entered<'_> {
 pub(in crate::storage::atoll) struct Observed<'a> {
     slot: MutexGuard<'a, Slot>,
     owing: &'a AtomicBool,
+}
+
+impl Observed<'_> {
+    /// [`Entered::pin_admits`], for a statement that begins nothing: a nested one, which reads in
+    /// the open transaction a statement rollback may be owed in.
+    pub(in crate::storage::atoll) fn pin_admits(
+        &self,
+        who: Admit,
+    ) -> Option<crate::io::Completion> {
+        let pin = self.slot.pin.as_ref()?;
+        pin_refuses(pin, who)
+    }
 }
 
 impl std::ops::Deref for Observed<'_> {
@@ -398,6 +758,12 @@ enum Owed {
     },
     /// Its rollback failed: the transaction refuses every operation until it ends.
     Failed(LimboError),
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The pins cleared on this thread ([`TxnSlot::clear_pin`]).
+    pub(crate) static PIN_CLEARS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

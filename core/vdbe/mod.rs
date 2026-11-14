@@ -1348,6 +1348,10 @@ pub struct ProgramState {
     /// The Atoll transaction (its slot and start) whose owed statement rollback this statement
     /// found failed: its abort rolls that transaction back whole (R19, ASYNC1 D2e (iii-b)).
     pub(crate) atoll_met_failure: Option<(u16, u64)>,
+    /// The permit of the Atoll schema reparse that prepared this statement, if one did: it lets
+    /// the statement's begin read in the view the reparse's pin owns (ASYNC1 D2e (iii-c)). Kept by
+    /// `reset`, and so by a reprepare, which resets.
+    pub(crate) atoll_pin_permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
     /// In Atoll mode, this statement's hold on the end of its connection's transaction, from the
     /// ending's start to the end of the commit's finishing (`Connection::atoll_end`).
     pub(crate) atoll_ending_begun: Option<EndingBegun>,
@@ -1488,6 +1492,7 @@ impl ProgramState {
             atoll_statement: None,
             atoll_taking: false,
             atoll_met_failure: None,
+            atoll_pin_permit: None,
             atoll_ending_begun: None,
             atoll_commit_failure: None,
             atoll_create: None,
@@ -3053,6 +3058,7 @@ impl Program {
                         None => continue 'io_check,
                     }
                 }
+                crate::race::point("vdbe.owed_flag_read");
                 // Another statement of the connection is ending its transaction, which this one
                 // was reading (no root statement starts meanwhile): it reads on in a view of its
                 // own (DESIGN.md §17).

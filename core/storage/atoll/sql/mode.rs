@@ -20,7 +20,10 @@
 //! again. Writes wait on other transactions, so they come back to the VDBE.
 
 use super::catalog::{self, Catalog, Entry, Layout, System};
-use super::cursor::{AtollCursor, OwedRollback, TxnCell};
+use super::cursor::{
+    Admit, AtollCursor, Claim, FinishAfter, OwedRollback, PinPhase, ReleaseMet, ReleasePath,
+    TxnCell,
+};
 use super::header::{Field, Header};
 use super::key;
 use super::lifecycle::Destroy;
@@ -621,14 +624,22 @@ pub struct ConnTxn {
     taking: Mutex<Option<Completion>>,
     /// The wait of a begin for a free slot or of a gate take, with its edge.
     begin_wait: Mutex<Waiting>,
+    /// The wait of a schema reparse's pin's own begin for a free slot (ASYNC1 D2e (iii-c)): the
+    /// pin's alone, one pin at a time, ended at its release whatever step it stood at.
+    pin_wait: Mutex<Waiting>,
     /// How its statements wait, and its transaction's group in the wait graph.
     waits: Arc<Waits>,
     /// The named savepoints, oldest first.
     savepoints: Mutex<Vec<Savepoint>>,
-    /// Whether a schema reparse holds the transaction, which its statements read in and do not
-    /// end (DESIGN.md §17, §6), and whether it began it.
-    pinned: AtomicBool,
-    pin_began: AtomicBool,
+    /// The last id a schema reparse's pin took (ASYNC1 D2e (iii-c)): ids are never 0 and never
+    /// reused.
+    next_pin: AtomicU64,
+    /// This connection's transaction among the process's, named by a reparse's permit: never 0 and
+    /// never reused.
+    serial: u64,
+    /// The connection, bound once it is made: how a host that meets a pin's owed release reaches
+    /// the one consumer of a release ([`crate::Connection::finish_release`]).
+    connection: std::sync::OnceLock<std::sync::Weak<crate::Connection>>,
     /// What its statements changed in each tree, which a cursor positioned before reads again.
     changes: Arc<TreeChanges>,
     /// The stamps of the trees the open transaction wrote, raised to its commit timestamp once it
@@ -691,6 +702,14 @@ crate::thread::thread_local! {
     /// The calls of a commit's ending on this thread into the statement rollback it owed
     /// (`Ending::step_owed`), for a test to see none after its kept wait failed.
     pub(crate) static ENDING_OWED_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether the next pin's own begin on this thread fails right after it installs its view, as
+    /// a test injects (ASYNC1 D2e (iii-c)).
+    pub(crate) static PIN_FAILS_AFTER_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the next ending of a pin's view on this thread fails once it is done, as a test
+    /// injects.
+    pub(crate) static PIN_ENDINGS_FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The endings of pins' views on this thread (`end_for_pin`).
+    pub(crate) static PIN_ENDINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// The completion the last of those calls returned for IO, before its top saw it, for a test
     /// to tell it from the one the top returned in its place.
     pub(crate) static ENDING_OWED_RAW: std::cell::RefCell<Option<crate::io::Completion>> =
@@ -956,7 +975,7 @@ impl ConnTxn {
     /// `max` of it.
     #[turso_macros::atoll_entry]
     pub fn check_pages(&self, max: usize) -> Result<Vec<String>> {
-        let mut guard = self.cell.enter_now("check_pages")?;
+        let mut guard = self.enter_now("check_pages")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         self.db.check_pages(txn, max)
     }
@@ -970,10 +989,12 @@ impl ConnTxn {
             setting: Mutex::new(None),
             taking: Mutex::new(None),
             begin_wait: Mutex::new(Waiting::default()),
+            pin_wait: Mutex::new(Waiting::default()),
             waits: Arc::new(Waits::new()),
             savepoints: Mutex::new(Vec::new()),
-            pinned: AtomicBool::new(false),
-            pin_began: AtomicBool::new(false),
+            next_pin: AtomicU64::new(0),
+            serial: next_serial(),
+            connection: std::sync::OnceLock::new(),
             changes: Arc::new(TreeChanges::new()),
             stamped: Arc::new(Mutex::new(HashMap::default())),
             known: Arc::new(Mutex::new(HashMap::default())),
@@ -984,43 +1005,304 @@ impl ConnTxn {
         }
     }
 
-    /// Holds a read transaction for a schema reparse, beginning one if none is open: the cookie
-    /// and `sqlite_schema` are read in one view, and so is every row the reparse reads after them,
-    /// its nested statements' among them, which begin no transaction of their own (DESIGN.md §17,
-    /// §6). The statements it runs read in it and do not end it; [`unpin`](Self::unpin) does.
+    /// Binds the connection this transaction is the main database's of, once, right after the
+    /// connection is made: a second bind is a broken invariant.
     #[turso_macros::atoll_entry]
-    pub fn pin(&self) -> Result<()> {
-        if self.pinned.swap(true, Ordering::AcqRel) {
-            return Err(LimboError::InternalError(
-                "a schema reparse inside another on one connection".to_string(),
-            ));
+    pub fn bind(&self, connection: &Arc<crate::Connection>) {
+        crate::turso_assert!(
+            self.connection.set(Arc::downgrade(connection)).is_ok(),
+            "a connection's Atoll transaction bound twice"
+        );
+    }
+
+    /// Holds a view for a schema reparse (ASYNC1 D2e (iii-c)): the cookie and `sqlite_schema` are
+    /// read in it, and so is every row the reparse reads after them, its nested statements'
+    /// among them. Registered first, refused while another is; then a statement rollback owed is
+    /// finished, then the view is begun, if none is open, by the pin's own begin, which records
+    /// that the pin owns it as it installs it. Each step returns the IO it waits for, its state
+    /// kept in `hold`, and goes on where it stopped. A refused registration leaves `hold`
+    /// unarmed; a failed step leaves it armed, `Failed`, for its release.
+    #[turso_macros::atoll_entry]
+    pub fn pin_in(&self, hold: &mut PinHold) -> Result<IOResult<()>> {
+        loop {
+            match hold.at {
+                PinAt::Unregistered => {
+                    let last = self
+                        .next_pin
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+                        .map_err(|_| {
+                            LimboError::InternalError(
+                                "the connection's schema reparse ids are used up".to_string(),
+                            )
+                        })?;
+                    let id = last + 1;
+                    self.cell.register_pin(id)?;
+                    hold.id = Some(id);
+                    hold.at = PinAt::Settling;
+                }
+                PinAt::Settling => {
+                    let id = hold.id.expect("a registered pin's id");
+                    match self.cell.settle() {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(())) => {
+                            self.cell.pin_phase(id, PinPhase::Beginning);
+                            hold.at = PinAt::Beginning;
+                        }
+                        Err(e) => {
+                            self.cell.pin_failed(id, e.clone());
+                            hold.at = PinAt::Failed;
+                            return Err(e);
+                        }
+                    }
+                }
+                PinAt::Beginning => {
+                    let id = hold.id.expect("a registered pin's id");
+                    match self.begin_admitted(
+                        Begin::Read,
+                        &[],
+                        &mut None,
+                        Admit::Pin(id),
+                        &self.pin_wait,
+                    ) {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(_)) => {
+                            // The installing guard is let go here: another admission may meet the
+                            // pin `Installed` before it is `Held` (#5680).
+                            crate::race::point("pin.before_held");
+                            self.cell.pin_held(id);
+                            hold.at = PinAt::Held;
+                            return Ok(IOResult::Done(()));
+                        }
+                        Err(e) => {
+                            self.cell.pin_failed(id, e.clone());
+                            hold.at = PinAt::Failed;
+                            return Err(e);
+                        }
+                    }
+                }
+                PinAt::Held => return Ok(IOResult::Done(())),
+                PinAt::Failed | PinAt::Released => {
+                    return Err(LimboError::InternalError(
+                        "a schema reparse's pin stepped after it failed or was released"
+                            .to_string(),
+                    ))
+                }
+            }
         }
-        // Its begin runs inside `drive_for`'s top, where a statement rollback owed is refused:
-        // finished first, here (ASYNC1 D2e (iii-b)).
-        if let Err(e) = self.cell.settle_now("pin") {
-            self.pinned.store(false, Ordering::Release);
-            return Err(e);
-        }
-        self.pin_began.store(!self.is_open(), Ordering::Release);
-        let io = self.db.io().clone();
-        drive_for(self.cell.conn(), &io, || self.begin(Begin::Read)).inspect_err(|_| {
-            self.pinned.store(false, Ordering::Release);
+    }
+
+    /// Whether the pin's own wait for a slot has a bound under way and a timer, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn pin_wait_for_test(&self) -> (Option<Instant>, bool) {
+        let wait = self.pin_wait.lock();
+        (wait.since, wait.timed.is_some())
+    }
+
+    /// [`complete_owed_release`](Self::complete_owed_release), for a test of its frame assertion.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn complete_owed_release_for_test(&self) -> Result<()> {
+        self.complete_owed_release().map(|_| ())
+    }
+
+    /// [`end_for_pin`](Self::end_for_pin), for a test of its frame assertion: its step consumed
+    /// through the connection's one consumer.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn end_for_pin_for_test(
+        &self,
+        id: u64,
+        connection: &crate::Connection,
+    ) -> Result<()> {
+        connection.finish_release(self.end_for_pin(id))
+    }
+
+    /// Sets the last pin id handed out, for a test of the ids' exhaustion.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn set_last_pin_for_test(&self, last: u64) {
+        self.next_pin.store(last, Ordering::Release);
+    }
+
+    /// The permit the statements a reparse prepares carry while its pin is held: this
+    /// transaction's serial and the pin's id. None for an unarmed hold.
+    #[turso_macros::atoll_entry]
+    pub fn permit(&self, hold: &PinHold) -> Option<PinPermit> {
+        hold.id.map(|id| PinPermit {
+            txn: self.serial,
+            id,
         })
     }
 
-    /// Lets go of the reparse's transaction: ended here if the reparse began it; one the caller
-    /// had open before goes on.
+    /// Whether `hold`'s pin is registered and the open transaction is its view.
     #[turso_macros::atoll_entry]
-    pub fn unpin(&self) -> Result<()> {
-        if !self.pinned.swap(false, Ordering::AcqRel) {
-            return Ok(());
+    pub fn pin_view_is(&self, hold: &PinHold) -> bool {
+        hold.id.is_some_and(|id| self.cell.pin_view_is(id))
+    }
+
+    /// Releases `hold`'s pin, once: the hold is disarmed here, whatever follows. A pin that owns
+    /// no view is cleared. One that owns its view is ended here outside every frame, the step
+    /// left for [`crate::Connection::finish_release`] to publish and clear; in a cooperative
+    /// frame its ending is owed to a host, the registration owning it ([`PinPhase::ReleaseOwed`]).
+    #[turso_macros::atoll_entry]
+    pub fn release_pin(&self, hold: &mut PinHold) -> ReleaseStep {
+        let Some(id) = hold.id.take() else {
+            return ReleaseStep::nothing();
+        };
+        hold.at = PinAt::Released;
+        // The pin's own wait for a slot, if it waited, withdrawn with it: its timer and the start
+        // of its bound go, so a later begin's bound starts afresh (#5657).
+        let _ = self.pin_wait.lock().over();
+        match self
+            .cell
+            .release_pin(id, crate::storage::atoll::cooperative::inside())
+        {
+            ReleasePath::Cleared | ReleasePath::Deferred => ReleaseStep::nothing(),
+            ReleasePath::Ending(original) => {
+                let mut step = self.end_for_pin(id);
+                step.error = match (original, step.error.take()) {
+                    (Some(o), Some(e)) => Some(LimboError::InternalError(format!(
+                        "{o}; then the schema reparse's view failed to end: {e}"
+                    ))),
+                    (o, e) => o.or(e),
+                };
+                step
+            }
         }
-        if !self.pin_began.load(Ordering::Acquire) {
-            return Ok(());
+    }
+
+    /// Ends the view pin `id` owns, which is `Ending` and this call's to end: the ending
+    /// [`end_publishing`](Self::end_publishing) makes, through a take the pin's registration
+    /// allows its own ending alone, finished here. A host-driving helper: never in a cooperative
+    /// frame. The view is gone afterwards whether or not its ending failed, by its failure route.
+    fn end_for_pin(&self, id: u64) -> ReleaseStep {
+        assert!(
+            !crate::storage::atoll::cooperative::inside(),
+            "a schema reparse's view ended in a cooperative frame"
+        );
+        self.served.store(false, Ordering::Release);
+        self.savepoints.lock().clear();
+        let taken = self.cell.take_for_pin(id);
+        crate::race::point("pin.after_take");
+        let (txn, owed) = taken.expect("a pin's owned view gone before its ending");
+        let (written, stamped) = self.let_go_of_ended();
+        let conn = self.cell.conn().clone();
+        let mut ending = Ending::commit(self.db.clone(), conn, txn, written, stamped, None, owed);
+        let error = ending.finish().err();
+        #[cfg(test)]
+        let error = error.or_else(|| {
+            PIN_ENDINGS_FAIL_NEXT
+                .with(|f| f.replace(false))
+                .then(|| LimboError::InternalError("an injected failure of a pin's ending".into()))
+        });
+        #[cfg(test)]
+        PIN_ENDINGS.with(|n| n.set(n.get() + 1));
+        ReleaseStep {
+            ended_own_view: true,
+            error,
+            clear: Some(PinClear { id }),
         }
-        match self.end(true) {
-            Some(mut ending) => ending.finish(),
-            None => Ok(()),
+    }
+
+    /// Clears the pin `clear` names, its release done, consuming the token: what waited on the pin
+    /// is woken once the slot's lock is let go.
+    #[turso_macros::atoll_entry]
+    pub fn clear_pin(&self, clear: PinClear) {
+        let id = clear.id;
+        std::mem::forget(clear);
+        self.cell.clear_pin(id);
+    }
+
+    /// Completes a pin's owed release (ASYNC1 D2e (iii-c)), as the host that meets it: the one
+    /// route by which an owed release is completed. A host-driving helper: never in a cooperative
+    /// frame. It takes the release over (`ReleaseOwed` to `Ending`, this call its owner), ends the
+    /// view, and hands the step straight to the connection's one consumer, which publishes the
+    /// connection's state before it clears the pin and only then returns the ending's error. An
+    /// ending another call owns is that call's: its wait is returned, to park on.
+    #[cold]
+    #[inline(never)]
+    fn complete_owed_release(&self) -> Result<Completed> {
+        assert!(
+            !crate::storage::atoll::cooperative::inside(),
+            "a schema reparse's owed release completed in a cooperative frame"
+        );
+        let connection = self.connection.get().and_then(std::sync::Weak::upgrade);
+        crate::turso_assert!(
+            connection.is_some(),
+            "a pin's release met with its connection gone"
+        );
+        let connection = connection.expect("the connection just checked");
+        match self.cell.claim_owed_release() {
+            Claim::Nothing => Ok(Completed::Nothing),
+            Claim::Elsewhere(c) => Ok(Completed::Wait(c)),
+            Claim::Mine(id, original) => {
+                // The pin's own error went to its reparse, from the step that failed: this host,
+                // another caller, meets only the ending's.
+                if let Some(original) = original {
+                    tracing::debug!(
+                        "a schema reparse's owed release completed after its error ({original})"
+                    );
+                }
+                connection.finish_release(self.end_for_pin(id))?;
+                Ok(Completed::Done)
+            }
+        }
+    }
+
+    /// [`settle`](Self::settle)'s pin: a release owed is completed here outside every frame, and
+    /// its wait returned in one; an ending under way elsewhere returns its wait, in a frame or
+    /// outside one, for the caller to wait on. None once nothing of a pin is owed.
+    #[cold]
+    #[inline(never)]
+    fn settle_pin(&self) -> Result<Option<IOCompletions>> {
+        loop {
+            match self.cell.release_met() {
+                ReleaseMet::Nothing => return Ok(None),
+                ReleaseMet::Owed(c) if crate::storage::atoll::cooperative::inside() => {
+                    return Ok(Some(IOCompletions(c)))
+                }
+                ReleaseMet::Owed(_) => match self.complete_owed_release()? {
+                    Completed::Wait(c) => return Ok(Some(IOCompletions(c))),
+                    Completed::Done | Completed::Nothing => {}
+                },
+                ReleaseMet::Ending(c) => return Ok(Some(IOCompletions(c))),
+            }
+        }
+    }
+
+    /// The transaction, for a synchronous form at the top of a call: what the connection owes is
+    /// finished first ([`settle_now`](Self::settle_now)).
+    fn enter_now(&self, site: &'static str) -> Result<super::cursor::Entered<'_>> {
+        if self.cell.owes() {
+            self.settle_now(site)?;
+        }
+        Ok(self.cell.enter()?)
+    }
+
+    /// [`settle`](Self::settle) for a synchronous form at the top of a call: outside a cooperative
+    /// frame, a pin's owed release is completed here, an ending another call owns waited for, and
+    /// a statement rollback owed driven to its end. In a frame, where such a form never meets
+    /// either, each is an error naming `site`, never a park.
+    fn settle_now(&self, site: &'static str) -> Result<()> {
+        loop {
+            match self.settle()? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(IOCompletions(c)) => {
+                    if crate::storage::atoll::cooperative::inside() {
+                        let what = match self.cell.release_met() {
+                            ReleaseMet::Nothing => "a statement rollback owed",
+                            ReleaseMet::Owed(_) | ReleaseMet::Ending(_) => "a pin's release owed",
+                        };
+                        return Err(LimboError::InternalError(format!(
+                            "{site}: a synchronous form met {what} in a cooperative frame"
+                        )));
+                    }
+                    // A pin's ending another call owns: that call finishes it.
+                    crate::race::point("pin.sync_park");
+                    crate::storage::atoll::park::wait(self.db.io().as_ref(), &c);
+                }
+            }
         }
     }
 
@@ -1110,7 +1392,7 @@ impl ConnTxn {
     /// Whether a schema reparse holds the transaction ([`pin`](Self::pin)).
     #[turso_macros::atoll_entry]
     pub fn is_pinned(&self) -> bool {
-        self.pinned.load(Ordering::Acquire)
+        self.cell.pinned()
     }
 
     /// Whether the open transaction has written.
@@ -1176,7 +1458,7 @@ impl ConnTxn {
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
     #[turso_macros::atoll_entry]
     pub fn begin(&self, wants: Begin) -> Result<IOResult<()>> {
-        Ok(self.begin_reading(wants, &[], &mut None)?.map(|_| ()))
+        Ok(self.begin_reading(wants, &[], &mut None, None)?.map(|_| ()))
     }
 
     /// [`begin`](Self::begin) for a schema writer that reads rows of the trees `reads` names: in a
@@ -1187,12 +1469,45 @@ impl ConnTxn {
     /// whether this call found no transaction open, so began it: the Transaction opcode's one
     /// look at the connection's transaction. The check's read is kept in `read`, the opcode's,
     /// across the begin's returns.
+    ///
+    /// A schema reparse's pin in the way makes it wait on the pin's phase (ASYNC1 D2e (iii-c)):
+    /// `permit` is the one the statement's reparse gave it, if one did, which passes while that
+    /// reparse's pin owns its view.
     #[turso_macros::atoll_entry]
     pub fn begin_reading(
         &self,
         wants: Begin,
         reads: &[u64],
         read: &mut Option<Box<FacadeRead>>,
+        permit: Option<PinPermit>,
+    ) -> Result<IOResult<bool>> {
+        let who = Admit::Statement(permit.filter(|p| p.txn == self.serial).map(|p| p.id));
+        self.begin_admitted(wants, reads, read, who, &self.begin_wait)
+    }
+
+    /// The admission of a nested statement, which begins no transaction (#5665): a helper
+    /// statement marks its whole connection nested while it lives, so a statement unrelated to a
+    /// schema reparse may run nested beside it, and must still wait while the reparse's pin owns its
+    /// view. None to go on; else the pin's phase wait.
+    #[turso_macros::atoll_entry]
+    pub fn admits_nested(&self, permit: Option<PinPermit>) -> Option<IOCompletions> {
+        if !self.cell.pinned() {
+            return None;
+        }
+        let who = Admit::Statement(permit.filter(|p| p.txn == self.serial).map(|p| p.id));
+        self.cell.observe().pin_admits(who).map(IOCompletions)
+    }
+
+    /// [`begin_reading`](Self::begin_reading) for `who`: a statement, or a pin's own begin, which
+    /// records under the installing lock that the pin owns the view it installs.
+    #[inline]
+    fn begin_admitted(
+        &self,
+        wants: Begin,
+        reads: &[u64],
+        read: &mut Option<Box<FacadeRead>>,
+        who: Admit,
+        wait: &Mutex<Waiting>,
     ) -> Result<IOResult<bool>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
@@ -1202,7 +1517,12 @@ impl ConnTxn {
             // the checkpoint goes on at the next step, whoever takes it.
             self.db.atoll().checkpointer().step_due(txns).map(|_| ())?;
         }
+        // Declared before the guard, so a pin's phase wait it holds is finished after the lock.
+        let mut after = FinishAfter::default();
         let mut guard = self.cell.enter()?;
+        if let Some(wait) = guard.pin_admits(who) {
+            return Ok(IOResult::IO(IOCompletions(wait)));
+        }
         let began = guard.is_none();
         if began {
             let begun = match wants {
@@ -1213,13 +1533,23 @@ impl ConnTxn {
             match begun {
                 IOResult::Done(txn) => {
                     let slot = txn.slot();
+                    let view = (slot, txn.start());
                     *guard = Some(txn);
-                    self.begin_wait.lock().over()?;
+                    if let Admit::Pin(id) = who {
+                        after.set(guard.pin_installed(id, view));
+                        #[cfg(test)]
+                        if PIN_FAILS_AFTER_INSTALL.with(|f| f.replace(false)) {
+                            return Err(LimboError::InternalError(
+                                "an injected failure after a pin's install".to_string(),
+                            ));
+                        }
+                    }
+                    wait.lock().over()?;
                     self.db.collect_after_begin(slot)?;
                 }
                 // No slot is free (R13): no one transaction is in the way, so no edge.
                 IOResult::IO(IOCompletions(c)) => {
-                    return self.begin_wait.lock().wait(&self.waits, c);
+                    return wait.lock().wait(&self.waits, c);
                 }
             }
         }
@@ -1260,7 +1590,7 @@ impl ConnTxn {
             };
             match taken {
                 Taken::Done => {
-                    self.begin_wait.lock().over()?;
+                    wait.lock().over()?;
                     if checks && done!(self.read_since_snapshot(txn, reads, read)) {
                         txns.hand_back_exclusive(txn);
                         return Err(LimboError::BusySnapshot);
@@ -1268,7 +1598,7 @@ impl ConnTxn {
                 }
                 Taken::Lost => {
                     // Cleared for a victim: this one, if its wait was flagged.
-                    let flagged = self.begin_wait.lock().over().is_err();
+                    let flagged = wait.lock().over().is_err();
                     drop(taking);
                     self.end_if_fresh(&mut guard);
                     return Err(if flagged {
@@ -1281,7 +1611,7 @@ impl ConnTxn {
                     // A pending exclusive take stays pending meanwhile (R15).
                     *taking = Some(c.clone());
                     let db: Arc<dyn super::wait::Holders> = self.db.clone();
-                    let mut wait = self.begin_wait.lock();
+                    let mut wait = wait.lock();
                     wait.publish(&self.waits, On::Take(take), || Edge::Take { db, take })?;
                     return wait.wait(&self.waits, c);
                 }
@@ -1297,7 +1627,7 @@ impl ConnTxn {
                         .into_iter()
                         .map(|(slot, start)| Blocker { slot, start })
                         .collect();
-                    let mut wait = self.begin_wait.lock();
+                    let mut wait = wait.lock();
                     wait.publish(&self.waits, On::Drain(take), || Edge::Drain {
                         db,
                         holders,
@@ -1389,7 +1719,7 @@ impl ConnTxn {
     /// to if it fails (R18).
     #[turso_macros::atoll_entry]
     pub fn start_statement(&self) -> Result<Statement> {
-        let mut guard = self.cell.enter_now("start_statement")?;
+        let mut guard = self.enter_now("start_statement")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let n = txn.command();
         self.db.atoll().transactions().statement(txn)?;
@@ -1435,6 +1765,11 @@ impl ConnTxn {
     /// connection ([`TxnSlot::settle`]): a statement step's entry, before its first instruction.
     #[turso_macros::atoll_entry]
     pub fn settle(&self) -> Result<IOResult<()>> {
+        if self.cell.pinned() {
+            if let Some(io) = self.settle_pin()? {
+                return Ok(IOResult::IO(io));
+            }
+        }
         self.cell.settle()
     }
 
@@ -1475,9 +1810,10 @@ impl ConnTxn {
         commit: bool,
         publish: Option<Box<dyn FnOnce() + Send>>,
     ) -> Option<Ending> {
-        if self.pinned.load(Ordering::Acquire) {
+        if self.cell.pinned() {
             return None;
         }
+        crate::race::point("end.after_pinned_read");
         self.served.store(false, Ordering::Release);
         let (txn, written, stamped, owed) = self.take_to_end()?;
         let conn = self.cell.conn().clone();
@@ -1497,6 +1833,13 @@ impl ConnTxn {
     fn take_to_end(&self) -> Option<EndedTxn> {
         self.savepoints.lock().clear();
         let (txn, owed) = self.cell.take()?;
+        let (written, stamped) = self.let_go_of_ended();
+        Some((txn, written, stamped, owed))
+    }
+
+    /// The connection's part of a transaction just taken out to end: what it wrote to the header
+    /// and the stamps of the trees it wrote, handed back, and the rest let go.
+    fn let_go_of_ended(&self) -> (Vec<(Statement, Field, u32)>, Vec<super::trees::Stamp>) {
         self.changes.destroyed(Vec::clear);
         let written = std::mem::take(&mut *self.written.lock());
         let stamped: Vec<_> = std::mem::take(&mut *self.stamped.lock())
@@ -1509,7 +1852,7 @@ impl ConnTxn {
         // No sibling cursor keeps the gate, `R` or a protected set past the transaction it served
         // (DESIGN.md 9.1.3, *Revoking an inactive tenure*).
         crate::storage::atoll::buffer::cancel_shortage(self.db.atoll().pool(), self.cell.conn());
-        Some((txn, written, stamped, owed))
+        (written, stamped)
     }
 
     /// Ends the open read begun for siblings (`served`) by letting its slot and snapshot go: it
@@ -1521,7 +1864,7 @@ impl ConnTxn {
     /// later statement wrote in, which that statement ends.
     #[turso_macros::atoll_entry]
     pub fn end_served(&self) -> bool {
-        if self.pinned.load(Ordering::Acquire) || !self.served.swap(false, Ordering::AcqRel) {
+        if self.cell.pinned() || !self.served.swap(false, Ordering::AcqRel) {
             return false;
         }
         if !self.cell.observe().as_ref().is_some_and(|txn| !txn.wrote()) {
@@ -1615,7 +1958,7 @@ impl ConnTxn {
     /// here, for a blocking host.
     #[turso_macros::atoll_entry]
     pub fn schema_cookie(&self) -> Result<u32> {
-        let mut guard = self.cell.enter_now("schema_cookie")?;
+        let mut guard = self.enter_now("schema_cookie")?;
         match guard.as_mut() {
             None => Ok(self.db.header().committed(Field::SchemaCookie)),
             Some(txn) => self.field_in(txn, Field::SchemaCookie),
@@ -1647,7 +1990,7 @@ impl ConnTxn {
     /// blocking host.
     #[turso_macros::atoll_entry]
     pub fn header(&self) -> Result<DatabaseHeader> {
-        let mut guard = self.cell.enter_now("header")?;
+        let mut guard = self.enter_now("header")?;
         let mut words = [0u32; 7];
         for field in Field::ALL {
             words[field as usize - 1] = match guard.as_mut() {
@@ -1988,7 +2331,7 @@ impl ConnTxn {
     /// The rows tree `id` holds as the current statement reads them.
     fn count_rows(&self, id: u64) -> Result<u64> {
         let entry = {
-            let mut guard = self.cell.enter_now("count_rows")?;
+            let mut guard = self.enter_now("count_rows")?;
             let txn = guard.as_mut().ok_or_else(outside)?;
             let mut get = Get::new(&catalog::key(id));
             let db = &self.db;
@@ -2254,6 +2597,141 @@ impl Drop for FacadeRead {
 
 fn outside() -> LimboError {
     LimboError::InternalError("an Atoll read or write outside any transaction".to_string())
+}
+
+/// A schema reparse's hold on its pin (ASYNC1 D2e (iii-c)): plain facade data the reparse keeps
+/// across its returns, neither `Clone` nor `Copy`. `id` is set only while the hold owns a live
+/// registration; a refused registration leaves it unset, and a release disarms it.
+#[derive(Debug)]
+pub struct PinHold {
+    id: Option<u64>,
+    at: PinAt,
+}
+
+/// Where a reparse's hold stands ([`ConnTxn::pin_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinAt {
+    Unregistered,
+    Settling,
+    Beginning,
+    Held,
+    Failed,
+    Released,
+}
+
+impl PinHold {
+    /// A hold not yet registered.
+    pub fn new() -> Self {
+        Self {
+            id: None,
+            at: PinAt::Unregistered,
+        }
+    }
+
+    /// Whether the hold owns a live registration, which its release lets go.
+    pub fn armed(&self) -> bool {
+        self.id.is_some()
+    }
+
+    /// Where it stands.
+    pub fn at(&self) -> PinAt {
+        self.at
+    }
+
+    /// A hold of registration `id`, forged for a test of the stale-hold invariant.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn forged_for_test(id: u64) -> Self {
+        Self {
+            id: Some(id),
+            at: PinAt::Held,
+        }
+    }
+
+    /// Its registration's id, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn id_for_test(&self) -> Option<u64> {
+        self.id
+    }
+}
+
+impl Default for PinHold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What lets a statement a schema reparse prepared read in the view the reparse's pin owns: that
+/// connection's transaction's serial and the pin's id ([`ConnTxn::permit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinPermit {
+    txn: u64,
+    id: u64,
+}
+
+/// What a pin's release left for its connection to finish ([`ConnTxn::release_pin`]), consumed
+/// by [`crate::Connection::finish_release`] alone: whether the pin's own view is gone, by its
+/// ending or that ending's failure route, whatever error it also met; the error, the pin's own
+/// before its ending's; and the token that clears the registration, once the connection's state is
+/// published.
+#[must_use]
+pub struct ReleaseStep {
+    pub ended_own_view: bool,
+    pub error: Option<LimboError>,
+    pub clear: Option<PinClear>,
+}
+
+impl ReleaseStep {
+    fn nothing() -> Self {
+        Self {
+            ended_own_view: false,
+            error: None,
+            clear: None,
+        }
+    }
+}
+
+/// The one token that clears a pin's registration ([`ConnTxn::clear_pin`]), neither `Clone` nor
+/// `Copy`. Dropped unconsumed, it is a broken invariant: nothing clears a registration without the
+/// connection's state published first.
+#[must_use]
+pub struct PinClear {
+    id: u64,
+}
+
+impl PinClear {
+    /// A token for registration `id`, forged for a test of the unconsumed-token invariant.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn forged_for_test(id: u64) -> Self {
+        Self { id }
+    }
+}
+
+impl Drop for PinClear {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        crate::turso_assert!(false, "a pin's clear was dropped unconsumed");
+    }
+}
+
+/// What completing a pin's owed release did ([`ConnTxn::complete_owed_release`]).
+enum Completed {
+    Nothing,
+    Done,
+    /// Another call owns the ending: its phase's wait.
+    Wait(Completion),
+}
+
+/// A fresh serial for a connection's transaction: never 0 and never reused.
+fn next_serial() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let last = LAST
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .expect("the process's connection serials are used up");
+    last + 1
 }
 
 /// Whether a connection's Atoll transaction owes a statement rollback (R19, ASYNC1 D2e (iii-b)):

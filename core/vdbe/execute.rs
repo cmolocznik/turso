@@ -4848,6 +4848,7 @@ pub fn op_transaction_inner(
                             wants,
                             &program.schema_reads,
                             &mut state.atoll_read,
+                            state.atoll_pin_permit,
                         ) {
                             Ok(IOResult::Done(began)) => {
                                 state.atoll_taking = false;
@@ -4871,6 +4872,10 @@ pub fn op_transaction_inner(
                         if statement_writes_db && state.atoll_statement.is_none() {
                             state.atoll_statement = Some(atoll.start_statement()?);
                         }
+                    } else if let Some(io) = atoll.admits_nested(state.atoll_pin_permit) {
+                        // Nested, it begins nothing, but a schema reparse's pin that owns its view
+                        // admits only the reparse's own statements (ASYNC1 D2e (iii-c), #5665).
+                        return Ok(state.suspend_on_io(io));
                     }
                 } else if let Some(mv_store) = mv_store.as_ref() {
                     if is_secondary_db {

@@ -199,7 +199,125 @@ impl Drop for SchemaReparseGuard {
 pub enum ReparseSchemaState {
     #[default]
     Start,
+    /// In Atoll mode, before `Building`: the reparse's pin and its cookie's read, kept across their
+    /// returns (ASYNC1 D2e (iii-c)).
+    Pinning(Box<PendingReparse>),
     Building(Box<ReparseSchemaInner>),
+}
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+impl ReparseSchemaState {
+    /// Where the reparse stands, for a test.
+    pub(crate) fn stage_for_test(&self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Pinning(p) if p.at == PendingAt::Pin => "pin",
+            Self::Pinning(p) if p.cookie.is_some() => "cookie kept",
+            Self::Pinning(_) => "cookie",
+            Self::Building(_) => "building",
+        }
+    }
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// What an Atoll reparse on this thread let go of, in order: its cookie's read, its statements,
+    /// its pin (ASYNC1 D2e (iii-c)).
+    pub(crate) static REPARSE_EVENTS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The step at which the next Atoll reparse on this thread fails, as a test injects.
+    pub(crate) static REPARSE_FAILS_AT: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a test injected a failure of the next Atoll reparse on this thread at `step`, taken.
+fn reparse_fails_at(step: &'static str) -> bool {
+    #[cfg(test)]
+    {
+        REPARSE_FAILS_AT.with(|f| {
+            let hit = f.get() == Some(step);
+            if hit {
+                f.set(None);
+            }
+            hit
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = step;
+        false
+    }
+}
+
+/// Records `what` an Atoll reparse let go of, for a test.
+#[inline(always)]
+fn reparse_event(what: &'static str) {
+    #[cfg(test)]
+    REPARSE_EVENTS.with(|e| e.borrow_mut().push(what));
+    #[cfg(not(test))]
+    let _ = what;
+}
+
+/// An Atoll reparse before its schema build: where it stands, the cookie's read kept, and its pin,
+/// last, so the read is dropped before the pin is released.
+pub struct PendingReparse {
+    at: PendingAt,
+    cookie: Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
+    pin: ReparsePin,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingAt {
+    Pin,
+    Cookie,
+}
+
+/// A reparse's hold on its Atoll pin, with its connection (ASYNC1 D2e (iii-c)): released
+/// explicitly at every terminal result, its drop releasing it only as a backstop.
+pub struct ReparsePin {
+    conn: Arc<Connection>,
+    hold: crate::storage::atoll::sql::mode::PinHold,
+}
+
+impl ReparsePin {
+    fn new(conn: Arc<Connection>) -> Self {
+        Self {
+            conn,
+            hold: crate::storage::atoll::sql::mode::PinHold::new(),
+        }
+    }
+
+    /// The permit the reparse's statements carry.
+    fn permit(&self) -> Option<crate::storage::atoll::sql::mode::PinPermit> {
+        self.conn.atoll().and_then(|atoll| atoll.permit(&self.hold))
+    }
+
+    /// Releases the pin, once: the hold is disarmed by the first call.
+    fn release(&mut self) -> Result<()> {
+        let Some(atoll) = self.conn.atoll() else {
+            return Ok(());
+        };
+        if self.hold.armed() {
+            reparse_event("pin");
+        }
+        self.conn.finish_release(atoll.release_pin(&mut self.hold))
+    }
+}
+
+impl Drop for ReparsePin {
+    fn drop(&mut self) {
+        // The release is an Atoll entry, which ends the process if this thread is unwinding
+        // before it changes anything.
+        if self.hold.armed() {
+            if let Err(e) = self.release() {
+                tracing::error!("a schema reparse's pin, released as it dropped, failed: {e}");
+            }
+        }
+    }
 }
 
 pub struct ReparseSchemaInner {
@@ -215,6 +333,37 @@ pub struct ReparseSchemaInner {
     /// materialized views that are built once the types are loaded.
     parse: Box<crate::util::ParseSchemaRowsState>,
     phase: ReparsePhase,
+    /// The Atoll pin the reparse reads in, last: every statement above drops before it is
+    /// released. None outside Atoll mode and for VACUUM's reparse.
+    pin: Option<ReparsePin>,
+}
+
+/// `stmt`, carrying `permit`: a statement an Atoll schema reparse prepares, which reads in the view
+/// the reparse's pin owns (ASYNC1 D2e (iii-c)). The one way a statement comes to carry a permit.
+pub(crate) fn permitted(
+    mut stmt: Statement,
+    permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
+) -> Statement {
+    if permit.is_some() {
+        stmt.set_atoll_pin_permit(permit);
+    }
+    stmt
+}
+
+/// A reparse whose pin no longer holds the open transaction as its view.
+fn view_changed() -> LimboError {
+    LimboError::InternalError("the schema reparse's view changed".to_string())
+}
+
+/// `original`, the reparse's error, once its pin is released: a failure of the release after it
+/// is logged, never put in its place.
+fn released_after(original: LimboError, released: Result<()>) -> LimboError {
+    if let Err(e) = released {
+        tracing::error!(
+            "a schema reparse's pin, released after its error ({original}), failed: {e}"
+        );
+    }
+    original
 }
 
 /// Test-only control over correlated-subquery rewrites.
@@ -1452,6 +1601,32 @@ impl Connection {
     }
 
     /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
+    /// The one consumer of an Atoll pin's release (ASYNC1 D2e (iii-c)): the connection's state is
+    /// published first, `None` if the pin's own view is gone even when its ending failed; then the
+    /// registration is cleared, which wakes what waited on it; only then is the error returned.
+    pub(crate) fn finish_release(
+        &self,
+        step: crate::storage::atoll::sql::mode::ReleaseStep,
+    ) -> Result<()> {
+        let crate::storage::atoll::sql::mode::ReleaseStep {
+            ended_own_view,
+            error,
+            clear,
+        } = step;
+        if ended_own_view {
+            self.set_tx_state(TransactionState::None);
+        }
+        if let Some(clear) = clear {
+            self.atoll()
+                .expect("a pin's release in Atoll mode")
+                .clear_pin(clear);
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Retained for the many synchronous callers (statement reprepare, attach,
     /// extension load, vacuum). The genuinely non-blocking callers (MVCC
     /// bootstrap, the open-db state machine) drive `*_nonblock` directly.
@@ -1485,9 +1660,11 @@ impl Connection {
         let mut preserved = Some(sequences);
         io.block(|| {
             if matches!(state, ReparseSchemaState::Start) {
-                state = ReparseSchemaState::Building(Box::new(
-                    self.init_reparse_building(cookie, preserved.take())?,
-                ));
+                state = ReparseSchemaState::Building(Box::new(self.init_reparse_building(
+                    cookie,
+                    preserved.take(),
+                    None,
+                )?));
             }
             self.drive_reparse_building(&mut state)
         })
@@ -1502,44 +1679,126 @@ impl Connection {
         use crate::types::IOResult;
         if let Some(atoll) = self.atoll() {
             // Atoll mode: the cookie, `sqlite_schema` and every row the reparse reads after them,
-            // in one Atoll view the reparse holds (DESIGN.md §17, §6).
-            if matches!(state, ReparseSchemaState::Start) {
-                atoll.pin()?;
-                let built = atoll
-                    .schema_cookie()
-                    .and_then(|cookie| self.init_reparse_building(cookie, None));
-                match built {
-                    Ok(inner) => *state = ReparseSchemaState::Building(Box::new(inner)),
-                    Err(e) => {
-                        let _ = atoll.unpin();
-                        if !atoll.is_open() {
-                            self.set_tx_state(TransactionState::None);
-                        }
-                        return Err(e.into());
-                    }
-                }
-            }
-            let out = self.drive_reparse_building(state);
-            if !matches!(out, Ok(IOResult::IO(_))) {
-                let unpinned = atoll.unpin();
-                // The transaction it began and ended, which its statements read in.
-                if !atoll.is_open() {
-                    self.set_tx_state(TransactionState::None);
-                }
-                if out.is_ok() {
-                    unpinned?;
-                }
-            }
-            return out;
+            // in one Atoll view the reparse's pin holds (DESIGN.md §17, §6), each step resumable
+            // in a cooperative frame (ASYNC1 D2e (iii-c)).
+            return self.reparse_schema_atoll(atoll, state);
         }
         if matches!(state, ReparseSchemaState::Start) {
             // read cookie before consuming statement program - otherwise we can
             // end up reading cookie with closed transaction state
             let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
-            *state =
-                ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
+            *state = ReparseSchemaState::Building(Box::new(
+                self.init_reparse_building(cookie, None, None)?,
+            ));
         }
         self.drive_reparse_building(state)
+    }
+
+    /// [`Self::reparse_schema_nonblock`] in Atoll mode: the pin, then the cookie in its view, then the
+    /// build, every statement it prepares carrying the pin's permit. At every terminal result the
+    /// reads and statements drop before the pin is released, explicitly; the original error comes
+    /// first, a failure of the release after it logged.
+    fn reparse_schema_atoll(
+        self: &Arc<Connection>,
+        atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+        state: &mut ReparseSchemaState,
+    ) -> crate::types::IOResultOr<()> {
+        use crate::types::IOResult;
+        loop {
+            match state {
+                ReparseSchemaState::Start => {
+                    *state = ReparseSchemaState::Pinning(Box::new(PendingReparse {
+                        at: PendingAt::Pin,
+                        cookie: None,
+                        pin: ReparsePin::new(self.clone()),
+                    }));
+                }
+                ReparseSchemaState::Pinning(pending) => {
+                    let stepped = match pending.at {
+                        PendingAt::Pin => atoll
+                            .pin_in(&mut pending.pin.hold)
+                            .map(|io| io.map(|()| None)),
+                        PendingAt::Cookie if !atoll.pin_view_is(&pending.pin.hold) => {
+                            Err(view_changed())
+                        }
+                        #[cfg(test)]
+                        PendingAt::Cookie if reparse_fails_at("cookie") => Err(
+                            LimboError::InternalError("an injected failure at the cookie".into()),
+                        ),
+                        PendingAt::Cookie => atoll
+                            .schema_cookie_in(&mut pending.cookie)
+                            .map(|io| io.map(Some)),
+                    };
+                    let cookie = match stepped {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(None)) => {
+                            pending.at = PendingAt::Cookie;
+                            continue;
+                        }
+                        Ok(IOResult::Done(Some(cookie))) => Ok(cookie),
+                        Err(e) => Err(e),
+                    };
+                    let ReparseSchemaState::Pinning(pending) = std::mem::take(state) else {
+                        unreachable!("the reparse is pinning");
+                    };
+                    let PendingReparse {
+                        cookie: read,
+                        mut pin,
+                        ..
+                    } = *pending;
+                    let had_read = read.is_some();
+                    drop(read);
+                    if had_read {
+                        reparse_event("cookie read");
+                    }
+                    let built = cookie
+                        .and_then(|cookie| self.init_reparse_building(cookie, None, pin.permit()));
+                    match built {
+                        Ok(mut inner) => {
+                            inner.pin = Some(pin);
+                            *state = ReparseSchemaState::Building(Box::new(inner));
+                        }
+                        Err(e) => return Err(released_after(e, pin.release()).into()),
+                    }
+                }
+                ReparseSchemaState::Building(inner) => {
+                    let view = inner
+                        .pin
+                        .as_ref()
+                        .is_none_or(|pin| atoll.pin_view_is(&pin.hold));
+                    let out = if !view {
+                        Err(view_changed().into())
+                    } else if cfg!(test) && reparse_fails_at("building") {
+                        Err(
+                            LimboError::InternalError("an injected failure in the build".into())
+                                .into(),
+                        )
+                    } else {
+                        self.drive_reparse_building(state)
+                    };
+                    return match out {
+                        Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+                        // The build took its state as it finished, and released its pin there.
+                        Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
+                        Err(e) => {
+                            let ReparseSchemaState::Building(mut inner) = std::mem::take(state)
+                            else {
+                                return Err(e);
+                            };
+                            let pin = inner.pin.take();
+                            drop(inner);
+                            reparse_event("statements");
+                            match pin {
+                                Some(mut pin) => {
+                                    Err(released_after(e.into(), pin.release()).into())
+                                }
+                                None => Err(e),
+                            }
+                        }
+                    };
+                }
+            }
+        }
     }
 
     /// Synchronous setup shared by the reparse entry points: install the cookie,
@@ -1551,6 +1810,7 @@ impl Connection {
         self: &Arc<Connection>,
         cookie: u32,
         preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+        permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
     ) -> Result<ReparseSchemaInner> {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
@@ -1573,7 +1833,7 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = permitted(self.prepare("SELECT * FROM sqlite_schema")?, permit);
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1587,6 +1847,7 @@ impl Connection {
             preserved_sequences,
             parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
             phase: ReparsePhase::ParseSchema,
+            pin: None,
         })
     }
 
@@ -1601,6 +1862,8 @@ impl Connection {
             let ReparseSchemaState::Building(inner) = state else {
                 unreachable!("drive_reparse_building requires Building state");
             };
+            // What every statement the build prepares carries in Atoll mode: its pin's permit.
+            let permit = inner.pin.as_ref().and_then(ReparsePin::permit);
             match &mut inner.phase {
                 ReparsePhase::ParseSchema => {
                     // Resolver so attached-db qualifiers in temp triggers can be
@@ -1630,10 +1893,13 @@ impl Connection {
                             *schema = inner.fresh.try_clone()?;
                             Ok::<_, crate::alloc::TryReserveError>(())
                         })??;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT id, name FROM {}",
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-                        ))?;
+                        let stmt = permitted(
+                            self.prepare_internal(format!(
+                                "SELECT id, name FROM {}",
+                                crate::schema::TURSO_NAMESPACES_TABLE_NAME
+                            ))?,
+                            permit,
+                        );
                         inner.phase = ReparsePhase::LoadNamespaces {
                             stmt: Box::new(stmt),
                             rows: Vec::new(),
@@ -1712,6 +1978,7 @@ impl Connection {
                                 &seq_name,
                                 stmt,
                                 meta,
+                                permit,
                             ));
                             *seq = Some(Self::sequence_from_descriptor_meta(
                                 sequence_name,
@@ -1727,6 +1994,7 @@ impl Connection {
                             sequence,
                             watermark_stmt,
                             watermark_row,
+                            permit,
                         ));
                         let watermark = Self::sequence_watermark_from_row(
                             &backing_table_name,
@@ -1758,10 +2026,13 @@ impl Connection {
                             *schema = inner.fresh.try_clone()?;
                             Ok::<_, crate::alloc::TryReserveError>(())
                         })??;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT name, sql FROM {}",
-                            crate::schema::TURSO_TYPES_TABLE_NAME
-                        ))?;
+                        let stmt = permitted(
+                            self.prepare_internal(format!(
+                                "SELECT name, sql FROM {}",
+                                crate::schema::TURSO_TYPES_TABLE_NAME
+                            ))?,
+                            permit,
+                        );
                         inner.phase = ReparsePhase::LoadTypes {
                             stmt: Box::new(stmt),
                             type_rows: Vec::new(),
@@ -1792,22 +2063,39 @@ impl Connection {
                 }
                 ReparsePhase::RefreshStats { stats } => {
                     // Best-effort load stats if sqlite_stat1 is present.
-                    crate::return_if_io!(crate::stats::refresh_analyze_stats_nonblock(self, stats));
+                    crate::return_if_io!(crate::stats::refresh_analyze_stats_permitted(
+                        self, stats, permit
+                    ));
 
                     // Finalize: install the rebuilt schema. Take ownership so the
                     // guard drops and `state` is reusable.
                     let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
                         unreachable!("state is Building");
                     };
-                    let fresh = inner.fresh;
+                    // Its statements drop here; the guard after the schema is installed; the pin,
+                    // released, last.
+                    let ReparseSchemaInner {
+                        _guard: guard,
+                        fresh,
+                        preserved_sequences,
+                        parse,
+                        phase,
+                        pin,
+                    } = *inner;
+                    drop((parse, phase, preserved_sequences));
+                    reparse_event("statements");
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
                         fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
-                    self.with_schema_mut(|schema| {
+                    let installed = self.with_schema_mut(|schema| {
                         *schema = fresh;
-                    })?;
+                    });
+                    drop(guard);
+                    let released = pin.map_or(Ok(()), |mut pin| pin.release());
+                    installed?;
+                    released?;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -4118,6 +4406,7 @@ impl Connection {
                             &seq_name,
                             stmt,
                             meta,
+                            None,
                         ));
                         *seq = Some(Self::sequence_from_descriptor_meta(
                             sequence_name,
@@ -4133,6 +4422,7 @@ impl Connection {
                         sequence,
                         watermark_stmt,
                         watermark_row,
+                        None,
                     ));
                     let watermark = Self::sequence_watermark_from_row(
                         &backing_table_name,
@@ -4170,6 +4460,7 @@ impl Connection {
         seq_name: &str,
         stmt: &mut Option<Box<Statement>>,
         meta: &mut Option<(i64, i64, i64, i64, bool)>,
+        permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
@@ -4181,7 +4472,7 @@ impl Connection {
                      \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
                 ))
             })?;
-            *stmt = Some(Box::new(prepared));
+            *stmt = Some(Box::new(permitted(prepared, permit)));
             // Fresh statement → clear any descriptor captured for a prior backing
             // table, so an empty backing table is detected as missing-row
             // corruption rather than silently reusing the previous descriptor.
@@ -4248,6 +4539,7 @@ impl Connection {
         seq: &crate::schema::Sequence,
         stmt: &mut Option<Box<Statement>>,
         row: &mut Option<(i64, bool)>,
+        permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
@@ -4263,7 +4555,7 @@ impl Connection {
                     seq.name
                 ))
             })?;
-            *stmt = Some(Box::new(prepared));
+            *stmt = Some(Box::new(permitted(prepared, permit)));
             *row = None;
         }
         let s = stmt.as_mut().expect("stmt set above");
@@ -4430,6 +4722,7 @@ impl Connection {
                                 seq,
                                 stmt,
                                 sequence_row,
+                                None,
                             ));
                             // sqlite_sequence holds the largest id the table ever used.
                             let last_used_id = rows[*idx].1;

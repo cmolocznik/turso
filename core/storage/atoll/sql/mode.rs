@@ -1876,8 +1876,10 @@ impl ConnTxn {
                     self.count_step(id, count)
                 } else {
                     // A count kept from a frame, entered outside one: driven to its end here.
-                    drive_for(self.cell.conn(), self.db.io(), || self.count_step(id, count))
-                        .map(IOResult::Done)
+                    drive_for(self.cell.conn(), self.db.io(), || {
+                        self.count_step(id, count)
+                    })
+                    .map(IOResult::Done)
                 };
                 match out {
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),

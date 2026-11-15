@@ -1246,10 +1246,8 @@ impl Connection {
         false
     }
 
-    // Inlined into both forms of op_program, the synchronous one and the poll's (ASYNC1 D2e (iv)),
-    // where both exist: the poll's is test-only until (v). With op_program its one caller, the
-    // compiler chooses, as before.
-    #[cfg_attr(test, inline(always))]
+    // Inlined into both forms of op_program, the synchronous one and the poll's (ASYNC1 D2e (iv)).
+    #[inline(always)]
     pub fn start_trigger_execution(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger execution: {}", trigger.name);
         self.executing_triggers.write().push(trigger);

@@ -2688,3 +2688,335 @@ fn a_full_checkpoint_claimed_alone_registers_no_wait_on_the_states_let_go() {
         );
     });
 }
+
+/// Polls `f` every millisecond for at most a minute: whether it came true.
+fn within_a_minute_polled(f: &dyn Fn() -> bool) -> bool {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !f() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
+/// ASYNC1 D2e (iii-d) E4 proofs 1, 4 and 5: an integrity walk's lease held, the state free, the
+/// worker's step of the checkpoint's task runs no unit and returns the lease's own wait, still
+/// unfinished once the step has let the state go, and the task is no contender; a wake of the task
+/// meanwhile steps it once more, with no unit and the same wait; the lease's release finishes the
+/// wait, and the full checkpoint asked for meanwhile is done (mutant `gate-skipped`).
+#[test]
+fn a_held_lease_holds_the_workers_units_off_on_its_one_wait_until_released() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_held_lease_holds_the_workers_units_off_on_its_one_wait_until_released"
+        ),
+        || {
+            let db = Db::threaded();
+            let (tree, _) = db.owed_tree();
+            let cp = db.db.checkpointer_arc().clone();
+            // The writes' own checkpoints done first, so the task rests.
+            let rested = {
+                let first = cp.request_full();
+                within_a_minute_polled(&|| cp.fulls_done() >= first.ticket())
+            };
+            let before = cp.task_steps_for_test().len();
+            let lease = match cp.lease_or_wait(&mut None) {
+                IOResult::Done(lease) => Some(lease),
+                IOResult::IO(_) => None,
+            };
+            let leased = lease.is_some();
+            let (run0, tried0, _) = cp.units_for_test();
+            let ticket = cp.request_full();
+            let stepped = within_a_minute_polled(&|| {
+                cp.units_for_test().0 > run0
+                    || cp.task_steps_for_test()[before..]
+                        .iter()
+                        .any(|(said, _)| *said == "wait")
+            });
+            let first = cp.task_steps_for_test()[before..].to_vec();
+            let (run1, tried1, _) = cp.units_for_test();
+            let wait = first
+                .iter()
+                .find_map(|(said, c)| if *said == "wait" { c.clone() } else { None });
+            let signal = cp.lease_signal_for_test();
+            let unfinished = wait.as_ref().is_some_and(|c| !c.finished());
+            let contends = cp.driver_contends();
+            let woken_at = cp.task_steps_for_test().len();
+            cp.wake_task_for_test();
+            let woke = within_a_minute_polled(&|| cp.task_steps_for_test().len() > woken_at);
+            let second = cp.task_steps_for_test()[woken_at..].to_vec();
+            let (run2, _, _) = cp.units_for_test();
+            drop(lease);
+            let released = wait.as_ref().is_some_and(|c| c.finished());
+            let done = within_a_minute_polled(&|| cp.fulls_done() >= ticket.ticket());
+            let (run3, _, _) = cp.units_for_test();
+            drop(ticket);
+            drop((tree, cp, db));
+            assert!(rested, "the writes' checkpoints never ended");
+            assert!(leased, "the lease was not taken with the state free");
+            assert_eq!(
+                run1, run0,
+                "a checkpoint unit ran while the integrity check held the lease"
+            );
+            assert!(
+                stepped,
+                "the worker never returned a wait while the lease was held: {first:?}"
+            );
+            assert!(tried1 > tried0, "the task's step attempted no unit");
+            let wait = wait.expect("the task's wait");
+            assert!(wait.ptr_eq(&signal), "the task's wait was not the lease's");
+            assert!(unfinished, "the task's wait was finished at its return");
+            assert!(!contends, "the task is listed as the state's contender");
+            assert!(woke, "the woken task was not stepped");
+            assert!(
+                matches!(second.as_slice(), [("wait", Some(c))] if c.ptr_eq(&wait)),
+                "a woken task's step under the lease: {second:?}"
+            );
+            assert_eq!(run2, run0, "a woken task ran a unit under the lease");
+            assert!(released, "the lease's release did not finish its wait");
+            assert!(
+                done && run3 > run0,
+                "the full checkpoint did not go on after the release"
+            );
+        },
+    );
+}
+
+/// ASYNC1 D2e (iii-d) E4 proofs 2 and 3: a lease released after a unit's look found it held, before
+/// the unit registered its wait or between that registration and its second look, is seen by the
+/// unit, which runs.
+#[test]
+fn a_lease_released_around_a_units_registration_lets_the_unit_run() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_lease_released_around_a_units_registration_lets_the_unit_run"
+        ),
+        || {
+            let db = Db::crash();
+            let (tree, _) = db.owed_tree();
+            let cp = db.db.checkpointer_arc().clone();
+            let txns = db.db.transactions_arc().clone();
+            let mut seen = Vec::new();
+            for point in [
+                "checkpoint.before_lease_wait",
+                "checkpoint.before_lease_recheck",
+            ] {
+                let lease =
+                    std::rc::Rc::new(std::cell::RefCell::new(match cp.lease_or_wait(&mut None) {
+                        IOResult::Done(lease) => Some(lease),
+                        IOResult::IO(_) => None,
+                    }));
+                let leased = lease.borrow().is_some();
+                let mut ticket = cp.request_full();
+                let (run0, _, _) = cp.units_for_test();
+                let taken = lease.clone();
+                crate::race::at(point, move || drop(taken.borrow_mut().take()));
+                let stepped = cp.step(&txns).map(|_| ()).map_err(|e| e.to_string());
+                let (run1, _, _) = cp.units_for_test();
+                let fired = lease.borrow().is_none();
+                let finished =
+                    drive(&db.io, || cp.step_full(&mut ticket, &txns)).map_err(|e| e.to_string());
+                seen.push((point, leased, fired, run1 > run0, stepped, finished));
+            }
+            drop((tree, cp, txns, db));
+            for (point, leased, fired, ran, stepped, finished) in seen {
+                assert!(
+                    leased,
+                    "{point}: the lease was not taken with the state free"
+                );
+                assert!(fired, "{point}: the unit never reached the point");
+                assert_eq!(stepped, Ok(()), "{point}: the writer's step");
+                assert!(
+                    ran,
+                    "{point}: the unit did not run after the release it saw"
+                );
+                assert_eq!(finished, Ok(()), "{point}: the full checkpoint");
+            }
+        },
+    );
+}
+
+/// ASYNC1 D2e (iii-d) v2 §5 proof 3: a full checkpoint waited for in a cooperative frame, failing
+/// on the checkpointing thread meanwhile, returns that failure, not the refusal a frame meets with
+/// no worker, though the failed task is over.
+#[test]
+fn a_full_checkpoint_waited_for_in_a_frame_returns_its_failure_first() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_full_checkpoint_waited_for_in_a_frame_returns_its_failure_first"
+        ),
+        || {
+            let db = Db::threaded();
+            let crash = db.crash.clone().unwrap();
+            let (tree, _) = db.owed_tree();
+            crash.set_faults_on(Some(&format!("{BASE}.c{}.0", node_class().index())));
+            crash.set_faults(Faults {
+                write: 1.0,
+                ..Faults::default()
+            });
+            let cp = db.db.checkpointer_arc().clone();
+            let mut ticket = cp.request_full();
+            let mut out = Err("not ended in 1000 calls".to_string());
+            for _ in 0..1_000 {
+                let called = {
+                    let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                    cp.full_in_frame(&mut ticket)
+                };
+                match called {
+                    Ok(IOResult::IO(IOCompletions(c))) => {
+                        if !within_a_minute_polled(&|| c.finished()) {
+                            out = Err("a wait the worker never ended".to_string());
+                            break;
+                        }
+                    }
+                    Ok(IOResult::Done(())) => {
+                        out = Ok("done".to_string());
+                        break;
+                    }
+                    Err(e) => {
+                        out = Ok(e.to_string());
+                        break;
+                    }
+                }
+            }
+            let over = within_a_minute_polled(&|| cp.task_done());
+            crash.set_faults(Faults::default());
+            drop(ticket);
+            if !over {
+                // The task goes on stepping a failed state: closing would wait on its loop.
+                std::mem::forget((tree, cp, db));
+            } else {
+                drop((tree, cp, db));
+            }
+            let out = out.expect("the frame's full checkpoint ended");
+            assert!(over, "the failed task is not over");
+            assert!(
+                out.contains("a checkpoint failed"),
+                "the frame's full checkpoint did not return the failure: {out}"
+            );
+        },
+    );
+}
+
+/// ASYNC1 D2e (iii-d) E4 proof 6, the writers' routes (the worker's is proof 1's): under a held
+/// lease a writer's claim of the checkpoint's task attempts a unit, runs none and returns the
+/// lease's own wait, unfinished; released, it runs units and the full checkpoint finishes. Once
+/// the task has failed and is over, a writer stepping the state itself meets the same gate, and
+/// after the release meets the failure.
+#[test]
+fn a_held_lease_holds_off_a_writers_claim_and_a_writers_own_step() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_held_lease_holds_off_a_writers_claim_and_a_writers_own_step"
+        ),
+        || {
+            let lease_of = |cp: &Arc<crate::storage::atoll::checkpoint::Checkpointer>| match cp
+                .lease_or_wait(&mut None)
+            {
+                IOResult::Done(lease) => Some(lease),
+                IOResult::IO(_) => None,
+            };
+            let gated = |cp: &Arc<crate::storage::atoll::checkpoint::Checkpointer>,
+                         txns: &crate::storage::atoll::txn::Transactions| {
+                let (run0, tried0, _) = cp.units_for_test();
+                let stepped = cp.step(txns);
+                let (run1, tried1, _) = cp.units_for_test();
+                let wait = match stepped {
+                    Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+                    _ => None,
+                };
+                let signal = cp.lease_signal_for_test();
+                let own = wait
+                    .as_ref()
+                    .is_some_and(|c| c.ptr_eq(&signal) && !c.finished());
+                (run1 == run0, tried1 > tried0, own, wait)
+            };
+            // A writer's claim of the task.
+            let db = Db::crash();
+            let (tree, _) = db.owed_tree();
+            let cp = db.db.checkpointer_arc().clone();
+            let txns = db.db.transactions_arc().clone();
+            let lease = lease_of(&cp);
+            let mut ticket = cp.request_full();
+            let (none_ran, tried, own, wait) = gated(&cp, &txns);
+            let leased = lease.is_some();
+            drop(lease);
+            let released = wait.as_ref().is_some_and(|c| c.finished());
+            let (run_before, _, _) = cp.units_for_test();
+            let done =
+                drive(&db.io, || cp.step_full(&mut ticket, &txns)).map_err(|e| e.to_string());
+            let ran = cp.units_for_test().0 > run_before;
+            drop(ticket);
+            drop((tree, cp, txns, db));
+            // A writer's own step, the task over after its failure.
+            let db = Db::crash();
+            let crash = db.crash.clone().unwrap();
+            let (tree, _) = db.owed_tree();
+            crash.set_faults_on(Some(&format!("{BASE}.c{}.0", node_class().index())));
+            crash.set_faults(Faults {
+                write: 1.0,
+                ..Faults::default()
+            });
+            let cp = db.db.checkpointer_arc().clone();
+            let txns = db.db.transactions_arc().clone();
+            let mut ticket = cp.request_full();
+            let failure = drive(&db.io, || cp.step_full(&mut ticket, &txns))
+                .err()
+                .map(|e| e.to_string());
+            let over = within_a_minute_polled(&|| cp.task_done());
+            crash.set_faults(Faults::default());
+            let lease = lease_of(&cp);
+            let (writer_none_ran, writer_tried, writer_own, writer_wait) = gated(&cp, &txns);
+            let writer_leased = lease.is_some();
+            drop(lease);
+            let writer_released = writer_wait.as_ref().is_some_and(|c| c.finished());
+            let met = drive(&db.io, || cp.step(&txns)).map_err(|e| e.to_string());
+            drop(ticket);
+            drop((tree, cp, txns, db));
+            assert!(
+                leased,
+                "the claim's lease was not taken with the state free"
+            );
+            assert!(
+                none_ran,
+                "a checkpoint unit ran while the integrity check held the lease (claim)"
+            );
+            assert!(tried, "the claim attempted no unit");
+            assert!(own, "the claim's wait was not the lease's, unfinished");
+            assert!(released, "the release did not finish the claim's wait");
+            assert_eq!(done, Ok(()), "the full checkpoint after the release");
+            assert!(ran, "no unit ran after the release");
+            assert!(failure.is_some() && over, "the task did not fail and end");
+            assert!(
+                writer_leased,
+                "the writer's lease was not taken with the state free"
+            );
+            assert!(
+                writer_none_ran,
+                "a checkpoint unit ran while the integrity check held the lease (writer)"
+            );
+            assert!(writer_tried, "the writer attempted no unit");
+            assert!(
+                writer_own,
+                "the writer's wait was not the lease's, unfinished"
+            );
+            assert!(
+                writer_released,
+                "the release did not finish the writer's wait"
+            );
+            // The failure the task recorded is the one its failing step returned.
+            let recorded = format!("a checkpoint failed ({})", failure.unwrap_or_default());
+            assert!(
+                met.as_ref().is_err_and(|e| e.contains(&recorded)),
+                "the writer after the release did not meet the task's recorded failure \
+                 ({recorded}): {met:?}"
+            );
+        },
+    );
+}

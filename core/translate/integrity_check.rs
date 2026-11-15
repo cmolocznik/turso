@@ -117,7 +117,7 @@ fn translate_integrity_check_impl(
 
 fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers) {
     program.emit_int(1, registers.had_error);
-    program.emit_result_row(registers.message, 1);
+    emit_check_row(program, registers);
 
     let continue_label = program.allocate_label();
     program.emit_insn(Insn::IfPos {
@@ -133,6 +133,15 @@ fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers
         description: String::new(),
     });
     program.preassign_label_to_next_insn(continue_label);
+}
+
+/// The check's message row: every row of an integrity check is one, so the first of them ends the
+/// check's hold on its connection's statements (`Insn::IntegrityResultRow`).
+fn emit_check_row(program: &mut ProgramBuilder, registers: &Registers) {
+    program.emit_insn(Insn::IntegrityResultRow {
+        start_reg: registers.message,
+        count: 1,
+    });
 }
 
 fn emit_row_missing_from_index_error(
@@ -649,7 +658,7 @@ fn translate_integrity_check_for_schema(
         jump_if_null: false,
     });
     program.emit_string8("ok".to_string(), registers.message);
-    program.emit_result_row(registers.message, 1);
+    emit_check_row(program, &registers);
     program.preassign_label_to_next_insn(has_errors_label);
 
     let column_name = if quick {

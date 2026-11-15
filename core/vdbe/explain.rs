@@ -992,7 +992,8 @@ pub fn insn_to_row(
                     ),
                 )
             }
-            Insn::ResultRow { start_reg, count } => (
+            Insn::ResultRow { start_reg, count }
+            | Insn::IntegrityResultRow { start_reg, count } => (
                 "ResultRow",
                 *start_reg as i64,
                 *count as i64,

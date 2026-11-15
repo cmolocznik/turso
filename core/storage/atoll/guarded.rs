@@ -32,12 +32,14 @@ std::thread_local! {
 /// check, which holds the write gate exclusive, so at most one runs at a time.
 const CONTENDERS: usize = 2;
 
-/// A taker waiting for a state (DESIGN.md 22.2 item 3): a parked thread, unparked, or an
-/// executor's task, woken as a completion it waits on would wake it.
+/// A taker waiting for a state (DESIGN.md 22.2 item 3): a parked thread, unparked, an executor's
+/// task, woken as a completion it waits on would wake it, or a cooperative caller's wait, finished
+/// (ASYNC1 D2e (iii-d)): an integrity walk in a frame returns it as its IO.
 #[derive(Clone)]
 pub enum Contender {
     Thread(Thread),
     Task(TaskRef),
+    Wait(super::notify::WaitCompletion),
 }
 
 impl Contender {
@@ -45,6 +47,7 @@ impl Contender {
         match (self, other) {
             (Self::Thread(a), Self::Thread(b)) => a.id() == b.id(),
             (Self::Task(a), Self::Task(b)) => a.same(b),
+            (Self::Wait(a), Self::Wait(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -53,6 +56,7 @@ impl Contender {
         match self {
             Self::Thread(t) => t.unpark(),
             Self::Task(t) => t.wake(),
+            Self::Wait(c) => super::notify::finish(&c, Ok(0)),
         }
     }
 }
@@ -122,11 +126,34 @@ impl<T> Guarded<T> {
         held
     }
 
+    /// Takes back `me`'s registration, if it is still listed: a contender that stops waiting
+    /// (ASYNC1 D2e (iii-d)). A let-go that already took it leaves nothing to take.
+    pub fn withdraw(&self, me: &Contender) {
+        for t in self.contenders.lock().iter_mut() {
+            if t.as_ref().is_some_and(|t| t.is(me)) {
+                *t = None;
+            }
+        }
+    }
+
     /// Whether `who` waits for the state.
     #[cfg(test)]
     pub(crate) fn contends(&self, who: &Contender) -> bool {
         self.contenders.lock().iter().flatten().any(|t| t.is(who))
     }
+
+    /// How many wait for the state.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn contenders_for_test(&self) -> usize {
+        self.contenders.lock().iter().flatten().count()
+    }
+}
+
+/// Runs `between` in this thread's next [`Guarded::hold_or_contend`], between the try that found
+/// the state held and its registration, for a test.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(crate) fn before_contending_for_test(between: impl FnOnce() + 'static) {
+    BEFORE_CONTENDING.with(|b| *b.borrow_mut() = Some(Box::new(between)));
 }
 
 impl<T> Deref for Hold<'_, T> {
@@ -194,6 +221,11 @@ mod tests {
                      impl TaskRef {{ pub fn same(&self, _: &Self) -> bool {{ true }} pub fn wake(&self) {{}} }}\n\
                  }}\n\
                  mod unwind {{ pub fn abort_if_unwinding() {{}} }}\n\
+                 mod notify {{\n\
+                     #[derive(Clone)] pub struct WaitCompletion;\n\
+                     impl WaitCompletion {{ pub fn ptr_eq(&self, _: &Self) -> bool {{ true }} }}\n\
+                     pub fn finish(_: &WaitCompletion, _: Result<i32, ()>) {{}}\n\
+                 }}\n\
                  #[path = {module:?}]\n\
                  mod guarded;\n\
                  pub fn take(g: &guarded::Guarded<u32>) -> u32 {{ {body} }}\n"

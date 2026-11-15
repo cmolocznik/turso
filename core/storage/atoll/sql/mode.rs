@@ -640,6 +640,9 @@ pub struct ConnTxn {
     /// The connection, bound once it is made: how a host that meets a pin's owed release reaches
     /// the one consumer of a release ([`crate::Connection::finish_release`]).
     connection: std::sync::OnceLock<std::sync::Weak<crate::Connection>>,
+    /// Who walks the connection's pages for an integrity check (ASYNC1 D2e (iii-d)): [`COOP`] while
+    /// a cooperative walk holds the connection, else the number of host checks running.
+    walking: AtomicU64,
     /// What its statements changed in each tree, which a cursor positioned before reads again.
     changes: Arc<TreeChanges>,
     /// The stamps of the trees the open transaction wrote, raised to its commit timestamp once it
@@ -705,6 +708,15 @@ crate::thread::thread_local! {
     /// Whether the next pin's own begin on this thread fails right after it installs its view, as
     /// a test injects (ASYNC1 D2e (iii-c)).
     pub(crate) static PIN_FAILS_AFTER_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A lease a walk dropped on this thread kept instead of releasing, for the `hold-kept`
+    /// opposite: its test drops it in its cleanup.
+    pub(crate) static RETAINED_LEASE:
+        std::cell::RefCell<Option<crate::storage::atoll::checkpoint::CheckpointLease>> =
+        const { std::cell::RefCell::new(None) };
+    /// Where each integrity walk stepped on this thread stood at each of its returns for IO, with
+    /// the address of its owner.
+    pub(crate) static WALKED_AT_IO: std::cell::RefCell<Vec<(&'static str, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Whether the next ending of a pin's view on this thread fails once it is done, as a test
     /// injects.
     pub(crate) static PIN_ENDINGS_FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -975,9 +987,147 @@ impl ConnTxn {
     /// `max` of it.
     #[turso_macros::atoll_entry]
     pub fn check_pages(&self, max: usize) -> Result<Vec<String>> {
+        // Admitted first, before the slot and the full checkpoint: a cooperative walk holding the
+        // connection would otherwise wait on this check's slot while this one waits on its lease.
+        let _walk = self.host_walk()?;
         let mut guard = self.enter_now("check_pages")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         self.db.check_pages(txn, max)
+    }
+
+    /// [`check_pages`](Self::check_pages) resumable in a cooperative frame (ASYNC1 D2e (iii-d)):
+    /// the walk kept in `walk` across returns, each call going on from where it stopped. Outside a
+    /// frame with no walk under way it is the synchronous check. A walk's first entry is admitted
+    /// before anything else: refused, it registers, asks and holds nothing. A walk that ends with
+    /// its findings hands over its claim, which the check keeps to its first row or its end: its
+    /// row and index pass reads in the same transaction (the auditor's III-D-I2).
+    #[turso_macros::atoll_entry]
+    pub fn check_pages_in(
+        &self,
+        walk: &mut Option<Box<IntegrityWalk>>,
+        max: usize,
+    ) -> Result<IOResult<(Vec<String>, Option<WalkClaim>)>> {
+        if walk.is_none() {
+            if !crate::storage::atoll::cooperative::inside() {
+                return self
+                    .check_pages(max)
+                    .map(|found| IOResult::Done((found, None)));
+            }
+            let claim = self.claim_walk()?;
+            let view = {
+                let guard = self.cell.enter()?;
+                let txn = guard.as_ref().ok_or_else(outside)?;
+                (txn.slot(), txn.start())
+            };
+            *walk = Some(Box::new(IntegrityWalk::new(
+                &self.db,
+                self.cell.conn().clone(),
+                view,
+                max,
+                claim,
+            )));
+        }
+        // Every outcome but IO lets the walk go, an early failure of the entry included.
+        let out = (|| {
+            let w = walk.as_mut().expect("the walk");
+            let mut guard = self.cell.enter()?;
+            let txn = guard.as_mut().ok_or_else(outside)?;
+            if (txn.slot(), txn.start()) != w.view()
+                || !matches!(txn.hold(), Hold::Exclusive { .. })
+            {
+                Err(LimboError::InternalError(
+                    "the integrity check's transaction changed".to_string(),
+                ))
+            } else {
+                w.step(&self.db, txn)
+            }
+        })();
+        match out {
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(found)) => {
+                let mut ended = walk.take().expect("the walk");
+                let claim = ended.claim.take();
+                drop(ended);
+                Ok(IOResult::Done((found, claim)))
+            }
+            Err(e) => {
+                *walk = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// A host integrity check's admission: refused while a cooperative walk holds the connection,
+    /// else counted beside the other host checks, which serialize on the slot as they always have.
+    fn host_walk(&self) -> Result<HostWalk<'_>> {
+        let mut w = self.walking.load(Ordering::Acquire);
+        loop {
+            // Refusals of the engine's own kind: nothing was touched, so the walk in progress goes
+            // on unharmed (`Program::abort`'s arm for this error).
+            if w & COOP != 0 {
+                return Err(LimboError::StatementsInProgress(
+                    "an integrity check while a cooperative one runs on this connection",
+                ));
+            }
+            if w & HOST_MASK == HOST_MASK {
+                return Err(LimboError::StatementsInProgress(
+                    "too many integrity checks on one connection",
+                ));
+            }
+            match self
+                .walking
+                .compare_exchange(w, w + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(HostWalk(&self.walking)),
+                Err(now) => w = now,
+            }
+        }
+    }
+
+    /// The connection's integrity admission word, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn walking_for_test(&self) -> u64 {
+        self.walking.load(Ordering::Acquire)
+    }
+
+    /// Sets the connection's integrity admission word, for a test of its bounds, while nothing
+    /// holds it.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn set_walking_for_test(&self, word: u64) {
+        self.walking.store(word, Ordering::Release);
+    }
+
+    /// A cooperative walk's admission: the connection's whole word, taken from 0, so it is refused
+    /// beside any host check or another cooperative walk. The connection is upgraded first, which
+    /// changes nothing, so a refusal leaves nothing behind and a claim is owned at once.
+    fn claim_walk(&self) -> Result<WalkClaim> {
+        let connection = self.connection.get().and_then(std::sync::Weak::upgrade);
+        crate::turso_assert!(
+            connection.is_some(),
+            "an integrity walk with its connection gone"
+        );
+        let connection = connection.expect("the connection just checked");
+        // Its statement the connection's only one, then the word, under the statements' lock: so
+        // nothing of its connection changes what its transaction sees until it ends (the
+        // auditor's III-D-I1).
+        let ((), exclusive) = connection.begin_integrity_walk(|| {
+            if self
+                .walking
+                .compare_exchange(0, COOP, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(LimboError::StatementsInProgress(
+                    "an integrity check while another runs on this connection, in a cooperative \
+                     frame",
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(WalkClaim {
+            exclusive: Some(exclusive),
+            conn: connection,
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+        })
     }
 
     #[turso_macros::atoll_entry]
@@ -995,6 +1145,7 @@ impl ConnTxn {
             next_pin: AtomicU64::new(0),
             serial: next_serial(),
             connection: std::sync::OnceLock::new(),
+            walking: AtomicU64::new(0),
             changes: Arc::new(TreeChanges::new()),
             stamped: Arc::new(Mutex::new(HashMap::default())),
             known: Arc::new(Mutex::new(HashMap::default())),
@@ -2550,6 +2701,51 @@ pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
     drive(db.io(), || checkpointer.step_full(&mut ticket, txns))
 }
 
+/// [`full_checkpoint`] for a caller that keeps `wait` across its returns (ASYNC1 D2e (iii-d)):
+/// asked for at the first call, then what it came to, if anything, first at every call; in a
+/// cooperative frame, the worker's next end waited for, and refused with no worker (the staged
+/// slice: a frame steps no checkpoint); outside one, driven in place. `wait` is let go at any
+/// outcome, so the next call asks afresh.
+pub(in crate::storage::atoll) fn full_checkpoint_in(
+    db: &AtollDb,
+    wait: &mut Option<crate::storage::atoll::checkpoint::FullWait>,
+) -> Result<IOResult<()>> {
+    let checkpointer = db.atoll().checkpointer();
+    let w = wait.get_or_insert_with(|| checkpointer.request_full());
+    let out = if crate::storage::atoll::cooperative::inside() {
+        checkpointer.full_in_frame(w)
+    } else {
+        let txns = db.atoll().transactions();
+        drive(db.io(), || checkpointer.step_full(w, txns)).map(IOResult::Done)
+    };
+    if !matches!(out, Ok(IOResult::IO(_))) {
+        *wait = None;
+    }
+    out
+}
+
+/// A Checkpoint opcode's full checkpoint kept across its returns (ASYNC1 D2e (iii-d)), dropped
+/// inside a frame.
+#[derive(Default)]
+pub struct FullCheckpointOp {
+    wait: Option<crate::storage::atoll::checkpoint::FullWait>,
+    _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+impl FullCheckpointOp {
+    /// One call of the opcode's full checkpoint ([`full_checkpoint_in`]).
+    #[turso_macros::atoll_entry]
+    pub fn step(&mut self, db: &AtollDb) -> Result<IOResult<()>> {
+        full_checkpoint_in(db, &mut self.wait)
+    }
+}
+
+/// An operation's state the VDBE held, dropped inside a frame (DESIGN.md 22.11).
+impl Drop for FullCheckpointOp {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {}
+}
+
 /// Steps the checkpointer only while a checkpoint is due, once its share of the log budget has
 /// been appended, or one is under way (DESIGN.md 22.9, Due). Its IO is not waited for: the
 /// checkpoint goes on at the next step, whoever takes it.
@@ -2597,6 +2793,170 @@ impl Drop for FacadeRead {
 
 fn outside() -> LimboError {
     LimboError::InternalError("an Atoll read or write outside any transaction".to_string())
+}
+
+/// An integrity check walking in a cooperative frame (ASYNC1 D2e (iii-d)): its full checkpoint,
+/// then its lease on the database's checkpoint units, then the page walk under its own top, kept
+/// across returns. Fields drop in order: the walk's reads, its owner, its wait for the
+/// checkpointer's state (withdrawn by `Drop` first), its lease, its full checkpoint's ticket, its
+/// connection's admission, the frame's end.
+pub struct IntegrityWalk {
+    pages: super::integrity::Pages,
+    owner: crate::storage::atoll::buffer::Owner,
+    at: WalkAt,
+    view: (u16, u64),
+    lease_wait: Option<crate::io::Completion>,
+    lease: Option<crate::storage::atoll::checkpoint::CheckpointLease>,
+    full: Option<crate::storage::atoll::checkpoint::FullWait>,
+    checkpointer: Arc<crate::storage::atoll::checkpoint::Checkpointer>,
+    /// Set until the walk ends with its findings and hands it to its check.
+    claim: Option<WalkClaim>,
+    _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WalkAt {
+    Checkpoint,
+    Lease,
+    Pages,
+}
+
+impl IntegrityWalk {
+    fn new(
+        db: &AtollDb,
+        conn: Arc<crate::storage::atoll::buffer::Conn>,
+        view: (u16, u64),
+        max: usize,
+        claim: WalkClaim,
+    ) -> Self {
+        Self {
+            pages: super::integrity::Pages::new(max),
+            owner: crate::storage::atoll::buffer::Owner::of(conn),
+            at: WalkAt::Checkpoint,
+            view,
+            lease_wait: None,
+            lease: None,
+            full: None,
+            checkpointer: db.atoll().checkpointer_shared().clone(),
+            claim: Some(claim),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+        }
+    }
+
+    /// The transaction view the walk began in.
+    fn view(&self) -> (u16, u64) {
+        self.view
+    }
+
+    /// One call of the walk, in `txn`.
+    fn step(&mut self, db: &AtollDb, txn: &mut Txn) -> Result<IOResult<Vec<String>>> {
+        let out = self.stepped(db, txn);
+        #[cfg(test)]
+        if matches!(out, Ok(IOResult::IO(_))) {
+            let at = match self.at {
+                WalkAt::Checkpoint => "checkpoint",
+                WalkAt::Lease => "lease",
+                WalkAt::Pages => self.pages.at_for_test(),
+            };
+            let owner = std::ptr::from_ref(&self.owner) as usize;
+            WALKED_AT_IO.with(|w| w.borrow_mut().push((at, owner)));
+        }
+        out
+    }
+
+    fn stepped(&mut self, db: &AtollDb, txn: &mut Txn) -> Result<IOResult<Vec<String>>> {
+        loop {
+            match self.at {
+                WalkAt::Checkpoint => {
+                    done!(full_checkpoint_in(db, &mut self.full));
+                    self.at = WalkAt::Lease;
+                }
+                WalkAt::Lease => match self.checkpointer.lease_or_wait(&mut self.lease_wait) {
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    IOResult::Done(lease) => {
+                        self.lease = Some(lease);
+                        self.lease_wait = None;
+                        self.at = WalkAt::Pages;
+                    }
+                },
+                WalkAt::Pages => {
+                    return crate::storage::atoll::buffer::Owner::call_in(
+                        self,
+                        |w| &mut w.owner,
+                        |w| w.pages.step(db, txn),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// A walk dropped, ended or reset: its wait for the checkpointer's state, if it still stands, taken
+/// back first, then its fields in order, inside a frame (DESIGN.md 22.11).
+impl Drop for IntegrityWalk {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {
+        if let Some(wait) = self.lease_wait.take() {
+            self.checkpointer.withdraw_wait(&wait);
+        }
+        let _ = &self.claim;
+    }
+}
+
+/// The cooperative walk's bit of a connection's integrity admission word; the bits below count its
+/// host checks (ASYNC1 D2e (iii-d)).
+const COOP: u64 = 1 << 63;
+const HOST_MASK: u64 = COOP - 1;
+
+/// A host integrity check's place in its connection's admission word, for one call.
+struct HostWalk<'a>(&'a AtomicU64);
+
+impl Drop for HostWalk<'_> {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        let mut w = self.0.load(Ordering::Acquire);
+        loop {
+            crate::turso_assert!(
+                w & COOP == 0 && w & HOST_MASK != 0,
+                "a host integrity check's admission released with none held"
+            );
+            match self
+                .0
+                .compare_exchange(w, w - 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(now) => w = now,
+            }
+        }
+    }
+}
+
+/// A cooperative integrity walk's hold on its connection's admission word and statements (ASYNC1
+/// D2e (iii-d)), with the connection it holds: released once, as it drops, after the walk's other
+/// state. A walk that ends with its findings hands it to its check, which keeps it to its first
+/// row or its end ([`ConnTxn::check_pages_in`]).
+pub(crate) struct WalkClaim {
+    /// The walk's hold on its connection's statements, let go before the word: the word alone
+    /// keeps a second walk out until both are clear.
+    exclusive: Option<crate::connection::IntegrityWalkGuard>,
+    conn: Arc<crate::Connection>,
+    _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+impl Drop for WalkClaim {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        drop(self.exclusive.take());
+        let atoll = self.conn.atoll().expect("an integrity walk in Atoll mode");
+        crate::turso_assert!(
+            atoll
+                .walking
+                .compare_exchange(COOP, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "a cooperative integrity walk's admission released by another"
+        );
+    }
 }
 
 /// A schema reparse's hold on its pin (ASYNC1 D2e (iii-c)): plain facade data the reparse keeps

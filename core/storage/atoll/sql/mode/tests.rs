@@ -3774,6 +3774,10 @@ fn every_drive_of_the_connections_facade_carries_its_identity() {
             "a full checkpoint, maintenance: no tenure, no connection",
         ),
         (
+            "full_checkpoint_in",
+            "a full checkpoint outside a frame, maintenance: no tenure, no connection",
+        ),
+        (
             "drive_to_end",
             "an ending's own owner carries the connection; the outer drive only parks",
         ),
@@ -14418,21 +14422,6 @@ mod in_frames {
 /// and why that function may block its thread (ASYNC1 D2e §1 (i)): each later slice, or D3, that
 /// converts it, or the one condition under which it drives.
 const DRIVE_SITES: &[(&str, &str, &str)] = &[
-    (
-        "integrity.rs",
-        "roots",
-        "slice (iii): the integrity check's walk",
-    ),
-    (
-        "integrity.rs",
-        "reached",
-        "slice (iii): the integrity check's walk",
-    ),
-    (
-        "integrity.rs",
-        "account",
-        "slice (iii): the integrity check's walk",
-    ),
     ("lifecycle.rs", "drain_lists", "D3: the open phase"),
     ("mod.rs", "drop", "D3: the database's drop"),
     ("mod.rs", "open_holding", "D3: the open phase"),
@@ -14476,7 +14465,17 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
     (
         "mode.rs",
         "full_checkpoint",
-        "slice (iii): the checkpoint task's work",
+        "blocking hosts only: the full checkpoint's synchronous form",
+    ),
+    (
+        "mode.rs",
+        "full_checkpoint_in",
+        "blocking hosts only: outside a frame; in one, the worker's end is waited on (ASYNC1 D2e (iii-d))",
+    ),
+    (
+        "integrity.rs",
+        "check_pages",
+        "blocking hosts only: the synchronous integrity check, its walk driven in place",
     ),
     ("mode.rs", "drive_to_end", "D3: an ending's finish and drop"),
 ];

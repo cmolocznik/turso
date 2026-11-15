@@ -9,6 +9,10 @@
 //! counts and their retirement stay where their backend finishes them.
 
 use crate::io::{Completion, Wakers};
+
+/// The completion a cooperative contender waits on (`guarded::Contender::Wait`), named here so the
+/// guard's module reaches it through Atoll's own `notify`.
+pub(crate) type WaitCompletion = Completion;
 use crate::CompletionError;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

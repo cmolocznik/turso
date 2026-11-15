@@ -68,6 +68,9 @@ crate::thread::thread_local! {
     /// Claims of a checkpoint's task that stepped it, made on this thread.
     #[cfg(test)]
     pub(crate) static CLAIMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Claims of a checkpoint's task attempted on this thread, stepped or not.
+    #[cfg(test)]
+    pub(crate) static CLAIM_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Triggers of a checkpoint's task notified on this thread.
     #[cfg(test)]
     pub(crate) static TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -88,6 +91,28 @@ pub const META_INTENT: Kind = Kind::new(31).unwrap();
 pub struct FullWait {
     ticket: u64,
     demand: Option<executor::Ticket>,
+}
+
+/// An integrity walk's lease on its database's checkpoint units (ASYNC1 D2e (iii-d)): while it
+/// lives, no unit runs, whoever steps it. Neither `Clone` nor `Copy`; released once, as it drops:
+/// the lease cleared, then what met it woken.
+pub struct CheckpointLease {
+    checkpointer: Arc<Checkpointer>,
+    id: u64,
+}
+
+impl Drop for CheckpointLease {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        crate::turso_assert!(
+            self.checkpointer
+                .lease
+                .compare_exchange(self.id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "an integrity walk's lease released by another"
+        );
+        self.checkpointer.lease_ends.let_go();
+    }
 }
 
 impl FullWait {
@@ -248,6 +273,23 @@ pub struct Checkpointer {
     /// let go (DESIGN.md 9.1.3, the checkpointer's state held by another stepper). Any number
     /// share it, which the state's two parked contenders (`Guarded`) cannot.
     released: crate::storage::atoll::notify::LetGo,
+    /// The integrity walk's lease that holds every checkpoint unit off (ASYNC1 D2e (iii-d)): 0
+    /// when none is held, else its holder's id. Set only under the state's hold, cleared only by
+    /// its own release.
+    lease: AtomicU64,
+    /// The last lease id handed out: ids are never 0 and never reused.
+    last_lease: AtomicU64,
+    /// What a unit that met the lease waits on: let go only by the lease's release.
+    lease_ends: crate::storage::atoll::notify::LetGo,
+    /// Units run and units attempted, on any thread, for a test.
+    #[cfg(test)]
+    units_run: AtomicU64,
+    #[cfg(test)]
+    unit_attempts: AtomicU64,
+    /// Each step of the checkpoint's task, on any thread: what it said, with the wait it returned,
+    /// for a test.
+    #[cfg(test)]
+    task_steps: Mutex<Vec<(&'static str, Option<Completion>)>>,
 }
 
 crate::thread::thread_local! {
@@ -396,6 +438,8 @@ impl Task for CheckpointTask {
         let Some(mut state) = held else {
             // Its contender: the state let go wakes it.
             tell_claimant(Claimed::Held);
+            #[cfg(test)]
+            cp.task_steps.lock().push(("contending", None));
             return Ok(Step::Idle(Watched::of(&[])));
         };
         let out = {
@@ -425,6 +469,14 @@ impl Task for CheckpointTask {
             }
             Err(_) => Step::Done,
         };
+        #[cfg(test)]
+        cp.task_steps.lock().push(match &step {
+            Step::Done => ("done", None),
+            Step::Again => ("again", None),
+            Step::Wait(c) => ("wait", Some(c.clone())),
+            Step::Idle(_) => ("idle", None),
+            Step::WaitOn(_, c) => ("wait-on", Some(c.clone())),
+        });
         tell_claimant(Claimed::Stepped(out));
         Ok(step)
     }
@@ -776,6 +828,15 @@ impl Checkpointer {
             failure: Mutex::new(None),
             full_ends: Default::default(),
             released: Default::default(),
+            lease: AtomicU64::new(0),
+            last_lease: AtomicU64::new(0),
+            lease_ends: Default::default(),
+            #[cfg(test)]
+            units_run: AtomicU64::new(0),
+            #[cfg(test)]
+            unit_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            task_steps: Mutex::new(Vec::new()),
         }
     }
 
@@ -801,6 +862,15 @@ impl Checkpointer {
         txns: &Transactions,
         until: Until<'_>,
     ) -> Result<Unit> {
+        #[cfg(test)]
+        self.unit_attempts.fetch_add(1, Ordering::Relaxed);
+        // The one gate of every unit, whoever steps it: an integrity walk's lease holds them all
+        // off (ASYNC1 D2e (iii-d)).
+        if let Some(c) = self.leased() {
+            return Ok(Unit::Wait(c));
+        }
+        #[cfg(test)]
+        self.units_run.fetch_add(1, Ordering::Relaxed);
         let clock = self.store.io();
         let began = clock.current_time_monotonic();
         #[cfg(test)]
@@ -817,6 +887,123 @@ impl Checkpointer {
         let moved = self.recorded(state);
         state.waiters_owed |= moved;
         out
+    }
+
+    /// The wait of a unit that meets an integrity walk's lease, under the state's hold: none
+    /// with no lease. Registered, then looked at again, so a release between the look and the
+    /// registration is seen here or finishes the wait; no hold's drop finishes it, so a waiter's
+    /// own let-go never wakes it.
+    #[inline]
+    fn leased(&self) -> Option<Completion> {
+        if self.lease.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.leased_wait()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn leased_wait(&self) -> Option<Completion> {
+        crate::race::point("checkpoint.before_lease_wait");
+        let c = self.lease_ends.wait();
+        crate::race::point("checkpoint.before_lease_recheck");
+        (self.lease.load(Ordering::Acquire) != 0).then_some(c)
+    }
+
+    /// The lease an integrity walk holds checkpoint units off with (ASYNC1 D2e (iii-d)): taken
+    /// under the state's hold, so no unit is under way, then the hold let go. `wait` is the walk's
+    /// one wait for the hold while another holds it: registered as the state's contender, kept
+    /// across returns while unfinished, so its registration is never doubled.
+    pub(crate) fn lease_or_wait(
+        self: &Arc<Self>,
+        wait: &mut Option<Completion>,
+    ) -> IOResult<CheckpointLease> {
+        let c = match wait.take() {
+            Some(c) if !c.finished() => c,
+            _ => crate::storage::atoll::notify::remote_wait(),
+        };
+        let me = Contender::Wait(c.clone());
+        let Some(hold) = self.state.hold_or_contend(&me) else {
+            *wait = Some(c.clone());
+            return IOResult::IO(IOCompletions(c));
+        };
+        let id = self
+            .last_lease
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .expect("an integrity walk's lease ids used up")
+            + 1;
+        crate::turso_assert!(
+            self.lease
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "an integrity walk met a live lease"
+        );
+        let state = StateHold {
+            hold: Some(hold),
+            checkpointer: self,
+            waiters_owed: false,
+            task: false,
+        };
+        drop(state);
+        IOResult::Done(CheckpointLease {
+            checkpointer: self.clone(),
+            id,
+        })
+    }
+
+    /// Takes back a walk's registration as the state's contender, if it is still listed: the walk
+    /// ended, failed or was reset while it waited.
+    pub(crate) fn withdraw_wait(&self, wait: &Completion) {
+        self.state.withdraw(&Contender::Wait(wait.clone()));
+    }
+
+    /// The steps of the checkpoint's task so far, for a test.
+    #[cfg(test)]
+    pub(crate) fn task_steps_for_test(&self) -> Vec<(&'static str, Option<Completion>)> {
+        self.task_steps.lock().clone()
+    }
+
+    /// Wakes the checkpoint's task as a trigger does, for a test.
+    #[cfg(test)]
+    pub(crate) fn wake_task_for_test(&self) {
+        self.task.get().expect("the checkpoint's task").wake();
+    }
+
+    /// The wait a lease's release finishes, for a test.
+    #[cfg(test)]
+    pub(crate) fn lease_signal_for_test(&self) -> Completion {
+        self.lease_ends.wait()
+    }
+
+    /// Whether `c` is listed as the state's contender, for a test.
+    #[cfg(test)]
+    pub(crate) fn contends_wait_for_test(&self, c: &Completion) -> bool {
+        self.state.contends(&Contender::Wait(c.clone()))
+    }
+
+    /// The lease held, 0 for none, and the full checkpoints asked for so far, for a test.
+    #[cfg(test)]
+    pub(crate) fn lease_and_fulls_for_test(&self) -> (u64, u64) {
+        (
+            self.lease.load(Ordering::Acquire),
+            self.full_wanted.load(Ordering::Acquire),
+        )
+    }
+
+    /// How many wait for the state, the task among them, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn contenders_for_test(&self) -> usize {
+        self.state.contenders_for_test()
+    }
+
+    /// Units run and attempted on any thread, and whether a lease is held, for a test.
+    #[cfg(test)]
+    pub(crate) fn units_for_test(&self) -> (u64, u64, bool) {
+        (
+            self.units_run.load(Ordering::Relaxed),
+            self.unit_attempts.load(Ordering::Relaxed),
+            self.lease.load(Ordering::Acquire) != 0,
+        )
     }
 
     /// Units of the state, held, until one waits or nothing more is due, or, for a writer refused
@@ -984,6 +1171,8 @@ impl Checkpointer {
     /// thread, unless another writer is stepping it or the task is over; what it came to. Made
     /// only through [`Claims`], which owes the wake a step that held the state leaves.
     fn claim(&self, task: &TaskRef) -> Claimed {
+        #[cfg(test)]
+        CLAIM_ATTEMPTS.with(|n| n.set(n.get() + 1));
         CLAIMING.with(|c| *c.borrow_mut() = Claiming::Made);
         let ran = task.run_once();
         let claiming = CLAIMING.with(|c| std::mem::replace(&mut *c.borrow_mut(), Claiming::No));
@@ -1359,6 +1548,26 @@ impl Checkpointer {
             ticket,
             demand: None,
         }
+    }
+
+    /// [`step_full`](Self::step_full) for a caller in a cooperative frame (ASYNC1 D2e (iii-d)): what
+    /// the checkpoint `wait` names came to, if it came to anything, first, so a failure is never
+    /// replaced by the refusal below; then, the worker stepping the database's checkpoint task, the
+    /// shared wait its next end finishes. With no worker (a caller would claim the task, or the
+    /// writer step the state) it is refused, claiming and running nothing: a frame never steps a
+    /// checkpoint, and the staged slice has no other actor for it.
+    pub(crate) fn full_in_frame(&self, wait: &mut FullWait) -> Result<IOResult<()>> {
+        if let Some(out) = self.full_outcome(wait.ticket) {
+            wait.demand = None;
+            return out;
+        }
+        if !matches!(self.stepper(), Stepper::Worker) {
+            wait.demand = None;
+            return Err(LimboError::InternalError(
+                "a full checkpoint in a cooperative frame needs the checkpoint worker".to_string(),
+            ));
+        }
+        self.wait_full(wait)
     }
 
     /// Done once the full checkpoint `wait` names is done.

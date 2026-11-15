@@ -1233,6 +1233,111 @@ mod tests {
             "a_write_without_the_gate_is_refused_at_commit",
             "child",
         ),
+        (
+            "sql/integrity/tests.rs",
+            "a_cold_integrity_check_in_frames_returns_io_at_each_step_and_finds_what_the_synchronous_one_does",
+            "child",
+        ),
+        (
+            "buffer/kept/tests.rs",
+            "a_held_lease_holds_the_workers_units_off_on_its_one_wait_until_released",
+            "child",
+        ),
+        (
+            "buffer/kept/tests.rs",
+            "a_lease_released_around_a_units_registration_lets_the_unit_run",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_walk_meeting_the_checkpointers_state_held_waits_on_its_one_registered_wait",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_reset_walk_takes_its_registered_wait_back",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_sibling_walk_is_refused_at_its_first_entry",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_walk_after_an_ended_one_is_admitted",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_host_check_beside_a_cooperative_walk_is_refused",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_cooperative_walk_beside_a_host_check_is_refused",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "errors_a_walk_in_frames_meets_are_findings_or_end_it",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_full_checkpoint_in_a_frame_waits_on_the_worker_and_steps_nothing",
+            "child",
+        ),
+        (
+            "buffer/kept/tests.rs",
+            "a_full_checkpoint_waited_for_in_a_frame_returns_its_failure_first",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_reset_walk_lets_go_and_a_walk_in_another_transaction_is_refused",
+            "child",
+        ),
+        (
+            "buffer/kept/tests.rs",
+            "a_held_lease_holds_off_a_writers_claim_and_a_writers_own_step",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "the_admission_word_refuses_a_host_check_past_its_count",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_walk_in_frames_keeps_its_connections_other_statements_out",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_walk_beside_a_suspended_statement_of_its_connection_is_refused",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "each_hold_on_a_connections_statements_refuses_with_its_own_words_and_leaves_none",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_check_in_frames_keeps_its_connections_statements_out_through_its_row_pass",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_check_in_frames_lets_its_connection_go_at_its_first_row",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_check_in_frames_ended_in_its_row_pass_lets_its_connection_go",
+            "child",
+        ),
     ];
 
     /// Every `should_panic`, `catch_unwind` and child-process test in Atoll is listed with its
@@ -1329,6 +1434,9 @@ mod tests {
         "RetireOp",
         "FacadeRead",
         "RefusingStorage",
+        "IntegrityWalk",
+        "WalkClaim",
+        "FullCheckpointOp",
     ];
 
     /// Facade types that own Atoll state: each drops it inside a frame, its last field the end.
@@ -1340,6 +1448,9 @@ mod tests {
         "CreateOp",
         "RetireOp",
         "FacadeRead",
+        "IntegrityWalk",
+        "WalkClaim",
+        "FullCheckpointOp",
     ];
 
     /// Plain data the facade passes in or out, which code outside Atoll may name: it holds no

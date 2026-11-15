@@ -507,7 +507,67 @@ pub enum SyncRowStep {
 
 #[derive(Default)]
 pub(crate) struct StatementActivity {
-    explicit_checkpoint_active: bool,
+    /// What keeps the connection's statements from starting, if anything: one byte, so a
+    /// statement's start tests it once.
+    exclusive: Exclusive,
+}
+
+/// What holds a connection's statements from starting.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum Exclusive {
+    #[default]
+    None,
+    /// An explicit checkpoint.
+    Checkpoint,
+    /// An integrity check that walked the connection's pages in a cooperative frame (ASYNC1 D2e
+    /// (iii-d)), from its page walk to its first row or its end: no other statement starts
+    /// meanwhile, so nothing changes what its transaction sees between its calls, in its page
+    /// walk or in its row and index pass.
+    IntegrityWalk,
+}
+
+impl Exclusive {
+    /// A statement's refusal while `self` holds the connection's statements.
+    #[cold]
+    #[inline(never)]
+    fn refusal(self) -> LimboError {
+        LimboError::StatementsInProgress(match self {
+            Exclusive::Checkpoint => "cannot start a statement while a checkpoint is active",
+            Exclusive::IntegrityWalk => {
+                "cannot start a statement while an integrity check in a cooperative frame is under \
+                 way on the connection, before its first row"
+            }
+            Exclusive::None => unreachable!("a statement refused with nothing holding it"),
+        })
+    }
+}
+
+/// What a statement holds of its connection's statements, which no other starts while it is held.
+pub(crate) enum StatementsHold {
+    /// An explicit checkpoint's guard, while the checkpoint is suspended.
+    Checkpoint { _guard: ExplicitCheckpointGuard },
+    /// A cooperative integrity walk's claim, its admission word and its statements' hold, kept by
+    /// its check from the walk's end to the check's first row.
+    IntegrityWalk {
+        _claim: crate::storage::atoll::sql::mode::WalkClaim,
+    },
+}
+
+/// A cooperative integrity walk's hold on its connection's statements: the only one active, and no
+/// other started until this drops.
+pub(crate) struct IntegrityWalkGuard {
+    activity: Arc<Mutex<StatementActivity>>,
+}
+
+impl Drop for IntegrityWalkGuard {
+    fn drop(&mut self) {
+        let mut activity = self.activity.lock();
+        turso_assert!(
+            activity.exclusive == Exclusive::IntegrityWalk,
+            "dropping an inactive integrity walk's guard"
+        );
+        activity.exclusive = Exclusive::None;
+    }
 }
 
 pub(crate) struct ExplicitCheckpointGuard {
@@ -522,10 +582,10 @@ impl Drop for ExplicitCheckpointGuard {
         }
         let mut activity = self.activity.lock();
         turso_assert!(
-            activity.explicit_checkpoint_active,
+            activity.exclusive == Exclusive::Checkpoint,
             "dropping an inactive explicit checkpoint guard"
         );
-        activity.explicit_checkpoint_active = false;
+        activity.exclusive = Exclusive::None;
     }
 }
 
@@ -5102,10 +5162,8 @@ impl Connection {
 
     pub(crate) fn start_root_statement(&self) -> Result<()> {
         let activity = self.statement_activity.lock();
-        if activity.explicit_checkpoint_active {
-            return Err(LimboError::StatementsInProgress(
-                "cannot start a statement while a checkpoint is active",
-            ));
+        if activity.exclusive != Exclusive::None {
+            return Err(activity.exclusive.refusal());
         }
         // A statement ending the connection's transaction finishes it before another begins: one
         // starting meanwhile would begin a transaction, or end or roll back one, under it (the
@@ -5118,6 +5176,46 @@ impl Connection {
         }
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// What holds the connection's statements from starting, for a test: "none", "checkpoint" or
+    /// "integrity walk".
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn exclusive_for_test(&self) -> &'static str {
+        match self.statement_activity.lock().exclusive {
+            Exclusive::None => "none",
+            Exclusive::Checkpoint => "checkpoint",
+            Exclusive::IntegrityWalk => "integrity walk",
+        }
+    }
+
+    /// A cooperative integrity walk's admission among its connection's statements (ASYNC1 D2e
+    /// (iii-d)): refused unless the walk's own statement is the only one active, a parked blob
+    /// handle counted, since it may write; then `admit`, the walk's own admission, under the same
+    /// lock. Admitted, no other statement starts until the guard drops.
+    pub(crate) fn begin_integrity_walk<T>(
+        &self,
+        admit: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, IntegrityWalkGuard)> {
+        let mut activity = self.statement_activity.lock();
+        if activity.exclusive == Exclusive::Checkpoint
+            || self.n_active_root_statements.load(Ordering::SeqCst) != 1
+        {
+            return Err(LimboError::StatementsInProgress(
+                "an integrity check while another statement of this connection is active, in a \
+                 cooperative frame",
+            ));
+        }
+        // The walk's own admission keeps a second walk out (its word's exchange from 0); the flag
+        // only mirrors it for the statements that would start meanwhile.
+        let admitted = admit()?;
+        activity.exclusive = Exclusive::IntegrityWalk;
+        Ok((
+            admitted,
+            IntegrityWalkGuard {
+                activity: self.statement_activity.clone(),
+            },
+        ))
     }
 
     /// `from_statement` is true when the checkpoint runs inside a root
@@ -5139,12 +5237,12 @@ impl Connection {
         // checkpoint until it is closed.
         let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
             - self.n_active_blob_statements.load(Ordering::SeqCst);
-        if activity.explicit_checkpoint_active || active_non_blob != statements_expected {
+        if activity.exclusive != Exclusive::None || active_non_blob != statements_expected {
             return Err(LimboError::StatementsInProgress(
                 "cannot checkpoint while another statement is active",
             ));
         }
-        activity.explicit_checkpoint_active = true;
+        activity.exclusive = Exclusive::Checkpoint;
         Ok(ExplicitCheckpointGuard {
             activity: self.statement_activity.clone(),
             pager,

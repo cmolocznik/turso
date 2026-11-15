@@ -237,6 +237,11 @@ impl Atoll {
         &self.checkpointer
     }
 
+    /// The checkpointer, shared: what an integrity walk's lease holds (ASYNC1 D2e (iii-d)).
+    pub(crate) fn checkpointer_shared(&self) -> &Arc<Checkpointer> {
+        &self.checkpointer
+    }
+
     /// The checkpointer as the checkpoint's task holds it, for a test to tell it let go.
     #[cfg(test)]
     pub(crate) fn checkpointer_arc(&self) -> &Arc<Checkpointer> {

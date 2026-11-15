@@ -588,8 +588,17 @@ pub fn op_checkpoint(
     }
     if let Some(atoll) = program.connection.atoll_for_db(*database) {
         // Atoll mode: a full checkpoint of Atoll's log (DESIGN.md §17, §11), reported as SQLite
-        // reports a database not in WAL mode.
-        crate::storage::atoll::sql::mode::full_checkpoint(atoll.db())?;
+        // reports a database not in WAL mode; kept across its returns in a cooperative frame
+        // (ASYNC1 D2e (iii-d)).
+        let op = state.atoll_checkpoint.get_or_insert_with(Default::default);
+        match op.step(atoll.db()) {
+            Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+            Ok(IOResult::Done(())) => state.atoll_checkpoint = None,
+            Err(e) => {
+                state.atoll_checkpoint = None;
+                return Err(e.into());
+            }
+        }
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -599,7 +608,7 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    if state.explicit_checkpoint_guard.is_none() {
+    if state.statements_hold.is_none() {
         // No exemption for nested statements: nothing in the engine prepares
         // wal_checkpoint as a nested helper (VACUUM checkpoints through
         // Connection::checkpoint), and nested statements are not counted in
@@ -608,11 +617,11 @@ pub fn op_checkpoint(
         // helper statement is alive on the connection would let a checkpoint
         // clobber a suspended statement that holds one (e.g. a pragma vtab
         // cursor's stored helper).
-        state.explicit_checkpoint_guard = Some(
-            program
+        state.statements_hold = Some(crate::connection::StatementsHold::Checkpoint {
+            _guard: program
                 .connection
                 .begin_explicit_checkpoint(pager.clone(), true)?,
-        );
+        });
     }
 
     // In autocommit mode, this statement can still hold an implicit read tx.
@@ -728,7 +737,7 @@ pub fn op_checkpoint(
         // 3rd col: # pages moved to db after checkpoint
         state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
-        state.explicit_checkpoint_guard = None;
+        state.statements_hold = None;
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -747,7 +756,7 @@ pub fn op_checkpoint(
             // 3rd col: # pages moved to db after checkpoint
             state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
-            state.explicit_checkpoint_guard = None;
+            state.statements_hold = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -755,7 +764,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
-            state.explicit_checkpoint_guard = None;
+            state.statements_hold = None;
             state.registers[*dest].set_int(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -3620,6 +3629,34 @@ pub fn op_result_row(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ResultRow { start_reg, count }, insn);
+    let row = Row {
+        values: &state.registers[*start_reg] as *const Register,
+        count: *count,
+    };
+    state.result_row = Some(row);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Row)
+}
+
+/// An integrity check's row: the claim its walk in a cooperative frame handed over, its
+/// connection's admission word and statements' hold, is let go here, at its first row (the
+/// auditor's III-D-I2).
+pub fn op_integrity_result_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IntegrityResultRow { start_reg, count }, insn);
+    if let Some(hold) = state.statements_hold.take() {
+        turso_assert!(
+            matches!(
+                hold,
+                crate::connection::StatementsHold::IntegrityWalk { .. }
+            ),
+            "an integrity check's row under a checkpoint's hold"
+        );
+    }
     let row = Row {
         values: &state.registers[*start_reg] as *const Register,
         count: *count,
@@ -17934,6 +17971,8 @@ fn has_freelist_error(errors: &[IntegrityCheckError]) -> bool {
 
 pub enum OpIntegrityCheckState {
     Start,
+    /// Atoll's page walk in a cooperative frame, kept across its returns (ASYNC1 D2e (iii-d)).
+    Atoll(Box<crate::storage::atoll::sql::mode::IntegrityWalk>),
     CheckingBTreeStructure {
         errors: crate::alloc::Vec<IntegrityCheckError>,
         current_root_idx: usize,
@@ -17970,7 +18009,37 @@ pub fn op_integrity_check(
         .filter(|mv_store| !mv_store.uses_passive_checkpoint());
     // Atoll mode: the page arm checks Atoll's trees and page store (DESIGN.md §17, §12, R36).
     if let Some(atoll) = program.connection.atoll_for_db(*db) {
-        let found = atoll.check_pages(*max_errors)?;
+        let op = state.active_op_state.integrity_check();
+        let mut walk = match std::mem::replace(op, OpIntegrityCheckState::Start) {
+            OpIntegrityCheckState::Atoll(walk) => Some(walk),
+            _ => None,
+        };
+        let found = match atoll.check_pages_in(&mut walk, *max_errors) {
+            Ok(IOResult::IO(io)) => {
+                *state.active_op_state.integrity_check() =
+                    OpIntegrityCheckState::Atoll(walk.expect("a walk kept across its IO"));
+                return Ok(state.suspend_on_io(io));
+            }
+            Ok(IOResult::Done((found, claim))) => {
+                state.active_op_state.clear();
+                // A walk in a cooperative frame hands over its claim, kept to the check's first
+                // row: its row and index pass reads in the same transaction (the auditor's
+                // III-D-I2).
+                if let Some(claim) = claim {
+                    turso_assert!(
+                        state.statements_hold.is_none(),
+                        "an integrity check holding its connection's statements twice"
+                    );
+                    state.statements_hold =
+                        Some(crate::connection::StatementsHold::IntegrityWalk { _claim: claim });
+                }
+                found
+            }
+            Err(e) => {
+                state.active_op_state.clear();
+                return Err(e.into());
+            }
+        };
         if found.is_empty() {
             state.registers[*message_register].set_null();
         } else {
@@ -17980,6 +18049,10 @@ pub fn op_integrity_check(
         return Ok(InsnFunctionStepResult::Step);
     }
     match state.active_op_state.integrity_check() {
+        // Only an Atoll target walks Atoll's pages, and it returned above.
+        OpIntegrityCheckState::Atoll(_) => {
+            unreachable!("an Atoll integrity walk kept for a database not in Atoll mode")
+        }
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(
                 state,

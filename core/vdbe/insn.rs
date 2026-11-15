@@ -2429,6 +2429,15 @@ pub enum Insn {
         start_reg: usize,
         num_regs: usize,
     },
+
+    /// A row of an integrity check's results, shown as ResultRow. A check that walked Atoll's
+    /// pages in a cooperative frame lets go of its connection's statements here, at its first
+    /// row: until then no other statement of its connection starts, so nothing changes what its
+    /// row and index pass reads (ASYNC1 D2e (iii-d), the auditor's III-D-I2).
+    IntegrityResultRow {
+        start_reg: usize, // P1
+        count: usize,     // P2
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2683,6 +2692,7 @@ impl InsnVariants {
             InsnVariants::FkUnseen => execute::op_fk_unseen,
             InsnVariants::FkGuardRow => execute::op_fk_guard_row,
             InsnVariants::KeyProbe => execute::op_key_probe,
+            InsnVariants::IntegrityResultRow => execute::op_integrity_result_row,
         }
     }
 }

@@ -3536,6 +3536,9 @@ impl JoinedTable {
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
+                if virtual_table.checks_pages() {
+                    program.mark_checks_pages();
+                }
                 let table_cursor_id = Some(program.alloc_cursor_id_keyed_if_not_exists(
                     CursorKey::table(self.internal_id),
                     CursorType::VirtualTable(virtual_table.clone()),

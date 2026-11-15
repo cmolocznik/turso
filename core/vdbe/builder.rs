@@ -316,6 +316,10 @@ pub struct ProgramBuilder {
     /// Whether the main database is an Atoll database, set once at translation time from the
     /// connection: its writes owe foreign-key guards (R10).
     atoll: bool,
+    /// Whether the program checks the main database's pages: its integrity check, or a cursor over
+    /// a table-valued form of the check (ICK-TVF1). Set where the translator emits the one or opens
+    /// the other, so a program with neither pays nothing to find out.
+    checks_pages: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -838,6 +842,7 @@ impl ProgramBuilder {
             capture_data_changes_info,
             mvcc_enabled,
             atoll: false,
+            checks_pages: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -1101,6 +1106,11 @@ impl ProgramBuilder {
 
     pub fn set_atoll(&mut self, atoll: bool) {
         self.atoll = atoll;
+    }
+
+    /// Marks the program as checking the main database's pages (ICK-TVF1).
+    pub fn mark_checks_pages(&mut self) {
+        self.checks_pages = true;
     }
 
     /// Whether a write into `database_id` owes its foreign-key guards (R10): only an Atoll
@@ -2566,12 +2576,19 @@ impl ProgramBuilder {
         // table-valued form of the check: the pragma its cursor runs is a nested statement, which
         // begins nothing, and walks in this statement's transaction (ICK-TVF1). Its arguments are
         // values known only when it runs, so whichever database they name, it takes the main one's.
-        let checks_pages = self.atoll
-            && (self.insns.iter().any(|(insn, _)| {
+        let checks_pages = self.atoll && self.checks_pages;
+        // The mark is set where the translator makes what it marks. A debug build checks it against
+        // every instruction and cursor the program holds, so a place that makes one unmarked fails
+        // here rather than walking pages it does not hold still (the auditor's #5786).
+        debug_assert_eq!(
+            self.checks_pages,
+            self.insns.iter().any(|(insn, _)| {
                 matches!(insn, Insn::IntegrityCk { data } if data.db == crate::MAIN_DB_ID)
             }) || self.cursor_ref.iter().any(|(_, cursor)| {
                 matches!(cursor, CursorType::VirtualTable(table) if table.checks_pages())
-            }));
+            }),
+            "a program's page-check mark differs from its integrity checks and check-form cursors"
+        );
         // The trees a schema writer reads rows of, sqlite_schema aside (DESIGN.md §17, §3, defect 4).
         let mut schema_reads: Vec<u64> = if writes_schema || checks_pages {
             self.insns

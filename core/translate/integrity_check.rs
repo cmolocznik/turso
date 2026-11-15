@@ -222,6 +222,9 @@ fn translate_integrity_check_for_schema(
 
     let registers = Registers::init(program, max_errors);
 
+    if database_id == crate::MAIN_DB_ID {
+        program.mark_checks_pages();
+    }
     program.emit_insn(Insn::IntegrityCk {
         data: Box::new(IntegrityCkData {
             db: database_id,

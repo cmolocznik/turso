@@ -719,52 +719,61 @@ fn a_statement_past_the_last_number_fails_and_the_transaction_rolls_back() {
 /// once their changes to them are undone, and keeps the rest with their earlier statements'
 /// changes; a whole rollback puts every tree it created on the list. The commit or rollback that
 /// ends the transaction hands over the trees on the list.
+#[cfg(all(unix, not(miri)))]
 #[test]
 fn undone_creations_go_on_the_list_and_the_rest_stay_with_their_earlier_changes() {
-    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let mut db = Db::create(io);
-    let list = db.make_list();
-    let mut t = db.begin();
-    let a = db.create_tree(&mut t, 0);
-    db.put_in(&mut t, a, "a1", "kept");
-    db.txns().statement(&mut t).unwrap();
-    db.put_in(&mut t, a, "a2", "undone");
-    let b = db.create_tree(&mut t, 1);
-    db.put_in(&mut t, b, "b2", "undone");
-    db.put(&mut t, 0, "k", "undone");
-    db.txns().statement(&mut t).unwrap();
-    let c = db.create_tree(&mut t, 0);
-    db.put_in(&mut t, b, "b3", "undone");
-    db.put_in(&mut t, c, "c3", "undone");
-    db.rollback_to(&mut t, 1);
-    let held: Vec<PageId> = t.created().iter().map(|c| c.root).collect();
-    assert_eq!(held, vec![a]);
-    assert_eq!(t.abandoned(), &[c, b], "newest first");
-    assert_eq!(db.listed(list), BTreeSet::from([b, c]));
-    assert_eq!(db.get_in(&mut t, a, "a1").as_deref(), Some("kept"));
-    assert_eq!(db.get_in(&mut t, a, "a2"), None);
-    assert_eq!(
-        (db.entries(b), db.entries(c)),
-        (0, 0),
-        "their changes undone"
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::undone_creations_go_on_the_list_and_the_rest_stay_with_their_earlier_changes"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+            let mut db = Db::create(io);
+            let list = db.make_list();
+            let mut t = db.begin();
+            let a = db.create_tree(&mut t, 0);
+            db.put_in(&mut t, a, "a1", "kept");
+            db.txns().statement(&mut t).unwrap();
+            db.put_in(&mut t, a, "a2", "undone");
+            let b = db.create_tree(&mut t, 1);
+            db.put_in(&mut t, b, "b2", "undone");
+            db.put(&mut t, 0, "k", "undone");
+            db.txns().statement(&mut t).unwrap();
+            let c = db.create_tree(&mut t, 0);
+            db.put_in(&mut t, b, "b3", "undone");
+            db.put_in(&mut t, c, "c3", "undone");
+            db.rollback_to(&mut t, 1);
+            let held: Vec<PageId> = t.created().iter().map(|c| c.root).collect();
+            assert_eq!(held, vec![a]);
+            assert_eq!(t.abandoned(), &[c, b], "newest first");
+            assert_eq!(db.listed(list), BTreeSet::from([b, c]));
+            assert_eq!(db.get_in(&mut t, a, "a1").as_deref(), Some("kept"));
+            assert_eq!(db.get_in(&mut t, a, "a2"), None);
+            assert_eq!(
+                (db.entries(b), db.entries(c)),
+                (0, 0),
+                "their changes undone"
+            );
+            let mut commit = Commit::new(t);
+            run(&db.io, || db.txns().commit(&mut commit));
+            assert_eq!(commit.abandoned(), &[c, b]);
+            db.more.kept.push(a);
+            let mut t = db.begin();
+            let d = db.create_tree(&mut t, 0);
+            db.txns().statement(&mut t).unwrap();
+            db.put_in(&mut t, d, "d2", "undone");
+            let e = db.create_tree(&mut t, 1);
+            let mut abort = Abort::new(t);
+            run(&db.io, || db.txns().rollback(&db.versions, &mut abort));
+            assert_eq!(abort.abandoned(), &[e, d]);
+            assert_eq!(db.listed(list), BTreeSet::from([b, c, d, e]));
+            let mut t = db.begin();
+            assert_eq!(db.get_in(&mut t, a, "a1").as_deref(), Some("kept"));
+            db.commit(t);
+            db.check_whole("after both");
+        },
     );
-    let mut commit = Commit::new(t);
-    run(&db.io, || db.txns().commit(&mut commit));
-    assert_eq!(commit.abandoned(), &[c, b]);
-    db.more.kept.push(a);
-    let mut t = db.begin();
-    let d = db.create_tree(&mut t, 0);
-    db.txns().statement(&mut t).unwrap();
-    db.put_in(&mut t, d, "d2", "undone");
-    let e = db.create_tree(&mut t, 1);
-    let mut abort = Abort::new(t);
-    run(&db.io, || db.txns().rollback(&db.versions, &mut abort));
-    assert_eq!(abort.abandoned(), &[e, d]);
-    assert_eq!(db.listed(list), BTreeSet::from([b, c, d, e]));
-    let mut t = db.begin();
-    assert_eq!(db.get_in(&mut t, a, "a1").as_deref(), Some("kept"));
-    db.commit(t);
-    db.check_whole("after both");
 }
 
 /// A loser that created trees in several statements and wrote them, crashed anywhere, through
@@ -978,4 +987,72 @@ fn a_rollback_reads_its_spilled_parts_back_through_the_logs_open_segments_return
 #[test]
 fn a_rollback_reads_a_part_across_segments_back_a_segment_at_a_time() {
     rolled_back_reading_its_parts_back(694, 64 << 10);
+}
+
+/// A rollback that failed is dropped by its owner, never stepped again: stepped again, it stops
+/// the process, naming why, before it reads or puts back anything more. Here its log's reads fail,
+/// so it cannot read a part it spilled back.
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn a_rollback_stepped_again_after_it_failed_stops_the_process() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_rollback_stepped_again_after_it_failed_stops_the_process"
+        ),
+        rollback_failed_then_stepped,
+    );
+    let Some(ended) = ended else { return };
+    assert!(
+        ended.aborted
+            && ended
+                .stderr
+                .contains("a rollback stepped again after it failed"),
+        "the child ended {:?} (aborted {}, hung {}): {}",
+        ended.code,
+        ended.aborted,
+        ended.hung,
+        ended.stderr
+    );
+}
+
+/// In the child: a transaction spills parts, its log's reads then fail, and its rollback, failed,
+/// is stepped once more.
+#[cfg(all(unix, not(miri)))]
+fn rollback_failed_then_stepped() {
+    let crash_io = Arc::new(CrashIO::new(695));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = Db::create(io.clone());
+    let mut t = db.begin();
+    for i in 0..120 {
+        db.put(&mut t, i % 2, &format!("k{i:03}"), &value("spilled", i));
+    }
+    assert!(t.changes().parts().len() > 1, "nothing spilled");
+    db.durable();
+    crash_io.set_faults_on(Some(&format!("{BASE}.log.{:016x}", 0)));
+    crash_io.set_faults(crate::io::crash::Faults {
+        read: 1.0,
+        write: 0.0,
+        sync: 0.0,
+        short_write: 0.0,
+    });
+    let mut op = Abort::new(t);
+    // Driven until the rollback's own step fails: the driver returns a failed wait before the
+    // rollback meets it.
+    let mut failure = None;
+    while failure.is_none() {
+        let driven = drive(&io, || match db.txns().rollback(&db.versions, &mut op) {
+            Err(e) => {
+                failure = Some(e);
+                Ok(IOResult::Done(()))
+            }
+            stepped => stepped,
+        });
+        assert!(
+            driven.is_err() || failure.is_some(),
+            "rolled back whole with its log's reads failing"
+        );
+    }
+    let again = drive(&io, || db.txns().rollback(&db.versions, &mut op));
+    panic!("the failed rollback's second step came to {again:?}");
 }

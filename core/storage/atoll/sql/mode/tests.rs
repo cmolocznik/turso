@@ -10769,6 +10769,12 @@ mod in_frames {
             /// The calls of `.method(` in the production code of `file`, each with the function it is
             /// in.
             fn method_sites(file: &std::path::Path, method: &str) -> Vec<String> {
+                sites_of(file, &format!(".{method}("))
+            }
+
+            /// The lines of the production code of `file` that hold `needle`, each by the function
+            /// it is in.
+            fn sites_of(file: &std::path::Path, needle: &str) -> Vec<String> {
                 use crate::storage::atoll::testing::code_of;
                 let code = code_of(&std::fs::read_to_string(file).unwrap());
                 let mut out = Vec::new();
@@ -10789,7 +10795,7 @@ mod in_frames {
                             }
                         }
                     }
-                    if line.contains(&format!(".{method}(")) {
+                    if line.contains(needle) {
                         out.push(within.clone());
                     }
                 }
@@ -10879,6 +10885,57 @@ mod in_frames {
                 assert!(
                     !cursor.contains("Deref for TxnSlot"),
                     "the slot derefs to its lock again"
+                );
+            }
+
+            /// The census of a rollback's steps (#5843). `rollback::undo` is stepped only by
+            /// `Transactions::rollback` and `rollback_to`, and those only by the three owners of a
+            /// rollback. Each owner drops its rollback in the arm that meets the rollback's failure,
+            /// so none steps a failed rollback again (`undo` stops the process if one did). The
+            /// cursor's owed rollback (`step`) makes its state `Owed::Failed`, which holds no
+            /// rollback; a commit's ending (`step_owed`) makes the commit the transaction's
+            /// rollback, a new `Abort` (`owed_failed`); and a rollback's ending (`step_rollback`)
+            /// abandons the transaction and makes its step `Step::Failed`.
+            #[test]
+            fn every_step_of_a_rollback_is_by_an_owner_that_drops_it_once_it_fails() {
+                use crate::storage::atoll::testing::{atoll_dir, atoll_sources};
+                let dir = atoll_dir();
+                let production = |path: &std::path::Path| {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    name != "tests.rs"
+                        && !name.ends_with("_tests.rs")
+                        && !path.components().any(|c| c.as_os_str() == "tests")
+                };
+                let sites = |needle: &str| -> std::collections::BTreeSet<String> {
+                    atoll_sources()
+                        .into_iter()
+                        .filter(|path| production(path))
+                        .flat_map(|path| {
+                            let file = path.strip_prefix(&dir).unwrap().display().to_string();
+                            sites_of(&path, needle)
+                                .into_iter()
+                                .map(move |within| format!("{file}:{within}"))
+                        })
+                        .collect()
+                };
+                let want = |list: &[&str]| -> std::collections::BTreeSet<String> {
+                    list.iter().map(|s| s.to_string()).collect()
+                };
+                let mut owners = sites(".rollback_to(");
+                owners.extend(sites(".rollback("));
+                assert_eq!(
+                    owners,
+                    want(&[
+                        "sql/cursor.rs:step",
+                        "sql/mode.rs:step_owed",
+                        "sql/mode.rs:step_rollback",
+                    ]),
+                    "the owners that step a rollback"
+                );
+                assert_eq!(
+                    sites("rollback::undo("),
+                    want(&["txn/mod.rs:rollback", "txn/mod.rs:rollback_to"]),
+                    "the steps of undo"
                 );
             }
 
@@ -12196,6 +12253,417 @@ mod in_frames {
                             "R's rows"
                         );
                     },
+                );
+            }
+
+            // ---------------------------------------- undo stepped in place, at each return (#5843)
+
+            /// What drives the sweep's rollback: the connection's settle of the statement rollback
+            /// it owes (the cursor's owed rollback, as a statement step's entry finishes it), a
+            /// commit's ending finishing that rollback as its first step, or a rollback's ending
+            /// rolling the whole transaction back.
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Driver {
+                Settle,
+                CommitEnding,
+                RollbackEnding,
+            }
+
+            /// The sweep's database over a `CrashIO`, as [`crashing`] makes one, with its
+            /// configuration for a reopen: table `r`, its rows indexed on `c`, every twentieth value
+            /// out of line, written and checkpointed; and a trigger on `go` whose insert changes `r`
+            /// in each way a rollback puts back. It inserts rows and their index entries, which are
+            /// removed again; it updates rows with out-of-line values, replacing the values and the
+            /// index entries, which go back, the values by their reference; and it deletes rows,
+            /// which go back. Its changes are enough to spill parts that the rollback reads back
+            /// from the log.
+            fn swept_db(
+                path: &str,
+            ) -> (
+                Arc<crate::io::crash::CrashIO>,
+                Arc<dyn IO>,
+                Arc<Database>,
+                Arc<Connection>,
+                crate::storage::atoll::db::AtollConfig,
+            ) {
+                let crash = Arc::new(crate::io::crash::CrashIO::new(731));
+                let io: Arc<dyn IO> = crash.clone();
+                let mut cfg = config();
+                cfg.log.buffer_bytes = 32 << 10;
+                cfg.log.chunk_bytes = 8 << 10;
+                cfg.log_budget = Some(16 << 20);
+                let db = crate::storage::atoll::requests::opened_async(|| {
+                    open_with(&io, path, cfg.clone())
+                });
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                for sql in [
+                    "CREATE TABLE r (a INTEGER PRIMARY KEY, b BLOB, c INTEGER)",
+                    "CREATE INDEX r_c ON r(c)",
+                    "INSERT INTO r SELECT value, CASE WHEN value % 20 = 0 THEN zeroblob(20000) \
+                     ELSE zeroblob(200) END, value FROM generate_series(1, 120)",
+                    "CREATE TABLE more (n INTEGER PRIMARY KEY)",
+                    "INSERT INTO more SELECT value FROM generate_series(1001, 1040)",
+                    "CREATE TABLE go (x)",
+                    "CREATE TRIGGER mix AFTER INSERT ON go BEGIN \
+                     INSERT INTO r SELECT n, zeroblob(2048), n FROM more; \
+                     UPDATE r SET b = zeroblob(30000), c = c + 5000 WHERE a % 20 = 0 AND a <= 100; \
+                     DELETE FROM r WHERE a > 100 AND a <= 120; \
+                     END",
+                ] {
+                    conn.execute(sql).unwrap();
+                }
+                checkpointed(&conn);
+                (crash, io, db, conn, cfg)
+            }
+
+            /// `r`'s rows, then its index's entries in order, as `conn` reads them.
+            fn r_read(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+                let mut read = rows(conn, "SELECT a, length(b), c FROM r ORDER BY a");
+                read.extend(rows(
+                    conn,
+                    "SELECT c, a FROM r INDEXED BY r_c WHERE c > -1 ORDER BY c, a",
+                ));
+                read
+            }
+
+            /// What one run of the sweep came to.
+            #[derive(Debug)]
+            struct Swept {
+                /// The rollback's returns, made in frames.
+                returns: usize,
+                /// The failure the rollback's driver came to, if it failed.
+                failed: Option<String>,
+                /// Whether the statement rollback owed was kept failed once its driver failed.
+                kept_failed: bool,
+                /// How the transaction's end came out: its COMMIT, or its ending's finish.
+                ended: std::result::Result<(), String>,
+                /// The database's failure once the transaction ended.
+                left: Option<String>,
+                /// `r` once the transaction ended, as a new connection reads it, the database
+                /// reopened if it failed; and what its integrity check reads then.
+                after: Vec<Vec<Value>>,
+                integrity: Vec<Vec<Value>>,
+                /// How a new transaction writing every key the rolled back one wrote came out: a
+                /// version of it left behind, unseen by a read, fails such a write.
+                rewritten: std::result::Result<(), String>,
+                /// `r` as committed before the transaction, and as its kept statement left it.
+                base: Vec<Vec<Value>>,
+                kept: Vec<Vec<Value>>,
+            }
+
+            /// One run of the sweep. A transaction writes row 0, which it keeps, and the
+            /// trigger's changes, which it rolls back; its pages are written out and evicted.
+            /// `driver` then runs the rollback in frames, the IO thread held for each call, until
+            /// its `k`-th return, and every page nothing holds is evicted at each return; a
+            /// commit's ending pauses before its commit step, so none of the commit runs in a
+            /// frame. Then it runs the rollback outside a frame to its end. With `fail`, the reads of the `k`-th
+            /// return's wait fail. The transaction then ends: committed once its statement
+            /// rollback finished (the commit failing, and so rolled back whole, once that rollback
+            /// failed), or rolled back whole by the rollback's ending.
+            fn swept(driver: Driver, k: usize, fail: bool) -> Swept {
+                use crate::storage::atoll::sql::mode::Ending;
+                let path = format!("/db/undo-swept-{driver:?}-{k}-{fail}");
+                let (crash, io, db, conn, cfg) = swept_db(&path);
+                let ct = conn.atoll().expect("Atoll mode");
+                let base = r_read(&conn);
+                conn.execute("BEGIN").unwrap();
+                conn.execute("INSERT INTO r VALUES (0, x'00', 0)").unwrap();
+                let kept = r_read(&conn);
+                let after_a = command(&conn);
+                conn.execute("INSERT INTO go VALUES (1)").unwrap();
+                if driver != Driver::RollbackEnding {
+                    let _ = in_frame(&io, &db, || {
+                        ct.rollback_statement(after_a).map(IOResult::Done)
+                    })
+                    .unwrap();
+                }
+                crate::storage::atoll::sql::mode::full_checkpoint(db.atoll.as_ref().unwrap())
+                    .unwrap();
+                chill(&db);
+                let mut ending = match driver {
+                    Driver::Settle => None,
+                    Driver::CommitEnding => Some(ct.end(true).expect("a transaction to end")),
+                    Driver::RollbackEnding => Some(ct.end(false).expect("a transaction to end")),
+                };
+                // A commit pauses before its first commit step, so none of it runs in a frame.
+                let pause = crate::io::Completion::new_wait();
+                crate::storage::atoll::testing::ENDING_PAUSE
+                    .with(|p| *p.borrow_mut() = Some(pause.clone()));
+                let rolling = |ending: &Option<Ending>| match ending {
+                    None => owed(&conn).is_some_and(|(_, failed)| !failed),
+                    Some(e) => format!("{e:?}").contains("rolling"),
+                };
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                let mut returns = 0;
+                let mut failed = None;
+                while returns < k && rolling(&ending) {
+                    let held = held_io(&db);
+                    let out = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        match ending.as_mut() {
+                            None => ct.settle(),
+                            Some(e) => e.step(),
+                        }
+                    };
+                    let idle = atoll.io_idle_for_test();
+                    let wait = match &out {
+                        Ok(IOResult::IO(IOCompletions(c))) => Some(c.clone()),
+                        _ => None,
+                    };
+                    if wait.as_ref().is_some_and(|c| c.ptr_eq(&pause)) {
+                        drop(held);
+                        break;
+                    }
+                    if fail && returns + 1 == k && wait.is_some() {
+                        reads_fail(&crash, None);
+                    }
+                    drop(held);
+                    if let Some(c) = &wait {
+                        returns += 1;
+                        assert!(waited(&io, c), "return {returns}: its wait never finished");
+                        assert!(retired(&db), "return {returns}: a request outstanding");
+                        assert!(
+                            idled(&idle),
+                            "return {returns}: the IO thread never went idle"
+                        );
+                    }
+                    clear_faults(&crash);
+                    chill(&db);
+                    match out {
+                        Ok(IOResult::IO(_)) => {}
+                        Ok(IOResult::Done(())) => break,
+                        Err(e) => {
+                            failed = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                pause.complete(0);
+                crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+                let finished = match ending.as_mut() {
+                    None if failed.is_none() => ct.settle().map(|_| ()),
+                    None => Ok(()),
+                    Some(e) => e.finish(),
+                };
+                if let Err(e) = &finished {
+                    failed.get_or_insert_with(|| e.to_string());
+                }
+                let kept_failed = owed(&conn).is_some_and(|(_, failed)| failed);
+                let ended = match ending.take() {
+                    None => conn.execute("COMMIT").map_err(|e| e.to_string()),
+                    Some(_) => finished.map_err(|e| e.to_string()),
+                };
+                let left = failure_of(&db);
+                let read = |reader: &Arc<Connection>| {
+                    let read = (r_read(reader), rows(reader, "PRAGMA integrity_check"));
+                    let rewritten = [
+                        "BEGIN",
+                        "INSERT OR REPLACE INTO r VALUES (0, x'01', 0)",
+                        "INSERT INTO go VALUES (2)",
+                        "ROLLBACK",
+                    ]
+                    .iter()
+                    .try_for_each(|sql| reader.execute(sql).map_err(|e| format!("{sql}: {e}")));
+                    (read.0, read.1, rewritten)
+                };
+                let (after, integrity, rewritten) = if left.is_some() {
+                    drop((conn, db));
+                    let reopened = open_with(&io, &path, cfg);
+                    let reader = reopened.connect(ConnectOpts::new()).unwrap();
+                    let out = read(&reader);
+                    drop((reader, reopened));
+                    out
+                } else {
+                    let reader = db.connect(ConnectOpts::new()).unwrap();
+                    let out = read(&reader);
+                    drop((reader, conn, db));
+                    out
+                };
+                drop((io, crash));
+                Swept {
+                    returns,
+                    failed,
+                    kept_failed,
+                    ended,
+                    left,
+                    after,
+                    integrity,
+                    rewritten,
+                    base,
+                    kept,
+                }
+            }
+
+            /// What a run's transaction leaves `r` as, once its rollback did not fail: its kept
+            /// row committed after a statement rollback, nothing of it after a whole one.
+            fn swept_want(driver: Driver, run: &Swept) -> &Vec<Vec<Value>> {
+                match driver {
+                    Driver::Settle | Driver::CommitEnding => &run.kept,
+                    Driver::RollbackEnding => &run.base,
+                }
+            }
+
+            /// Every return inside undo, made and taken up again (#5843). `driver`'s rollback is run
+            /// with its first `k` returns made in frames, for every `k` up to the whole rollback's
+            /// count, then finished outside a frame. Each run ends as the run with no return at all:
+            /// `r` as the transaction's outcome leaves it, its index in step with its rows, the
+            /// integrity check ok, and every key the transaction wrote writable again (a version
+            /// of it left behind is unseen by a read once the transaction is gone, but fails a
+            /// write).
+            fn returning_at_each_wait(driver: Driver) {
+                let whole = swept(driver, usize::MAX, false);
+                let none = swept(driver, 0, false);
+                assert!(
+                    whole.returns > 1,
+                    "{driver:?}: the rollback returned {} times",
+                    whole.returns
+                );
+                assert_eq!(none.returns, 0, "{driver:?}: a return outside a frame");
+                let ok = vec![vec![text("ok")]];
+                for k in 0..=whole.returns {
+                    let run = swept(driver, k, false);
+                    assert_eq!(
+                        (run.returns, &run.failed, &run.ended, &run.left),
+                        (k, &None, &Ok(()), &None),
+                        "{driver:?}, {k} returns: how it ended"
+                    );
+                    assert_eq!(
+                        &run.after,
+                        swept_want(driver, &run),
+                        "{driver:?}, {k} returns: r once the transaction ended"
+                    );
+                    assert_eq!(
+                        run.after, none.after,
+                        "{driver:?}, {k} returns: not as the rollback with no return"
+                    );
+                    assert_eq!(run.integrity, ok, "{driver:?}, {k} returns: integrity");
+                    assert_eq!(
+                        run.rewritten,
+                        Ok(()),
+                        "{driver:?}, {k} returns: the keys the transaction wrote, written again"
+                    );
+                }
+            }
+
+            /// The sweep with the reads of the `k`-th return's wait failing (#5843). Each driver
+            /// does with the failure what it is for. The cursor's owed rollback is kept failed,
+            /// and the COMMIT that meets it fails and rolls the transaction back whole. A commit's
+            /// ending makes the commit the transaction's rollback, the failure its outcome. A
+            /// rollback's ending leaves the transaction where it stands and the database failed
+            /// until it is reopened. Nothing steps a failed rollback again: such a step stops the
+            /// process. A failure ends each run with `r` as before the transaction; a `k` whose
+            /// wait read nothing ends as the rollback does; at least one `k` fails; and the
+            /// integrity check is ok after each.
+            fn failing_at_each_wait(driver: Driver) {
+                let whole = swept(driver, usize::MAX, false);
+                let ok = vec![vec![text("ok")]];
+                let mut failures = 0;
+                for k in 1..=whole.returns {
+                    let run = swept(driver, k, true);
+                    assert_eq!(run.integrity, ok, "{driver:?}, read {k} failing: integrity");
+                    assert_eq!(
+                        run.rewritten,
+                        Ok(()),
+                        "{driver:?}, read {k} failing: the keys the transaction wrote, written again"
+                    );
+                    let Some(failure) = &run.failed else {
+                        assert_eq!(
+                            (&run.ended, &run.left, &run.after),
+                            (&Ok(()), &None, swept_want(driver, &run)),
+                            "{driver:?}, read {k} failing: no failure, yet not as the rollback ends"
+                        );
+                        continue;
+                    };
+                    failures += 1;
+                    let how = (run.kept_failed, run.ended.is_err(), run.left.is_some());
+                    let want = match driver {
+                        Driver::Settle => (true, true, false),
+                        Driver::CommitEnding => (false, true, false),
+                        Driver::RollbackEnding => (false, true, true),
+                    };
+                    assert_eq!(
+                        how, want,
+                        "{driver:?}, read {k} failing ({failure}): (the owed rollback kept failed, \
+                         the transaction's end failed, the database failed)"
+                    );
+                    assert_eq!(
+                        run.after, run.base,
+                        "{driver:?}, read {k} failing ({failure}): r once the transaction ended"
+                    );
+                }
+                assert!(
+                    failures > 0,
+                    "{driver:?}: no read failing at any of the {} returns failed the rollback",
+                    whole.returns
+                );
+            }
+
+            #[test]
+            fn an_owed_rollback_settled_returning_at_each_wait_ends_as_one_that_never_returned() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_rollback_settled_returning_at_each_wait_ends_as_one_that_never_returned"
+                    ),
+                    || returning_at_each_wait(Driver::Settle),
+                );
+            }
+
+            #[test]
+            fn an_owed_rollback_a_commit_finishes_returning_at_each_wait_ends_as_one_that_never_returned(
+            ) {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_rollback_a_commit_finishes_returning_at_each_wait_ends_as_one_that_never_returned"
+                    ),
+                    || returning_at_each_wait(Driver::CommitEnding),
+                );
+            }
+
+            #[test]
+            fn a_whole_rollback_returning_at_each_wait_ends_as_one_that_never_returned() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_whole_rollback_returning_at_each_wait_ends_as_one_that_never_returned"
+                    ),
+                    || returning_at_each_wait(Driver::RollbackEnding),
+                );
+            }
+
+            #[test]
+            fn an_owed_rollback_settled_whose_read_fails_at_each_wait_stays_failed_and_rolls_back_whole(
+            ) {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_rollback_settled_whose_read_fails_at_each_wait_stays_failed_and_rolls_back_whole"
+                    ),
+                    || failing_at_each_wait(Driver::Settle),
+                );
+            }
+
+            #[test]
+            fn an_owed_rollback_a_commit_finishes_whose_read_fails_at_each_wait_makes_the_commit_a_rollback(
+            ) {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::an_owed_rollback_a_commit_finishes_whose_read_fails_at_each_wait_makes_the_commit_a_rollback"
+                    ),
+                    || failing_at_each_wait(Driver::CommitEnding),
+                );
+            }
+
+            #[test]
+            fn a_whole_rollback_whose_read_fails_at_each_wait_fails_the_database_until_reopened() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_whole_rollback_whose_read_fails_at_each_wait_fails_the_database_until_reopened"
+                    ),
+                    || failing_at_each_wait(Driver::RollbackEnding),
                 );
             }
         }

@@ -48,8 +48,6 @@ enum Step {
     Look,
     Put(Put),
     Remove(Remove),
-    /// Done with the entry: on to the one before.
-    Next,
 }
 
 /// What a rollback is working on.
@@ -58,6 +56,8 @@ enum Working {
     Entry(Step),
     /// Putting the transaction's last creation on its list.
     Creation(Put),
+    /// A step failed: its owner drops the rollback.
+    Failed,
 }
 
 /// A rollback in progress: every key a statement after `to` changed, put back, and every tree a
@@ -120,8 +120,22 @@ impl Rollback {
 }
 
 /// Steps `op`, rolling `txn` back as far as `op` says. Done once every key is put back and every
-/// creation undone.
+/// creation undone. One that fails is not stepped again.
 pub fn undo(
+    txns: &Transactions,
+    versions: &Versions,
+    txn: &mut Txn,
+    op: &mut Rollback,
+) -> Result<IOResult<()>> {
+    let stepped = step(txns, versions, txn, op);
+    if stepped.is_err() {
+        op.working = Some(Working::Failed);
+    }
+    stepped
+}
+
+/// [`undo`]'s steps, each worked on where `op` holds it.
+fn step(
     txns: &Transactions,
     versions: &Versions,
     txn: &mut Txn,
@@ -134,21 +148,18 @@ pub fn undo(
         op.sources.reverse();
     }
     loop {
-        let step = match op.working.take() {
+        let step = match &mut op.working {
             Some(Working::Entry(step)) => step,
-            Some(Working::Creation(mut put)) => {
+            Some(Working::Creation(put)) => {
                 let created = *txn.created.last().expect("a creation being undone");
-                match versions.open_plain(created.list).put(&mut put)? {
-                    IOResult::IO(io) => {
-                        op.working = Some(Working::Creation(put));
-                        return Ok(IOResult::IO(io));
-                    }
-                    IOResult::Done(Outcome::Inserted | Outcome::Unchanged) => {
+                match done!(versions.open_plain(created.list).put(put)) {
+                    Outcome::Inserted | Outcome::Unchanged => {
                         txn.created.pop();
                         txn.abandoned.push(created.root);
+                        op.working = None;
                         continue;
                     }
-                    IOResult::Done(other) => {
+                    other => {
                         return Err(LimboError::InternalError(format!(
                             "putting tree {:?} on its list came to {other:?}",
                             created.root
@@ -156,6 +167,7 @@ pub fn undo(
                     }
                 }
             }
+            Some(Working::Failed) => unreachable!("a rollback stepped again after it failed"),
             None => {
                 done!(walk_on(txns, txn, op));
                 let newest = op.left.last().map(|&at| txn.changes.statement_at(at));
@@ -163,14 +175,18 @@ pub fn undo(
                 match (newest, creation) {
                     // A change of the creation's statement or later first: its tree's changes are
                     // undone before the tree is.
-                    (Some(statement), Some(c)) if statement >= c.statement => Step::Look,
+                    (Some(statement), Some(c)) if statement >= c.statement => {}
                     (_, Some(c)) => {
                         op.working = Some(Working::Creation(abandoning(c.root, txn.start)));
                         continue;
                     }
-                    (Some(_), None) => Step::Look,
+                    (Some(_), None) => {}
                     (None, None) => return Ok(IOResult::Done(())),
                 }
+                let Working::Entry(step) = op.working.insert(Working::Entry(Step::Look)) else {
+                    unreachable!("the entry just begun")
+                };
+                step
             }
         };
         let at = *op.left.last().expect("a change being put back");
@@ -181,90 +197,71 @@ pub fn undo(
             }
             None => txn.changes.keyed_at(at)?,
         };
-        let (root, key) = match keyed {
-            Keyed {
-                by_key: true,
-                tree,
-                key,
-                ..
-            } => (tree, key.to_vec()),
+        let Keyed {
+            by_key: true,
+            tree,
+            key,
+            ..
+        } = keyed
+        else {
             // A plain tree's change, a write made plainly and a creation are a statement's only
             // with its own tree, which the creation's lane abandons whole.
-            _ => {
-                op.left.pop();
-                continue;
-            }
+            op.left.pop();
+            op.working = None;
+            continue;
         };
-        let tree = versions.open_tree(root);
-        let next = match step {
-            Step::Look => {
-                op.working = Some(Working::Entry(Step::Look));
-                let current = done!(tree.tree().stored(&key));
-                let current = current.and_then(|c| {
-                    let v = Version::decode(&c.head)?;
-                    ((v.slot, v.ts, v.command) == (txn.slot, txn.start, statement))
-                        .then_some((c, v))
-                });
-                match current {
-                    // Put back already, at a later change of the statement.
-                    None => Step::Next,
-                    Some((current, v)) => {
-                        let mut replaced = match v.prev {
-                            None => None,
-                            Some(ptr) => {
-                                decode_entry(&done!(versions.arenas().read(ptr)).replaced)?
-                            }
-                        };
-                        if let Some(r) = &mut replaced {
-                            restored_reserve(&mut r.head, txns, txn)?;
-                        }
-                        match &replaced {
-                            // A value out of line goes back by its reference, its pages kept.
-                            Some(replaced) => Step::Put(
-                                Put::restoring(&key, replaced, Mode::Update)
-                                    .expecting(Some(&current)),
-                            ),
-                            None => Step::Remove(Remove::new(&key).expecting(&current)),
-                        }
+        let tree = versions.open_tree(tree);
+        loop {
+            match step {
+                Step::Look => {
+                    let current = done!(tree.tree().stored(key));
+                    let current = current.and_then(|c| {
+                        let v = Version::decode(&c.head)?;
+                        ((v.slot, v.ts, v.command) == (txn.slot, txn.start, statement))
+                            .then_some((c, v))
+                    });
+                    // None: put back already, at a later change of the statement.
+                    let Some((current, v)) = current else { break };
+                    let mut replaced = match v.prev {
+                        None => None,
+                        Some(ptr) => decode_entry(&done!(versions.arenas().read(ptr)).replaced)?,
+                    };
+                    if let Some(r) = &mut replaced {
+                        restored_reserve(&mut r.head, txns, txn)?;
                     }
+                    *step = match &replaced {
+                        // A value out of line goes back by its reference, its pages kept.
+                        Some(replaced) => Step::Put(
+                            Put::restoring(key, replaced, Mode::Update).expecting(Some(&current)),
+                        ),
+                        None => Step::Remove(Remove::new(key).expecting(&current)),
+                    };
+                }
+                Step::Put(put) => match done!(tree.tree().put(put)) {
+                    // Changed since the look: look again.
+                    Outcome::Changed => *step = Step::Look,
+                    _ => {
+                        #[cfg(test)]
+                        {
+                            op.put_back += 1;
+                        }
+                        break;
+                    }
+                },
+                Step::Remove(remove) => {
+                    if done!(tree.tree().remove(remove)) {
+                        #[cfg(test)]
+                        {
+                            op.put_back += 1;
+                        }
+                        break;
+                    }
+                    *step = Step::Look;
                 }
             }
-            Step::Put(mut put) => match tree.tree().put(&mut put)? {
-                IOResult::IO(io) => {
-                    op.working = Some(Working::Entry(Step::Put(put)));
-                    return Ok(IOResult::IO(io));
-                }
-                // Changed since the look: look again.
-                IOResult::Done(Outcome::Changed) => Step::Look,
-                IOResult::Done(_) => {
-                    #[cfg(test)]
-                    {
-                        op.put_back += 1;
-                    }
-                    Step::Next
-                }
-            },
-            Step::Remove(mut remove) => match tree.tree().remove(&mut remove)? {
-                IOResult::IO(io) => {
-                    op.working = Some(Working::Entry(Step::Remove(remove)));
-                    return Ok(IOResult::IO(io));
-                }
-                IOResult::Done(true) => {
-                    #[cfg(test)]
-                    {
-                        op.put_back += 1;
-                    }
-                    Step::Next
-                }
-                IOResult::Done(false) => Step::Look,
-            },
-            Step::Next => {
-                op.left.pop();
-                op.working = None;
-                continue;
-            }
-        };
-        op.working = Some(Working::Entry(next));
+        }
+        op.left.pop();
+        op.working = None;
     }
 }
 

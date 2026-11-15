@@ -1229,6 +1229,46 @@ mod tests {
             "ordinary",
         ),
         (
+            "txn/rollback/tests.rs",
+            "a_rollback_stepped_again_after_it_failed_stops_the_process",
+            "child",
+        ),
+        (
+            "txn/rollback/tests.rs",
+            "undone_creations_go_on_the_list_and_the_rest_stay_with_their_earlier_changes",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_owed_rollback_settled_returning_at_each_wait_ends_as_one_that_never_returned",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_owed_rollback_a_commit_finishes_returning_at_each_wait_ends_as_one_that_never_returned",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_whole_rollback_returning_at_each_wait_ends_as_one_that_never_returned",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_owed_rollback_settled_whose_read_fails_at_each_wait_stays_failed_and_rolls_back_whole",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_owed_rollback_a_commit_finishes_whose_read_fails_at_each_wait_makes_the_commit_a_rollback",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_whole_rollback_whose_read_fails_at_each_wait_fails_the_database_until_reopened",
+            "child",
+        ),
+        (
             "txn/gate/tests.rs",
             "a_write_without_the_gate_is_refused_at_commit",
             "child",

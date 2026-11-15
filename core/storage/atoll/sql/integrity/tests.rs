@@ -680,16 +680,28 @@ enum Called {
     Failed(String),
 }
 
-/// One call of `stmt` in a test frame, the IO thread held through it.
+/// One call of `stmt` in a test frame, the IO thread held through it. A yield is called again, as a
+/// poller calls again a statement that yielded: a cooperative statement may yield before its first
+/// IO, while a checkpoint it waits for runs on another thread, and under load it does.
 fn called(db: &Database, stmt: &mut crate::Statement) -> Called {
     use crate::storage::atoll::sql::mode::WALKED_AT_IO;
     let walked = WALKED_AT_IO.with(|w| w.borrow().len());
-    let held = held_io(db);
-    let stepped = {
-        let _frame = crate::storage::atoll::cooperative::Frame::enter();
-        stmt.step()
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let stepped = loop {
+        let held = held_io(db);
+        let stepped = {
+            let _frame = crate::storage::atoll::cooperative::Frame::enter();
+            stmt.step()
+        };
+        drop(held);
+        if !matches!(stepped, Ok(crate::StepResult::Yield)) {
+            break stepped;
+        }
+        if std::time::Instant::now() >= end {
+            return Called::Failed("it yielded for 20 seconds".to_string());
+        }
+        std::thread::yield_now();
     };
-    drop(held);
     match stepped {
         Ok(crate::StepResult::IO) => {
             let place = WALKED_AT_IO.with(|w| {

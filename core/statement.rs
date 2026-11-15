@@ -913,10 +913,24 @@ impl Statement {
     /// arming, busy handler, metrics recording, and schema retry.
     /// The parent statement handles all of those concerns.
     #[inline]
+    /// One step of a nested statement (a trigger's subprogram, a foreign key's action). Inside a
+    /// cooperative frame it is charged to the frame's budget (ASYNC1 D2e (iv), R2): its countdown is
+    /// first cut to what the budget has left, so a cached subprogram does not carry its old
+    /// countdown past the budget (#5724 condition 1), and the instructions it ran are charged as it
+    /// returns. Its own checks charge and stop it as the top statement's do.
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
-        self.program
+        let framed = crate::storage::atoll::sql::mode::PollBudget::inside();
+        if framed {
+            self.state.clamp_to_poll_budget();
+        }
+        let stepped = self
+            .program
             .step(&mut self.state, &self.pager, self.query_mode, None)
-            .map_err(|err| *err)
+            .map_err(|err| *err);
+        if framed {
+            self.state.charge_poll_budget();
+        }
+        stepped
     }
 
     fn format_error(&self, error: LimboError) -> LimboError {

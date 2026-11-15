@@ -3111,6 +3111,50 @@ impl OwedFlag {
     }
 }
 
+/// A cooperative frame's budget of work units, as code outside Atoll reads and charges it (ASYNC1
+/// D2e (iv)): the thread's frame mark and what is left of its outermost frame's budget. It holds
+/// no Atoll state, and reading or charging it drives, wakes and cleans up nothing.
+pub struct PollBudget;
+
+impl PollBudget {
+    /// Whether this thread is inside a cooperative frame.
+    #[inline]
+    pub fn inside() -> bool {
+        crate::storage::atoll::cooperative::inside()
+    }
+
+    /// What is left of the frame's budget, called inside a frame.
+    #[inline]
+    pub fn remaining() -> u32 {
+        crate::storage::atoll::cooperative::remaining()
+    }
+
+    /// Charges `units` to the frame's budget, called inside a frame: whether it is spent.
+    #[inline]
+    pub fn charge(units: u64) -> bool {
+        crate::storage::atoll::cooperative::charge(units)
+    }
+
+    /// Whether this thread is inside a frame whose budget is spent.
+    #[inline]
+    pub fn spent() -> bool {
+        crate::storage::atoll::cooperative::poll_budget_spent()
+    }
+
+    /// Counts one VDBE instruction dispatched on this thread, for a test (proof 1).
+    #[cfg(test)]
+    #[inline]
+    pub fn count_dispatch_for_test() {
+        crate::storage::atoll::cooperative::DISPATCHED.with(|d| d.set(d.get() + 1));
+    }
+
+    /// Records a periodic check at `vm_steps` on this thread, for a test (IV-2's proof).
+    #[cfg(test)]
+    pub fn count_check_for_test(vm_steps: u64) {
+        crate::storage::atoll::cooperative::CHECKS.with(|c| c.borrow_mut().push(vm_steps));
+    }
+}
+
 /// An open transaction taken out of its connection to be ended ([`ConnTxn::take_to_end`]), with the
 /// header fields it wrote and the stamps of the trees it wrote.
 type EndedTxn = (

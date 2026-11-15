@@ -1348,6 +1348,21 @@ mod tests {
             "a_reparse_that_fails_in_its_build_keeps_its_connections_schema",
             "child",
         ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "only_a_stop_for_the_budget_wakes_its_own_waker",
+            "child",
+        ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "each_call_of_an_atoll_statement_in_a_frame_runs_at_most_its_budget",
+            "child",
+        ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "a_reset_of_a_statements_counters_resets_its_budget_mark",
+            "child",
+        ),
     ];
 
     /// Every `should_panic`, `catch_unwind` and child-process test in Atoll is listed with its
@@ -1470,6 +1485,8 @@ mod tests {
     /// reparse's `PinHold`, `PinAt` and `PinPermit` are ids and a phase, and a pin's release hands
     /// out `ReleaseStep`, an error, a flag and `PinClear`, an id whose drop unconsumed is a broken
     /// invariant: the registration they name lives in the transaction's slot (ASYNC1 D2e (iii-c)).
+    /// `PollBudget` reads and charges the thread's frame mark and budget, two thread-local
+    /// counters, and nothing of the engine (ASYNC1 D2e (iv)).
     const PLAIN: &[&str] = &[
         "AtollConfig",
         "Begin",
@@ -1480,6 +1497,7 @@ mod tests {
         "LogConfig",
         "OwedFlag",
         "NO_PAGE_CAP",
+        "PollBudget",
         "PinAt",
         "PinClear",
         "PinHold",

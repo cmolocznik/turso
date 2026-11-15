@@ -15255,3 +15255,6 @@ mod reparse_failed_in_its_build {
         );
     }
 }
+
+/// A cooperative frame's budget of work (ASYNC1 D2e (iv-a)).
+mod poll_budget;

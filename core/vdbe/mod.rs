@@ -1174,6 +1174,9 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// `metrics.vm_steps` when a cooperative frame's budget was last charged for this state's
+    /// instructions (ASYNC1 D2e (iv)).
+    charged_at: u64,
     io_completions: Option<PendingIO>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
@@ -1442,6 +1445,7 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            charged_at: 0,
             io_completions: None,
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
@@ -1955,6 +1959,26 @@ impl ProgramState {
         self.statements_hold = None;
     }
 
+    /// Charges the frame's budget for the instructions this state ran since it was last charged,
+    /// inside a frame (ASYNC1 D2e (iv)): whether the budget is spent.
+    pub(crate) fn charge_poll_budget(&mut self) -> bool {
+        let steps = self.metrics.vm_steps;
+        turso_assert!(
+            steps >= self.charged_at,
+            "a budget's mark past the statement's own steps"
+        );
+        let ran = steps - self.charged_at;
+        self.charged_at = steps;
+        crate::storage::atoll::sql::mode::PollBudget::charge(ran)
+    }
+
+    /// Cuts this state's countdown to what the frame's budget has left, at least 1, so its next
+    /// check comes within the budget, inside a frame (ASYNC1 D2e (iv)).
+    pub(crate) fn clamp_to_poll_budget(&mut self) {
+        let left = u64::from(crate::storage::atoll::sql::mode::PollBudget::remaining());
+        self.check_countdown = self.check_countdown.min(left).max(1);
+    }
+
     /// Parks the completion an instruction waits for and answers the result
     /// the instruction returns for it. The dispatch loop takes the
     /// completion back with [`Self::take_suspended_io`] before it decides
@@ -2098,6 +2122,8 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
+        // The budget's mark is on `vm_steps`, which the reset sets back to 0 (ASYNC1 D2e (iv)).
+        self.charged_at = 0;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -3093,7 +3119,7 @@ impl Program {
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
-                        if let Some(result) = program.periodic_checks(state, pager) {
+                        if let Some(result) = program.periodic_checks(state, pager, waker) {
                             return result;
                         }
                     }
@@ -3105,6 +3131,8 @@ impl Program {
 
                     // Always increment VM steps for every loop iteration
                     state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
+                    #[cfg(test)]
+                    crate::storage::atoll::sql::mode::PollBudget::count_dispatch_for_test();
 
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
@@ -3380,7 +3408,14 @@ impl Program {
     }
 
     #[inline(never)]
-    fn periodic_checks(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
+    fn periodic_checks(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        #[cfg(test)]
+        crate::storage::atoll::sql::mode::PollBudget::count_check_for_test(state.metrics.vm_steps);
         let progress_ops = self.connection.progress_ops();
         state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
             MAX_CHECK_INTERVAL
@@ -3388,6 +3423,12 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
+        // A cooperative frame's budget (ASYNC1 D2e (iv)): the synchronous API carries none.
+        if crate::storage::atoll::sql::mode::PollBudget::inside() {
+            if let Some(step) = Self::charge_budget(state, waker) {
+                return Some(step);
+            }
+        }
         if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
@@ -3402,6 +3443,27 @@ impl Program {
             return None;
         }
         self.periodic_interrupt_checks(state, pager)
+    }
+
+    /// Charges the frame's budget for the instructions this state has run since it was last
+    /// charged. Spent, the state yields with a wait that wakes its own waker, before the
+    /// instruction at its `pc`; its countdown is left at 1, so its next step looks at once, in
+    /// whatever budget that step's frame has. Not spent, the countdown is cut to what is left. A
+    /// progress handler may be called once more for each stop: the check after a stop or a cut
+    /// countdown takes its previous consultation to be one full interval back.
+    #[cold]
+    #[inline(never)]
+    fn charge_budget(state: &mut ProgramState, waker: Option<&Waker>) -> Option<ProgramStep> {
+        if state.charge_poll_budget() {
+            state.check_countdown = 1;
+            state.io_completions = Some(PendingIO::new(IOCompletions(
+                crate::Completion::new_yield(),
+            )));
+            state.set_pending_io_waker(waker);
+            return Some(ProgramStep::IO);
+        }
+        state.clamp_to_poll_budget();
+        None
     }
 
     #[inline(never)]

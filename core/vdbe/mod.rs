@@ -1167,6 +1167,16 @@ struct PendingIO {
     settle: bool,
 }
 
+/// Where a poll's step stands against its frame's budget (ASYNC1 D2e (iv)), kept for that step
+/// alone: `charged`, the state's `vm_steps` when the budget was last charged for it; and `free`,
+/// the `vm_steps` the step's first dispatch reaches if the state was already running at the step's
+/// entry, else the entry's own, so only a running state's first dispatch ever equals it.
+#[derive(Debug, Default)]
+pub(crate) struct BudgetMarks {
+    pub(crate) charged: u64,
+    pub(crate) free: u64,
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1174,9 +1184,6 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
-    /// `metrics.vm_steps` when a cooperative frame's budget was last charged for this state's
-    /// instructions (ASYNC1 D2e (iv)).
-    charged_at: u64,
     io_completions: Option<PendingIO>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
@@ -1445,7 +1452,6 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
-            charged_at: 0,
             io_completions: None,
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
@@ -1959,16 +1965,17 @@ impl ProgramState {
         self.statements_hold = None;
     }
 
-    /// Charges the frame's budget for the instructions this state ran since it was last charged,
-    /// inside a frame (ASYNC1 D2e (iv)): whether the budget is spent.
-    pub(crate) fn charge_poll_budget(&mut self) -> bool {
+    /// Charges the frame's budget for the instructions this state ran since `mark`, its
+    /// `vm_steps` when a poll's step began or was last charged ([`BudgetMarks::charged`]), and
+    /// moves `mark` to now, inside a frame (ASYNC1 D2e (iv)): whether the budget is spent.
+    pub(crate) fn charge_poll_budget(&self, mark: &mut u64) -> bool {
         let steps = self.metrics.vm_steps;
         turso_assert!(
-            steps >= self.charged_at,
+            steps >= *mark,
             "a budget's mark past the statement's own steps"
         );
-        let ran = steps - self.charged_at;
-        self.charged_at = steps;
+        let ran = steps - *mark;
+        *mark = steps;
         crate::storage::atoll::sql::mode::PollBudget::charge(ran)
     }
 
@@ -1977,6 +1984,33 @@ impl ProgramState {
     pub(crate) fn clamp_to_poll_budget(&mut self) {
         let left = u64::from(crate::storage::atoll::sql::mode::PollBudget::remaining());
         self.check_countdown = self.check_countdown.min(left).max(1);
+    }
+
+    /// [`clamp_to_poll_budget`](Self::clamp_to_poll_budget) at a poll's step entry, but with
+    /// nothing left a state already `running` gets a countdown of 2: its first dispatch comes
+    /// before its first check, whatever the budget.
+    pub(crate) fn clamp_at_poll_entry(&mut self, running: bool) {
+        let left = u64::from(crate::storage::atoll::sql::mode::PollBudget::remaining());
+        self.check_countdown = if left == 0 {
+            1 + u64::from(running)
+        } else {
+            self.check_countdown.min(left).max(1)
+        };
+    }
+
+    /// The budget's stop before a step in a frame of no budget (`Statement::step_in_frame`, which
+    /// is test-only until (v)): the state yields with a wait that wakes its own waker, before the
+    /// instruction at its `pc`, and its countdown is left at 1, so its next step looks at once, in
+    /// whatever budget that step's frame has. A wait already parked is kept, its waker set.
+    #[cfg(test)]
+    pub(crate) fn stop_for_budget(&mut self, waker: Option<&Waker>) {
+        self.check_countdown = 1;
+        if self.io_completions.is_none() {
+            self.io_completions = Some(PendingIO::new(IOCompletions(
+                crate::Completion::new_yield(),
+            )));
+        }
+        self.set_pending_io_waker(waker);
     }
 
     /// Parks the completion an instruction waits for and answers the result
@@ -2122,8 +2156,6 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
-        // The budget's mark is on `vm_steps`, which the reset sets back to 0 (ASYNC1 D2e (iv)).
-        self.charged_at = 0;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -2736,7 +2768,7 @@ impl Program {
 
     #[turso_macros::trace_stack]
     #[inline(always)]
-    pub fn step(
+    pub fn step<const POLLED: bool>(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
@@ -2744,7 +2776,7 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         if let QueryMode::Normal = query_mode {
-            return self.normal_step(state, pager, waker).into();
+            return self.normal_step::<POLLED>(state, pager, waker).into();
         }
         state.execution_state = ProgramExecutionState::Running;
         let result = self.explain_step_for_mode(state, pager, query_mode);
@@ -3012,22 +3044,49 @@ impl Program {
         state.pre_op_registers = Some(snapshots);
     }
 
-    /// Step in [QueryMode::Normal]
+    /// Step in [QueryMode::Normal]. `POLLED` for a poll's step, made inside a cooperative frame
+    /// (`Statement::step_in_frame`), the only steps the frame's budget is charged in (ASYNC1 D2e
+    /// (iv)): every other step runs the loop with nothing of the budget in it.
     #[inline(always)]
-    pub(crate) fn normal_step(
+    pub(crate) fn normal_step<const POLLED: bool>(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
+        // Read before the step marks the state running: whether a poll's step continues a
+        // statement already running (ASYNC1 D2e (iv), `poll_step`).
+        let running = POLLED && matches!(state.execution_state, ProgramExecutionState::Running);
         state.execution_state = ProgramExecutionState::Running;
         state.steps_with_waker = waker.is_some();
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+            if POLLED {
+                dispatch_loop_traced_polled(
+                    self,
+                    state,
+                    pager,
+                    waker,
+                    running,
+                    enable_tracing,
+                    vdbe_trace,
+                )
+            } else {
+                dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+            }
+        } else if POLLED {
+            poll_step::<false>(self, state, pager, waker, running, false, false)
         } else {
-            dispatch_loop::<false>(self, state, pager, waker, false, false)
+            dispatch_loop::<false, false>(
+                self,
+                state,
+                pager,
+                waker,
+                &mut BudgetMarks::default(),
+                false,
+                false,
+            )
         };
         match &result {
             ProgramStep::Row => {}
@@ -3060,15 +3119,86 @@ impl Program {
             enable_tracing: bool,
             vdbe_trace: bool,
         ) -> ProgramStep {
-            dispatch_loop::<true>(program, state, pager, waker, enable_tracing, vdbe_trace)
+            dispatch_loop::<true, false>(
+                program,
+                state,
+                pager,
+                waker,
+                &mut BudgetMarks::default(),
+                enable_tracing,
+                vdbe_trace,
+            )
         }
 
-        #[inline(always)]
-        fn dispatch_loop<const TRACE: bool>(
+        /// [`dispatch_loop_traced`] for a poll's step.
+        #[inline(never)]
+        fn dispatch_loop_traced_polled(
             program: &Program,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
             waker: Option<&Waker>,
+            running: bool,
+            enable_tracing: bool,
+            vdbe_trace: bool,
+        ) -> ProgramStep {
+            poll_step::<true>(
+                program,
+                state,
+                pager,
+                waker,
+                running,
+                enable_tracing,
+                vdbe_trace,
+            )
+        }
+
+        /// A poll's step (ASYNC1 D2e (iv)). Every dispatch is charged: at a check, before a
+        /// subprogram steps (`run_program`), and at the exit. A check whose charge finds the budget
+        /// spent stops the state before its next instruction, with a self-woken yield. But a state
+        /// already running at this step's entry makes its first dispatch here whatever the budget:
+        /// with nothing left its countdown is 2, so that dispatch comes before its first check. A
+        /// parent's first step of a subprogram inside that first dispatch (`vm_steps ==
+        /// marks.free`) is made the same way; any later one under a spent budget stops the parent
+        /// before it steps the subprogram. So a call runs the chain of statements it continues and
+        /// one instruction, then the budget holds: at most max(budget, depth + 1) dispatches.
+        /// Nothing is kept between calls. A frame of no budget runs nothing:
+        /// `Statement::step_in_frame` stops before the step, ahead of any first dispatch.
+        #[inline(always)]
+        fn poll_step<const TRACE: bool>(
+            program: &Program,
+            state: &mut ProgramState,
+            pager: &Arc<Pager>,
+            waker: Option<&Waker>,
+            running: bool,
+            enable_tracing: bool,
+            vdbe_trace: bool,
+        ) -> ProgramStep {
+            state.clamp_at_poll_entry(running);
+            let began = state.metrics.vm_steps;
+            let mut marks = BudgetMarks {
+                charged: began,
+                free: began + u64::from(running),
+            };
+            let stepped = dispatch_loop::<TRACE, true>(
+                program,
+                state,
+                pager,
+                waker,
+                &mut marks,
+                enable_tracing,
+                vdbe_trace,
+            );
+            state.charge_poll_budget(&mut marks.charged);
+            stepped
+        }
+
+        #[inline(always)]
+        fn dispatch_loop<const TRACE: bool, const POLLED: bool>(
+            program: &Program,
+            state: &mut ProgramState,
+            pager: &Arc<Pager>,
+            waker: Option<&Waker>,
+            marks: &mut BudgetMarks,
             enable_tracing: bool,
             vdbe_trace: bool,
         ) -> ProgramStep {
@@ -3080,6 +3210,8 @@ impl Program {
             // handed out between step calls, and ResultRow returns immediately
             // after setting a fresh one.
             let _ = state.result_row.take();
+            #[cfg(test)]
+            let mut first_dispatch_for_test = true;
             // The outer loop runs once per step call and is re-entered only when an
             // instruction completed its IO inline; the inner loop dispatches
             // instructions without re-inspecting the completion slot every time.
@@ -3119,7 +3251,12 @@ impl Program {
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
-                        if let Some(result) = program.periodic_checks(state, pager, waker) {
+                        let checked = if POLLED {
+                            program.periodic_checks_polled(state, pager, waker, &mut marks.charged)
+                        } else {
+                            program.periodic_checks(state, pager)
+                        };
+                        if let Some(result) = checked {
                             return result;
                         }
                     }
@@ -3133,6 +3270,19 @@ impl Program {
                     state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
                     #[cfg(test)]
                     crate::storage::atoll::sql::mode::PollBudget::count_dispatch_for_test();
+                    #[cfg(test)]
+                    if POLLED {
+                        use crate::storage::atoll::sql::mode::PollBudget;
+                        if std::mem::take(&mut first_dispatch_for_test) {
+                            PollBudget::count_first_dispatch_for_test(
+                                std::ptr::from_ref::<ProgramState>(state) as usize,
+                                state.metrics.vm_steps == marks.free,
+                            );
+                        }
+                        if PollBudget::remaining() == 0 {
+                            PollBudget::count_free_for_test();
+                        }
+                    }
 
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
@@ -3176,6 +3326,10 @@ impl Program {
                         Insn::Gosub { .. } => step_inline!(execute::op_gosub),
                         Insn::Return { .. } => step_inline!(execute::op_return),
                         Insn::Integer { .. } => step_inline!(execute::op_integer),
+                        // A poll's nested program is stepped as a poll's step too.
+                        Insn::Program { .. } if POLLED => {
+                            execute::op_program_polled(program, state, insn, pager, marks)
+                        }
                         _ => insn.to_function()(program, state, insn, pager),
                     };
                     // The two outcomes of every row are tested here, one compare
@@ -3408,11 +3562,41 @@ impl Program {
     }
 
     #[inline(never)]
-    fn periodic_checks(
+    fn periodic_checks(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
+        #[cfg(test)]
+        crate::storage::atoll::sql::mode::PollBudget::count_check_for_test(state.metrics.vm_steps);
+        let progress_ops = self.connection.progress_ops();
+        state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
+            MAX_CHECK_INTERVAL
+        } else {
+            progress_ops
+        };
+        state.check_countdown = state.check_interval;
+        if self.connection.is_closed() {
+            return Some(ProgramStep::Error(self.closed_during_step(pager)));
+        }
+        // With no interrupt requested, no deadline and no progress handler
+        // there is nothing to look at; the full test stays out of this
+        // function so it is a leaf.
+        let quiet = !state.is_interrupted()
+            && !self.connection.is_interrupted()
+            && state.query_deadline.is_none()
+            && progress_ops == 0;
+        if quiet {
+            return None;
+        }
+        self.periodic_interrupt_checks(state, pager)
+    }
+
+    /// [`periodic_checks`](Self::periodic_checks) for a poll's step: the frame's budget is charged
+    /// once the countdown is reloaded (ASYNC1 D2e (iv)).
+    #[inline(never)]
+    fn periodic_checks_polled(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
+        mark: &mut u64,
     ) -> Option<ProgramStep> {
         #[cfg(test)]
         crate::storage::atoll::sql::mode::PollBudget::count_check_for_test(state.metrics.vm_steps);
@@ -3423,18 +3607,12 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
-        // A cooperative frame's budget (ASYNC1 D2e (iv)): the synchronous API carries none.
-        if crate::storage::atoll::sql::mode::PollBudget::inside() {
-            if let Some(step) = Self::charge_budget(state, waker) {
-                return Some(step);
-            }
+        if let Some(step) = Self::charge_budget(state, waker, mark) {
+            return Some(step);
         }
         if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
-        // With no interrupt requested, no deadline and no progress handler
-        // there is nothing to look at; the full test stays out of this
-        // function so it is a leaf.
         let quiet = !state.is_interrupted()
             && !self.connection.is_interrupted()
             && state.query_deadline.is_none()
@@ -3453,8 +3631,12 @@ impl Program {
     /// countdown takes its previous consultation to be one full interval back.
     #[cold]
     #[inline(never)]
-    fn charge_budget(state: &mut ProgramState, waker: Option<&Waker>) -> Option<ProgramStep> {
-        if state.charge_poll_budget() {
+    fn charge_budget(
+        state: &mut ProgramState,
+        waker: Option<&Waker>,
+        mark: &mut u64,
+    ) -> Option<ProgramStep> {
+        if state.charge_poll_budget(mark) {
             state.check_countdown = 1;
             state.io_completions = Some(PendingIO::new(IOCompletions(
                 crate::Completion::new_yield(),

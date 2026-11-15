@@ -3162,6 +3162,49 @@ impl PollBudget {
         crate::storage::atoll::cooperative::DISPATCHED.with(|d| d.set(d.get() + 1));
     }
 
+    /// Begins a call on this thread, for a test: a top statement's poll's step, and every program
+    /// state stepped beneath it, none of which has dispatched yet.
+    #[cfg(test)]
+    pub fn begin_call_for_test() {
+        crate::storage::atoll::cooperative::DISPATCHED_IN_CALL.with(|d| d.borrow_mut().clear());
+    }
+
+    /// Counts the first dispatch of a poll's step of the program state at `state`, for a test: the
+    /// state is continued if it is the state's first dispatch in the call and the poll's step found
+    /// it `running`. A wait that finished at once can step a state again in the same call; it is
+    /// still one state.
+    #[cfg(test)]
+    pub fn count_first_dispatch_for_test(state: usize, running: bool) {
+        use crate::storage::atoll::cooperative::{CONTINUED, DISPATCHED_IN_CALL};
+        let first = DISPATCHED_IN_CALL.with(|d| {
+            let mut seen = d.borrow_mut();
+            let first = !seen.contains(&state);
+            if first {
+                seen.push(state);
+            }
+            first
+        });
+        if first && running {
+            CONTINUED.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Counts one dispatch made while the frame's budget is spent, for a test.
+    #[cfg(test)]
+    #[inline]
+    pub fn count_free_for_test() {
+        crate::storage::atoll::cooperative::FREE.with(|d| d.set(d.get() + 1));
+    }
+
+    /// Runs, once, what a test set to do with a subprogram's wait before its parent parks it.
+    #[cfg(test)]
+    pub fn before_parent_parks_for_test(wait: &crate::Completion) {
+        let hook = crate::storage::atoll::cooperative::BEFORE_PARENT_PARKS.with(|h| h.take());
+        if let Some(hook) = hook {
+            hook(wait);
+        }
+    }
+
     /// Records a periodic check at `vm_steps` on this thread, for a test (IV-2's proof).
     #[cfg(test)]
     pub fn count_check_for_test(vm_steps: u64) {

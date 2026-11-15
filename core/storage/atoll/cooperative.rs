@@ -21,9 +21,28 @@ crate::thread::thread_local! {
     /// The VDBE instructions dispatched on this thread, over every program state, for a test: a
     /// count beside the budget, not the budget (ASYNC1 D2e (iv), proof 1).
     pub(crate) static DISPATCHED: Cell<u64> = const { Cell::new(0) };
+    /// The program states continued on this thread, for a test: each one already running at the
+    /// poll's step of its first dispatch in a call, counted once a call, over every program state.
+    /// That first dispatch is made whatever the budget.
+    pub(crate) static CONTINUED: Cell<u64> = const { Cell::new(0) };
+    /// The program states that have dispatched in this thread's current call, by address, for a
+    /// test: what `CONTINUED` has already seen in the call.
+    pub(crate) static DISPATCHED_IN_CALL: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The dispatches made on this thread while the frame's budget was spent, for a test.
+    pub(crate) static FREE: Cell<u64> = const { Cell::new(0) };
+    /// The units charged to the budget, for a test: what every charge was asked to take.
+    pub(crate) static CHARGED: Cell<u64> = const { Cell::new(0) };
+    /// What a test does with a subprogram's wait before its parent parks it, once.
+    pub(crate) static BEFORE_PARENT_PARKS: std::cell::RefCell<Option<ParentParks>> =
+        const { std::cell::RefCell::new(None) };
     /// The `vm_steps` of each periodic check on this thread, in order, for a test (IV-2's proof).
     pub(crate) static CHECKS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// What a test does with a subprogram's wait before its parent parks it.
+#[cfg(test)]
+pub(crate) type ParentParks = Box<dyn FnOnce(&crate::Completion)>;
 
 /// A cooperative frame open on this thread until it drops. Left on the thread that entered it.
 #[cfg(test)]
@@ -80,6 +99,8 @@ pub(crate) fn remaining() -> u32 {
 /// Charges `units` to this thread's frame budget, called inside a frame: whether it is spent.
 #[inline]
 pub(crate) fn charge(units: u64) -> bool {
+    #[cfg(test)]
+    CHARGED.with(|c| c.set(c.get() + units));
     BUDGET.with(|b| {
         let left = u64::from(b.get()).saturating_sub(units);
         b.set(left as u32);

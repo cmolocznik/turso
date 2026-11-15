@@ -1373,6 +1373,26 @@ mod tests {
             "a_reset_of_a_statements_counters_resets_its_budget_mark",
             "child",
         ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "a_call_after_a_row_charges_its_first_instruction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "a_trigger_continued_inside_its_call_is_charged_again",
+            "child",
+        ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "a_call_that_dispatches_nothing_leaves_the_budget_as_it_found_it",
+            "child",
+        ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "drawn_statements_budgets_and_waits_keep_the_bound_and_conserve_the_units",
+            "child",
+        ),
     ];
 
     /// Every `should_panic`, `catch_unwind` and child-process test in Atoll is listed with its

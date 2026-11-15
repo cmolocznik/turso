@@ -189,7 +189,7 @@ use crate::{
     json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
 };
 
-use super::{Program, ProgramState, Register};
+use super::{BudgetMarks, Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
@@ -6234,6 +6234,32 @@ pub fn op_program(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    run_program::<false>(program, state, insn, pager, &mut BudgetMarks::default())
+}
+
+/// [`op_program`] in a poll's step: the subprogram is stepped as a poll's step too, charged to a
+/// cooperative frame's budget (ASYNC1 D2e (iv), R2). `marks` are the parent step's: the parent's
+/// instructions since its charged mark are charged before the subprogram steps, so the
+/// subprogram's cut sees the budget that is really left; with the budget spent, only the parent's
+/// first dispatch in its poll's step, a running parent's (`marks.free`), steps the subprogram.
+pub(crate) fn op_program_polled(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    marks: &mut BudgetMarks,
+) -> InsnResult {
+    run_program::<true>(program, state, insn, pager, marks)
+}
+
+#[inline(always)]
+fn run_program<const POLLED: bool>(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    marks: &mut BudgetMarks,
+) -> InsnResult {
     load_insn!(
         Program {
             param_registers,
@@ -6305,12 +6331,37 @@ pub fn op_program(
                 // runs inside the subprogram, it already calls end_trigger_execution(),
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
+                let mut first_step = true;
                 loop {
                     let now = *state
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
-                    let res = statement.step_subprogram();
+                    let res = if POLLED {
+                        // The parent's instructions are charged before the subprogram steps.
+                        // Under a spent budget only the first step of the parent's free first
+                        // dispatch goes on; any later one stops the parent here, its op state
+                        // kept, before it steps the subprogram again.
+                        if state.charge_poll_budget(&mut marks.charged)
+                            && !(first_step && state.metrics.vm_steps == marks.free)
+                        {
+                            *state.active_op_state.program() = OpProgramState::Step {
+                                is_trigger,
+                                statement,
+                                saved_last_insert_rowid,
+                                saved_changes_value: saved_last_changes_value,
+                            };
+                            return Ok(state.suspend_on_io(IOCompletions(Completion::new_yield())));
+                        }
+                        first_step = false;
+                        let stepped = statement.step_subprogram_polled();
+                        // What the subprogram ran is charged: the parent's next instructions are
+                        // cut to what is left.
+                        state.clamp_to_poll_budget();
+                        stepped
+                    } else {
+                        statement.step_subprogram()
+                    };
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
@@ -6318,6 +6369,10 @@ pub fn op_program(
                                 let io = statement
                                     .take_io_completions()
                                     .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                                #[cfg(test)]
+                                if POLLED {
+                                    crate::storage::atoll::sql::mode::PollBudget::before_parent_parks_for_test(&io.0);
+                                }
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,

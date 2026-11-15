@@ -465,11 +465,19 @@ impl Statement {
         }
     }
 
+    /// A step of the synchronous API, with a waker or without one. Not generic, so it is compiled
+    /// once, in this crate, whichever crate calls `step` or `step_with_waker`: a generic one would
+    /// be instantiated again in each calling crate and optimized there apart (ASYNC1 D2e (iv)).
+    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.run_step::<false>(waker)
+    }
+
     /// Every step of a statement passes through here, so the work that only
     /// matters on the first call, the last call, a busy wait or an error is
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    #[inline(always)]
+    fn run_step<const POLLED: bool>(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -499,7 +507,7 @@ impl Statement {
             QueryMode::Normal => {
                 match self
                     .program
-                    .normal_step(&mut self.state, &self.pager, waker)
+                    .normal_step::<POLLED>(&mut self.state, &self.pager, waker)
                 {
                     ProgramStep::Row => {
                         self.state.pending_fresh_tx = None;
@@ -512,9 +520,9 @@ impl Statement {
             }
             _ => self
                 .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
+                .step::<POLLED>(&mut self.state, &self.pager, self.query_mode, waker),
         };
-        self.finish_step(res, waker)
+        self.finish_step::<POLLED>(res, waker)
     }
 
     /// Advance the post-ANALYZE stats refresh. Returns `IO`/`Yield` while the
@@ -625,7 +633,7 @@ impl Statement {
     /// Everything [`Self::_step`] does after the interpreter returned something
     /// other than a row: schema retries, completion, busy handling and errors.
     #[inline(never)]
-    fn finish_step(
+    fn finish_step<const POLLED: bool>(
         &mut self,
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
@@ -659,7 +667,7 @@ impl Statement {
             }
             res = self
                 .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker);
+                .step::<POLLED>(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
         // Atoll mode (DESIGN.md §17, §3.2): a sole autocommit statement that met a conflict, which
@@ -684,7 +692,7 @@ impl Statement {
             }
             res = self
                 .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker);
+                .step::<POLLED>(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
         // A commit in Atoll mode that met a failure once published has finished whole: the
@@ -879,6 +887,20 @@ impl Statement {
         self.state.pc as u64
     }
 
+    /// Whether this statement has begun to end its connection's Atoll transaction and not finished,
+    /// for a test: from then on a reset or a drop leaves the ending to finish (DESIGN.md 22.18).
+    #[cfg(test)]
+    pub(crate) fn ending_begun_for_test(&self) -> bool {
+        self.state.ending_begun()
+    }
+
+    /// The instructions this statement's own program has dispatched, its nested programs' apart,
+    /// for a test.
+    #[cfg(test)]
+    pub(crate) fn own_vm_steps_for_test(&self) -> u64 {
+        self.state.metrics.vm_steps
+    }
+
     /// The pending completion, for tests that count this statement's waiter registrations.
     #[cfg(test)]
     pub(crate) fn pending_io_for_test(&self) -> Option<crate::Completion> {
@@ -909,28 +931,45 @@ impl Statement {
             .map_err(|error| self.format_error(error))
     }
 
+    /// A poll's step, made inside a cooperative frame: it charges the frame's budget and stops
+    /// when the budget is spent (ASYNC1 D2e (iv)). Every other step, `step_with_waker` included,
+    /// carries no budget. In a frame of no budget it runs nothing: it stops here, before the step,
+    /// since the step would make a running statement's first dispatch whatever the budget. Test
+    /// frames call it until the binding's poll does, in (v).
+    #[cfg(test)]
+    pub(crate) fn step_in_frame(&mut self, waker: &Waker) -> Result<StepResult> {
+        debug_assert!(
+            crate::storage::atoll::sql::mode::PollBudget::inside(),
+            "a poll's step outside any cooperative frame"
+        );
+        crate::storage::atoll::sql::mode::PollBudget::begin_call_for_test();
+        if crate::storage::atoll::sql::mode::PollBudget::remaining() == 0 {
+            self.state.stop_for_budget(Some(waker));
+            return Ok(StepResult::IO);
+        }
+        self.run_step::<true>(Some(waker))
+            .map_err(|error| self.format_error(error))
+    }
+
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
     /// arming, busy handler, metrics recording, and schema retry.
     /// The parent statement handles all of those concerns.
     #[inline]
-    /// One step of a nested statement (a trigger's subprogram, a foreign key's action). Inside a
-    /// cooperative frame it is charged to the frame's budget (ASYNC1 D2e (iv), R2): its countdown is
-    /// first cut to what the budget has left, so a cached subprogram does not carry its old
-    /// countdown past the budget (#5724 condition 1), and the instructions it ran are charged as it
-    /// returns. Its own checks charge and stop it as the top statement's do.
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
-        let framed = crate::storage::atoll::sql::mode::PollBudget::inside();
-        if framed {
-            self.state.clamp_to_poll_budget();
-        }
-        let stepped = self
-            .program
-            .step(&mut self.state, &self.pager, self.query_mode, None)
-            .map_err(|err| *err);
-        if framed {
-            self.state.charge_poll_budget();
-        }
-        stepped
+        self.program
+            .step::<false>(&mut self.state, &self.pager, self.query_mode, None)
+            .map_err(|err| *err)
+    }
+
+    /// [`Self::step_subprogram`] when the parent is a poll's step: the nested statement is stepped
+    /// as a poll's step too, in the parent's frame (ASYNC1 D2e (iv), R2). Its poll's step cuts its
+    /// countdown to what the budget has left, as every poll's step does, so a cached subprogram does
+    /// not carry its old countdown past the budget (#5724 condition 1); its checks charge and stop
+    /// it as the top statement's do.
+    pub fn step_subprogram_polled(&mut self) -> Result<StepResult> {
+        self.program
+            .step::<true>(&mut self.state, &self.pager, self.query_mode, None)
+            .map_err(|err| *err)
     }
 
     fn format_error(&self, error: LimboError) -> LimboError {

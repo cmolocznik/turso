@@ -1246,6 +1246,8 @@ impl Connection {
         false
     }
 
+    // Inlined into both forms of op_program, the synchronous one and the poll's (ASYNC1 D2e (iv)).
+    #[inline(always)]
     pub fn start_trigger_execution(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger execution: {}", trigger.name);
         self.executing_triggers.write().push(trigger);

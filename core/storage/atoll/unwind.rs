@@ -1338,6 +1338,16 @@ mod tests {
             "a_check_in_frames_ended_in_its_row_pass_lets_its_connection_go",
             "child",
         ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_whose_joined_view_an_end_took_does_not_finish_in_another_view",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_reparse_that_fails_in_its_build_keeps_its_connections_schema",
+            "child",
+        ),
     ];
 
     /// Every `should_panic`, `catch_unwind` and child-process test in Atoll is listed with its

@@ -333,6 +333,9 @@ pub struct ReparseSchemaInner {
     /// materialized views that are built once the types are loaded.
     parse: Box<crate::util::ParseSchemaRowsState>,
     phase: ReparsePhase,
+    /// The connection's schema before the build put its empty one in place: put back if the
+    /// build fails, so a failed reparse leaves the connection as it found it.
+    previous: Arc<Schema>,
     /// The Atoll pin the reparse reads in, last: every statement above drops before it is
     /// released. None outside Atoll mode and for VACUUM's reparse.
     pin: Option<ReparsePin>,
@@ -1826,6 +1829,7 @@ impl Connection {
                         .pin
                         .as_ref()
                         .is_none_or(|pin| atoll.pin_view_is(&pin.hold));
+                    crate::race::point("reparse.building_checked");
                     let out = if !view {
                         Err(view_changed().into())
                     } else if cfg!(test) && reparse_fails_at("building") {
@@ -1845,6 +1849,9 @@ impl Connection {
                             else {
                                 return Err(e);
                             };
+                            // The arm's own failures too: the schema the build found, put back
+                            // before the pin's release.
+                            self.put_back_schema(inner.previous.clone());
                             let pin = inner.pin.take();
                             drop(inner);
                             reparse_event("statements");
@@ -1882,6 +1889,7 @@ impl Connection {
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
+        let previous = self.schema.read().clone();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1893,7 +1901,13 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = permitted(self.prepare("SELECT * FROM sqlite_schema")?, permit);
+        let stmt = match self.prepare("SELECT * FROM sqlite_schema") {
+            Ok(stmt) => permitted(stmt, permit),
+            Err(e) => {
+                self.put_back_schema(previous);
+                return Err(e);
+            }
+        };
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1907,13 +1921,35 @@ impl Connection {
             preserved_sequences,
             parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
             phase: ReparsePhase::ParseSchema,
+            previous,
             pin: None,
         })
     }
 
+    /// Puts back the schema a failed build found, which its empty one replaced.
+    fn put_back_schema(&self, previous: Arc<Schema>) {
+        *self.schema.write() = previous;
+        self.bump_prepare_context_generation();
+    }
+
     /// Drive the schema-rebuild phases held in `state` (must be `Building`).
-    /// Yields IO; on completion installs the finished schema and resets `state`.
+    /// Yields IO; on completion installs the finished schema and resets `state`. A failure puts
+    /// back the schema the build found, its state left for the caller to end.
     fn drive_reparse_building(
+        self: &Arc<Connection>,
+        state: &mut ReparseSchemaState,
+    ) -> crate::types::IOResultOr<()> {
+        let out = self.drive_reparse_building_steps(state);
+        if out.is_err() {
+            if let ReparseSchemaState::Building(inner) = state {
+                self.put_back_schema(inner.previous.clone());
+            }
+        }
+        out
+    }
+
+    /// [`drive_reparse_building`](Self::drive_reparse_building)'s phases.
+    fn drive_reparse_building_steps(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
     ) -> crate::types::IOResultOr<()> {
@@ -2140,10 +2176,25 @@ impl Connection {
                         preserved_sequences,
                         parse,
                         phase,
+                        previous,
                         pin,
                     } = *inner;
                     drop((parse, phase, preserved_sequences));
                     reparse_event("statements");
+                    // The view looked at once more before the install: an end that took the view
+                    // the pin joined after the Building arm's look leaves rows read in another view
+                    // (the auditor's #5711 item 4). A view is a slot and its start, which name one
+                    // begin, so the same view means every read was in it.
+                    let kept = pin.as_ref().is_none_or(|pin| {
+                        self.atoll()
+                            .is_some_and(|atoll| atoll.pin_view_is(&pin.hold))
+                    });
+                    if !kept {
+                        self.put_back_schema(previous);
+                        drop(guard);
+                        let mut pin = pin.expect("a pin whose view changed");
+                        return Err(released_after(view_changed(), pin.release()).into());
+                    }
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
@@ -2152,6 +2203,9 @@ impl Connection {
                     let installed = self.with_schema_mut(|schema| {
                         *schema = fresh;
                     });
+                    if installed.is_err() {
+                        self.put_back_schema(previous);
+                    }
                     drop(guard);
                     let released = pin.map_or(Ok(()), |mut pin| pin.release());
                     installed?;

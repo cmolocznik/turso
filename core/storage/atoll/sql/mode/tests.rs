@@ -13950,7 +13950,7 @@ mod in_frames {
                     "a bare prepare in the build",
                     plant(
                         &connection,
-                        "drive_reparse_building",
+                        "drive_reparse_building_steps",
                         "let _ = self.prepare_internal(\"SELECT 1\");",
                     ),
                     stats.clone(),
@@ -13990,7 +13990,7 @@ mod in_frames {
                     "no permit to a sequence helper",
                     without_permit(
                         &connection,
-                        "drive_reparse_building",
+                        "drive_reparse_building_steps",
                         "read_seq_descriptor_row_nonblock(",
                     ),
                     stats.clone(),
@@ -14168,7 +14168,7 @@ mod in_frames {
             }
             for (code, name) in [
                 (connection, "init_reparse_building"),
-                (connection, "drive_reparse_building"),
+                (connection, "drive_reparse_building_steps"),
                 (connection, "read_seq_descriptor_row_nonblock"),
                 (connection, "read_sequence_watermark_row_nonblock"),
                 (stats, "refresh_analyze_stats_permitted"),
@@ -14197,19 +14197,21 @@ mod in_frames {
             if !atoll.contains("self.init_reparse_building(cookie, None, pin.permit())") {
                 wrong.push("reparse_schema_atoll does not give the build its pin's permit".into());
             }
-            let build = need(&mut wrong, connection, "drive_reparse_building");
+            let build = need(&mut wrong, connection, "drive_reparse_building_steps");
             if build
                 .matches("let permit = inner.pin.as_ref().and_then(ReparsePin::permit);")
                 .count()
                 != 1
             {
-                wrong.push("drive_reparse_building does not take its permit from its pin".into());
+                wrong.push(
+                    "drive_reparse_building_steps does not take its permit from its pin".into(),
+                );
             }
             for (code, name, calls) in [
                 (connection, "init_reparse_building", &["permitted("][..]),
                 (
                     connection,
-                    "drive_reparse_building",
+                    "drive_reparse_building_steps",
                     &[
                         "permitted(",
                         "read_seq_descriptor_row_nonblock(",
@@ -14241,7 +14243,7 @@ mod in_frames {
                         }
                     }
                 }
-                if name != "drive_reparse_building"
+                if name != "drive_reparse_building_steps"
                     && (body.contains("let permit") || body.contains("let mut permit"))
                 {
                     wrong.push(format!("{name} rebinds the permit"));
@@ -14816,4 +14818,440 @@ fn the_drive_census_sees_a_planted_drive() {
         vec![("field_step".to_string(), 2)],
         "the census's sites in the planted code"
     );
+}
+
+/// The auditor's #5711 item 4, native: an ordinary end that looked at the pin with its transaction
+/// open, then took it after the reparse's build had checked its view, must leave the reparse
+/// failing, never finishing in another view. Two real threads on one connection: the ender runs a
+/// real statement to its halt; the other runs the real blocking reparse.
+#[cfg(all(not(any(shuttle, atoll_loom, miri))))]
+mod reparse_view_taken_by_an_end {
+    use super::*;
+    use crate::storage::atoll::sql::cursor::{PinPhase, ViewId};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    type Pin = (u64, PinPhase, Option<ViewId>, bool);
+
+    fn pin_of(conn: &Arc<Connection>) -> Option<Pin> {
+        conn.atoll().unwrap().cell.pin_for_test()
+    }
+
+    fn view_of(conn: &Arc<Connection>) -> Option<ViewId> {
+        let slot = conn.atoll().unwrap().cell.lock_for_test();
+        slot.as_ref().map(|t| (t.slot(), t.start()))
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Kind {
+        /// No ending races the reparse: the reader stays at its first row while the reparse runs.
+        Control,
+        /// The ender's halt takes its transaction while the pin is before `Held`.
+        BeforeHeld,
+        /// The ender stays paused at its look until the reparse has returned.
+        StillEnding,
+        /// A statement reading only temp halts: its end looks before the pin registers, and
+        /// takes its transaction after the reparse's build has checked its view.
+        TempHalt,
+        /// The same, the statement reading the main database.
+        ReaderHalt,
+        /// The same, the ender a ROLLBACK of a transaction that created a table.
+        RollbackDdl,
+    }
+
+    #[derive(Debug, Default)]
+    struct Observation {
+        kind: String,
+        fixture: Option<String>,
+        /// At the ender's look: the connection's state, the open view, the pin.
+        state_at_look: Option<String>,
+        view_at_look: Option<ViewId>,
+        pin_at_look: Option<Pin>,
+        /// At the reparse's pause: its pin and the open view; whether the ender then finished;
+        /// the open view after that.
+        paused: bool,
+        pin_at_pause: Option<Pin>,
+        view_at_pause: Option<ViewId>,
+        ender_done_in_pause: bool,
+        view_after_ender: Option<ViewId>,
+        ender: String,
+        reparse: String,
+        view_after_reparse: Option<ViewId>,
+        pin_after_reparse: Option<Pin>,
+        state_after_reparse: String,
+        /// The schema the connection holds after the reparse, and the committed cookie.
+        installed_version: u32,
+        installed_has_u: bool,
+        installed_has_v: bool,
+        committed_cookie: String,
+        cleanup: bool,
+    }
+
+    /// Steps `stmt` to its end outside any frame, as a blocking host does.
+    fn drain(stmt: &mut crate::Statement) -> String {
+        let mut rows = 0;
+        for _ in 0..4096 {
+            match stmt.step() {
+                Ok(crate::StepResult::Row) => rows += 1,
+                Ok(crate::StepResult::Done) => return format!("Done({rows})"),
+                Ok(crate::StepResult::IO) => {
+                    let _ = stmt._io().step();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                other => return format!("{other:?}"),
+            }
+        }
+        "fixture: step bound".into()
+    }
+
+    fn observe(kind: Kind) -> Observation {
+        let mut o = Observation {
+            kind: format!("{kind:?}"),
+            ..Default::default()
+        };
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = crate::storage::atoll::requests::opened_async(|| {
+            open(&io, &format!("/db/auditor-nonowned-{kind:?}"))
+        });
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        conn.execute("CREATE TEMP TABLE tt(a INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO tt VALUES (1), (2)").unwrap();
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        if kind == Kind::Control {
+            let mut reader = conn.prepare("SELECT a FROM t").unwrap();
+            let first = reader.step();
+            if !matches!(first, Ok(crate::StepResult::Row)) {
+                o.fixture = Some(format!("the reader's first step: {first:?}"));
+            }
+            o.state_at_look = Some(format!("{:?}", conn.get_tx_state()));
+            o.view_at_look = view_of(&conn);
+            o.pin_at_look = pin_of(&conn);
+            let (s, c) = (seen.clone(), conn.clone());
+            crate::race::at("reparse.building_checked", move || {
+                *s.borrow_mut() = Some((pin_of(&c), view_of(&c), false, view_of(&c)));
+            });
+            o.reparse = match conn.reparse_schema() {
+                Ok(()) => "Ok".into(),
+                Err(e) => format!("Err({e})"),
+            };
+            o.view_after_reparse = view_of(&conn);
+            o.pin_after_reparse = pin_of(&conn);
+            o.state_after_reparse = format!("{:?}", conn.get_tx_state());
+            o.ender = drain(&mut reader);
+            drop(reader);
+        } else {
+            let sql: &'static str = match kind {
+                Kind::ReaderHalt => "SELECT a FROM t",
+                Kind::RollbackDdl => "ROLLBACK",
+                _ => "SELECT a FROM tt",
+            };
+            if kind == Kind::RollbackDdl {
+                conn.execute("BEGIN").unwrap();
+                conn.execute("CREATE TABLE v(a INTEGER PRIMARY KEY)")
+                    .unwrap();
+            }
+            let (at_look, looked) = channel::<(String, Option<ViewId>, Option<Pin>)>();
+            let (go, gone) = channel::<()>();
+            let go_after = go.clone();
+            let (halted, halt_done) = channel::<()>();
+            let a_conn = conn.clone();
+            let ender = std::thread::spawn(move || {
+                let c = a_conn.clone();
+                crate::race::at("end.after_pinned_read", move || {
+                    let _ =
+                        at_look.send((format!("{:?}", c.get_tx_state()), view_of(&c), pin_of(&c)));
+                    let _ = gone.recv_timeout(Duration::from_secs(20));
+                });
+                let out = match a_conn.prepare(sql) {
+                    Ok(mut stmt) => {
+                        let out = drain(&mut stmt);
+                        drop(stmt);
+                        out
+                    }
+                    Err(e) => format!("fixture: the ender's prepare: {e}"),
+                };
+                let _ = halted.send(());
+                out
+            });
+            match looked.recv_timeout(Duration::from_secs(20)) {
+                Ok((state, view, pin)) => {
+                    o.state_at_look = Some(state);
+                    o.view_at_look = view;
+                    o.pin_at_look = pin;
+                }
+                Err(_) => o.fixture = Some("the ender never reached its look".into()),
+            }
+            if o.fixture.is_none() {
+                if matches!(kind, Kind::TempHalt | Kind::ReaderHalt) {
+                    // A commit by another connection between the ender's snapshot and whatever
+                    // the reparse's statements read in afterwards: a table `u`, and a new cookie.
+                    if let Err(e) = other.execute("CREATE TABLE u(a INTEGER PRIMARY KEY)") {
+                        o.fixture = Some(format!("the other connection's CREATE TABLE: {e}"));
+                    }
+                }
+                let (s, c) = (seen.clone(), conn.clone());
+                let point = if kind == Kind::BeforeHeld {
+                    "pin.before_held"
+                } else {
+                    "reparse.building_checked"
+                };
+                let wait_for_ender = kind != Kind::StillEnding;
+                crate::race::at(point, move || {
+                    let before = (pin_of(&c), view_of(&c));
+                    let mut done = false;
+                    if wait_for_ender {
+                        let _ = go.send(());
+                        done = halt_done.recv_timeout(Duration::from_secs(20)).is_ok();
+                    }
+                    *s.borrow_mut() = Some((before.0, before.1, done, view_of(&c)));
+                });
+                o.reparse = match conn.reparse_schema() {
+                    Ok(()) => "Ok".into(),
+                    Err(e) => format!("Err({e})"),
+                };
+                o.view_after_reparse = view_of(&conn);
+                o.pin_after_reparse = pin_of(&conn);
+                o.state_after_reparse = format!("{:?}", conn.get_tx_state());
+            }
+            let _ = go_after.send(());
+            o.ender = ender
+                .join()
+                .unwrap_or_else(|_| "fixture: the ender's thread panicked".into());
+        }
+        if let Some((pin, view, done, after)) = seen.borrow_mut().take() {
+            o.paused = true;
+            o.pin_at_pause = pin;
+            o.view_at_pause = view;
+            o.ender_done_in_pause = done;
+            o.view_after_ender = after;
+        }
+        {
+            let schema = conn.schema.read();
+            o.installed_version = schema.schema_version;
+            o.installed_has_u = schema.has_table(crate::namespace::NamespaceId::ROOT, "u");
+            o.installed_has_v = schema.has_table(crate::namespace::NamespaceId::ROOT, "v");
+        }
+        // Whatever the scenario left open is ended before anything is asserted.
+        conn.rollback_atoll();
+        conn.set_tx_state(crate::TransactionState::None);
+        o.committed_cookie = match conn.atoll().unwrap().schema_cookie() {
+            Ok(c) => c.to_string(),
+            Err(e) => format!("Err({e})"),
+        };
+        o.cleanup = pin_of(&conn).is_none()
+            && !conn.atoll().unwrap().is_open()
+            && !conn.atoll().unwrap().cell.owes();
+        drop(other);
+        drop((conn, db, io));
+        o
+    }
+
+    /// Each scenario on a thread of its own, so a race action it set and never met dies with it.
+    fn on_its_own_thread(kind: Kind) -> Observation {
+        std::thread::spawn(move || observe(kind))
+            .join()
+            .unwrap_or_else(|_| Observation {
+                kind: format!("{kind:?}"),
+                fixture: Some("the scenario's thread panicked".into()),
+                ..Default::default()
+            })
+    }
+
+    /// Whether the scenario reached its interleaving: the ender looked with its transaction open
+    /// and no pin registered; the reparse paused `Held`, owning nothing, in that same view; the
+    /// ender then finished and its transaction was gone from the slot.
+    fn reached(o: &Observation) -> bool {
+        o.fixture.is_none()
+            && o.view_at_look.is_some()
+            && o.pin_at_look.is_none()
+            && o.paused
+            && o.pin_at_pause.is_some_and(|p| {
+                p.1 == PinPhase::Held && !p.3 && p.2.is_some() && p.2 == o.view_at_look
+            })
+            && o.view_at_pause == o.view_at_look
+            && o.ender_done_in_pause
+            && o.view_after_ender != o.view_at_look
+            && o.ender.starts_with("Done(")
+    }
+
+    #[test]
+    fn a_reparse_whose_joined_view_an_end_took_does_not_finish_in_another_view() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_reparse_whose_joined_view_an_end_took_does_not_finish_in_another_view"
+            ),
+            || {
+                let control = on_its_own_thread(Kind::Control);
+                let before_held = on_its_own_thread(Kind::BeforeHeld);
+                let still_ending = on_its_own_thread(Kind::StillEnding);
+                let temp = on_its_own_thread(Kind::TempHalt);
+                let reader = on_its_own_thread(Kind::ReaderHalt);
+                let rollback = on_its_own_thread(Kind::RollbackDdl);
+                for o in [
+                    &control,
+                    &before_held,
+                    &still_ending,
+                    &temp,
+                    &reader,
+                    &rollback,
+                ] {
+                    eprintln!("NONOWNED_END {o:?}");
+                }
+                for o in [
+                    &control,
+                    &before_held,
+                    &still_ending,
+                    &temp,
+                    &reader,
+                    &rollback,
+                ] {
+                    assert!(o.cleanup, "the fixture did not clean up: {o:?}");
+                    assert!(o.fixture.is_none(), "a fixture step failed: {o:?}");
+                }
+                // The controls: a reparse nothing races finishes in the view it joined; a view
+                // taken before the pin held it, or an ender still ending, fails the reparse.
+                assert!(
+                    control.reparse == "Ok"
+                        && control.paused
+                        && control
+                            .pin_at_pause
+                            .is_some_and(|p| p.1 == PinPhase::Held && !p.3)
+                        && control.view_at_pause == control.view_at_look
+                        && control.view_after_reparse == control.view_at_look
+                        && control.pin_after_reparse.is_none(),
+                    "the unraced control did not finish in the view it joined: {control:?}"
+                );
+                assert!(
+                    before_held.paused
+                        && before_held.ender_done_in_pause
+                        && before_held
+                            .reparse
+                            .contains("the schema reparse's view changed"),
+                    "a view taken before the pin held it did not fail the reparse: {before_held:?}"
+                );
+                assert!(
+                    still_ending.paused
+                        && !still_ending.ender_done_in_pause
+                        && still_ending.reparse.starts_with("Err("),
+                    "a reparse beside a statement still ending did not fail: {still_ending:?}"
+                );
+                // A statement reading only temp may leave the main slot empty: the pin then owns
+                // the view it begins, which is v4's own case and not this probe's.
+                let mut joined = vec![&reader, &rollback];
+                if temp.view_at_look.is_some() {
+                    joined.push(&temp);
+                } else {
+                    eprintln!(
+                        "NONOWNED_END the temp-only ender held no main transaction at its look"
+                    );
+                }
+                for o in &joined {
+                    assert!(reached(o), "the interleaving was not reached: {o:?}");
+                }
+                for o in &joined {
+                    assert!(
+                        o.reparse.starts_with("Err("),
+                        "a reparse whose joined view an end took finished in another view ({}): \
+                         {o:?}",
+                        o.kind
+                    );
+                }
+            },
+        );
+    }
+}
+
+/// The auditor's RP-FAIL1, native: a schema reparse that fails in its build leaves its connection
+/// with the schema it held before the build. The failure is the reparse's test injection
+/// (REPARSE_FAILS_AT "building"), standing for any error a build meets.
+#[cfg(all(not(any(shuttle, atoll_loom, miri))))]
+mod reparse_failed_in_its_build {
+    use super::*;
+
+    fn tables(conn: &Arc<Connection>) -> (u32, bool) {
+        let schema = conn.schema.read();
+        (
+            schema.schema_version,
+            schema.has_table(crate::namespace::NamespaceId::ROOT, "t"),
+        )
+    }
+
+    fn run(conn: &Arc<Connection>, sql: &str) -> String {
+        match conn.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+            Ok(rows) => format!("Ok({})", rows.len()),
+            Err(e) => format!("Err({e})"),
+        }
+    }
+
+    #[test]
+    fn a_reparse_that_fails_in_its_build_keeps_its_connections_schema() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_reparse_that_fails_in_its_build_keeps_its_connections_schema"
+            ),
+            a_connection_after_a_reparse_that_failed_in_its_build,
+        );
+    }
+
+    fn a_connection_after_a_reparse_that_failed_in_its_build() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open(&io, "/db/auditor-failed-build");
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        let mut seen = Vec::new();
+        seen.push(format!(
+            "before: schema {:?}; {}",
+            tables(&conn),
+            run(&conn, "SELECT a FROM t")
+        ));
+        crate::connection::REPARSE_FAILS_AT.with(|f| f.set(Some("building")));
+        let failed = conn.reparse_schema().map_err(|e| e.to_string());
+        seen.push(format!("reparse: {failed:?}"));
+        seen.push(format!(
+            "after the failed reparse: schema {:?}; state {:?}; pin {:?}; open {}",
+            tables(&conn),
+            conn.get_tx_state(),
+            conn.atoll().unwrap().cell.pin_for_test(),
+            conn.atoll().unwrap().is_open()
+        ));
+        seen.push(format!(
+            "SELECT a FROM t: {}",
+            run(&conn, "SELECT a FROM t")
+        ));
+        seen.push(format!("again: {}", run(&conn, "SELECT a FROM t")));
+        seen.push(format!(
+            "INSERT INTO t VALUES (3): {}",
+            run(&conn, "INSERT INTO t VALUES (3)")
+        ));
+        seen.push(format!("schema {:?}", tables(&conn)));
+        seen.push(format!(
+            "another connection: SELECT a FROM t: {}; CREATE TABLE w(a): {}",
+            run(&other, "SELECT a FROM t"),
+            run(&other, "CREATE TABLE w(a)")
+        ));
+        seen.push(format!(
+            "after another connection's CREATE TABLE: {}; schema {:?}",
+            run(&conn, "SELECT a FROM t"),
+            tables(&conn)
+        ));
+        for line in &seen {
+            eprintln!("FAILED_BUILD {line}");
+        }
+        let lost = seen.iter().any(|l| l.contains("no such table"));
+        assert!(
+            !lost,
+            "a connection whose reparse failed in its build lost its tables: {seen:?}"
+        );
+    }
 }

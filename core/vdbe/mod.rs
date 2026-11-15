@@ -857,6 +857,9 @@ enum ActiveOpState {
     HashBuild(Option<OpHashBuildState>),
     HashProbe(Option<OpHashProbeState>),
     InitCdcVersion(OpInitCdcVersionState),
+    /// Atoll's full checkpoint for a Checkpoint opcode in a cooperative frame, kept across its
+    /// returns (ASYNC1 D2e (iii-d)).
+    AtollCheckpoint(crate::storage::atoll::sql::mode::FullCheckpointOp),
 }
 
 impl std::fmt::Debug for ActiveOpState {
@@ -882,6 +885,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::HashBuild(_) => "HashBuild",
             ActiveOpState::HashProbe(_) => "HashProbe",
             ActiveOpState::InitCdcVersion(_) => "InitCdcVersion",
+            ActiveOpState::AtollCheckpoint(_) => "AtollCheckpoint",
         };
         f.write_str(name)
     }
@@ -1023,6 +1027,12 @@ impl ActiveOpStateSlot {
     active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
+    active_state_accessor!(
+        atoll_checkpoint,
+        AtollCheckpoint,
+        crate::storage::atoll::sql::mode::FullCheckpointOp,
+        Default::default()
+    );
     active_state_accessor!(
         init_cdc_version,
         InitCdcVersion,
@@ -1211,7 +1221,7 @@ pub struct ProgramState {
     /// What this statement holds of its connection's statements, which no other starts while it
     /// is held: an explicit checkpoint's guard while the checkpoint is suspended, or an integrity
     /// check's, from its page walk in a cooperative frame to its first row.
-    pub(crate) statements_hold: Option<crate::connection::StatementsHold>,
+    pub(crate) statements_hold: Option<Box<crate::connection::StatementsHold>>,
     /// The goal of an explicit TRUNCATE that reported Busy, for its retry at the same PC to go
     /// on with.
     pub(crate) explicit_checkpoint_goal: Option<u64>,
@@ -1354,8 +1364,6 @@ pub struct ProgramState {
     /// the statement's begin read in the view the reparse's pin owns (ASYNC1 D2e (iii-c)). Kept by
     /// `reset`, and so by a reprepare, which resets.
     pub(crate) atoll_pin_permit: Option<crate::storage::atoll::sql::mode::PinPermit>,
-    /// A Checkpoint opcode's full checkpoint kept across its returns (ASYNC1 D2e (iii-d)).
-    pub(crate) atoll_checkpoint: Option<Box<crate::storage::atoll::sql::mode::FullCheckpointOp>>,
     /// In Atoll mode, this statement's hold on the end of its connection's transaction, from the
     /// ending's start to the end of the commit's finishing (`Connection::atoll_end`).
     pub(crate) atoll_ending_begun: Option<EndingBegun>,
@@ -1497,7 +1505,6 @@ impl ProgramState {
             atoll_taking: false,
             atoll_met_failure: None,
             atoll_pin_permit: None,
-            atoll_checkpoint: None,
             atoll_ending_begun: None,
             atoll_commit_failure: None,
             atoll_create: None,
@@ -1657,7 +1664,7 @@ impl ProgramState {
         self.checkpoint_park_timer = None;
         self.checkpoint_wait_spent = false;
         if self.statements_hold.is_some() {
-            self.statements_hold = None;
+            self.release_statements_hold();
         }
         self.explicit_checkpoint_goal = None;
         self.current_time = None;
@@ -1718,7 +1725,6 @@ impl ProgramState {
         self.atoll_statement = None;
         self.atoll_taking = false;
         self.atoll_met_failure = None;
-        self.atoll_checkpoint = None;
         if self.atoll_create.is_some() {
             self.atoll_create = None;
         }
@@ -1939,6 +1945,14 @@ impl ProgramState {
                 tracing::debug!("releasing a parked checkpoint: {err}");
             }
         }
+    }
+
+    /// Lets go of what this statement holds of its connection's statements. Out of line, so the
+    /// reset's and the abort's test of the hold is one compare of its pointer.
+    #[cold]
+    #[inline(never)]
+    fn release_statements_hold(&mut self) {
+        self.statements_hold = None;
     }
 
     /// Parks the completion an instruction waits for and answers the result
@@ -4274,7 +4288,9 @@ impl Program {
         state.checkpoint_park_deadline = None;
         state.checkpoint_park_timer = None;
         state.checkpoint_wait_spent = false;
-        state.statements_hold = None;
+        if state.statements_hold.is_some() {
+            state.release_statements_hold();
+        }
         state.explicit_checkpoint_goal = None;
         // A statement that ran to its end, as every reset after a clean step finds it, owes
         // nothing below: none of the states the cleanups release is set, it is not running, and

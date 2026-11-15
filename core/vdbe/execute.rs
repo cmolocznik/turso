@@ -590,12 +590,12 @@ pub fn op_checkpoint(
         // Atoll mode: a full checkpoint of Atoll's log (DESIGN.md §17, §11), reported as SQLite
         // reports a database not in WAL mode; kept across its returns in a cooperative frame
         // (ASYNC1 D2e (iii-d)).
-        let op = state.atoll_checkpoint.get_or_insert_with(Default::default);
+        let op = state.active_op_state.atoll_checkpoint();
         match op.step(atoll.db()) {
             Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
-            Ok(IOResult::Done(())) => state.atoll_checkpoint = None,
+            Ok(IOResult::Done(())) => state.active_op_state.clear(),
             Err(e) => {
-                state.atoll_checkpoint = None;
+                state.active_op_state.clear();
                 return Err(e.into());
             }
         }
@@ -617,11 +617,11 @@ pub fn op_checkpoint(
         // helper statement is alive on the connection would let a checkpoint
         // clobber a suspended statement that holds one (e.g. a pragma vtab
         // cursor's stored helper).
-        state.statements_hold = Some(crate::connection::StatementsHold::Checkpoint {
+        state.statements_hold = Some(Box::new(crate::connection::StatementsHold::Checkpoint {
             _guard: program
                 .connection
                 .begin_explicit_checkpoint(pager.clone(), true)?,
-        });
+        }));
     }
 
     // In autocommit mode, this statement can still hold an implicit read tx.
@@ -3651,7 +3651,7 @@ pub fn op_integrity_result_row(
     if let Some(hold) = state.statements_hold.take() {
         turso_assert!(
             matches!(
-                hold,
+                *hold,
                 crate::connection::StatementsHold::IntegrityWalk { .. }
             ),
             "an integrity check's row under a checkpoint's hold"
@@ -18031,7 +18031,9 @@ pub fn op_integrity_check(
                         "an integrity check holding its connection's statements twice"
                     );
                     state.statements_hold =
-                        Some(crate::connection::StatementsHold::IntegrityWalk { _claim: claim });
+                        Some(Box::new(crate::connection::StatementsHold::IntegrityWalk {
+                            _claim: claim,
+                        }));
                 }
                 found
             }

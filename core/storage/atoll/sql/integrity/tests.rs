@@ -1785,7 +1785,7 @@ fn a_reset_walk_lets_go_and_a_walk_in_another_transaction_is_refused() {
             let holder = Holder::new(&db);
             let held = holder.hold(true);
             let mut walk = conn.prepare("PRAGMA integrity_check").unwrap();
-            let at_checkpoint = matches!(called(&db, &mut walk), Called::Io(_, Some("checkpoint")));
+            let at_checkpoint = called_to(&io, &db, &mut walk, "checkpoint", 1_000).is_ok();
             let waiting = cp.task_class();
             walk.reset().unwrap();
             let after_reset = cp.task_class();
@@ -2117,11 +2117,36 @@ fn a_walk_in_frames_keeps_its_connections_other_statements_out() {
     );
 }
 
+/// Calls `stmt`, a check in frames, past every return it makes before its walk's first entry (an
+/// IO its walk did not make: its begin's, or a yield of the memory backend), waiting for each, and
+/// counting them in `before`: the first return its walk's entry decides, or why not.
+fn called_to_its_walk(
+    io: &Arc<dyn IO>,
+    db: &Database,
+    stmt: &mut crate::Statement,
+    before: &mut usize,
+) -> Called {
+    for _ in 0..1_000 {
+        match called(db, stmt) {
+            Called::Io(c, None) => {
+                *before += 1;
+                if !waited(io, &c) || !retired(db) {
+                    return Called::Failed("a wait before the walk never finished".to_string());
+                }
+            }
+            other => return other,
+        }
+    }
+    Called::Failed("no return of the walk's entry in 1000 calls".to_string())
+}
+
 /// The auditor's III-D-I1: a statement of the connection suspended before the walk, at a row it
 /// returned, keeps the walk out. Beside a reader, and beside a writer in a transaction, the walk's
 /// first entry is refused at its words, so nothing of the walk runs and its word stays clear. Each
 /// time the other statement then finishes, and a walk after it is admitted and finds nothing
-/// (mutant `admission-ignores-others`).
+/// (mutant `admission-ignores-others`). The check is called past what it returns before its walk's
+/// entry (the auditor's #5746): a synchronous check first leaves every page clean, so the check's
+/// begin beside the reader reads cold and returns IO first.
 #[test]
 fn a_walk_beside_a_suspended_statement_of_its_connection_is_refused() {
     crate::storage::atoll::testing::cleanly(
@@ -2142,11 +2167,13 @@ fn a_walk_beside_a_suspended_statement_of_its_connection_is_refused() {
                 }
             };
             // Beside a reader.
+            let clean = integrity(&conn);
             let mut reader = conn.prepare("SELECT id FROM t").unwrap();
             let reading = matches!(reader.step(), Ok(crate::StepResult::Row));
             let mut walk = conn.prepare("PRAGMA integrity_check").unwrap();
             chill(&db);
-            let refused = called(&db, &mut walk);
+            let mut before_reader = 0;
+            let refused = called_to_its_walk(&io, &db, &mut walk, &mut before_reader);
             // At once: a walk admitted beside the reader holds the connection's word for a walk
             // another statement of its connection may yet follow.
             assert!(
@@ -2169,7 +2196,8 @@ fn a_walk_beside_a_suspended_statement_of_its_connection_is_refused() {
             let writing = matches!(writer.step(), Ok(crate::StepResult::Row));
             let mut walk = conn.prepare("PRAGMA integrity_check").unwrap();
             WALKED_AT_IO.with(|w| w.borrow_mut().clear());
-            let waited_out = called(&db, &mut walk);
+            let mut before_writer = 0;
+            let waited_out = called_to_its_walk(&io, &db, &mut walk, &mut before_writer);
             let walked = WALKED_AT_IO.with(|w| w.borrow().len());
             let word = conn.atoll().unwrap().walking_for_test();
             drop(walk);
@@ -2179,6 +2207,11 @@ fn a_walk_beside_a_suspended_statement_of_its_connection_is_refused() {
             let after_writer = called_out(&io, &db, &mut walk, 100_000);
             drop(walk);
             let committed = conn.execute("COMMIT").map_err(|e| e.to_string());
+            eprintln!(
+                "BESIDE_SUSPENDED returns before the walk's entry: reader {before_reader}, writer \
+                 {before_writer}"
+            );
+            assert_eq!(clean, ok(), "the database was not clean before");
             assert!(reading, "the reader did not stop at its first row");
             assert_eq!(read, Ok(()), "the reader after the refused walk");
             assert_eq!(after_reader, Ok(ok()), "the walk after the reader");
@@ -2465,7 +2498,7 @@ fn called_past_the_walk(
 /// database, at its "ok" row before it is called to its end, the hold is none and a write of its
 /// connection's transaction and a read in autocommit each start; on a database with a page
 /// nothing reaches, at its first row, the page walk's finding, before its row and index pass
-/// (mutants `row-keeps-the-hold`, `second-walk-under-the-hold`).
+/// (mutant `row-keeps-the-hold`).
 #[test]
 fn a_check_in_frames_lets_its_connection_go_at_its_first_row() {
     crate::storage::atoll::testing::cleanly(

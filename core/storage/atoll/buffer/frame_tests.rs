@@ -529,11 +529,15 @@ fn a_frames_miss_on_a_cold_data_file_is_opened_synced_and_read_on_an_io_thread()
             let io: Arc<dyn IO> = counted.clone();
             probe.forget_calls();
             let me = crate::thread::current().id();
+            // The IO thread held through the first call: a read it ran at once, landed before
+            // the call looked at its wait again, would have the call go on to the page.
+            let hold = counted.requests().hold_io_thread();
             let first = {
                 let _frame = Frame::enter();
                 pool.fix_exclusive(pid, None)
                     .map(|r| matches!(r, IOResult::IO(_)))
             };
+            drop(hold);
             let polled = probe.on(me);
             let read =
                 in_frames(&io, || pool.fix_exclusive(pid, None)).map(|g| stamped(g.page(), pid));

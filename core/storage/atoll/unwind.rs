@@ -1339,6 +1339,16 @@ mod tests {
             "child",
         ),
         (
+            "sql/integrity/tests.rs",
+            "a_table_valued_check_beside_an_open_writer_is_refused_as_the_pragma_is",
+            "child",
+        ),
+        (
+            "sql/integrity/tests.rs",
+            "a_page_walk_without_the_write_gate_exclusive_is_refused",
+            "child",
+        ),
+        (
             "sql/mode/tests.rs",
             "a_reparse_whose_joined_view_an_end_took_does_not_finish_in_another_view",
             "child",

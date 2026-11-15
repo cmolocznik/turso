@@ -2608,12 +2608,12 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
-    /// Whether the statement writes the main database's schema: in Atoll mode it then takes the
-    /// write gate exclusive (DESIGN.md §17, R23).
-    pub writes_schema: bool,
-    /// Whether the statement checks the main database's pages, an Atoll database's integrity
-    /// check: it takes the write gate exclusive, as a schema writer does, so the page store holds
-    /// still while it walks (DESIGN.md §17, §12, R36).
+    /// Whether the statement writes the main database's schema or checks its pages: in Atoll
+    /// mode a writing statement then takes the write gate exclusive (DESIGN.md §17, R23).
+    pub writes_schema_or_checks_pages: bool,
+    /// Whether the statement checks the main database's pages, through the integrity check or a
+    /// table-valued form of it: it takes the write gate exclusive, as a schema writer does, so the
+    /// page store holds still while it walks (DESIGN.md §17, §12, R36).
     pub checks_pages: bool,
     /// The trees of the main database a schema writer reads rows of, sqlite_schema aside: in a
     /// transaction with a snapshot, a commit that raised one's stamp past it fails its take of the

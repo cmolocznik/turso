@@ -2755,3 +2755,165 @@ fn a_check_in_frames_ended_in_its_row_pass_lets_its_connection_go() {
         },
     );
 }
+
+// ---------------------------------------------------------------- the table-valued forms (ICK-TVF1)
+
+/// The forms of the check a statement can read: the two table-valued ones and the pragma.
+const CHECK_FORMS: [&str; 3] = [
+    "SELECT * FROM pragma_integrity_check",
+    "SELECT * FROM pragma_quick_check",
+    "PRAGMA integrity_check",
+];
+
+/// `sql` run to its end on `conn`, its waits for IO stepped in place: its rows, or "busy" for a
+/// take of the write gate refused, or its error's words.
+fn checked(conn: &Arc<Connection>, sql: &str) -> std::result::Result<Vec<Vec<Value>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step() {
+            Ok(crate::StepResult::IO) => stmt._io().step().unwrap(),
+            Ok(crate::StepResult::Row) => {
+                rows.push(stmt.row().unwrap().get_values().cloned().collect())
+            }
+            Ok(crate::StepResult::Done) => return Ok(rows),
+            Ok(crate::StepResult::Busy) | Err(crate::LimboError::Busy) => {
+                return Err("busy".to_string())
+            }
+            Ok(other) => return Err(format!("{other:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// ICK-TVF1: a statement reading a table-valued form of the check takes the write gate exclusive,
+/// as the pragma does. Beside another connection's writer holding only its BEGIN every form says
+/// ok; beside one with a write open every form is refused as the pragma is, where the forms used to
+/// walk and report as wrong the pages the writer had not finished. Once the writer commits or
+/// rolls back, every form says ok (mutant `tvf-unmarked`).
+#[test]
+fn a_table_valued_check_beside_an_open_writer_is_refused_as_the_pragma_is() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_table_valued_check_beside_an_open_writer_is_refused_as_the_pragma_is"
+        ),
+        || {
+            let writes: [(&str, &[&str]); 6] = [
+                ("begin only", &[]),
+                (
+                    "a table created",
+                    &[
+                        "CREATE TABLE z(x)",
+                        "INSERT INTO z SELECT value FROM generate_series(1, 30)",
+                    ],
+                ),
+                ("an index dropped", &["DROP INDEX t_v"]),
+                ("a row inserted", &["INSERT INTO t VALUES (1000, 'w')"]),
+                ("a row deleted", &["DELETE FROM t WHERE id = 1"]),
+                ("a row updated", &["UPDATE t SET v = 'u' WHERE id = 2"]),
+            ];
+            let mut seen = Vec::new();
+            for (n, (case, sqls)) in writes.iter().enumerate() {
+                for end in ["COMMIT", "ROLLBACK"] {
+                    let (db, conn) = used(&format!("/db/integrity-tvf-{n}-{end}"));
+                    let writer = db.connect(ConnectOpts::new()).unwrap();
+                    writer.execute("BEGIN").unwrap();
+                    for sql in *sqls {
+                        writer.execute(*sql).unwrap();
+                    }
+                    let beside: Vec<_> = CHECK_FORMS.iter().map(|f| checked(&conn, f)).collect();
+                    writer.execute(end).unwrap();
+                    let after: Vec<_> = CHECK_FORMS.iter().map(|f| checked(&conn, f)).collect();
+                    seen.push((*case, end, beside, after));
+                }
+            }
+            for (case, end, beside, after) in &seen {
+                let wanted = if *case == "begin only" {
+                    Ok(ok())
+                } else {
+                    Err("busy".to_string())
+                };
+                for (form, got) in CHECK_FORMS.iter().zip(beside) {
+                    assert_eq!(
+                        got, &wanted,
+                        "{case}, then {end}: {form} beside the open writer"
+                    );
+                }
+                for (form, got) in CHECK_FORMS.iter().zip(after) {
+                    assert_eq!(
+                        got,
+                        &Ok(ok()),
+                        "{case}, then {end}: {form} after the writer"
+                    );
+                }
+            }
+        },
+    );
+}
+
+/// A page walk whose transaction does not hold the write gate exclusive is refused at its own
+/// words: a trigger's body reading a table-valued form of the check, its subprogram compiled apart
+/// from the statement that fires it, which so takes no exclusive hold. The firing statement fails
+/// whole and the database stays as it was, synchronously and in test frames (mutants
+/// `hold-untested` and `frame-hold-untested`).
+#[test]
+fn a_page_walk_without_the_write_gate_exclusive_is_refused() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_page_walk_without_the_write_gate_exclusive_is_refused"
+        ),
+        || {
+            let trigger = [
+                "CREATE TABLE log(r TEXT)",
+                "CREATE TRIGGER t_checked AFTER INSERT ON t BEGIN \
+                 INSERT INTO log SELECT integrity_check FROM pragma_integrity_check; END",
+            ];
+            let words = crate::storage::atoll::sql::mode::GATE_NOT_EXCLUSIVE;
+            let (_db, conn) = used("/db/integrity-tvf-trigger");
+            for sql in trigger {
+                conn.execute(sql).unwrap();
+            }
+            let fired = conn
+                .execute("INSERT INTO t VALUES (5000, 'fires')")
+                .map_err(|e| e.to_string());
+            let logged = rows(&conn, "SELECT count(*) FROM log");
+            let kept = rows(&conn, "SELECT count(*) FROM t WHERE id = 5000");
+            let after = integrity(&conn);
+
+            let (io, db, conn) = small_with_worker("/db/integrity-tvf-trigger-frames");
+            for sql in trigger {
+                conn.execute(sql).unwrap();
+            }
+            let mut x = conn
+                .prepare("INSERT INTO t VALUES (5000, 'fires')")
+                .unwrap();
+            let in_frames = walked_in_frames(&io, &db, &mut x, 10_000).out;
+            drop(x);
+            let logged_in_frames = rows(&conn, "SELECT count(*) FROM log");
+            let kept_in_frames = rows(&conn, "SELECT count(*) FROM t WHERE id = 5000");
+            let after_in_frames = integrity(&conn);
+
+            let none = vec![vec![Value::from_i64(0)]];
+            assert!(
+                matches!(&fired, Err(e) if e.contains(words)),
+                "a trigger's walk under a shared hold: {fired:?}"
+            );
+            assert_eq!(logged, none, "the refused statement's trigger logged");
+            assert_eq!(kept, none, "the refused statement's row was kept");
+            assert_eq!(after, ok(), "the database after the refusal");
+            assert!(
+                matches!(&in_frames, Err(e) if e.contains(words)),
+                "a trigger's walk under a shared hold, in frames: {in_frames:?}"
+            );
+            assert_eq!(logged_in_frames, none, "in frames, the trigger logged");
+            assert_eq!(kept_in_frames, none, "in frames, the row was kept");
+            assert_eq!(
+                after_in_frames,
+                ok(),
+                "the database after the refusal in frames"
+            );
+        },
+    );
+}

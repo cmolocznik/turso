@@ -44,6 +44,13 @@ impl VirtualTable {
         }
     }
 
+    /// Whether the table is a table-valued form of the integrity check, whose rows a walk of the
+    /// database's pages finds.
+    pub(crate) fn checks_pages(&self) -> bool {
+        matches!(&self.vtab_type, VirtualTableType::Pragma(table)
+            if matches!(table.pragma_name.as_str(), "integrity_check" | "quick_check"))
+    }
+
     /// Wrap an `InternalVirtualTable` implementation so it can appear in a
     /// `Schema`'s catalog. The table's `name()` becomes the catalog name and
     /// its `sql()` is parsed to derive the column metadata. Returns an error

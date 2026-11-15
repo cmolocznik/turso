@@ -30,7 +30,7 @@ use crate::storage::atoll::page::{PageId, SizeClass, CLASS_COUNT};
 use crate::storage::atoll::radix::{FREE, SLOT_BASE};
 use crate::storage::atoll::store::Census;
 use crate::storage::atoll::txn::versioned::{VersionedCursor, HEADER};
-use crate::storage::atoll::txn::Txn;
+use crate::storage::atoll::txn::{Hold, Txn};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -84,6 +84,10 @@ impl AtollDb {
     /// A blocking host: the full checkpoint is driven, the checkpointer's state held for the whole
     /// walk, and the walk's steps driven in place.
     pub fn check_pages(&self, txn: &mut Txn, max: usize) -> Result<Vec<String>> {
+        assert!(
+            matches!(txn.hold(), Hold::Exclusive { .. }),
+            "an integrity check walked the pages without the write gate exclusive"
+        );
         crate::race::point("integrity.host_checkpoint");
         super::mode::full_checkpoint(self)?;
         let _held = self.atoll().checkpointer().hold_waiting();

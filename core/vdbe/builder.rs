@@ -2562,11 +2562,16 @@ impl ProgramBuilder {
             _ => false,
         });
         // An integrity check of an Atoll database's pages takes the gate exclusive too, so the page
-        // store holds still while it walks (DESIGN.md §17, §12, R36).
+        // store holds still while it walks (DESIGN.md §17, §12, R36). So does a statement reading a
+        // table-valued form of the check: the pragma its cursor runs is a nested statement, which
+        // begins nothing, and walks in this statement's transaction (ICK-TVF1). Its arguments are
+        // values known only when it runs, so whichever database they name, it takes the main one's.
         let checks_pages = self.atoll
-            && self.insns.iter().any(|(insn, _)| {
+            && (self.insns.iter().any(|(insn, _)| {
                 matches!(insn, Insn::IntegrityCk { data } if data.db == crate::MAIN_DB_ID)
-            });
+            }) || self.cursor_ref.iter().any(|(_, cursor)| {
+                matches!(cursor, CursorType::VirtualTable(table) if table.checks_pages())
+            }));
         // The trees a schema writer reads rows of, sqlite_schema aside (DESIGN.md §17, §3, defect 4).
         let mut schema_reads: Vec<u64> = if writes_schema || checks_pages {
             self.insns
@@ -2614,7 +2619,7 @@ impl ProgramBuilder {
             custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
-            writes_schema,
+            writes_schema_or_checks_pages: writes_schema || checks_pages,
             checks_pages,
             schema_reads,
         };

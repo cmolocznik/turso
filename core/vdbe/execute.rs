@@ -4870,7 +4870,8 @@ pub fn op_transaction_inner(
                         use crate::storage::atoll::sql::mode::Begin;
                         let wants = if write {
                             Begin::Write {
-                                schema: !statement_writes_db || program.writes_schema,
+                                schema: !statement_writes_db
+                                    || program.writes_schema_or_checks_pages,
                             }
                         } else if program.checks_pages {
                             Begin::Write { schema: true }

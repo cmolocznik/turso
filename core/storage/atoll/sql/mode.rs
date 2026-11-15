@@ -984,7 +984,8 @@ struct Savepoint {
 impl ConnTxn {
     /// The page arm of `PRAGMA integrity_check`, in the transaction's current statement, which
     /// holds the write gate exclusive (DESIGN.md §17, §12, R36): what it found wrong, at most
-    /// `max` of it.
+    /// `max` of it. A transaction that does not hold it is refused: beside another writer the
+    /// pages move under the walk, which would report as wrong what that writer has not finished.
     #[turso_macros::atoll_entry]
     pub fn check_pages(&self, max: usize) -> Result<Vec<String>> {
         // Admitted first, before the slot and the full checkpoint: a cooperative walk holding the
@@ -992,6 +993,9 @@ impl ConnTxn {
         let _walk = self.host_walk()?;
         let mut guard = self.enter_now("check_pages")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
+        if !matches!(txn.hold(), Hold::Exclusive { .. }) {
+            return Err(gate_not_exclusive());
+        }
         self.db.check_pages(txn, max)
     }
 
@@ -1032,12 +1036,12 @@ impl ConnTxn {
             let w = walk.as_mut().expect("the walk");
             let mut guard = self.cell.enter()?;
             let txn = guard.as_mut().ok_or_else(outside)?;
-            if (txn.slot(), txn.start()) != w.view()
-                || !matches!(txn.hold(), Hold::Exclusive { .. })
-            {
+            if (txn.slot(), txn.start()) != w.view() {
                 Err(LimboError::InternalError(
                     "the integrity check's transaction changed".to_string(),
                 ))
+            } else if !matches!(txn.hold(), Hold::Exclusive { .. }) {
+                Err(gate_not_exclusive())
             } else {
                 w.step(&self.db, txn)
             }
@@ -2794,6 +2798,16 @@ impl Drop for FacadeRead {
 fn outside() -> LimboError {
     LimboError::InternalError("an Atoll read or write outside any transaction".to_string())
 }
+
+/// The refusal of a page walk whose transaction does not hold the write gate exclusive, as when a
+/// trigger's body reads a table-valued form of the check: the statement firing it took no such hold.
+fn gate_not_exclusive() -> LimboError {
+    LimboError::TxError(GATE_NOT_EXCLUSIVE.to_string())
+}
+
+/// The words of [`gate_not_exclusive`].
+pub(super) const GATE_NOT_EXCLUSIVE: &str =
+    "an integrity check of the pages needs the write gate exclusive, which its statement does not hold";
 
 /// An integrity check walking in a cooperative frame (ASYNC1 D2e (iii-d)): its full checkpoint,
 /// then its lease on the database's checkpoint units, then the page walk under its own top, kept

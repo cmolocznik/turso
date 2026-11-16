@@ -2273,9 +2273,9 @@ impl ProgramState {
     /// Attached DB savepoints are opened per-DB in `op_transaction_inner`
     /// when each DB's Transaction opcode is executed.
     ///
-    /// Pager/MVCC savepoints are only opened for write statements inside an
-    /// explicit transaction. In autocommit mode, a statement abort is a
-    /// transaction abort, so savepoints are unnecessary.
+    /// Pager/MVCC savepoints are only opened for write statements inside an explicit transaction.
+    /// In autocommit mode, a statement abort is a transaction abort, so savepoints are unnecessary.
+    #[inline(never)]
     pub fn begin_statement(
         &mut self,
         connection: &Connection,

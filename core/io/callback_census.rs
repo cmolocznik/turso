@@ -107,19 +107,19 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "mvcc/persistent_storage/logical_log.rs",
-        "sync",
+        "sync_files",
         "new",
         "nothing (a group)",
     ),
     (
         "mvcc/persistent_storage/logical_log.rs",
-        "sync",
+        "sync_files",
         "new_sync",
         "logs",
     ),
     (
         "mvcc/persistent_storage/logical_log.rs",
-        "sync",
+        "sync_files",
         "new_sync",
         "records the log synced",
     ),

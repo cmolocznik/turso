@@ -26029,7 +26029,7 @@ fn passive_scan_survives_rule3_drop_mid_scan(sql: &str, expected: &[String]) {
     let mut stmt = scanner.prepare(sql).unwrap();
     let io = stmt.get_pager().io.clone();
     let mut seen: Vec<String> = Vec::new();
-    let mut step = |stmt: &mut crate::Statement, seen: &mut Vec<String>, limit: usize| loop {
+    let step = |stmt: &mut crate::Statement, seen: &mut Vec<String>, limit: usize| loop {
         if seen.len() >= limit {
             return false;
         }

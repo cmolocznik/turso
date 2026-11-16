@@ -1343,7 +1343,15 @@ impl ConnTxn {
         let (txn, owed) = taken.expect("a pin's owned view gone before its ending");
         let (written, stamped) = self.let_go_of_ended();
         let conn = self.cell.conn().clone();
-        let mut ending = Ending::commit(self.db.clone(), conn, txn, written, stamped, None, owed);
+        let mut ending = Ending::commit(
+            self.db.clone(),
+            conn,
+            Some(txn),
+            written,
+            stamped,
+            None,
+            owed,
+        );
         let error = ending.finish().err();
         #[cfg(test)]
         let error = error.or_else(|| {
@@ -1570,6 +1578,22 @@ impl ConnTxn {
         Ok(SqlCursor::new(self, pager, tree_id(root)?, index).opening_fresh())
     }
 
+    /// [`open_cursor`](Self::open_cursor), the cursor built in its box: allocated first, so the
+    /// cursor is not built beside it and copied in, as a cursor returned and then boxed is.
+    #[turso_macros::atoll_entry]
+    pub fn open_cursor_boxed(
+        &self,
+        pager: Arc<Pager>,
+        root: i64,
+        index: Option<Arc<IndexInfo>>,
+    ) -> Result<Box<SqlCursor>> {
+        let id = tree_id(root)?;
+        Ok(Box::write(
+            Box::new_uninit(),
+            SqlCursor::new(self, pager, id, index).opening_fresh(),
+        ))
+    }
+
     /// [`open_cursor`](Self::open_cursor) for an index method's backing tree, whose writes fail
     /// at once on another writer's key instead of waiting for it ([`SqlCursor::no_wait`]). Outside
     /// a cooperative frame its open is finished here, so it is bound when made; in one it is left
@@ -1680,16 +1704,17 @@ impl ConnTxn {
         }
         let began = guard.is_none();
         if began {
+            // Begun in the cell, where it stays until its end takes it out.
             let begun = match wants {
-                Begin::Read => txns.begin(Isolation::Snapshot)?,
+                Begin::Read => txns.begin_into(Isolation::Snapshot, &mut guard)?,
                 // Its snapshot once it holds the gate: an exclusive taker's after the drain.
-                Begin::Write { .. } => txns.begin_slot_in(Isolation::Snapshot, 0)?,
+                Begin::Write { .. } => txns.begin_slot_into(Isolation::Snapshot, 0, &mut guard)?,
             };
             match begun {
-                IOResult::Done(txn) => {
+                IOResult::Done(()) => {
+                    let txn = guard.as_ref().expect("the transaction just begun");
                     let slot = txn.slot();
                     let view = (slot, txn.start());
-                    *guard = Some(txn);
                     if let Admit::Pin(id) = who {
                         after.set(guard.pin_installed(id, view));
                         #[cfg(test)]
@@ -1970,7 +1995,9 @@ impl ConnTxn {
         }
         crate::race::point("end.after_pinned_read");
         self.served.store(false, Ordering::Release);
-        let (txn, written, stamped, owed) = self.take_to_end()?;
+        let (mut owed, mut written, mut stamped) = (None, Vec::new(), Vec::new());
+        let txn = self.take_to_end(&mut owed, &mut written, &mut stamped);
+        txn.as_ref()?;
         let conn = self.cell.conn().clone();
         Some(if commit {
             Ending::commit(self.db.clone(), conn, txn, written, stamped, publish, owed)
@@ -1983,13 +2010,90 @@ impl ConnTxn {
         })
     }
 
-    /// The open transaction, taken out of the connection to be ended, with what it wrote to the
-    /// header and the trees it stamped; the connection's part of it let go.
-    fn take_to_end(&self) -> Option<EndedTxn> {
+    /// [`end_publishing`](Self::end_publishing), the ending built in the connection's place
+    /// instead of returned, so it is not moved: whether there was one to build. Whichever
+    /// statement of the connection meets the ending there steps it (DESIGN.md §17). One at a
+    /// time: the end word lets one statement end the connection's transaction
+    /// (`Connection::atoll_end`). The place's lock is taken once the transaction is out of the
+    /// connection.
+    #[turso_macros::atoll_entry]
+    pub fn end_into_place(&self, commit: bool, publish: Option<Box<dyn FnOnce() + Send>>) -> bool {
+        if self.cell.pinned() {
+            return false;
+        }
+        crate::race::point("end.after_pinned_read");
+        self.served.store(false, Ordering::Release);
+        // Taken out of the cell straight into this frame, and from here into the ending in the
+        // place: two copies, the cell's lock and the place's never held together (D2E-COST2
+        // item 9).
+        let (mut owed, mut written, mut stamped) = (None, Vec::new(), Vec::new());
+        let txn = self.take_to_end(&mut owed, &mut written, &mut stamped);
+        if txn.is_none() {
+            return false;
+        }
+        let conn = self.cell.conn().clone();
+        let mut place = self.ending.lock();
+        crate::turso_assert!(place.is_none(), "two endings in one connection's place");
+        // Written in each branch: an ending chosen by the `if` would be built beside the place and
+        // copied in.
+        if commit && owed.is_none() {
+            // The ending first, awaiting its transaction, then the transaction into it: moved
+            // once, from this frame into the commit where it lies.
+            crate::storage::atoll::fill_option(
+                &mut place,
+                Ending::committing(self.db.clone(), conn, written, stamped, publish),
+            );
+            let Some(Ending {
+                step: Step::Commit(commit),
+                ..
+            }) = place.as_mut()
+            else {
+                unreachable!("the commit just placed");
+            };
+            crate::storage::atoll::fill_option(
+                commit.txn_place(),
+                txn.expect("the transaction just taken"),
+            );
+            // A commit awaiting its transaction reads as ended (`Commit::ended`): one left so would
+            // end nothing, its slot never freed.
+            crate::turso_assert!(!commit.ended(), "an ending placed without its transaction");
+        } else if commit {
+            crate::storage::atoll::fill_option(
+                &mut place,
+                Ending::commit(self.db.clone(), conn, txn, written, stamped, publish, owed),
+            );
+        } else {
+            drop(owed);
+            self.changes.rolled_back();
+            crate::storage::atoll::fill_option(
+                &mut place,
+                Ending::rollback(self.db.clone(), conn, txn),
+            );
+        }
+        true
+    }
+
+    /// The open transaction, taken out of the connection to be ended, with a statement rollback
+    /// it owes in `owed`, and the connection's part of it let go, its savepoints with it: what it
+    /// wrote to the header in `written`, the stamps of the trees it wrote in `stamped`
+    /// ([`let_go_of_ended`](Self::let_go_of_ended)). Returned as the cell's take returns it, so
+    /// it is copied once, into the caller's frame; what the caller needs besides comes back
+    /// through its arguments, so no caller takes a transaction out without letting go its part.
+    #[inline(always)]
+    fn take_to_end(
+        &self,
+        owed: &mut Option<Box<OwedRollback>>,
+        written: &mut Vec<(Statement, Field, u32)>,
+        stamped: &mut Vec<super::trees::Stamp>,
+    ) -> Option<Txn> {
         self.savepoints.lock().clear();
-        let (txn, owed) = self.cell.take()?;
-        let (written, stamped) = self.let_go_of_ended();
-        Some((txn, written, stamped, owed))
+        let txn = self.cell.take(owed);
+        // Matched, not borrowed: a borrow of `txn` would keep it apart from the caller's, and
+        // returning it would copy it there.
+        if matches!(txn, Some(_)) {
+            (*written, *stamped) = self.let_go_of_ended();
+        }
+        txn
     }
 
     /// The connection's part of a transaction just taken out to end: what it wrote to the header
@@ -2000,7 +2104,7 @@ impl ConnTxn {
         let stamped: Vec<_> = std::mem::take(&mut *self.stamped.lock())
             .into_values()
             .collect();
-        *self.setting.lock() = None;
+        crate::storage::atoll::clear_option(&mut self.setting.lock());
         *self.taking.lock() = None;
         let _ = self.begin_wait.lock().over();
         self.waits.end_group();
@@ -2025,23 +2129,15 @@ impl ConnTxn {
         if !self.cell.observe().as_ref().is_some_and(|txn| !txn.wrote()) {
             return false;
         }
-        // Only with no changes, so a statement rollback owed has nothing to undo.
-        let Some((txn, _, _, _owed)) = self.take_to_end() else {
+        // Only with no changes, so a statement rollback owed has nothing to undo, nor a header
+        // field or a tree it wrote to publish.
+        let (mut owed, mut written, mut stamped) = (None, Vec::new(), Vec::new());
+        let Some(txn) = self.take_to_end(&mut owed, &mut written, &mut stamped) else {
             return false;
         };
         self.changes.rolled_back();
         self.db.atoll().transactions().abort(txn);
         true
-    }
-
-    /// Puts `ending` in the connection's place, where whichever statement of the connection meets
-    /// it steps it (DESIGN.md §17). One at a time: the end word lets one statement end the
-    /// connection's transaction (`Connection::atoll_end`).
-    #[turso_macros::atoll_entry]
-    pub fn place(&self, ending: Ending) {
-        let mut place = self.ending.lock();
-        crate::turso_assert!(place.is_none(), "two endings in one connection's place");
-        *place = Some(ending);
     }
 
     /// Steps the ending in the place; done with none there.
@@ -2067,10 +2163,33 @@ impl ConnTxn {
         }
     }
 
-    /// Takes the ending out of the place: done, or to drop, which drives it to its end.
+    /// Drops the ending in the place: one over where it lies; one not over taken out first, since
+    /// its drop drives it to its end, which is not done under the place's lock.
     #[turso_macros::atoll_entry]
-    pub fn take_placed(&self) -> Option<Ending> {
-        self.ending.lock().take()
+    pub fn drop_placed(&self) {
+        let mut place = self.ending.lock();
+        match place.as_ref() {
+            None => {}
+            Some(ending) if ending.is_over() => crate::storage::atoll::clear_option(&mut place),
+            Some(_) => {
+                let ending = place.take();
+                drop(place);
+                drop(ending);
+            }
+        }
+    }
+
+    /// Whether a header write is under way in the connection, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn header_write_under_way_for_test(&self) -> bool {
+        self.setting.lock().is_some()
+    }
+
+    /// Whether the connection's place is free to lock and empty: an ending not over is taken out
+    /// and driven to its end with the place let go, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn place_free_and_empty_for_test(&self) -> bool {
+        self.ending.try_lock().is_some_and(|place| place.is_none())
     }
 
     /// A view for a statement that was reading the connection's transaction when another statement
@@ -3222,15 +3341,6 @@ impl PollBudget {
     }
 }
 
-/// An open transaction taken out of its connection to be ended ([`ConnTxn::take_to_end`]), with the
-/// header fields it wrote and the stamps of the trees it wrote.
-type EndedTxn = (
-    Txn,
-    Vec<(Statement, Field, u32)>,
-    Vec<super::trees::Stamp>,
-    Option<Box<OwedRollback>>,
-);
-
 /// A transaction's commit or rollback, then the drain of the trees it abandoned. Step it until
 /// done. Never abandoned: dropped unfinished, it is driven to its end where it drops (R19).
 pub struct Ending {
@@ -3273,15 +3383,23 @@ enum Step {
 }
 
 impl Ending {
+    /// Whether it is over, so its drop does nothing but let its fields go.
+    fn is_over(&self) -> bool {
+        matches!(self.step, Step::Done)
+    }
+
     /// Commits `txn`: once it is published, its header fields `written` and the stamps of the
     /// trees it wrote are raised to its commit timestamp, and `publish` runs, before it releases
     /// the write gate. A statement rollback `txn` owes is finished first, its top the ending's own
     /// (ASYNC1 D2e (iii-b)); one that failed makes the commit the transaction's rollback, its
     /// failure the outcome.
+    /// Always in line, so a caller that builds the ending in place builds it there, its commit
+    /// made inside its step.
+    #[inline(always)]
     fn commit(
         db: Arc<AtollDb>,
         conn: Arc<crate::storage::atoll::buffer::Conn>,
-        txn: Txn,
+        txn: Option<Txn>,
         written: Vec<(Statement, Field, u32)>,
         stamped: Vec<super::trees::Stamp>,
         publish: Option<Box<dyn FnOnce() + Send>>,
@@ -3289,30 +3407,16 @@ impl Ending {
     ) -> Self {
         #[cfg(test)]
         crate::storage::atoll::testing::ending_made();
-        let published = db.clone();
-        let mut commit = Commit::new(txn).on_published(move |ts| {
-            for (_, field, value) in written {
-                published.header().publish(field, ts, value);
-            }
-            super::trees::TreeStamps::raise(&stamped, ts);
-            if let Some(publish) = publish {
-                publish();
-            }
-        });
+        let hook = Self::publish_hook(&db, written, stamped, publish);
         let Some(owed) = owed else {
-            return Self {
-                db,
-                step: Step::Commit(commit),
-                published: false,
-                owner: crate::storage::atoll::buffer::Owner::of(conn),
-                _frame: crate::storage::atoll::unwind::FrameEnd::default(),
-            };
+            return Self::committing_with(db, conn, txn, hook);
         };
+        let mut commit = Commit::published_by(txn, hook);
         let mut owner = crate::storage::atoll::buffer::Owner::of(conn);
         let step = match Some(owed).map(|o| o.into_parts()) {
             None => Step::Commit(commit),
             // Its top goes on as the ending's, its keeps with it; its place in the shortage queue,
-            // if it had one, `take_to_end` ended, and its next call starts afresh.
+            // if it had one, `let_go_of_ended` ended, and its next call starts afresh.
             Some(Ok((rollback, top, waiting))) => {
                 owner = top;
                 Step::Owed {
@@ -3339,15 +3443,83 @@ impl Ending {
         }
     }
 
-    fn rollback(
+    /// [`commit`](Self::commit) of a transaction that owes no statement rollback, awaiting the
+    /// transaction, which its caller then moves into its place: one value, built in one
+    /// expression with no transaction in it, so a caller that writes it into a place writes it
+    /// there, and the transaction is moved once.
+    #[inline(always)]
+    fn committing(
         db: Arc<AtollDb>,
         conn: Arc<crate::storage::atoll::buffer::Conn>,
-        txn: Txn,
+        written: Vec<(Statement, Field, u32)>,
+        stamped: Vec<super::trees::Stamp>,
+        publish: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         #[cfg(test)]
         crate::storage::atoll::testing::ending_made();
-        if !txn.wrote() {
-            db.atoll().transactions().abort(txn);
+        Self {
+            step: Step::Commit(Commit::awaiting_txn(Self::publish_hook(
+                &db, written, stamped, publish,
+            ))),
+            db,
+            published: false,
+            owner: crate::storage::atoll::buffer::Owner::of(conn),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+        }
+    }
+
+    #[inline(always)]
+    fn committing_with(
+        db: Arc<AtollDb>,
+        conn: Arc<crate::storage::atoll::buffer::Conn>,
+        txn: Option<Txn>,
+        hook: impl FnOnce(crate::storage::atoll::txn::Ts) + Send + 'static,
+    ) -> Self {
+        Self {
+            db,
+            step: Step::Commit(Commit::published_by(txn, hook)),
+            published: false,
+            owner: crate::storage::atoll::buffer::Owner::of(conn),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+        }
+    }
+
+    /// What a commit publishes, run with its commit timestamp once it is published and before it
+    /// releases the write gate: its header fields `written`, the stamps of the trees it wrote, then
+    /// `publish`. The one definition [`commit`](Self::commit) and
+    /// [`committing`](Self::committing) build their commits with; always in line, so it is built
+    /// where the commit holds it.
+    #[inline(always)]
+    fn publish_hook(
+        db: &Arc<AtollDb>,
+        written: Vec<(Statement, Field, u32)>,
+        stamped: Vec<super::trees::Stamp>,
+        publish: Option<Box<dyn FnOnce() + Send>>,
+    ) -> impl FnOnce(crate::storage::atoll::txn::Ts) + Send + 'static {
+        let published = db.clone();
+        move |ts| {
+            for (_, field, value) in written {
+                published.header().publish(field, ts, value);
+            }
+            super::trees::TreeStamps::raise(&stamped, ts);
+            if let Some(publish) = publish {
+                publish();
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn rollback(
+        db: Arc<AtollDb>,
+        conn: Arc<crate::storage::atoll::buffer::Conn>,
+        txn: Option<Txn>,
+    ) -> Self {
+        #[cfg(test)]
+        crate::storage::atoll::testing::ending_made();
+        if !txn.as_ref().expect("a transaction to roll back").wrote() {
+            db.atoll()
+                .transactions()
+                .abort(txn.expect("a transaction to roll back"));
             return Self {
                 db,
                 step: Step::Drain,
@@ -3358,7 +3530,7 @@ impl Ending {
         }
         Self {
             db,
-            step: Step::Rollback(Abort::new(txn), None),
+            step: Step::Rollback(Abort::of(txn), None),
             published: false,
             owner: crate::storage::atoll::buffer::Owner::of(conn),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
@@ -3652,14 +3824,15 @@ impl Ending {
             }
         }
         self.db.abandoned(op.abandoned());
-        let Step::Rollback(_, commit_failure) = std::mem::replace(&mut self.step, Step::Done)
-        else {
+        // The failure is taken out where the step lies, and the next step assigned in each
+        // branch: the step moved out, or chosen by a `match`, would be the whole step copied.
+        let Step::Rollback(_, commit_failure) = &mut self.step else {
             unreachable!("the step just matched")
         };
-        self.step = match commit_failure {
-            Some(failure) => Step::Failed(failure),
-            None => Step::Drain,
-        };
+        match commit_failure.take() {
+            Some(failure) => self.step = Step::Failed(failure),
+            None => self.step = Step::Drain,
+        }
         Ok(IOResult::Done(()))
     }
 
@@ -3681,14 +3854,16 @@ impl Ending {
                     // could bring it nearer.
                     let checkpointer = self.db.atoll().checkpointer();
                     let over = 2 * checkpointer.budget();
-                    self.step = if checkpointer.lag() > over
+                    // Assigned in each branch: a step chosen by the `if` would be the whole step
+                    // written twice.
+                    if checkpointer.lag() > over
                         && checkpointer.lag_to(self.db.atoll().transactions().held_from()) > over
                     {
-                        Step::Checkpoint(checkpointer.request_full())
+                        self.step = Step::Checkpoint(checkpointer.request_full());
                     } else {
                         nudge_checkpoint(&self.db)?;
-                        Step::Done
-                    };
+                        self.step = Step::Done;
+                    }
                 }
                 Step::Checkpoint(wait) => {
                     let txns = self.db.atoll().transactions();
@@ -3871,6 +4046,7 @@ impl SqlCursor {
     /// A cursor over tree `id` in `ct`'s transaction. `index` describes an index's or WITHOUT
     /// ROWID table's keys.
     #[turso_macros::atoll_entry]
+    #[inline(always)]
     pub fn new(ct: &ConnTxn, pager: Arc<Pager>, id: u64, index: Option<Arc<IndexInfo>>) -> Self {
         Self {
             db: ct.db.clone(),
@@ -4021,6 +4197,7 @@ impl SqlCursor {
     /// The cursor, whose writes meeting another transaction's open version fail at once with
     /// `WriteWriteConflict`, changing nothing, as MVCC's do: an index method's, written against
     /// that contract (DESIGN.md §17, §3.1).
+    #[inline(always)]
     pub(in crate::storage::atoll) fn no_wait(mut self) -> Self {
         self.no_wait = true;
         self
@@ -4078,6 +4255,7 @@ impl SqlCursor {
     }
 
     /// A new cursor's open under way, which [`finish_open`](CursorTrait::finish_open) finishes.
+    #[inline(always)]
     pub(in crate::storage::atoll) fn opening_fresh(mut self) -> Self {
         self.opening = Some(Opening::Fresh);
         self
@@ -4192,14 +4370,19 @@ impl SqlCursor {
         }
         if self.open.is_none() {
             let (entry, plain, near) = done!(self.entry_now());
-            let mut cursor = Box::new(AtollCursor::new(
-                self.db.clone(),
-                self.cell.clone(),
-                self.id,
-                entry,
-                self.index.clone(),
-                key::ENCODING,
-            ));
+            // Allocated first and the cursor built in it: a cursor built and then boxed would be
+            // the whole cursor copied.
+            let mut cursor = Box::write(
+                Box::new_uninit(),
+                AtollCursor::new(
+                    self.db.clone(),
+                    self.cell.clone(),
+                    self.id,
+                    entry,
+                    self.index.clone(),
+                    key::ENCODING,
+                ),
+            );
             if plain {
                 cursor.write_plainly();
             }

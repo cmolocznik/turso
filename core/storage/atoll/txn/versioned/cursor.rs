@@ -129,6 +129,8 @@ enum UnseenValue {
 enum Move {
     /// The plain cursor's seek from the cursor's target, not yet done.
     Seek(Seek),
+    /// The plain cursor's seek to its first entry, not yet done: a seek from no key.
+    First,
     /// On past the plain cursor's entry, forward or backward.
     Step { forward: bool },
 }
@@ -137,6 +139,7 @@ impl Move {
     fn forward(self) -> bool {
         match self {
             Move::Seek(seek) => matches!(seek, Seek::Ge | Seek::Gt),
+            Move::First => true,
             Move::Step { forward } => forward,
         }
     }
@@ -298,12 +301,34 @@ impl VersionedTree {
         if cursor.moving.is_none() {
             cursor.target.clear();
             cursor.target.extend_from_slice(key);
-            cursor.moving = Some(Move::Seek(seek));
-            cursor.chain = None;
-            cursor.cursor.set_lazy(true);
-            cursor.edits = txn.changes().edits();
+            self.start_move(txn, cursor, Move::Seek(seek));
         }
         self.settle(txns, versions, txn, cursor)
+    }
+
+    /// Moves `cursor` to the first row `txn`'s current statement sees: a seek at or above no key,
+    /// which has no key to copy. Step it until done; then whether it found one.
+    pub fn seek_first(
+        &self,
+        txns: &Transactions,
+        versions: &Versions,
+        txn: &mut Txn,
+        cursor: &mut VersionedCursor,
+    ) -> Result<IOResult<bool>> {
+        if cursor.moving.is_none() {
+            cursor.target.clear();
+            self.start_move(txn, cursor, Move::First);
+        }
+        self.settle(txns, versions, txn, cursor)
+    }
+
+    /// A seek's start, its target already set.
+    #[inline(always)]
+    fn start_move(&self, txn: &Txn, cursor: &mut VersionedCursor, moving: Move) {
+        cursor.moving = Some(moving);
+        cursor.chain = None;
+        cursor.cursor.set_lazy(true);
+        cursor.edits = txn.changes().edits();
     }
 
     /// The row after the cursor's that `txn`'s current statement sees. Step it until done.
@@ -500,6 +525,7 @@ impl VersionedTree {
                 Move::Seek(seek) => {
                     done!(self.tree().seek(&mut cursor.cursor, &cursor.target, seek))
                 }
+                Move::First => done!(self.tree().seek_first(&mut cursor.cursor)),
                 Move::Step { forward: true } => done!(self.tree().next(&mut cursor.cursor)),
                 Move::Step { forward: false } => done!(self.tree().prev(&mut cursor.cursor)),
             };
@@ -583,7 +609,7 @@ impl VersionedTree {
             match cursor.unseen.as_mut().expect("a walk under way") {
                 Unseen::Key { first } => {
                     let found = if *first {
-                        done!(self.tree().seek(&mut cursor.cursor, &[], Seek::Ge))
+                        done!(self.tree().seek_first(&mut cursor.cursor))
                     } else {
                         done!(self.tree().next(&mut cursor.cursor))
                     };

@@ -14810,7 +14810,7 @@ fn atoll_cursor_shell(
         }
     }
     let index = atoll_index_info(cursor_type)?;
-    Ok(Box::new(atoll.open_cursor(pager.clone(), root, index)?))
+    Ok(atoll.open_cursor_boxed(pager.clone(), root, index)?)
 }
 
 pub fn op_open_write(

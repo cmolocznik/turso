@@ -175,3 +175,35 @@ fn drive_over<T>(
         }
     }
 }
+
+/// Drops what `slot` holds where it lies and leaves it `None`. `*slot = None` would build the
+/// `None` beside it and copy the whole option over the slot once the old value is dropped.
+#[inline(always)]
+pub(in crate::storage::atoll) fn clear_option<T>(slot: &mut Option<T>) {
+    /// Writes `None` over the option when it drops, so the option is `None` after the value's
+    /// drop even if that drop unwinds, as `*slot = None` leaves it.
+    struct WriteNone<T>(*mut Option<T>);
+    impl<T> Drop for WriteNone<T> {
+        fn drop(&mut self) {
+            // SAFETY: the option's value was dropped, so writing over it drops nothing; the
+            // pointer is the `&mut` borrow's, valid and aligned.
+            unsafe { std::ptr::write(self.0, None) }
+        }
+    }
+    if slot.is_some() {
+        let none = WriteNone(slot as *mut Option<T>);
+        // SAFETY: the option is valid, aligned and initialized, and dropped once here; `none`
+        // writes `None` over it next, on the way out or on an unwind.
+        unsafe { std::ptr::drop_in_place(none.0) };
+        drop(none);
+    }
+}
+
+/// Puts `value` in `slot`, which is `None`. `*slot = Some(value)` would drop the slot first and
+/// copy the value in after; written over an empty slot, it is built there.
+#[inline(always)]
+pub(in crate::storage::atoll) fn fill_option<T>(slot: &mut Option<T>, value: T) {
+    crate::turso_assert!(slot.is_none(), "filling an option already filled");
+    // SAFETY: the slot is `None`, so writing over it drops nothing.
+    unsafe { std::ptr::write(slot, Some(value)) };
+}

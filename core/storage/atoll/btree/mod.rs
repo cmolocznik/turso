@@ -1521,10 +1521,29 @@ impl Tree {
 
     /// Moves `cursor` as `seek` says. Step it until done; then whether it found an entry.
     pub fn seek(&self, cursor: &mut Cursor, key: &[u8], seek: Seek) -> Result<IOResult<bool>> {
+        self.seek_from(cursor, Some(key), seek)
+    }
+
+    /// Moves `cursor` to the first entry: a seek at or above no key, which has no key to copy.
+    /// Step it until done; then whether it found one.
+    pub fn seek_first(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
+        self.seek_from(cursor, None, Seek::Ge)
+    }
+
+    /// [`seek`](Self::seek) from `key`, or from no key.
+    #[inline(always)]
+    fn seek_from(
+        &self,
+        cursor: &mut Cursor,
+        key: Option<&[u8]>,
+        seek: Seek,
+    ) -> Result<IOResult<bool>> {
         if cursor.pending.is_none() {
             let mut target = std::mem::take(&mut cursor.spare.2);
             target.clear();
-            target.extend_from_slice(key);
+            if let Some(key) = key {
+                target.extend_from_slice(key);
+            }
             cursor.pending = Some((seek, target));
             cursor.leaf = None;
             cursor.at = None;
@@ -2166,7 +2185,7 @@ impl Put {
     }
 
     /// [`with_entry`](Self::with_entry), the key in a buffer of the caller's, which
-    /// [`into_buffers`](Self::into_buffers) gives back.
+    /// [`take_buffers`](Self::take_buffers) gives back.
     pub fn with_owned(key: Vec<u8>, entry: Vec<u8>, head_len: usize, mode: Mode) -> Self {
         Self {
             key,
@@ -2232,12 +2251,14 @@ impl Put {
     }
 
     /// Its key, and its entry while whole: `None` once its value went out of line, taking the
-    /// entry's bytes past its head.
-    pub fn into_buffers(self) -> (Vec<u8>, Option<Vec<u8>>) {
+    /// entry's bytes past its head. Taken out, leaving it empty, for a put that is then dropped
+    /// where it lies.
+    pub fn take_buffers(&mut self) -> (Vec<u8>, Option<Vec<u8>>) {
         // A value gone out of line took the entry's bytes past its head, whether or not its
         // write is still held.
         let whole = self.restoring.is_none() && self.entry.len() == self.head_len + self.value_len;
-        (self.key, whole.then_some(self.entry))
+        let key = std::mem::take(&mut self.key);
+        (key, whole.then(|| std::mem::take(&mut self.entry)))
     }
 
     /// Puts `entry` back as [`Tree::stored`] read it: a value out of line by its reference, its

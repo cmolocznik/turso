@@ -283,15 +283,20 @@ impl TxnSlot {
     /// open, or while it is the view a schema reparse's pin owns: that view is the pin's to end
     /// ([`take_for_pin`](Self::take_for_pin)), and an end that looked at the pin before the pin
     /// began it must not take it (#5690).
-    pub(in crate::storage::atoll) fn take(&self) -> Option<(Txn, Option<Box<OwedRollback>>)> {
+    /// Its statement rollback owed comes out in `owed`, and the transaction is returned in the
+    /// option it lies in, so it is moved once, never taken out of its option and put back in one.
+    #[inline(always)]
+    pub(in crate::storage::atoll) fn take(
+        &self,
+        owed: &mut Option<Box<OwedRollback>>,
+    ) -> Option<Txn> {
         let mut slot = self.slot.lock();
-        if slot.pin.as_ref().is_some_and(|pin| pin.owned) {
+        if slot.pin.as_ref().is_some_and(|pin| pin.owned) || slot.txn.is_none() {
             return None;
         }
-        let txn = slot.txn.take()?;
-        let owed = slot.owed.take();
+        *owed = slot.owed.take();
         self.owing.store(slot.owing(), AtomicOrdering::Release);
-        Some((txn, owed))
+        slot.txn.take()
     }
 
     /// The slot as it stands, for a test that sets up or ends the transaction directly.
@@ -1131,6 +1136,8 @@ struct Seeking {
 /// A move of the versioned cursor.
 enum Move<'a> {
     Seek(&'a [u8], Seek),
+    /// To the first row: a seek from no key.
+    First,
     Next,
     Prev,
 }
@@ -1147,6 +1154,7 @@ impl AtollCursor {
     /// A cursor over tree `id`, whose catalog row is `entry`, reading in `txn`. `index` describes
     /// an index's or WITHOUT ROWID table's keys, and `encoding` is the encoding this build writes
     /// for them.
+    #[inline(always)]
     pub fn new(
         db: Arc<AtollDb>,
         txn: TxnCell,
@@ -1276,7 +1284,7 @@ impl AtollCursor {
         self.seeking = None;
         self.record.forget(&mut self.cursor);
         self.null_row = false;
-        self.writing = None;
+        crate::storage::atoll::clear_option(&mut self.writing);
         self.left = None;
         self.refreshing = None;
         self.guarding = None;
@@ -1350,6 +1358,9 @@ impl AtollCursor {
                 self.tree
                     .seek(txns, versions, txn, &mut self.cursor, key, seek)?
             }
+            Move::First => self
+                .tree
+                .seek_first(txns, versions, txn, &mut self.cursor)?,
             Move::Next => self.tree.next(txns, versions, txn, &mut self.cursor)?,
             Move::Prev => self.tree.prev(txns, versions, txn, &mut self.cursor)?,
         };
@@ -1366,7 +1377,7 @@ impl AtollCursor {
         if self.unseen {
             return self.owned(|c| c.step_unseen(true));
         }
-        done!(self.owned(|c| c.step(Move::Seek(&[], Seek::Ge))));
+        done!(self.owned(|c| c.step(Move::First)));
         Ok(IOResult::Done(()))
     }
 
@@ -1840,7 +1851,7 @@ impl AtollCursor {
                 .take()
                 .filter(|_| self.probed == k)
                 .or_else(|| self.cursor.kept_at(&k));
-            self.writing = Some(if self.plain {
+            let writing = if self.plain {
                 let guard = self.txn.enter()?;
                 let txn = guard.as_ref().ok_or_else(outside)?;
                 Writing::PlainPut(self.tree.plain_put(txn, k, entry, mode), mode)
@@ -1851,7 +1862,8 @@ impl AtollCursor {
                         .kept(kept),
                     mode,
                 )
-            });
+            };
+            crate::storage::atoll::fill_option(&mut self.writing, writing);
         }
         self.owned(Self::write)
     }
@@ -1990,7 +2002,7 @@ impl AtollCursor {
     /// Drops a write that came back `Write::Wait`, which wrote nothing, so that the cursor's next
     /// write starts afresh.
     pub fn abandon_write(&mut self) {
-        self.writing = None;
+        crate::storage::atoll::clear_option(&mut self.writing);
     }
 
     /// Deletes the row or index entry the cursor is at. Step it until done.
@@ -2005,7 +2017,7 @@ impl AtollCursor {
             let (mut k, entry) = std::mem::take(&mut self.spare);
             k.clear();
             k.extend_from_slice(at);
-            self.writing = Some(if self.plain {
+            let writing = if self.plain {
                 let remove = Remove::new(&k);
                 self.spare = (k, entry);
                 Writing::PlainRemove(remove)
@@ -2017,7 +2029,8 @@ impl AtollCursor {
                         .kept(kept),
                     Mode::Update,
                 )
-            });
+            };
+            crate::storage::atoll::fill_option(&mut self.writing, writing);
         }
         self.owned(Self::write)
     }
@@ -2081,18 +2094,20 @@ impl AtollCursor {
         self.record.forget(&mut self.cursor);
         // An insert's row is where the cursor now stands, shown from the entry it stored; any
         // write's buffers serve the next.
-        let (k, entry, put) = match self.writing.take().expect("a write") {
+        // The buffers are taken out where the write lies, and the write is then dropped there.
+        let (k, entry, put) = match self.writing.as_mut().expect("a write") {
             Writing::Versioned(op, _) => {
                 let put = !op.deletes();
-                let (k, entry) = op.into_buffers();
+                let (k, entry) = op.take_buffers();
                 (k, entry, put)
             }
             Writing::PlainPut(put, _) => {
-                let (k, entry) = put.into_buffers();
+                let (k, entry) = put.take_buffers();
                 (k, entry.unwrap_or_default(), true)
             }
             Writing::PlainRemove(_) => (Vec::new(), Vec::new(), false),
         };
+        crate::storage::atoll::clear_option(&mut self.writing);
         match write {
             Write::Done(Outcome::Inserted | Outcome::Updated) if put && entry.len() >= HEADER => {
                 self.spare = self.cursor.place_entry(k, entry, HEADER, self.reached);

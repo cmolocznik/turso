@@ -160,10 +160,15 @@ fn put16<P: BytesMut + ?Sized>(p: &mut P, at: usize, v: usize) {
 /// The first four bytes of a key as a big-endian integer, zero-padded: heads order like the keys,
 /// and keys with equal heads are compared whole.
 pub fn head(key: &[u8]) -> u32 {
-    let mut b = [0u8; 4];
-    let n = key.len().min(4);
-    b[..n].copy_from_slice(&key[..n]);
-    u32::from_be_bytes(b)
+    // Read in place: a copy of the first bytes into a buffer is a call to copy them, whatever
+    // their length, none included.
+    match *key {
+        [a, b, c, d, ..] => u32::from_be_bytes([a, b, c, d]),
+        [a, b, c] => u32::from_be_bytes([a, b, c, 0]),
+        [a, b] => u32::from_be_bytes([a, b, 0, 0]),
+        [a] => u32::from_be_bytes([a, 0, 0, 0]),
+        [] => 0,
+    }
 }
 
 pub fn common_prefix(a: &[u8], b: &[u8]) -> usize {
@@ -1436,6 +1441,23 @@ mod tests {
             upper,
             next: (PageId::from_raw(0), 0),
             reserving: false,
+        }
+    }
+
+    /// A key's head is its first four bytes as a big-endian integer, zero-padded: for every
+    /// length up to five, each byte in its place.
+    #[test]
+    fn a_keys_head_is_its_first_four_bytes_big_endian_zero_padded() {
+        let key = [0x12, 0x34, 0x56, 0x78, 0x9a];
+        for len in 0..=key.len() {
+            let mut padded = [0; 4];
+            let n = len.min(4);
+            padded[..n].copy_from_slice(&key[..n]);
+            assert_eq!(
+                head(&key[..len]),
+                u32::from_be_bytes(padded),
+                "the head of a key of {len} bytes"
+            );
         }
     }
 

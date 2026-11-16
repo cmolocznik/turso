@@ -405,7 +405,7 @@ impl Get {
 
 /// A put or delete of one key in a transaction: step it with [`VersionedTree::write`] until done.
 /// Its key and entry are buffers the caller may take back once it is done
-/// ([`WriteOp::into_buffers`]), to build its next write in.
+/// ([`WriteOp::take_buffers`]), to build its next write in.
 pub struct WriteOp {
     key: Vec<u8>,
     /// A put's entry: [`HEADER`] bytes the version header goes in, then the value, built once, in
@@ -448,6 +448,7 @@ impl WriteOp {
 
     /// Puts `entry`'s value under `key`: `entry` holds [`HEADER`] bytes for the version header,
     /// then the value.
+    #[inline(always)]
     pub fn put_entry(key: Vec<u8>, entry: Vec<u8>, mode: Mode) -> Self {
         assert!(
             entry.len() >= HEADER,
@@ -473,6 +474,7 @@ impl WriteOp {
     }
 
     /// [`delete`](Self::delete), its entry built in `spare`.
+    #[inline(always)]
     pub fn delete_into(key: Vec<u8>, spare: Vec<u8>) -> Self {
         Self {
             key,
@@ -492,24 +494,32 @@ impl WriteOp {
         self.deletes
     }
 
-    /// Its key, and the entry it wrote once done: a put's as the leaf stores it inline, its
-    /// version header then its value.
-    pub fn into_buffers(self) -> (Vec<u8>, Vec<u8>) {
-        (self.key, self.entry)
+    /// Its key, and the entry it wrote once done (a put's as the leaf stores it inline, its
+    /// version header then its value), taken out and leaving it empty: for a write that is done,
+    /// whose op is then dropped where it lies.
+    pub fn take_buffers(&mut self) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::mem::take(&mut self.key),
+            std::mem::take(&mut self.entry),
+        )
     }
 
-    /// The put's buffers back from `put`, once it is done or must be built again: the entry, whole
-    /// unless its value went out of line, when the copy kept for that is the entry.
-    fn take_back(&mut self, mut put: Put) {
+    /// The put's buffers back from the put under way, once it is done or must be built again: the
+    /// entry, whole unless its value went out of line, when the copy kept for that is the entry.
+    /// The put is dropped where it lies, so `put` is `None` before anything reads it again.
+    fn take_back(&mut self) {
+        let (put, _) = self.put.as_mut().expect("a put under way");
         self.room = put.take_room();
-        let (key, entry) = put.into_buffers();
+        let (key, entry) = put.take_buffers();
         self.key = key;
         if let Some(entry) = entry {
             self.entry = entry;
         }
+        crate::storage::atoll::clear_option(&mut self.put);
     }
 
     /// Tries `near` before a descent.
+    #[inline(always)]
     pub fn near(mut self, near: Near) -> Self {
         self.near = near;
         self
@@ -522,6 +532,7 @@ impl WriteOp {
 
     /// Starts from `kept`, the look at the key's leaf a probe of the key made
     /// ([`VersionedTree::probe`]): the write's look, while the leaf is unchanged since.
+    #[inline(always)]
     pub fn kept(mut self, kept: Option<Kept>) -> Self {
         self.kept = kept;
         self
@@ -839,23 +850,20 @@ impl VersionedTree {
                     Some(looked) => done!(self.tree.put_looked(put, looked)),
                     None => done!(self.tree.put(put)),
                 };
-                let (put, _) = op.put.take().expect("a put");
                 match outcome {
                     // Another version came first: judge it.
                     Outcome::Changed => {
-                        op.take_back(put);
+                        op.take_back();
                         continue;
                     }
                     Outcome::Full => {
-                        op.take_back(put);
+                        op.take_back();
                         op.reserves = Reserves::GivingBack;
                         continue;
                     }
                     _ => {}
                 }
-                return Ok(IOResult::Done(Write::Done(
-                    self.wrote(txn, op, put, present),
-                )));
+                return Ok(IOResult::Done(Write::Done(self.wrote(txn, op, present))));
             }
             if op.reserves == Reserves::GivingBack {
                 let settled = |head: &[u8]| {
@@ -993,9 +1001,9 @@ impl VersionedTree {
 
     /// A write's put done: its leaf noted, its change noted by key, its buffers back in `op`, and
     /// what it came to.
-    fn wrote(&self, txn: &mut Txn, op: &mut WriteOp, put: Put, present: bool) -> Outcome {
-        op.near = put.reached();
-        op.take_back(put);
+    fn wrote(&self, txn: &mut Txn, op: &mut WriteOp, present: bool) -> Outcome {
+        op.near = op.put.as_ref().expect("a put under way").0.reached();
+        op.take_back();
         let root = self.root();
         txn.changed(|statement, changes| match op.deletes {
             true => changes.delete(statement, root, &op.key),

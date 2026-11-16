@@ -3487,8 +3487,11 @@ fn ending_comes_short() -> std::result::Result<(), String> {
     if !pool.evict_clean(root) {
         return Err("the tree's root was not evicted".into());
     }
-    let mut ending =
-        super::Ending::rollback(db.clone(), crate::storage::atoll::buffer::Conn::new(), txn);
+    let mut ending = super::Ending::rollback(
+        db.clone(),
+        crate::storage::atoll::buffer::Conn::new(),
+        Some(txn),
+    );
     let mut short = 0;
     loop {
         match scarce(|| ending.step()).map_err(|e| e.to_string())? {
@@ -5162,6 +5165,141 @@ fn step_to_end(
     }
 }
 
+/// An ending in the connection's place that is not over, dropped (`ConnTxn::drop_placed`), is taken
+/// out of the place and driven to its end with the place let go: a commit's ending placed and not
+/// yet stepped waits in its drive on a test's pause, while another thread finds the place free and
+/// empty; the commit then lands (mutant `not-over-under-lock`: dropped under the place's lock, the
+/// drive holds it). A child of its own.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn an_ending_not_over_is_driven_to_its_end_outside_its_connections_place() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_ending_not_over_is_driven_to_its_end_outside_its_connections_place"
+        ),
+        || {
+            let crash = Arc::new(crate::io::crash::CrashIO::new(667));
+            let io: Arc<dyn IO> = crash.clone();
+            let db = open(&io, "/db/ending-not-over-dropped");
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            let reader = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE t(a INTEGER)",
+                "BEGIN",
+                "INSERT INTO t VALUES (1)",
+            ] {
+                ran_on(&writer, &crash, sql).unwrap();
+            }
+            let atoll = writer.atoll().expect("an Atoll connection");
+            // Placed, never stepped: not over.
+            let placed = atoll.end_into_place(true, None);
+            let pause = crate::io::Completion::new_wait();
+            crate::storage::atoll::testing::ENDING_PAUSE
+                .with(|p| *p.borrow_mut() = Some(pause.clone()));
+            // The drive waits on the pause at its commit step. A helper lets the pause go once it
+            // finds the place free and empty; a place still held after 20 seconds is the drive
+            // running under it, and the helper lets the pause go anyway, so the drive ends.
+            let (conn, paused) = (writer.clone(), pause.clone());
+            let helper = std::thread::spawn(move || {
+                let atoll = conn.atoll().expect("an Atoll connection");
+                let start = std::time::Instant::now();
+                let found = loop {
+                    if atoll.place_free_and_empty_for_test() {
+                        break true;
+                    }
+                    if start.elapsed() > std::time::Duration::from_secs(20) {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                paused.complete(0);
+                found
+            });
+            atoll.drop_placed();
+            let found = helper.join().expect("the helper");
+            crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+            let committed = reader
+                .prepare("SELECT count(*) FROM t")
+                .and_then(|mut statement| statement.run_collect_rows())
+                .map_err(|e| e.to_string());
+            drop((writer, reader, db));
+            assert!(placed, "an ending placed");
+            assert!(
+                found,
+                "the place was held while the ending not over was driven to its end"
+            );
+            assert_eq!(committed, Ok(vec![vec![crate::Value::from_i64(1)]]));
+        },
+    );
+}
+
+/// A header write that waits behind another connection's write of the same field, its statement
+/// dropped so its transaction ends, leaves no header write under way in its connection, and the
+/// connection's next header write writes its own field (`ConnTxn::let_go_of_ended` lets go of the
+/// write under way; mutant `setting-left`: kept, the next write reuses its field and op). A child
+/// of its own.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_header_write_waiting_when_its_transaction_ends_leaves_none_under_way() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_header_write_waiting_when_its_transaction_ends_leaves_none_under_way"
+        ),
+        || {
+            let crash = Arc::new(crate::io::crash::CrashIO::new(669));
+            let io: Arc<dyn IO> = crash.clone();
+            let db = open(&io, "/db/header-write-let-go");
+            let holder = db.connect(ConnectOpts::new()).unwrap();
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            // It waits behind the holder's write rather than failing at once.
+            writer.set_busy_timeout(std::time::Duration::from_secs(30));
+            ran_on(&holder, &crash, "BEGIN").unwrap();
+            ran_on(&holder, &crash, "PRAGMA user_version = 5").unwrap();
+            let mut waiting = writer.prepare("PRAGMA user_version = 7").unwrap();
+            let atoll = writer.atoll().expect("an Atoll connection");
+            let mut steps = 0;
+            while !atoll.header_write_under_way_for_test() && steps < 100 {
+                match waiting.step() {
+                    Ok(crate::StepResult::IO) => crash.step().unwrap(),
+                    other => panic!("the waiting write ended: {other:?}"),
+                }
+                steps += 1;
+            }
+            let under_way = atoll.header_write_under_way_for_test();
+            // Its statement dropped: its autocommit transaction ends.
+            drop(waiting);
+            let left = atoll.header_write_under_way_for_test();
+            ran_on(&holder, &crash, "ROLLBACK").unwrap();
+            let next = ran_on(&writer, &crash, "PRAGMA application_id = 9");
+            let read = |sql: &str| {
+                holder
+                    .prepare(sql)
+                    .and_then(|mut statement| statement.run_collect_rows())
+                    .map_err(|e| e.to_string())
+            };
+            let (user_version, application_id) =
+                (read("PRAGMA user_version"), read("PRAGMA application_id"));
+            drop((holder, writer, db));
+            assert!(under_way, "the write never waited behind the other's");
+            assert!(
+                !left,
+                "a header write left under way after its transaction ended"
+            );
+            assert_eq!(next, Ok(()));
+            assert_eq!(
+                (user_version, application_id),
+                (
+                    Ok(vec![vec![crate::Value::from_i64(0)]]),
+                    Ok(vec![vec![crate::Value::from_i64(9)]])
+                ),
+                "(user_version, application_id) after the next header write"
+            );
+        },
+    );
+}
+
 /// A statement of a connection started while another of its statements holds the connection's
 /// end, a `CREATE TABLE` waiting in its commit's ending, is refused and changes nothing, and a close
 /// then is too; once the first has finished, as it drops, the refused statement runs and the
@@ -6767,7 +6905,7 @@ fn a_rollback_ending_dropped_unstepped(fail: bool, other: bool) {
         drop(super::Ending::rollback(
             db.clone(),
             crate::storage::atoll::buffer::Conn::new(),
-            txn,
+            Some(txn),
         ));
         let in_drop = crash.completed() - before;
         crash.set_faults(crate::io::crash::Faults::default());
@@ -6952,7 +7090,7 @@ fn a_commit_told_of_its_drivers_failure_before_it_ended_rolls_back() {
         let mut ending = super::Ending::commit(
             db.clone(),
             crate::storage::atoll::buffer::Conn::new(),
-            txn,
+            Some(txn),
             Vec::new(),
             Vec::new(),
             None,
@@ -7079,7 +7217,7 @@ fn a_commit_whose_admission_its_driver_sees_fail(seed: u64, fail: bool, by_drop:
         let mut ending = super::Ending::commit(
             db.clone(),
             crate::storage::atoll::buffer::Conn::new(),
-            txn,
+            Some(txn),
             Vec::new(),
             Vec::new(),
             None,

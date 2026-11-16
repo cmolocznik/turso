@@ -454,7 +454,7 @@ impl Drop for EndingBegun {
         // An ending still in the place drives itself to its end as it drops, before the end is
         // let go.
         if let Some(atoll) = self.0.atoll() {
-            drop(atoll.take_placed());
+            atoll.drop_placed();
         }
         self.0
             .atoll_end
@@ -3916,15 +3916,13 @@ impl Program {
                 let (db, schema) = (connection.db.clone(), connection.schema.read().clone());
                 Box::new(move || db.update_schema_if_newer(schema)) as Box<dyn FnOnce() + Send>
             });
-            program_state.commit_state = match atoll.end_publishing(!rollback, publish) {
-                Some(ending) => {
-                    atoll.place(ending);
-                    CommitState::Atoll {
-                        schema_did_change,
-                        rollback,
-                    }
+            program_state.commit_state = if atoll.end_into_place(!rollback, publish) {
+                CommitState::Atoll {
+                    schema_did_change,
+                    rollback,
                 }
-                None => CommitState::CommittingAttached,
+            } else {
+                CommitState::CommittingAttached
             };
         }
         if let CommitState::Atoll {
@@ -3945,7 +3943,7 @@ impl Program {
                 Err(e) => return Err(e.into()),
             }
             // Over: done, or failed once published.
-            drop(atoll.take_placed());
+            atoll.drop_placed();
             // A commit's schema was published with it; a rollback's is put back.
             if schema_did_change && rollback {
                 *connection.schema.write() = connection.db.clone_schema();

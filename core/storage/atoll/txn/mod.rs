@@ -489,8 +489,17 @@ pub struct Abort {
 
 impl Abort {
     pub fn new(txn: Txn) -> Self {
+        Self::of(Some(txn))
+    }
+
+    /// [`new`](Self::new) for a transaction in the option it lies in, which holds one: moved into
+    /// the rollback in its option, not taken out of it. Always in line, so a rollback built inside
+    /// another value is built there.
+    #[inline(always)]
+    pub fn of(txn: Option<Txn>) -> Self {
+        crate::turso_assert!(txn.is_some(), "a rollback of no transaction");
         Self {
-            txn: Some(txn),
+            txn,
             undo: Rollback::after(0),
             abandoned: Vec::new(),
         }
@@ -546,15 +555,26 @@ impl Commit {
         }
     }
 
-    /// Runs `hook` with the commit timestamp of a commit that wrote, once it is published and
-    /// before the write gate is released: what a taker of the gate after the commit must see, such
-    /// as the stamps of the trees it wrote and the header fields it set (DESIGN.md §17). Published
-    /// is not covered: the horizon may still be below the timestamp while a commit below it on
-    /// another slot draws, and a snapshot taken then misses the commit
-    /// ([`Transactions::wait_covered`]).
-    pub fn on_published(mut self, hook: impl FnOnce(Ts) + Send + 'static) -> Self {
-        self.published = Some(Box::new(hook));
-        self
+    /// A commit of the transaction `txn` holds, running `hook` with the commit timestamp of a
+    /// commit that wrote, once it is published and before the write gate is released: what a
+    /// taker of the gate after the commit must see, such as the stamps of the trees it wrote and
+    /// the header fields it set (DESIGN.md §17). Published is not covered: the horizon may still
+    /// be below the timestamp while a commit below it on another slot draws, and a snapshot taken
+    /// then misses the commit ([`Transactions::wait_covered`]). Made in one expression and always
+    /// in line, so a commit built inside another value is built there, the transaction moved in
+    /// its option.
+    #[inline(always)]
+    pub fn published_by(txn: Option<Txn>, hook: impl FnOnce(Ts) + Send + 'static) -> Self {
+        crate::turso_assert!(txn.is_some(), "a commit of no transaction");
+        Self {
+            txn,
+            admitted: None,
+            log_wait: LogWait::default(),
+            ts: None,
+            durable: 0,
+            abandoned: Vec::new(),
+            published: Some(Box::new(hook)),
+        }
     }
 
     /// Whether the commit has been published: its pair is in its slot's commit log, so what it
@@ -581,6 +601,27 @@ impl Commit {
     /// ([`Abort::new`]): nothing it wrote was published.
     pub fn take_txn(&mut self) -> Option<Txn> {
         self.txn.take()
+    }
+
+    /// A commit whose transaction is put in its place next ([`txn_place`](Self::txn_place)), by
+    /// whoever built the commit where it will step: the transaction is then moved once, into
+    /// the commit where it lies.
+    #[inline(always)]
+    pub fn awaiting_txn(hook: impl FnOnce(Ts) + Send + 'static) -> Self {
+        Self {
+            txn: None,
+            admitted: None,
+            log_wait: LogWait::default(),
+            ts: None,
+            durable: 0,
+            abandoned: Vec::new(),
+            published: Some(Box::new(hook)),
+        }
+    }
+
+    /// The place of the transaction of a commit made [`awaiting_txn`](Self::awaiting_txn).
+    pub fn txn_place(&mut self) -> &mut Option<Txn> {
+        &mut self.txn
     }
 
     /// The transaction it commits, while it holds it: before its transaction has ended.
@@ -667,7 +708,9 @@ impl Transactions {
     }
 
     /// Gives `changes`, of the transaction ending in `slot`, to the slot's next transaction,
-    /// before the slot is freed.
+    /// before the slot is freed. Always in line, so the changes go from the transaction straight
+    /// to the slot.
+    #[inline(always)]
     fn keep(&self, slot: u16, mut changes: changes::Changes) {
         changes.recycle();
         // SAFETY: the transaction ending holds the slot until it is freed.
@@ -786,6 +829,43 @@ impl Transactions {
     /// Begins a transaction of `group` once a slot is free, without a snapshot: an exclusive
     /// taker takes its slot before it marks itself pending, and its snapshot after the drain.
     pub fn begin_slot_in(&self, isolation: Isolation, group: u64) -> Result<IOResult<Txn>> {
+        let (slot, start) = match self.seat(group)? {
+            IOResult::Done(seated) => seated,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        Ok(IOResult::Done(self.new_txn(slot, start, isolation)))
+    }
+
+    /// [`begin_slot_in`](Self::begin_slot_in), the transaction built in `into`, which is `None`,
+    /// instead of returned: a statement's begins it in its connection's cell, where it stays.
+    pub fn begin_slot_into(
+        &self,
+        isolation: Isolation,
+        group: u64,
+        into: &mut Option<Txn>,
+    ) -> Result<IOResult<()>> {
+        assert!(into.is_none(), "a transaction begun over another");
+        let (slot, start) = match self.seat(group)? {
+            IOResult::Done(seated) => seated,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        *into = Some(self.new_txn(slot, start, isolation));
+        Ok(IOResult::Done(()))
+    }
+
+    /// [`begin`](Self::begin), the transaction built in `into`, which is `None`, and its
+    /// snapshot taken there.
+    pub fn begin_into(&self, isolation: Isolation, into: &mut Option<Txn>) -> Result<IOResult<()>> {
+        if let IOResult::IO(io) = self.begin_slot_into(isolation, 0, into)? {
+            return Ok(IOResult::IO(io));
+        }
+        self.take_snapshot(into.as_mut().expect("the transaction just begun"));
+        Ok(IOResult::Done(()))
+    }
+
+    /// A free slot taken and seated for `group`, with the transaction's start: IO while none is
+    /// free.
+    fn seat(&self, group: u64) -> Result<IOResult<(u16, Ts)>> {
         self.refuse_if_failed()?;
         let slot = match self.take_slot() {
             Some(slot) => slot,
@@ -812,9 +892,16 @@ impl Transactions {
             start,
             group,
         );
+        Ok(IOResult::Done((slot, start)))
+    }
+
+    /// The transaction seated in `slot` at `start`. Always in line, so a caller that builds it
+    /// in place builds it there.
+    #[inline(always)]
+    fn new_txn(&self, slot: u16, start: Ts, isolation: Isolation) -> Txn {
         // The snapshot, when it is taken, before the log's end: every commit it covers is in the
         // log by then.
-        Ok(IOResult::Done(Txn {
+        Txn {
             slot,
             start,
             isolation,
@@ -833,7 +920,7 @@ impl Transactions {
             // SAFETY: the slot was just taken.
             changes: unsafe { self.kept[slot as usize].take() }
                 .unwrap_or_else(|| changes::Changes::in_chunks(None, self.redo_chunk, None)),
-        }))
+        }
     }
 
     /// Takes the gate shared for `txn`, which is to write. Behind another's exclusive take it

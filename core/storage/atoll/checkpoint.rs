@@ -1349,16 +1349,29 @@ impl Checkpointer {
 
     /// How far the redo point in charge trails the log's end, in bytes.
     pub fn lag(&self) -> u64 {
-        self.log.end().saturating_sub(self.superblock().redo)
+        self.log.end().saturating_sub(self.redo())
     }
 
     /// How far the redo point in charge trails `at`, in bytes: the most a checkpoint could take
     /// off it while the log is held back there.
     pub fn lag_to(&self, at: Lsn) -> u64 {
-        at.saturating_sub(self.superblock().redo)
+        at.saturating_sub(self.redo())
+    }
+
+    /// The redo point of the superblock in charge, read where it lies: [`superblock`] would copy
+    /// the whole superblock, continuations and all, for it.
+    ///
+    /// [`superblock`]: Self::superblock
+    fn redo(&self) -> Lsn {
+        let step = self.releasing.epochs().enter();
+        self.published
+            .get(&step)
+            .expect("a superblock in charge")
+            .redo
     }
 
     /// The superblock in charge.
+    #[cfg(test)]
     pub fn superblock(&self) -> Superblock {
         let step = self.releasing.epochs().enter();
         (*self.published.get(&step).expect("a superblock in charge")).clone()

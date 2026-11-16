@@ -1753,47 +1753,58 @@ fn an_open_shrink_keeps_its_room_so_its_leaf_as_of_a_snapshot_fits_and_its_rollb
     }
 }
 
+/// A child of its own (`cleanly`): a put rebuilt after its leaf gave room back (`Outcome::Full`) must be built
+/// afresh, not stepped again from the put whose buffers were taken (B3: `WriteOp::take_back`; mutant `put-left`).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_reserve_is_given_back_once_every_new_snapshot_sees_the_version_that_made_it() {
-    use crate::storage::atoll::btree::node::View;
-    use crate::storage::atoll::btree::SPLITS;
-    let splits = || SPLITS.with(|n| n.get());
-    let db = open();
-    let wide = |s: &str| padded(s, 700);
-    let mut setup = db.begin(Isolation::Snapshot);
-    for key in ["x0", "x1", "x2", "x3"] {
-        db.put(&mut setup, key, &wide(key), Mode::Insert);
-    }
-    db.commit(setup);
-    let mut shrink = db.begin(Isolation::Snapshot);
-    for key in ["x0", "x1", "x2", "x3"] {
-        db.put(&mut shrink, key, "-", Mode::Update);
-    }
-    db.commit(shrink);
-    let reserved = |db: &Db| View::new(&db.page(db.tree.root())[..]).reserved();
-    let one = (HEADER + wide("x0").len()) - (HEADER + 1);
-    assert_eq!(reserved(&db), 4 * one, "kept until a write needs the room");
-    // A version put back that every snapshot sees keeps no reserve.
-    let mut grow = db.begin(Isolation::Snapshot);
-    db.put(&mut grow, "x0", &wide("x0"), Mode::Update);
-    db.rollback(grow);
-    assert_eq!(reserved(&db), 3 * one);
-    let before = splits();
-    let mut fill = db.begin(Isolation::Snapshot);
-    for key in ["y0", "y1", "y2", "y3"] {
-        db.put(&mut fill, key, &wide(key), Mode::Insert);
-    }
-    db.commit(fill);
-    assert_eq!(splits(), before, "the room given back, not split for");
-    assert_eq!(reserved(&db), 0);
-    let mut reader = db.begin(Isolation::Snapshot);
-    for key in ["x0", "x1", "x2", "x3"] {
-        assert_eq!(db.get(&mut reader, key).as_deref(), Some("-"), "{key}");
-    }
-    for key in ["y0", "y1", "y2", "y3"] {
-        assert_eq!(db.get(&mut reader, key), Some(wide(key)), "{key}");
-    }
-    db.leaves();
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_reserve_is_given_back_once_every_new_snapshot_sees_the_version_that_made_it"
+        ),
+        || {
+            use crate::storage::atoll::btree::node::View;
+            use crate::storage::atoll::btree::SPLITS;
+            let splits = || SPLITS.with(|n| n.get());
+            let db = open();
+            let wide = |s: &str| padded(s, 700);
+            let mut setup = db.begin(Isolation::Snapshot);
+            for key in ["x0", "x1", "x2", "x3"] {
+                db.put(&mut setup, key, &wide(key), Mode::Insert);
+            }
+            db.commit(setup);
+            let mut shrink = db.begin(Isolation::Snapshot);
+            for key in ["x0", "x1", "x2", "x3"] {
+                db.put(&mut shrink, key, "-", Mode::Update);
+            }
+            db.commit(shrink);
+            let reserved = |db: &Db| View::new(&db.page(db.tree.root())[..]).reserved();
+            let one = (HEADER + wide("x0").len()) - (HEADER + 1);
+            assert_eq!(reserved(&db), 4 * one, "kept until a write needs the room");
+            // A version put back that every snapshot sees keeps no reserve.
+            let mut grow = db.begin(Isolation::Snapshot);
+            db.put(&mut grow, "x0", &wide("x0"), Mode::Update);
+            db.rollback(grow);
+            assert_eq!(reserved(&db), 3 * one);
+            let before = splits();
+            let mut fill = db.begin(Isolation::Snapshot);
+            for key in ["y0", "y1", "y2", "y3"] {
+                db.put(&mut fill, key, &wide(key), Mode::Insert);
+            }
+            db.commit(fill);
+            assert_eq!(splits(), before, "the room given back, not split for");
+            assert_eq!(reserved(&db), 0);
+            let mut reader = db.begin(Isolation::Snapshot);
+            for key in ["x0", "x1", "x2", "x3"] {
+                assert_eq!(db.get(&mut reader, key).as_deref(), Some("-"), "{key}");
+            }
+            for key in ["y0", "y1", "y2", "y3"] {
+                assert_eq!(db.get(&mut reader, key), Some(wide(key)), "{key}");
+            }
+            db.leaves();
+        },
+    );
 }
 
 #[test]

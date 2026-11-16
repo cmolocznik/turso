@@ -140,7 +140,9 @@ impl AtollDb {
 
     /// Hands over the trees a commit or rollback abandoned, each on the abandoned list, to drain.
     pub fn abandoned(&self, roots: &[PageId]) {
-        self.draining.lock().extend_from_slice(roots);
+        if !roots.is_empty() {
+            self.draining.lock().extend_from_slice(roots);
+        }
     }
 
     /// Drains every tree handed over. One drainer works at a time: a call while another is at work

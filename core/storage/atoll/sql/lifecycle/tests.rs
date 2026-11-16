@@ -241,33 +241,42 @@ impl Db {
 
 /// A statement rollback and a whole rollback each put the trees they undo on the abandoned list;
 /// handed over once the transaction ends, they drain, while a tree whose creation stands keeps
-/// its rows.
+/// its rows (mutant `abandoned-skipped`: a list with trees not handed over). A child of its own.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn undone_creations_drain_once_handed_over_and_kept_ones_stay() {
-    let db = Db::open(Arc::new(MemoryIO::new()));
-    let mut t = db.begin();
-    let kept = db.table(&mut t, 10, 40);
-    db.statement(&mut t);
-    let undone = db.table(&mut t, 11, 40);
-    let pages = db.pages(undone);
-    db.rollback_to(&mut t, 1);
-    assert_eq!(t.abandoned(), &[undone]);
-    assert!(db.row_in(&mut t, 11).is_none());
-    let abandoned = db.commit(t);
-    assert_eq!(abandoned, vec![undone]);
-    assert_eq!(db.listed(System::Abandoned), vec![undone]);
-    db.hand_over(&abandoned);
-    assert!(db.listed(System::Abandoned).is_empty());
-    assert!(pages.iter().all(|&p| db.free(p)), "{undone:?} not freed");
-    assert_eq!(db.row(10).map(|r| r.root), Some(kept));
-    let mut t = db.begin();
-    assert!(db.get(&mut t, kept, "r0003").unwrap().starts_with("10-3-"));
-    let whole = db.table(&mut t, 12, 40);
-    let abandoned = db.rollback(t);
-    assert_eq!(abandoned, vec![whole]);
-    db.hand_over(&abandoned);
-    assert!(db.listed(System::Abandoned).is_empty());
-    db.check_whole(&[10, 11, 12], "after both");
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::undone_creations_drain_once_handed_over_and_kept_ones_stay"
+        ),
+        || {
+            let db = Db::open(Arc::new(MemoryIO::new()));
+            let mut t = db.begin();
+            let kept = db.table(&mut t, 10, 40);
+            db.statement(&mut t);
+            let undone = db.table(&mut t, 11, 40);
+            let pages = db.pages(undone);
+            db.rollback_to(&mut t, 1);
+            assert_eq!(t.abandoned(), &[undone]);
+            assert!(db.row_in(&mut t, 11).is_none());
+            let abandoned = db.commit(t);
+            assert_eq!(abandoned, vec![undone]);
+            assert_eq!(db.listed(System::Abandoned), vec![undone]);
+            db.hand_over(&abandoned);
+            assert!(db.listed(System::Abandoned).is_empty());
+            assert!(pages.iter().all(|&p| db.free(p)), "{undone:?} not freed");
+            assert_eq!(db.row(10).map(|r| r.root), Some(kept));
+            let mut t = db.begin();
+            assert!(db.get(&mut t, kept, "r0003").unwrap().starts_with("10-3-"));
+            let whole = db.table(&mut t, 12, 40);
+            let abandoned = db.rollback(t);
+            assert_eq!(abandoned, vec![whole]);
+            db.hand_over(&abandoned);
+            assert!(db.listed(System::Abandoned).is_empty());
+            db.check_whole(&[10, 11, 12], "after both");
+        },
+    );
 }
 
 /// A drop lists the root in its transaction, and its rollback unlists it with the catalog row

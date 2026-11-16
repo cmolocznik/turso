@@ -61,7 +61,7 @@ impl Db {
             .iter()
             .map(|t| self.db.stamps().stamp(t.root()))
             .collect();
-        let mut op = Commit::new(txn).on_published(move |ts| {
+        let mut op = Commit::published_by(Some(txn), move |ts| {
             TreeStamps::raise(&stamps, ts);
             check(ts);
         });

@@ -33,6 +33,16 @@ impl Frame {
         );
         Self(())
     }
+
+    /// An entry's body, run once inside the frame (`#[atoll_entry]`), with the entry's owned
+    /// parameters `args` as its own: they drop after its last expression's temporaries, as a
+    /// function's do, inside the frame, and its value is made where the entry returns it. The
+    /// arguments come first, so their types are known when the closure is checked; taking it as
+    /// `FnOnce` lets the body return what it borrows from the entry's arguments.
+    #[inline(always)]
+    pub(crate) fn run<A, R>(args: A, body: impl FnOnce(A) -> R) -> R {
+        body(args)
+    }
 }
 
 impl Drop for Frame {
@@ -110,6 +120,11 @@ mod tests {
             "frees its own block, or lends it back unread",
         ),
         ("arc_cell.rs", "ArcCell", "drops its last reference"),
+        (
+            "mod.rs",
+            "WriteNone",
+            "writes None over an option whose value it just dropped; it lets no shared state go",
+        ),
         (
             "buffer/shortage.rs",
             "Installed",
@@ -214,6 +229,11 @@ mod tests {
             "unwind.rs",
             "EntersOnDrop",
             "a test's caller outside Atoll entering it from a drop",
+        ),
+        (
+            "unwind.rs",
+            "Dropped",
+            "a test's value recording its name as it drops",
         ),
     ];
 
@@ -401,6 +421,26 @@ mod tests {
     /// Tests in Atoll that panic, and how each runs: in a child process when the panic passes a
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
+        (
+            "sql/lifecycle/tests.rs",
+            "undone_creations_drain_once_handed_over_and_kept_ones_stay",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_header_write_waiting_when_its_transaction_ends_leaves_none_under_way",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_ending_not_over_is_driven_to_its_end_outside_its_connections_place",
+            "child",
+        ),
+        (
+            "txn/versioned/tests.rs",
+            "a_reserve_is_given_back_once_every_new_snapshot_sees_the_version_that_made_it",
+            "child",
+        ),
         (
             "log/unit_tests.rs",
             "over_the_ring_an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted",
@@ -2050,6 +2090,26 @@ mod tests {
         }
     }
 
+    std::thread_local! {
+        static DROPPED: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A value that records its name as it drops, for the order an entry drops in.
+    struct Dropped(&'static str);
+
+    impl Dropped {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            DROPPED.with(|d| d.borrow_mut().push(self.0));
+        }
+    }
+
     /// Entries as the facade writes them, for proof 9.
     struct Probe;
 
@@ -2083,6 +2143,22 @@ mod tests {
         #[turso_macros::atoll_entry]
         fn fails(&self) -> crate::Result<()> {
             Err(crate::LimboError::InternalError("an ordinary error".into()))
+        }
+
+        /// Owned parameters named, ignored and borrowed, a local, and a temporary in the last
+        /// expression, as a lock's guard would be.
+        #[turso_macros::atoll_entry]
+        fn drops(&self, first: Dropped, _: Dropped, last: Dropped) -> usize {
+            let _local = Dropped("a local of the body");
+            let _ = (&first, &last);
+            Dropped("a temporary of the last expression").name().len()
+        }
+
+        /// The same as a function.
+        fn drops_as_a_function(&self, first: Dropped, _: Dropped, last: Dropped) -> usize {
+            let _local = Dropped("a local of the body");
+            let _ = (&first, &last);
+            Dropped("a temporary of the last expression").name().len()
         }
     }
 
@@ -2341,5 +2417,43 @@ mod tests {
     #[test]
     fn an_ordinary_error_returns_through_a_frame() {
         assert!(Probe.fails().is_err());
+    }
+
+    /// An entry drops what it owns in the order a function does: its body's locals, its last
+    /// expression's temporaries, then its owned parameters, the last first. A lock's guard in its
+    /// last expression is let go before the parameters drop. That they all drop inside the frame
+    /// is the tests above.
+    #[test]
+    fn an_entry_drops_its_owned_parameters_after_its_last_expressions_temporaries() {
+        let order = || {
+            (
+                Dropped("the first parameter"),
+                Dropped("an ignored parameter"),
+                Dropped("the last parameter"),
+            )
+        };
+        let take = || DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+        take();
+        let (first, ignored, last) = order();
+        Probe.drops_as_a_function(first, ignored, last);
+        let function = take();
+        let (first, ignored, last) = order();
+        Probe.drops(first, ignored, last);
+        let entry = take();
+        assert_eq!(
+            entry, function,
+            "an entry dropped what it owns in another order than a function"
+        );
+        assert_eq!(
+            function,
+            [
+                "a local of the body",
+                "a temporary of the last expression",
+                "the last parameter",
+                "an ignored parameter",
+                "the first parameter",
+            ],
+            "a function drops in another order (an edition's change?)"
+        );
     }
 }

@@ -1,11 +1,18 @@
 //! `#[atoll_entry]`: an entry into Atoll (docs/internals/atoll/DESIGN.md 22.11) runs in a frame.
 //!
-//! The body begins with `let __atoll_frame = crate::storage::atoll::unwind::Frame::enter();`:
-//! entering aborts if the thread is already unwinding, and the frame, dropped last, aborts if a
-//! panic unwinds out of the body. Every parameter the function owns by value is renamed in the
-//! signature and moved into a local of the body declared after the frame, so it drops inside the
-//! frame whether the body uses it, only borrows it or ignores it; its pattern, `_` and `mut`
-//! included, binds from that local. A parameter taken by reference is the caller's.
+//! The function's body becomes `let __atoll_frame = Frame::enter();` followed by
+//! `Frame::run((owned arguments), move |(their patterns)| body)`: entering aborts if the thread
+//! is already unwinding, and the frame, dropped last, aborts if a panic unwinds out of the body.
+//! Every parameter the function owns by value is renamed in the signature and passed to the
+//! closure that runs the body, as that closure's parameter, with its pattern, `mut` included; a
+//! pattern of `_` binds a name of the attribute's instead, so the value is held as a named one
+//! is. A parameter taken by reference is the caller's.
+//!
+//! So an entry drops what it owns in the order a function does, all of it inside the frame,
+//! whether the body uses a parameter, only borrows it or ignores it: the body's locals, then the
+//! temporaries of its last expression (a lock's guard, say), then its owned parameters, the last
+//! bound first, then the frame. Parts of a parameter its pattern leaves unbound (`..`, a `_`
+//! inside it) drop after every binding. The body's value is made where the entry returns it.
 //!
 //! Every name the attribute adds is hygienic (`Span::mixed_site`): no parameter or binding of the
 //! function can shadow one, or be shadowed by one. Two forms are refused, as their owned values
@@ -14,7 +21,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, FnArg, ItemFn, Pat, Type};
+use syn::{spanned::Spanned, FnArg, ItemFn, Pat, ReturnType, Type};
 
 pub fn atoll_entry(
     attr: proc_macro::TokenStream,
@@ -41,7 +48,7 @@ fn expand(attr: TokenStream, input: TokenStream) -> TokenStream {
         .to_compile_error();
     }
     let hygienic = |name: String| format_ident!("{}", name, span = Span::mixed_site());
-    let mut moved = Vec::new();
+    let (mut args, mut patterns) = (Vec::new(), Vec::new());
     for (n, arg) in function.sig.inputs.iter_mut().enumerate() {
         match arg {
             FnArg::Receiver(receiver) => {
@@ -59,29 +66,34 @@ fn expand(attr: TokenStream, input: TokenStream) -> TokenStream {
                     continue;
                 }
                 let arg = hygienic(format!("__atoll_arg{n}"));
-                let whole = hygienic(format!("__atoll_owned{n}"));
-                let pat = std::mem::replace(&mut *typed.pat, Pat::Verbatim(quote! { #arg }));
-                moved.push(quote! {
-                    let #whole = #arg;
-                    #[allow(unused_variables, unused_mut, clippy::let_unit_value)]
-                    let #pat = #whole;
-                });
+                let pat = match std::mem::replace(&mut *typed.pat, Pat::Verbatim(quote! { #arg })) {
+                    Pat::Wild(_) => {
+                        let ignored = hygienic(format!("__atoll_ignored{n}"));
+                        Pat::Verbatim(quote! { #ignored })
+                    }
+                    pat => pat,
+                };
+                args.push(arg);
+                patterns.push(pat);
             }
         }
     }
-    let (frame, out) = (
-        hygienic("__atoll_frame".into()),
-        hygienic("__atoll_out".into()),
-    );
+    let frame = hygienic("__atoll_frame".into());
     let body = &function.block;
-    // The body's value is bound first, so the temporaries of its last expression (a lock's
-    // guard, say) drop at the end of that statement, inside the frame: as the tail of a block
-    // they would outlive the block's locals, the frame among them.
+    let output = match &function.sig.output {
+        ReturnType::Default => quote! { () },
+        ReturnType::Type(_, ty) => quote! { #ty },
+    };
+    // The body is the closure's, its owned parameters the closure's own, and the closure the
+    // block's tail: its value is the call's, made where the function returns it (bound to a local
+    // and returned after, a large value would be copied there). Rebound inside the closure, the
+    // parameters would be its locals, dropped before its last expression's temporaries.
     function.block = syn::parse_quote!({
         let #frame = crate::storage::atoll::unwind::Frame::enter();
-        #(#moved)*
-        let #out = #body;
-        #out
+        crate::storage::atoll::unwind::Frame::run(
+            (#(#args,)*),
+            move |#[allow(unused_variables, unused_mut)] (#(#patterns,)*)| -> #output #body,
+        )
     });
     // A body that only ever returns from inside a loop, or that panics, has type `!`, which makes
     // the binding's use unreachable and the binding a diverging sub-expression; that is the
@@ -149,28 +161,29 @@ mod tests {
         );
     }
 
-    /// The frame opens first, each owned parameter is moved into the body after it, and a
-    /// parameter taken by reference stays in the signature.
+    /// The frame opens first; the owned parameters are passed to the closure that runs the body,
+    /// as its parameter, each with its pattern and a `_` bound to a name; a parameter taken by
+    /// reference stays in the signature.
     #[test]
-    fn an_entry_opens_its_frame_before_it_takes_its_parameters() {
+    fn an_entry_opens_its_frame_and_passes_its_owned_parameters_to_its_body() {
         let out = expand(
             quote!(),
             quote!(
-                fn f(&self, a: A, (b, _): (B, C), r: &R) -> u8 {
+                fn f(&self, a: A, (b, _): (B, C), _: D, r: &R) -> u8 {
                     0
                 }
             ),
         )
         .to_string();
         let frame = out.find("Frame :: enter ()").expect("a frame");
-        let first = out
-            .find("let __atoll_owned1 = __atoll_arg1")
-            .expect("a moved");
-        let pattern = out
-            .find("let (b , _) = __atoll_owned2")
-            .expect("a pattern bound");
-        assert!(frame < first && first < pattern, "{out}");
+        let args = out
+            .find("(__atoll_arg1 , __atoll_arg2 , __atoll_arg3 ,)")
+            .expect("the owned arguments");
+        let patterns = out
+            .find("(a , (b , _) , __atoll_ignored3 ,) | -> u8")
+            .expect("their patterns, the closure's parameter");
+        assert!(frame < args && args < patterns, "{out}");
         assert!(out.contains("r : & R"), "{out}");
-        assert!(!out.contains("__atoll_arg3"), "{out}");
+        assert!(!out.contains("__atoll_arg4"), "{out}");
     }
 }

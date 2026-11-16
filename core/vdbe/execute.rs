@@ -12707,7 +12707,11 @@ pub fn op_function(
         crate::function::Func::Fts(fts_func) => {
             use crate::function::FtsFunc;
             match fts_func {
-                FtsFunc::Score | FtsFunc::Match => {
+                FtsFunc::Score
+                | FtsFunc::Match
+                | FtsFunc::FilteredScore
+                | FtsFunc::FilteredPopulation
+                | FtsFunc::Segments => {
                     return Err(LimboError::InternalError(
                         "unplanned FTS function reached execution".to_string(),
                     )

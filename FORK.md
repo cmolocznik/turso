@@ -17,6 +17,14 @@ upstream: the fork keeps up with upstream and keeps its own changes.
   commits it took and the checks it passed; each run's log and verdict are in
   `/home/me/cognition-data/turso-sync`, and a `hold` file there skips runs while a timed
   measurement needs the machine.
+- `atoll`, the branch of the Atoll storage mode (`core/storage/atoll`, "Atoll, a storage mode after
+  LeanStore" under Additions), takes no routine merges of upstream (Clay, 2026-11-15). It imports
+  from upstream selectively, and only from the layers it has not diverged in: the parser, the
+  translator and optimizer, functions, extensions, test corpora and fuzzers, each import a change
+  of its own through Atoll's gate and cost check. The layers Atoll owns (the VDBE loop, the
+  statement and connection lifecycle, storage, IO and MVCC) are never merged from upstream.
+  `workreef` is merged into `atoll` as a change of its own, with the same gate and a cost run
+  against the head before it.
 - `fork/repro` holds the harnesses the entries below cite (`ivf_crash`, `mvcc_reopen`,
   `read_changes`, `wal_growth` and the rest), a crate of its own on the compiler WorkReef
   cognition builds with.
@@ -1512,6 +1520,63 @@ pager's IO is not aligned), `File::sync_data`, `File::pwrite_durable` (RWF_DSYNC
 `io::crash::CrashIO` (tests and the `io_crash` feature), which produces what a crash at any moment
 could leave.
 Tests: `storage::atoll`, `io::crash`.
+
+### FTS filtered scoring, filter columns and embedder tokenizers (`fts_filtered_score`)
+2026-11-11, branch `fts-cognition` on `b235afd8f`. `core/index_method/fts/mod.rs`,
+`core/index_method/fts/filter.rs`, `core/index_method/fts/filtered_tests.rs`; the function in
+`core/function.rs`, `core/dialect/sqlite/mod.rs`, `core/util.rs`,
+`core/translate/expr/translator.rs` and `core/vdbe/execute.rs`.
+WorkReef cognition ranks words over only the memories a recall is admitted to, with every BM25
+statistic counted over that set (Clay, 2026-11-11: "yes tantivy route in our fork is the
+ruling"). An FTS index takes integer filter columns (`filter_fields`, optional i64 fast fields)
+and one packed event-interval column (`interval_field`, a BLOB of at most 16 little-endian
+`(from, to)` pairs, a bytes fast field), each column its own tokenizer (`tokenizers`), and
+tokenizers an embedder registers by name for the process (`register_tokenizer`; `tantivy` is
+re-exported for it). `SELECT rowid, fts_filtered_score(cols, ?1 query, ?2 filter) AS score FROM t
+ORDER BY score DESC LIMIT ?3` evaluates the JSON filter (`all`, `any`, `in`, `range`, `null`,
+`within`) per segment into a document set, counts the document count, the field-norm token
+totals and every query term's document frequency over it, and takes the top documents with
+Tantivy's pruning scorers under those statistics. Searched columns come before filter columns;
+a filtered function with no FTS index is an error. Proof: `filtered_tests.rs` — the top documents
+equal an exact BM25 oracle over the admitted set on random corpora in WAL and MVCC (deletes,
+updates that move a document's filter values, OPTIMIZE merges), statistics follow the filter,
+concurrent writers, a rollback and a merge, refused filters and columns, a registered tokenizer,
+and OPTIMIZE INDEX after a DELETE leaving none of the erased document's segment rows in the store
+or the file under `secure_delete`.
+
+2026-11-11 later, same branch: the store's BM25 exactly. A query string that is a JSON object
+(`{"field": col, "should": [..], "must": [..]}`) is pre-analyzed terms taken verbatim, a
+BooleanQuery of term queries with frequencies (never re-tokenized; a repeated term counts once;
+`must` terms are required and score). The filter gains `not` and `not_in` (a missing value is
+not in any set) and `rowid` as a column. The cut at the LIMIT is tie-complete: every document
+scoring exactly the last kept one is returned, so rows may outnumber the LIMIT and the embedder
+orders ties by its own key. A `sum_field` column (a 32-byte BLOB, stored as four u64 fast fields)
+and `SELECT fts_filtered_population(cols, ?1) AS population FROM t ORDER BY population DESC
+LIMIT 1` give the admitted population: a BLOB of the document count (u64 big-endian) and the
+little-endian 256-bit wrapping sum of the admitted documents' sum values; a filtered query keeps
+the population it counted for a population query of the same filter on the same segment set.
+Field norms are Tantivy's (exact to 40 tokens, then quantized): the oracle quantizes with
+`FieldNormReader::{fieldnorm_to_id, id_to_fieldnorm}`, reachable through the re-exported `tantivy`.
+
+2026-11-11, later still: the cut is exactly the LIMIT, with equal scores ordered by an embedder tie
+key (`tie_field`, a 16-byte BLOB read as a big-endian u128, stored as two u64 fast fields; a
+missing value orders last), or by the rowid where the index has none. A document tied with the
+lowest kept score still reaches the heap (the scorers' threshold sits one f32 step below it) and
+enters only when its key orders before the last kept one. The tie-complete cut is gone: on real
+memories with identical text its rows grew with the population. An inspection report,
+`SELECT fts_segments(cols, ?1) AS report FROM t ORDER BY report DESC LIMIT 1` (tests and the
+`fts_inspect` feature only), lists the visible segments with their document, live and tombstone
+counts and whether a probed term is in each term dictionary, so a test can show an erased
+document's term gone after OPTIMIZE INDEX.
+
+2026-11-11, last: a term query's score is deterministic. The pruning scorers add a document's term
+scores in whatever order they meet them, and f32 addition is not associative, so three or more
+terms could differ by an ulp from a sum in any fixed order. The selection now keeps every hit within
+a slack (1e-5 relative) of the lowest kept score, scores the kept hits again as the f32 sum of each
+term's score (a term query of its own under the same statistics) in clause order (the `must` terms
+as given, then the `should` terms as given, repeats dropped), and cuts by that score, then the tie
+key. Proof: `many_term_queries_sum_in_clause_order_bit_for_bit`, 3 to 12 terms against an f32
+oracle built on Tantivy's `Bm25Weight`.
 
 ## Taken upstream
 

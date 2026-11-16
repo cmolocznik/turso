@@ -1,0 +1,1598 @@
+//! `fts_filtered_score`: the top documents a filter admits, scored with every
+//! BM25 statistic counted over exactly that set, held to an exact oracle.
+
+use super::*;
+use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect};
+use std::collections::HashMap as StdHashMap;
+
+/// A small deterministic generator, so a failure names its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    /// A word index skewed toward the common words.
+    fn word(&mut self, vocab: usize) -> usize {
+        let a = self.below(vocab as u64) as usize;
+        let b = self.below(vocab as u64) as usize;
+        a.min(b)
+    }
+}
+
+const VOCAB: usize = 40;
+
+fn word(i: usize) -> String {
+    format!("w{i}x")
+}
+
+#[derive(Clone, Debug)]
+struct Doc {
+    words: Vec<usize>,
+    shape: Option<i64>,
+    closed: i64,
+    observed: Option<i64>,
+    intervals: Vec<(i64, i64)>,
+    digest: [u8; 32],
+    tie: [u8; 16],
+}
+
+fn packed(intervals: &[(i64, i64)]) -> String {
+    let mut bytes = Vec::new();
+    for (from, to) in intervals {
+        bytes.extend_from_slice(&from.to_le_bytes());
+        bytes.extend_from_slice(&to.to_le_bytes());
+    }
+    format!(
+        "X'{}'",
+        bytes.iter().map(|b| format!("{b:02X}")).collect::<String>()
+    )
+}
+
+fn random_doc(rng: &mut Rng) -> Doc {
+    // Most documents are short; one in four is long enough that its field
+    // norm is quantized.
+    let len = if rng.below(4) == 0 {
+        30 + rng.below(250) as usize
+    } else {
+        1 + rng.below(25) as usize
+    };
+    let mut intervals = Vec::new();
+    for _ in 0..rng.below(3) {
+        let from = if rng.below(6) == 0 {
+            i64::MIN
+        } else {
+            rng.below(100) as i64
+        };
+        let to = if rng.below(6) == 0 {
+            i64::MAX
+        } else {
+            from.max(0) + 1 + rng.below(30) as i64
+        };
+        intervals.push((from, to));
+    }
+    Doc {
+        words: (0..len).map(|_| rng.word(VOCAB)).collect(),
+        shape: (rng.below(8) != 0).then(|| 1 + rng.below(5) as i64),
+        closed: (rng.below(3) == 0) as i64,
+        observed: (rng.below(5) != 0).then(|| rng.below(100) as i64),
+        intervals,
+        digest: std::array::from_fn(|_| rng.next() as u8),
+        tie: std::array::from_fn(|_| rng.next() as u8),
+    }
+}
+
+fn sql_value(value: Option<i64>) -> String {
+    value.map_or("NULL".into(), |v| v.to_string())
+}
+
+fn insert_sql(rows: &[(i64, Doc)]) -> String {
+    let values: Vec<String> = rows
+        .iter()
+        .map(|(id, doc)| {
+            let body: Vec<String> = doc.words.iter().map(|&w| word(w)).collect();
+            format!(
+                "({id}, '{}', {}, {}, {}, {}, X'{}', X'{}')",
+                body.join(" "),
+                sql_value(doc.shape),
+                doc.closed,
+                sql_value(doc.observed),
+                if doc.intervals.is_empty() {
+                    "NULL".to_string()
+                } else {
+                    packed(&doc.intervals)
+                },
+                doc.digest
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<String>(),
+                doc.tie
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    format!("INSERT INTO docs VALUES {}", values.join(","))
+}
+
+/// The filter as the oracle reads it.
+#[derive(Clone, Debug)]
+enum F {
+    All(Vec<F>),
+    Any(Vec<F>),
+    Not(Box<F>),
+    In(&'static str, Vec<i64>),
+    NotIn(&'static str, Vec<i64>),
+    Range(&'static str, Option<i64>, Option<i64>),
+    Null(&'static str),
+    Within(Option<i64>, Option<i64>),
+}
+
+fn json_bound(b: Option<i64>) -> String {
+    b.map_or("null".into(), |v| v.to_string())
+}
+
+impl F {
+    fn json(&self) -> String {
+        match self {
+            F::All(items) => format!(
+                "{{\"all\":[{}]}}",
+                items.iter().map(F::json).collect::<Vec<_>>().join(",")
+            ),
+            F::Any(items) => format!(
+                "{{\"any\":[{}]}}",
+                items.iter().map(F::json).collect::<Vec<_>>().join(",")
+            ),
+            F::Not(inner) => format!("{{\"not\":{}}}", inner.json()),
+            F::NotIn(col, values) => format!(
+                "{{\"not_in\":[\"{col}\",[{}]]}}",
+                values
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            F::In(col, values) => format!(
+                "{{\"in\":[\"{col}\",[{}]]}}",
+                values
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            F::Range(col, lo, hi) => format!(
+                "{{\"range\":[\"{col}\",{},{}]}}",
+                json_bound(*lo),
+                json_bound(*hi)
+            ),
+            F::Null(col) => format!("{{\"null\":\"{col}\"}}"),
+            F::Within(lo, hi) => {
+                format!("{{\"within\":[{},{}]}}", json_bound(*lo), json_bound(*hi))
+            }
+        }
+    }
+
+    fn admits(&self, id: i64, doc: &Doc) -> bool {
+        let column = |col: &str| match col {
+            "rowid" => Some(id),
+            "shape" => doc.shape,
+            "closed" => Some(doc.closed),
+            "observed" => doc.observed,
+            other => panic!("no column {other}"),
+        };
+        match self {
+            F::All(items) => items.iter().all(|f| f.admits(id, doc)),
+            F::Any(items) => items.iter().any(|f| f.admits(id, doc)),
+            F::Not(inner) => !inner.admits(id, doc),
+            F::In(col, values) => column(col).is_some_and(|v| values.contains(&v)),
+            F::NotIn(col, values) => column(col).is_none_or(|v| !values.contains(&v)),
+            F::Range(col, lo, hi) => column(col)
+                .is_some_and(|v| lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v < hi)),
+            F::Null(col) => column(col).is_none(),
+            F::Within(lo, hi) => doc.intervals.iter().any(|&(from, to)| {
+                let (from_known, to_known) = (from != i64::MIN, to != i64::MAX);
+                match (lo, hi) {
+                    (Some(lo), Some(hi)) => {
+                        from_known && from >= *lo && from < *hi && to_known && to <= *hi
+                    }
+                    (Some(lo), None) => from_known && from >= *lo,
+                    (None, Some(hi)) => from < *hi && to_known && to <= *hi,
+                    (None, None) => true,
+                }
+            }),
+        }
+    }
+}
+
+fn random_bound(rng: &mut Rng) -> Option<i64> {
+    (rng.below(4) != 0).then(|| rng.below(110) as i64)
+}
+
+fn random_filter(rng: &mut Rng, depth: u32) -> F {
+    match rng.below(if depth >= 2 { 7 } else { 10 }) {
+        5 => F::NotIn(
+            if rng.below(2) == 0 { "rowid" } else { "shape" },
+            (0..1 + rng.below(40))
+                .map(|_| 1 + rng.below(400) as i64)
+                .collect(),
+        ),
+        6 => F::In(
+            "rowid",
+            (0..1 + rng.below(200))
+                .map(|_| 1 + rng.below(400) as i64)
+                .collect(),
+        ),
+        7 => F::Not(Box::new(random_filter(rng, depth + 1))),
+        0 => F::In(
+            "shape",
+            (0..1 + rng.below(3))
+                .map(|_| 1 + rng.below(5) as i64)
+                .collect(),
+        ),
+        1 => F::Range("closed", Some(0), Some(1)),
+        2 => {
+            let lo = random_bound(rng);
+            let hi = random_bound(rng);
+            F::Range("observed", lo, hi)
+        }
+        3 => F::Null(if rng.below(2) == 0 {
+            "shape"
+        } else {
+            "observed"
+        }),
+        4 => {
+            let lo = random_bound(rng);
+            let hi = random_bound(rng);
+            F::Within(lo, hi)
+        }
+        8 => F::All(
+            (0..1 + rng.below(3))
+                .map(|_| random_filter(rng, depth + 1))
+                .collect(),
+        ),
+        _ => F::Any(
+            (0..1 + rng.below(3))
+                .map(|_| random_filter(rng, depth + 1))
+                .collect(),
+        ),
+    }
+}
+
+/// A document's length as its field norm keeps it: exact up to 40 tokens,
+/// then rounded down to the nearest of Tantivy's 256 field norm values.
+fn quantized(len: usize) -> f64 {
+    use tantivy::fieldnorm::FieldNormReader;
+    f64::from(FieldNormReader::id_to_fieldnorm(
+        FieldNormReader::fieldnorm_to_id(len as u32),
+    ))
+}
+
+/// BM25 as Tantivy scores it (k1 1.2, b 0.75, lengths as their field norms
+/// keep them), with the document count, the average length and each term's
+/// document frequency counted over the admitted documents. A document must
+/// hold every `must` term and at least one term, and every distinct term it
+/// holds scores.
+fn oracle_terms(
+    docs: &StdHashMap<i64, Doc>,
+    filter: &F,
+    should: &[usize],
+    must: &[usize],
+) -> Vec<(f64, i64)> {
+    let admitted: Vec<(&i64, &Doc)> = docs
+        .iter()
+        .filter(|(id, d)| filter.admits(**id, d))
+        .collect();
+    let n = admitted.len() as f64;
+    if n == 0.0 {
+        return Vec::new();
+    }
+    let total: f64 = admitted.iter().map(|(_, d)| quantized(d.words.len())).sum();
+    let avg = total / n;
+    let mut terms: Vec<usize> = should.iter().chain(must).copied().collect();
+    terms.sort_unstable();
+    terms.dedup();
+    let mut scored = Vec::new();
+    for (id, doc) in &admitted {
+        if must.iter().any(|t| !doc.words.contains(t)) {
+            continue;
+        }
+        let mut score = 0.0;
+        let mut matched = false;
+        for &term in &terms {
+            let tf = doc.words.iter().filter(|&&w| w == term).count() as f64;
+            if tf == 0.0 {
+                continue;
+            }
+            matched = true;
+            let df = admitted
+                .iter()
+                .filter(|(_, d)| d.words.contains(&term))
+                .count() as f64;
+            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            let len = quantized(doc.words.len());
+            score += idf * (1.2 + 1.0) * tf / (tf + 1.2 * (1.0 - 0.75 + 0.75 * len / avg));
+        }
+        if matched {
+            scored.push((score, **id));
+        }
+    }
+    // Equal scores (as Tantivy's f32 holds them) in the tie key's order.
+    let tie = |id: &i64| u128::from_be_bytes(docs[id].tie);
+    scored.sort_by(|a, b| {
+        (b.0 as f32)
+            .total_cmp(&(a.0 as f32))
+            .then(tie(&a.1).cmp(&tie(&b.1)))
+    });
+    scored
+}
+
+fn oracle(docs: &StdHashMap<i64, Doc>, filter: &F, terms: &[usize]) -> Vec<(f64, i64)> {
+    oracle_terms(docs, filter, terms, &[])
+}
+
+/// The oracle's population: the admitted count and the little-endian 256-bit
+/// wrapping sum of the admitted documents' digests.
+fn oracle_population(docs: &StdHashMap<i64, Doc>, filter: &F) -> Vec<u8> {
+    let mut sum = [0u8; 32];
+    let mut count = 0u64;
+    for (id, doc) in docs {
+        if !filter.admits(*id, doc) {
+            continue;
+        }
+        count += 1;
+        let mut carry = 0u16;
+        for (a, b) in sum.iter_mut().zip(&doc.digest) {
+            let total = u16::from(*a) + u16::from(*b) + carry;
+            *a = total as u8;
+            carry = total >> 8;
+        }
+    }
+    let mut blob = count.to_be_bytes().to_vec();
+    blob.extend_from_slice(&sum);
+    blob
+}
+
+fn open(mvcc: bool) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered.db");
+    let io: Arc<dyn crate::IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    if mvcc {
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    }
+    conn.execute(
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, shape INTEGER, closed INTEGER, observed INTEGER, ivs BLOB, dig BLOB, tk BLOB)",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE INDEX docs_fts ON docs USING fts(body, shape, closed, observed, ivs, dig, tk) \
+         WITH (filter_fields = 'shape,closed,observed', interval_field = 'ivs', sum_field = 'dig', tie_field = 'tk')",
+    )
+    .unwrap();
+    (dir, db, conn)
+}
+
+fn filtered(conn: &Arc<Connection>, terms: &[usize], filter: &str, limit: i64) -> Vec<(f64, i64)> {
+    let query: Vec<String> = terms.iter().map(|&t| word(t)).collect();
+    let mut statement = conn
+        .prepare(
+            "SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT ?3",
+        )
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text(query.join(" ")))
+        .unwrap();
+    statement
+        .bind_at(2.try_into().unwrap(), Value::build_text(filter.to_string()))
+        .unwrap();
+    statement
+        .bind_at(3.try_into().unwrap(), Value::from_i64(limit))
+        .unwrap();
+    statement
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row[1].as_float(), row[0].as_int().unwrap()))
+        .collect()
+}
+
+/// A filtered query by pre-analyzed terms.
+fn filtered_terms(
+    conn: &Arc<Connection>,
+    should: &[usize],
+    must: &[usize],
+    filter: &str,
+    limit: i64,
+) -> Vec<(f64, i64)> {
+    let list = |terms: &[usize]| {
+        terms
+            .iter()
+            .map(|&t| format!("\"{}\"", word(t)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let query = format!(
+        "{{\"should\":[{}],\"must\":[{}]}}",
+        list(should),
+        list(must)
+    );
+    run_filtered(conn, &query, filter, limit)
+}
+
+fn run_filtered(conn: &Arc<Connection>, query: &str, filter: &str, limit: i64) -> Vec<(f64, i64)> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT ?3",
+        )
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text(query.to_string()))
+        .unwrap();
+    statement
+        .bind_at(2.try_into().unwrap(), Value::build_text(filter.to_string()))
+        .unwrap();
+    statement
+        .bind_at(3.try_into().unwrap(), Value::from_i64(limit))
+        .unwrap();
+    statement
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row[1].as_float(), row[0].as_int().unwrap()))
+        .collect()
+}
+
+/// The population row of a filter.
+fn population(conn: &Arc<Connection>, filter: &str) -> Vec<u8> {
+    let mut statement = conn
+        .prepare(
+            "SELECT fts_filtered_population(body, ?1) AS population FROM docs \
+             ORDER BY population DESC LIMIT 1",
+        )
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text(filter.to_string()))
+        .unwrap();
+    let rows = statement.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1, "one population row");
+    match &rows[0][0] {
+        Value::Blob(blob) => blob.to_vec(),
+        other => panic!("population is {other:?}"),
+    }
+}
+
+/// The index's answer equals the oracle's top `limit`: exactly that many rows
+/// (or every match when fewer), the same scores in order, every document the
+/// oracle ranks clearly above the last kept one, and equal scores in the tie
+/// key's ascending order. Scores within f32 rounding of each other may land
+/// either side of the cut, so documents are compared only away from it.
+fn assert_agrees_with_ties(
+    got: &[(f64, i64)],
+    want: &[(f64, i64)],
+    limit: usize,
+    tie: &dyn Fn(i64) -> u128,
+    context: &str,
+) {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-4 * b.abs().max(1.0);
+    let top = &want[..want.len().min(limit)];
+    assert_eq!(
+        got.len(),
+        top.len(),
+        "{context}: rows (got {got:?}, want {top:?})"
+    );
+    for (g, w) in got.iter().zip(top) {
+        assert!(
+            close(g.0, w.0),
+            "{context}: score {} where the oracle has {} (got {got:?}, want {top:?})",
+            g.0,
+            w.0
+        );
+    }
+    if let Some(last) = top.last() {
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-6 * b.abs().max(1.0);
+        let ids = |hits: &[(f64, i64)]| {
+            let mut ids: Vec<i64> = hits
+                .iter()
+                .filter(|h| h.0 > last.0 && !near(h.0, last.0))
+                .map(|h| h.1)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(got), ids(top), "{context}: documents above the cut");
+    }
+    for pair in got.windows(2) {
+        assert!(pair[0].0 >= pair[1].0, "{context}: rows not in score order");
+        if pair[0].0 == pair[1].0 {
+            assert!(
+                tie(pair[0].1) < tie(pair[1].1),
+                "{context}: equal scores out of tie order: {got:?}"
+            );
+        }
+    }
+}
+
+fn assert_agrees(
+    docs: &StdHashMap<i64, Doc>,
+    got: &[(f64, i64)],
+    want: &[(f64, i64)],
+    limit: usize,
+    context: &str,
+) {
+    assert_agrees_with_ties(
+        got,
+        want,
+        limit,
+        &|id| u128::from_be_bytes(docs[&id].tie),
+        context,
+    );
+}
+
+/// Random corpora written over several statements (so several segments),
+/// with deletes and updates that close documents and move their shape, read
+/// under random filters in WAL and MVCC mode: every answer equals the exact
+/// BM25 oracle over the admitted set, including after OPTIMIZE INDEX merges.
+#[test]
+fn filtered_top_k_equals_the_exact_oracle_over_the_admitted_set() {
+    for mvcc in [false, true] {
+        for seed in [7u64, 11, 23] {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (_dir, _db, conn) = open(mvcc);
+            let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+            let mut next_id = 1i64;
+            let mut queries = 0;
+            let mut answered = 0;
+            for round in 0..6 {
+                let batch: Vec<(i64, Doc)> = (0..60)
+                    .map(|_| {
+                        let id = next_id;
+                        next_id += 1;
+                        (id, random_doc(&mut rng))
+                    })
+                    .collect();
+                conn.execute(insert_sql(&batch)).unwrap();
+                docs.extend(batch);
+                // Deletes and updates of earlier documents.
+                let ids: Vec<i64> = docs.keys().copied().collect();
+                for _ in 0..8 {
+                    let id = ids[rng.below(ids.len() as u64) as usize];
+                    if !docs.contains_key(&id) {
+                        continue;
+                    }
+                    if rng.below(2) == 0 {
+                        conn.execute(format!("DELETE FROM docs WHERE id = {id}"))
+                            .unwrap();
+                        docs.remove(&id);
+                    } else {
+                        let shape = 1 + rng.below(5) as i64;
+                        conn.execute(format!(
+                            "UPDATE docs SET closed = 1, shape = {shape} WHERE id = {id}"
+                        ))
+                        .unwrap();
+                        let doc = docs.get_mut(&id).unwrap();
+                        doc.closed = 1;
+                        doc.shape = Some(shape);
+                    }
+                }
+                if round == 4 {
+                    conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+                }
+                for _ in 0..12 {
+                    let filter = random_filter(&mut rng, 0);
+                    let terms: Vec<usize> =
+                        (0..1 + rng.below(3)).map(|_| rng.word(VOCAB)).collect();
+                    let limit = [1i64, 5, 10, 50][rng.below(4) as usize];
+                    // Half the queries are pre-analyzed terms, some with a
+                    // required term; the other half go through the parser.
+                    let (got, want) = if rng.below(2) == 0 {
+                        let must: Vec<usize> = if rng.below(2) == 0 {
+                            vec![terms[0]]
+                        } else {
+                            Vec::new()
+                        };
+                        (
+                            filtered_terms(&conn, &terms, &must, &filter.json(), limit),
+                            oracle_terms(&docs, &filter, &terms, &must),
+                        )
+                    } else {
+                        (
+                            filtered(&conn, &terms, &filter.json(), limit),
+                            oracle(&docs, &filter, &terms),
+                        )
+                    };
+                    // The population row of the same filter, read right after
+                    // the query (the counted population kept for it) and of a
+                    // filter no query counted.
+                    assert_eq!(
+                        population(&conn, &filter.json()),
+                        oracle_population(&docs, &filter),
+                        "mvcc={mvcc} seed={seed} population of {}",
+                        filter.json()
+                    );
+                    let other = random_filter(&mut rng, 0);
+                    assert_eq!(
+                        population(&conn, &other.json()),
+                        oracle_population(&docs, &other),
+                        "mvcc={mvcc} seed={seed} population of {}",
+                        other.json()
+                    );
+                    answered += usize::from(!want.is_empty());
+                    assert_agrees(
+                        &docs,
+                        &got,
+                        &want,
+                        limit as usize,
+                        &format!(
+                            "mvcc={mvcc} seed={seed} round={round} filter={} terms={terms:?}",
+                            filter.json()
+                        ),
+                    );
+                    queries += 1;
+                }
+            }
+            assert_eq!(queries, 72);
+            assert!(
+                answered >= 36,
+                "mvcc={mvcc} seed={seed}: only {answered} of 72 queries had an answer"
+            );
+        }
+    }
+}
+
+/// A `phrase` admits only the documents carrying its terms at its relative
+/// positions, wherever a gap a dropped token left lies between them, and adds
+/// nothing to a score: every admitted document scores exactly as the same
+/// query without the phrase scores it, over random corpora.
+#[test]
+fn a_phrase_admits_by_position_and_leaves_the_score_alone() {
+    let (_dir, _db, conn) = open(false);
+    let mut rng = Rng(0x9a5e_1433 | 1);
+    let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+    for round in 0..3 {
+        let batch: Vec<(i64, Doc)> = (0..80)
+            .map(|i| (1 + round * 80 + i, random_doc(&mut rng)))
+            .collect();
+        conn.execute(insert_sql(&batch)).unwrap();
+        docs.extend(batch);
+    }
+    let filter = r#"{"all":[{"in":["closed",[0]]}]}"#;
+    let mut admitted_some = 0;
+    let mut refused_some = 0;
+    for _ in 0..40 {
+        let (a, b) = (rng.word(VOCAB), rng.word(VOCAB));
+        let gap = rng.below(2) as usize + 1;
+        let must = format!("[\"{}\",\"{}\"]", word(a), word(b));
+        let plain = run_filtered(&conn, &format!("{{\"must\":{must}}}"), filter, 1000);
+        let phrased = run_filtered(
+            &conn,
+            &format!("{{\"must\":{must},\"phrase\":[[3,\"{}\"],[{},\"{}\"]]}}", word(a), 3 + gap, word(b)),
+            filter,
+            1000,
+        );
+        // The oracle: a document carrying `a` and, `gap` words on, `b`.
+        let carries = |doc: &Doc| doc.words.windows(gap + 1).any(|w| w[0] == a && w[gap] == b);
+        let mut want: Vec<i64> = docs.iter().filter(|(_, d)| d.closed == 0 && carries(d)).map(|(id, _)| *id).collect();
+        let mut got: Vec<i64> = phrased.iter().map(|(_, id)| *id).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want, "phrase {a} +{gap} {b}");
+        let plain: StdHashMap<i64, f64> = plain.into_iter().map(|(score, id)| (id, score)).collect();
+        for (score, id) in &phrased {
+            assert_eq!(plain[id].to_bits(), score.to_bits(), "doc {id}: the phrase moved its score");
+        }
+        admitted_some += usize::from(!got.is_empty());
+        refused_some += usize::from(got.len() < plain.len());
+    }
+    assert!(admitted_some >= 5 && refused_some >= 5, "admitted {admitted_some}, refused {refused_some}");
+}
+
+/// The same filters read again and again while the index changes under them:
+/// after every insert, delete, update and merge, and from a second connection
+/// whose view is the same committed segments, each answer and population
+/// equals the exact oracle, so an admitted set kept for one view is never read
+/// for another. The second read of each filter in a view is read from the
+/// admitted sets the first kept.
+#[test]
+fn a_filter_read_again_answers_its_own_view_after_every_change() {
+    for mvcc in [false, true] {
+        let mut rng = Rng(0x5eed_a5e7 | 1);
+        let (_dir, db, conn) = open(mvcc);
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        let filters: Vec<F> = (0..4).map(|_| random_filter(&mut rng, 0)).collect();
+        let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+        let mut next_id = 1i64;
+        let mut reads = 0;
+        for round in 0..6 {
+            let batch: Vec<(i64, Doc)> = (0..50)
+                .map(|_| {
+                    let id = next_id;
+                    next_id += 1;
+                    (id, random_doc(&mut rng))
+                })
+                .collect();
+            conn.execute(insert_sql(&batch)).unwrap();
+            docs.extend(batch);
+            for read in 0..2 {
+                let ids: Vec<i64> = docs.keys().copied().collect();
+                // The second read of the round follows deletes and updates of
+                // documents the first read admitted.
+                if read == 1 {
+                    for _ in 0..6 {
+                        let id = ids[rng.below(ids.len() as u64) as usize];
+                        if rng.below(2) == 0 {
+                            conn.execute(format!("DELETE FROM docs WHERE id = {id}")).unwrap();
+                            docs.remove(&id);
+                        } else if let Some(doc) = docs.get_mut(&id) {
+                            let shape = 1 + rng.below(5) as i64;
+                            conn.execute(format!("UPDATE docs SET closed = 1, shape = {shape} WHERE id = {id}")).unwrap();
+                            doc.closed = 1;
+                            doc.shape = Some(shape);
+                        }
+                    }
+                    if round == 3 {
+                        conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+                    }
+                }
+                for filter in &filters {
+                    let terms: Vec<usize> = (0..2).map(|_| rng.word(VOCAB)).collect();
+                    for (name, reader) in [("writer", &conn), ("other", &other)] {
+                        for again in 0..2 {
+                            let context = format!("mvcc={mvcc} round={round} read={read} {name} again={again} filter={}", filter.json());
+                            assert_eq!(population(reader, &filter.json()), oracle_population(&docs, filter), "{context}: population");
+                            let got = filtered(reader, &terms, &filter.json(), 10);
+                            assert_agrees(&docs, &got, &oracle(&docs, filter, &terms), 10, &context);
+                            reads += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(reads, 6 * 2 * 4 * 2 * 2);
+    }
+}
+
+/// Statistics are counted over the admitted set, not the index: the same
+/// document scores differently when the filter changes which other documents
+/// count, exactly as the oracle says.
+#[test]
+fn a_filter_that_changes_the_admitted_set_changes_the_weights() {
+    let (_dir, _db, conn) = open(false);
+    // 'w1x' is rare among shape 1 and common among shape 2.
+    let mut docs = StdHashMap::new();
+    let mut rows = Vec::new();
+    for id in 1..=20i64 {
+        let shape = if id <= 10 { 1 } else { 2 };
+        let words = if id == 1 || id > 10 {
+            vec![1, 2]
+        } else {
+            vec![2, 3]
+        };
+        let doc = Doc {
+            words,
+            shape: Some(shape),
+            closed: 0,
+            observed: None,
+            intervals: Vec::new(),
+            digest: [id as u8; 32],
+            tie: (id as u128).to_be_bytes(),
+        };
+        rows.push((id, doc.clone()));
+        docs.insert(id, doc);
+    }
+    conn.execute(insert_sql(&rows)).unwrap();
+    let only_one = F::In("shape", vec![1]);
+    let both = F::In("shape", vec![1, 2]);
+    let narrow = filtered(&conn, &[1], &only_one.json(), 5);
+    let wide = filtered(&conn, &[1], &both.json(), 50);
+    assert_agrees(
+        &docs,
+        &narrow,
+        &oracle(&docs, &only_one, &[1]),
+        5,
+        "shape 1",
+    );
+    assert_agrees(
+        &docs,
+        &wide,
+        &oracle(&docs, &both, &[1]),
+        50,
+        "shapes 1 and 2",
+    );
+    let one_narrow = narrow.iter().find(|h| h.1 == 1).unwrap().0;
+    let one_wide = wide.iter().find(|h| h.1 == 1).unwrap().0;
+    assert!(
+        one_narrow > one_wide * 1.5,
+        "document 1 weighs {one_narrow} among shape 1 and {one_wide} among both"
+    );
+}
+
+/// Under MVCC two BEGIN CONCURRENT writers add documents, a rolled-back one
+/// adds none, and a merge runs between them: the filtered answer is the
+/// oracle's over what committed.
+#[test]
+fn concurrent_writers_a_rollback_and_a_merge_keep_the_filtered_answer_exact() {
+    let (_dir, db, conn) = open(true);
+    let mut rng = Rng(0xC0FFEE);
+    let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+    let first: Vec<(i64, Doc)> = (1..=80).map(|id| (id, random_doc(&mut rng))).collect();
+    conn.execute(insert_sql(&first)).unwrap();
+    docs.extend(first);
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    let b = db.connect(ConnectOpts::new()).unwrap();
+    let c = db.connect(ConnectOpts::new()).unwrap();
+    let to_a: Vec<(i64, Doc)> = (100..=140).map(|id| (id, random_doc(&mut rng))).collect();
+    let to_b: Vec<(i64, Doc)> = (200..=240).map(|id| (id, random_doc(&mut rng))).collect();
+    let to_c: Vec<(i64, Doc)> = (300..=340).map(|id| (id, random_doc(&mut rng))).collect();
+    a.execute("BEGIN CONCURRENT").unwrap();
+    b.execute("BEGIN CONCURRENT").unwrap();
+    c.execute("BEGIN CONCURRENT").unwrap();
+    a.execute(insert_sql(&to_a)).unwrap();
+    b.execute(insert_sql(&to_b)).unwrap();
+    c.execute(insert_sql(&to_c)).unwrap();
+    // A writer sees its own uncommitted documents.
+    let probe = F::Range("closed", Some(0), Some(2));
+    let mut own = docs.clone();
+    own.extend(to_a.clone());
+    assert_agrees(
+        &own,
+        &filtered(&a, &[0, 1], &probe.json(), 500),
+        &oracle(&own, &probe, &[0, 1]),
+        500,
+        "own writes",
+    );
+    a.execute("COMMIT").unwrap();
+    conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    b.execute("COMMIT").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    docs.extend(to_a);
+    docs.extend(to_b);
+    for seed in 0..20 {
+        let mut rng = Rng(seed + 99);
+        let filter = random_filter(&mut rng, 0);
+        let terms: Vec<usize> = (0..1 + rng.below(3)).map(|_| rng.word(VOCAB)).collect();
+        assert_agrees(
+            &docs,
+            &filtered(&conn, &terms, &filter.json(), 20),
+            &oracle(&docs, &filter, &terms),
+            20,
+            &format!("after commits, filter={}", filter.json()),
+        );
+    }
+}
+
+/// Equal scores are cut by the tie key ascending, so a query returns exactly
+/// LIMIT rows however many documents tie, and a document tied with the last
+/// kept one enters only when its key orders before it, across segments.
+/// Without a tie field the rowid orders ties.
+#[test]
+fn equal_scores_are_cut_by_the_tie_key_to_exactly_the_limit() {
+    let (_dir, _db, conn) = open(false);
+    let doc = |words: Vec<usize>, tie: u128| Doc {
+        words,
+        shape: Some(1),
+        closed: 0,
+        observed: None,
+        intervals: Vec::new(),
+        digest: [0; 32],
+        tie: tie.to_be_bytes(),
+    };
+    // One better document, then twelve identical ones in two segments whose
+    // tie keys run against their rowids.
+    let key = |id: i64| ((id * 7) % 13) as u128;
+    let mut rows = vec![(1, doc(vec![1, 1], 99))];
+    rows.extend((2..=7).map(|id| (id, doc(vec![1, 2], key(id)))));
+    conn.execute(insert_sql(&rows)).unwrap();
+    let more: Vec<(i64, Doc)> = (8..=13).map(|id| (id, doc(vec![1, 2], key(id)))).collect();
+    conn.execute(insert_sql(&more)).unwrap();
+    let mut tied: Vec<i64> = (2..=13).collect();
+    tied.sort_by_key(|&id| key(id));
+    let all = F::In("shape", vec![1]);
+    for limit in [1usize, 2, 3, 7, 13, 20] {
+        let want: Vec<i64> = std::iter::once(1)
+            .chain(tied.iter().copied())
+            .take(limit)
+            .collect();
+        let ids = |hits: Vec<(f64, i64)>| hits.into_iter().map(|h| h.1).collect::<Vec<_>>();
+        assert_eq!(
+            ids(filtered(&conn, &[1], &all.json(), limit as i64)),
+            want,
+            "LIMIT {limit}"
+        );
+        assert_eq!(
+            ids(filtered_terms(&conn, &[1], &[], &all.json(), limit as i64)),
+            want,
+            "terms, LIMIT {limit}"
+        );
+    }
+    conn.execute("CREATE TABLE q(id INTEGER PRIMARY KEY, body TEXT, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX q_fts ON q USING fts(body, k) WITH (filter_fields = 'k')")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO q VALUES (5, 'same words', 1), (3, 'same words', 1), (9, 'same words', 1)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO q VALUES (4, 'same words', 1), (8, 'same words', 1)")
+        .unwrap();
+    let mut statement = conn
+        .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM q ORDER BY score DESC LIMIT 3")
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text("same"))
+        .unwrap();
+    statement
+        .bind_at(
+            2.try_into().unwrap(),
+            Value::build_text("{\"in\":[\"k\",[1]]}"),
+        )
+        .unwrap();
+    let ids: Vec<i64> = statement
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect();
+    assert_eq!(ids, vec![3, 4, 5], "rowid orders ties without a tie field");
+}
+
+/// The store's oracle for a term query, in f32 exactly as Tantivy computes
+/// it: each term's BM25 score from `Bm25Weight` under the admitted set's
+/// statistics, summed in clause order (the `must` terms as given, then the
+/// `should` terms as given), equal scores cut by the tie key.
+fn oracle_clause_order(
+    docs: &StdHashMap<i64, Doc>,
+    filter: &F,
+    must: &[usize],
+    should: &[usize],
+    limit: usize,
+) -> Vec<(f32, i64)> {
+    use tantivy::fieldnorm::FieldNormReader;
+    use tantivy::query::Bm25Weight;
+    let admitted: Vec<(&i64, &Doc)> = docs
+        .iter()
+        .filter(|(id, d)| filter.admits(**id, d))
+        .collect();
+    if admitted.is_empty() {
+        return Vec::new();
+    }
+    let norm = |len: usize| FieldNormReader::fieldnorm_to_id(len as u32);
+    let total: u64 = admitted
+        .iter()
+        .map(|(_, d)| u64::from(FieldNormReader::id_to_fieldnorm(norm(d.words.len()))))
+        .sum();
+    let n = admitted.len() as u64;
+    let average = total as f32 / n as f32;
+    let mut clauses: Vec<usize> = Vec::new();
+    for &t in must.iter().chain(should) {
+        if !clauses.contains(&t) {
+            clauses.push(t);
+        }
+    }
+    let weights: Vec<Bm25Weight> = clauses
+        .iter()
+        .map(|t| {
+            let df = admitted.iter().filter(|(_, d)| d.words.contains(t)).count() as u64;
+            Bm25Weight::for_one_term(df, n, average)
+        })
+        .collect();
+    let mut scored: Vec<(f32, i64)> = Vec::new();
+    for (id, doc) in &admitted {
+        if must.iter().any(|t| !doc.words.contains(t)) {
+            continue;
+        }
+        let mut score = 0.0f32;
+        let mut matched = false;
+        for (t, weight) in clauses.iter().zip(&weights) {
+            let tf = doc.words.iter().filter(|&w| w == t).count() as u32;
+            if tf > 0 {
+                matched = true;
+                score += weight.score(norm(doc.words.len()), tf);
+            }
+        }
+        if matched {
+            scored.push((score, **id));
+        }
+    }
+    let tie = |id: &i64| u128::from_be_bytes(docs[id].tie);
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(tie(&a.1).cmp(&tie(&b.1))));
+    scored.truncate(limit);
+    scored
+}
+
+/// Term queries of 3 to 12 terms score bit for bit as the f32 sum of their
+/// terms' scores in clause order, and cut by that score then the tie key:
+/// the rows equal the oracle's exactly, in WAL and MVCC, across segments and
+/// after a merge.
+#[test]
+fn many_term_queries_sum_in_clause_order_bit_for_bit() {
+    for mvcc in [false, true] {
+        let mut rng = Rng(0xA11CE ^ u64::from(mvcc));
+        let (_dir, _db, conn) = open(mvcc);
+        let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+        for batch in 0..5i64 {
+            let rows: Vec<(i64, Doc)> = (batch * 80 + 1..=batch * 80 + 80)
+                .map(|id| (id, random_doc(&mut rng)))
+                .collect();
+            conn.execute(insert_sql(&rows)).unwrap();
+            docs.extend(rows);
+        }
+        let mut checked = 0;
+        let mut rows_seen = 0;
+        for round in 0..2 {
+            if round == 1 {
+                conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            }
+            for _ in 0..60 {
+                let count = 3 + rng.below(10) as usize;
+                let mut terms: Vec<usize> = Vec::new();
+                while terms.len() < count {
+                    let t = rng.below(VOCAB as u64) as usize;
+                    if !terms.contains(&t) {
+                        terms.push(t);
+                    }
+                }
+                let must: Vec<usize> = if rng.below(4) == 0 {
+                    vec![terms[0]]
+                } else {
+                    Vec::new()
+                };
+                let should: Vec<usize> = terms[must.len()..].to_vec();
+                let filter = random_filter(&mut rng, 0);
+                let limit = [1usize, 5, 10, 50][rng.below(4) as usize];
+                let got: Vec<(f32, i64)> =
+                    filtered_terms(&conn, &should, &must, &filter.json(), limit as i64)
+                        .into_iter()
+                        .map(|(score, id)| (score as f32, id))
+                        .collect();
+                let want = oracle_clause_order(&docs, &filter, &must, &should, limit);
+                assert_eq!(
+                    got.iter().map(|h| (h.0.to_bits(), h.1)).collect::<Vec<_>>(),
+                    want.iter()
+                        .map(|h| (h.0.to_bits(), h.1))
+                        .collect::<Vec<_>>(),
+                    "mvcc={mvcc} round={round} must={must:?} should={should:?} filter={}",
+                    filter.json()
+                );
+                checked += 1;
+                rows_seen += got.len();
+            }
+        }
+        assert_eq!(checked, 120);
+        assert!(
+            rows_seen > 500,
+            "mvcc={mvcc}: only {rows_seen} rows compared"
+        );
+    }
+}
+
+/// Pre-analyzed terms are used verbatim: an upper-case term the default
+/// tokenizer never indexes matches nothing (the parser would lower-case it
+/// and match); a `must` term is required while every term still scores; and
+/// `not_in` on `rowid` removes exactly the excluded documents from both the
+/// hits and the statistics.
+#[test]
+fn terms_are_verbatim_must_requires_and_not_in_excludes() {
+    let (_dir, _db, conn) = open(false);
+    let mut docs = StdHashMap::new();
+    let mut rows = Vec::new();
+    for id in 1..=30i64 {
+        let words = match id % 3 {
+            0 => vec![1, 2, 2],
+            1 => vec![1, 3],
+            _ => vec![2, 3, 4],
+        };
+        let doc = Doc {
+            words,
+            shape: Some(1 + id % 2),
+            closed: 0,
+            observed: None,
+            intervals: Vec::new(),
+            digest: [id as u8; 32],
+            tie: (id as u128).to_be_bytes(),
+        };
+        rows.push((id, doc.clone()));
+        docs.insert(id, doc);
+    }
+    conn.execute(insert_sql(&rows)).unwrap();
+    let all = F::In("shape", vec![1, 2]);
+    assert_eq!(
+        run_filtered(&conn, "{\"should\":[\"W1X\"]}", &all.json(), 50),
+        Vec::new(),
+        "an upper-case term is not lower-cased"
+    );
+    assert_eq!(
+        filtered(&conn, &[1], &all.json(), 50).len(),
+        20,
+        "the parser lower-cases"
+    );
+    let got = filtered_terms(&conn, &[1, 3], &[2], &all.json(), 50);
+    let want = oracle_terms(&docs, &all, &[1, 3], &[2]);
+    assert_agrees(&docs, &got, &want, 50, "must w2x");
+    assert!(got.iter().all(|h| docs[&h.1].words.contains(&2)));
+    assert!(
+        got.iter().any(|h| docs[&h.1].words.contains(&1)),
+        "w1x still scores beside w2x"
+    );
+    let excluded = F::All(vec![all, F::NotIn("rowid", vec![3, 6, 9, 10])]);
+    let got = filtered_terms(&conn, &[1, 2], &[], &excluded.json(), 50);
+    assert_agrees(
+        &docs,
+        &got,
+        &oracle_terms(&docs, &excluded, &[1, 2], &[]),
+        50,
+        "not_in rowid",
+    );
+    assert!(got.iter().all(|h| ![3, 6, 9, 10].contains(&h.1)));
+    assert_eq!(
+        population(&conn, &excluded.json()),
+        oracle_population(&docs, &excluded)
+    );
+    let negated = F::Not(Box::new(F::In("rowid", vec![1, 2, 3])));
+    assert_agrees(
+        &docs,
+        &filtered(&conn, &[3], &negated.json(), 50),
+        &oracle(&docs, &negated, &[3]),
+        50,
+        "not",
+    );
+}
+
+/// A filter naming a column that is not a filter column, malformed JSON, and
+/// `within` on an index with no interval field are refused, not ignored.
+#[test]
+fn a_filter_the_index_cannot_apply_is_refused() {
+    let (_dir, _db, conn) = open(false);
+    conn.execute("INSERT INTO docs VALUES (1, 'w1x', 1, 0, 5, NULL, NULL, NULL)")
+        .unwrap();
+    for bad in [
+        "{\"in\":[\"body\",[1]]}",
+        "not json",
+        "{\"in\":[\"shape\",[1]],\"null\":\"shape\"}",
+        "{\"range\":[\"shape\",1]}",
+    ] {
+        let mut statement = conn
+            .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT 5")
+            .unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::build_text("w1x"))
+            .unwrap();
+        statement
+            .bind_at(2.try_into().unwrap(), Value::build_text(bad))
+            .unwrap();
+        assert!(statement.run_collect_rows().is_err(), "{bad} was accepted");
+    }
+    conn.execute("CREATE TABLE plain(id INTEGER PRIMARY KEY, body TEXT, shape INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE INDEX plain_fts ON plain USING fts(body, shape) WITH (filter_fields = 'shape')",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO plain VALUES (1, 'w1x', 1)")
+        .unwrap();
+    let mut statement = conn
+        .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM plain ORDER BY score DESC LIMIT 5")
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text("w1x"))
+        .unwrap();
+    statement
+        .bind_at(
+            2.try_into().unwrap(),
+            Value::build_text("{\"within\":[1,2]}"),
+        )
+        .unwrap();
+    assert!(statement.run_collect_rows().is_err());
+    // A filter column must hold an integer, and the intervals a valid packing.
+    assert!(conn
+        .execute("INSERT INTO docs VALUES (2, 'w1x', 'one', 0, 5, NULL, NULL, NULL)")
+        .is_err());
+    assert!(conn
+        .execute("INSERT INTO docs VALUES (3, 'w1x', 1, 0, 5, X'0102', NULL, NULL)")
+        .is_err());
+    // The tie column holds 16 bytes.
+    assert!(conn
+        .execute("INSERT INTO docs VALUES (4, 'w1x', 1, 0, 5, NULL, NULL, X'01')")
+        .is_err());
+    // Searched columns come first.
+    assert!(conn
+        .execute(
+            "CREATE INDEX bad_fts ON plain USING fts(shape, body) WITH (filter_fields = 'shape')"
+        )
+        .is_err());
+}
+
+/// An index names a tokenizer an embedder registered: queries tokenize with
+/// it, and an index naming an unregistered one is refused.
+#[test]
+fn a_registered_tokenizer_serves_its_index_and_an_unregistered_one_is_refused() {
+    use tantivy::tokenizer::{LowerCaser, TextAnalyzer, Token, TokenStream, Tokenizer};
+    #[derive(Clone)]
+    struct Pipes;
+    struct PipeStream {
+        tokens: Vec<Token>,
+        at: usize,
+    }
+    impl TokenStream for PipeStream {
+        fn advance(&mut self) -> bool {
+            self.at += 1;
+            self.at <= self.tokens.len()
+        }
+        fn token(&self) -> &Token {
+            &self.tokens[self.at - 1]
+        }
+        fn token_mut(&mut self) -> &mut Token {
+            &mut self.tokens[self.at - 1]
+        }
+    }
+    impl Tokenizer for Pipes {
+        type TokenStream<'a> = PipeStream;
+        fn token_stream<'a>(&'a mut self, text: &'a str) -> PipeStream {
+            let mut tokens = Vec::new();
+            let mut offset = 0;
+            for (position, part) in text.split('|').enumerate() {
+                tokens.push(Token {
+                    offset_from: offset,
+                    offset_to: offset + part.len(),
+                    position,
+                    text: part.to_string(),
+                    position_length: 1,
+                });
+                offset += part.len() + 1;
+            }
+            PipeStream { tokens, at: 0 }
+        }
+    }
+    register_tokenizer(
+        "test_pipes_v1",
+        TextAnalyzer::builder(Pipes).filter(LowerCaser).build(),
+    )
+    .unwrap();
+    assert!(register_tokenizer("test_pipes_v1", TextAnalyzer::from(Pipes)).is_err());
+    assert!(register_tokenizer("default", TextAnalyzer::from(Pipes)).is_err());
+    let (_dir, _db, conn) = open(false);
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, body TEXT, k INTEGER)")
+        .unwrap();
+    assert!(conn
+        .execute("CREATE INDEX p_bad ON p USING fts(body) WITH (tokenizers = 'body=never_registered_v1')")
+        .is_err());
+    conn.execute(
+        "CREATE INDEX p_fts ON p USING fts(body, k) WITH (tokenizers = 'body=test_pipes_v1', filter_fields = 'k')",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO p VALUES (1, 'red apple|Green Pear', 1), (2, 'red|apple', 1)")
+        .unwrap();
+    let ids = |query: &str| -> Vec<i64> {
+        let mut statement = conn
+            .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM p ORDER BY score DESC LIMIT 5")
+            .unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::build_text(query.to_string()))
+            .unwrap();
+        statement
+            .bind_at(
+                2.try_into().unwrap(),
+                Value::build_text("{\"in\":[\"k\",[1]]}"),
+            )
+            .unwrap();
+        let mut ids: Vec<i64> = statement
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(
+        ids("\"green pear\""),
+        vec![1],
+        "a pipe-delimited token with a space in it"
+    );
+    assert_eq!(
+        ids("red"),
+        vec![2],
+        "'red apple' is one token, so only document 2 has 'red'"
+    );
+}
+
+/// One segment of the inspection report.
+#[derive(Debug)]
+struct SegmentReport {
+    live: u64,
+    tombstones: u64,
+    term: bool,
+}
+
+/// The `fts_segments` report of `docs_fts`, probing `body` for a term.
+fn segments(conn: &Arc<Connection>, term: &str) -> Vec<SegmentReport> {
+    let mut statement = conn
+        .prepare("SELECT fts_segments(body, ?1) AS report FROM docs ORDER BY report DESC LIMIT 1")
+        .unwrap();
+    statement
+        .bind_at(
+            1.try_into().unwrap(),
+            Value::build_text(serde_json::json!({"field": "body", "term": term}).to_string()),
+        )
+        .unwrap();
+    let rows = statement.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    let Value::Text(text) = &rows[0][0] else {
+        panic!("report is {:?}", rows[0][0]);
+    };
+    let report: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+    report["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| SegmentReport {
+            live: s["live"].as_u64().unwrap(),
+            tombstones: s["tombstones"].as_u64().unwrap(),
+            term: s["term"].as_bool().unwrap(),
+        })
+        .collect()
+}
+
+/// Erasure: after DELETE, OPTIMIZE INDEX and a TRUNCATE checkpoint under
+/// secure_delete, none of the segment rows that held the erased document is
+/// left in the backing store or the database file, while before the
+/// OPTIMIZE they still are.
+#[test]
+fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_file() {
+    for mvcc in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("erase.db");
+        let io: Arc<dyn crate::IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("PRAGMA secure_delete = ON").unwrap();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, k INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body, k) WITH (filter_fields = 'k')")
+            .unwrap();
+        for batch in 0..4 {
+            let values: Vec<String> = (batch * 40 + 1..=batch * 40 + 40)
+                .map(|id| format!("({id}, 'shared words mark{id}', 1)"))
+                .collect();
+            conn.execute(format!("INSERT INTO docs VALUES {}", values.join(",")))
+                .unwrap();
+        }
+        // The erased document is the only one of its segment.
+        conn.execute("INSERT INTO docs VALUES (999, 'zqxplantedsecretterm shared', 1)")
+            .unwrap();
+        let before = super::tests::backing_bytes(&conn, &io);
+        conn.execute("DELETE FROM docs WHERE id = 999").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let file = std::fs::read(&path).unwrap();
+        let present = |file: &[u8]| {
+            before
+                .iter()
+                .filter(|blob| {
+                    blob.len() >= 64 && file.windows(blob.len()).any(|w| w == blob.as_slice())
+                })
+                .count()
+        };
+        let held = present(&file);
+        assert!(
+            held > 0,
+            "mvcc={mvcc}: the segments are in the file before the OPTIMIZE"
+        );
+        let report = segments(&conn, "zqxplantedsecretterm");
+        assert!(
+            report.iter().any(|s| s.tombstones > 0 && s.term),
+            "mvcc={mvcc}: before the OPTIMIZE a segment holds the erased document as a tombstone and its term: {report:?}"
+        );
+        conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let report = segments(&conn, "zqxplantedsecretterm");
+        assert!(!report.is_empty(), "mvcc={mvcc}: no segment read");
+        assert!(
+            report.iter().all(|s| s.tombstones == 0 && !s.term),
+            "mvcc={mvcc}: after the OPTIMIZE a segment still carries a tombstone or the term: {report:?}"
+        );
+        assert_eq!(
+            report.iter().map(|s| s.live).sum::<u64>(),
+            160,
+            "mvcc={mvcc}"
+        );
+        let shared = segments(&conn, "shared");
+        assert!(
+            shared.iter().any(|s| s.term),
+            "mvcc={mvcc}: the probe sees a term that is there"
+        );
+        let after = super::tests::backing_bytes(&conn, &io);
+        let kept = before
+            .iter()
+            .filter(|blob| blob.len() >= 64 && after.contains(*blob))
+            .count();
+        assert_eq!(
+            kept, 0,
+            "mvcc={mvcc}: {kept} old segment rows still in the backing store"
+        );
+        drop(conn);
+        drop(db);
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(
+            present(&file),
+            0,
+            "mvcc={mvcc}: old segment rows left in the file after the OPTIMIZE"
+        );
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let mut statement = conn
+            .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT 500")
+            .unwrap();
+        statement
+            .bind_at(1.try_into().unwrap(), Value::build_text("shared"))
+            .unwrap();
+        statement
+            .bind_at(
+                2.try_into().unwrap(),
+                Value::build_text("{\"in\":[\"k\",[1]]}"),
+            )
+            .unwrap();
+        assert_eq!(
+            statement.run_collect_rows().unwrap().len(),
+            160,
+            "mvcc={mvcc}"
+        );
+    }
+}
+
+/// Timing over real memory texts (`FTS_BENCH_TEXTS`, JSON lines with a
+/// `text`; `FTS_BENCH_QUERIES` likewise): 41 admission shapes of which 38 are
+/// admitted, 80% of documents closed, a recorded time spread over a year and
+/// event intervals on some. Prints p50/p95/p99 of the filtered top 10 and top
+/// 50, undated and dated, before and after OPTIMIZE INDEX. Run with
+/// `--ignored --nocapture` in a release build.
+#[test]
+#[ignore = "timing over a real corpus; needs FTS_BENCH_TEXTS"]
+fn bench_filtered_over_real_texts() {
+    let Ok(texts) = std::env::var("FTS_BENCH_TEXTS") else {
+        return;
+    };
+    let queries = std::env::var("FTS_BENCH_QUERIES").unwrap();
+    let limit_docs: usize = std::env::var("FTS_BENCH_DOCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    let read = |path: &str| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let words = |text: &str| -> String {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let docs: Vec<String> = read(&texts).into_iter().take(limit_docs).collect();
+    let queries: Vec<String> = read(&queries).iter().map(|q| words(q)).take(100).collect();
+    let (_dir, _db, conn) = open(true);
+    let mut rng = Rng(0x5EED);
+    let year = 365 * 24 * 3600 * 1_000_000i64;
+    let start = std::time::Instant::now();
+    for chunk in docs.chunks(128).enumerate() {
+        let (offset, chunk) = chunk;
+        let values: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let id = offset * 128 + i + 1;
+                let observed = rng.below(year as u64) as i64;
+                let ivs = if rng.below(3) == 0 {
+                    packed(&[(observed, observed + 24 * 3600 * 1_000_000)])
+                } else {
+                    "NULL".into()
+                };
+                format!(
+                    "({id}, '{}', {}, {}, {observed}, {ivs})",
+                    text.replace('\'', "''"),
+                    1 + rng.below(41),
+                    i64::from(rng.below(5) != 0)
+                )
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO docs VALUES {}", values.join(",")))
+            .unwrap();
+    }
+    eprintln!("BENCH built {} docs in {:?}", docs.len(), start.elapsed());
+    let admitted: Vec<String> = (1..=38).map(|s| s.to_string()).collect();
+    let undated = format!(
+        "{{\"all\":[{{\"in\":[\"shape\",[{}]]}},{{\"range\":[\"closed\",0,1]}}]}}",
+        admitted.join(",")
+    );
+    let month_from = year - 30 * 24 * 3600 * 1_000_000;
+    let dated = format!(
+        "{{\"all\":[{{\"in\":[\"shape\",[{}]]}},{{\"range\":[\"closed\",0,1]}},{{\"any\":[{{\"range\":[\"observed\",{month_from},{year}]}},{{\"within\":[{month_from},{year}]}}]}}]}}",
+        admitted.join(",")
+    );
+    let pct = |mut v: Vec<f64>, p: f64| -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() as f64 - 1.0) * p).round() as usize]
+    };
+    for pass in ["as-written", "optimized"] {
+        if pass == "optimized" {
+            let t = std::time::Instant::now();
+            conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            eprintln!("BENCH optimize {:?}", t.elapsed());
+        }
+        for (name, filter) in [("undated", &undated), ("dated", &dated)] {
+            for limit in [10i64, 50] {
+                // One warm-up pass, then the timed one.
+                for timed in [false, true] {
+                    let mut times = Vec::new();
+                    let mut hits = 0;
+                    for q in &queries {
+                        let t = std::time::Instant::now();
+                        let mut statement = conn
+                            .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT ?3")
+                            .unwrap();
+                        statement
+                            .bind_at(1.try_into().unwrap(), Value::build_text(q.clone()))
+                            .unwrap();
+                        statement
+                            .bind_at(2.try_into().unwrap(), Value::build_text(filter.clone()))
+                            .unwrap();
+                        statement
+                            .bind_at(3.try_into().unwrap(), Value::from_i64(limit))
+                            .unwrap();
+                        hits += statement.run_collect_rows().unwrap().len();
+                        times.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    if timed {
+                        eprintln!(
+                            "BENCH {pass} {name} top{limit} n={} p50={:.2}ms p95={:.2}ms p99={:.2}ms hits={hits}",
+                            times.len(),
+                            pct(times.clone(), 0.5),
+                            pct(times.clone(), 0.95),
+                            pct(times, 0.99)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

@@ -177,6 +177,10 @@ pub type IndexRowsMap<A = TursoAllocator> =
     SkipMap<Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
 
 impl MVTableId {
+    /// The bounds of the id order, for range probes that name no particular id.
+    const MIN: Self = Self(i64::MIN);
+    const MAX: Self = Self(i64::MAX);
+
     pub fn new(value: i64) -> Self {
         turso_assert_less_than!(value, 0, "MVCC table IDs are always negative");
         Self(value)
@@ -1024,6 +1028,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
+    /// `MvStore::durable_txid_max` captured at `begin_tx`, under the clock the passive publish
+    /// window holds: every version committed at or below it is in the B-tree this transaction's
+    /// read mark reaches. A passive reader serves such a version's lone current copy from the
+    /// B-tree, so the answer never changes while the transaction runs.
+    durable_at_begin: u64,
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
@@ -1038,6 +1047,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         begin_ts: u64,
         header: DatabaseHeader,
         read_mark: WalPos,
+        durable_at_begin: u64,
         schema_generation_at_begin: u64,
         portable_logical_changes: bool,
     ) -> Transaction<A> {
@@ -1046,6 +1056,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             tx_id,
             begin_ts,
             read_mark,
+            durable_at_begin,
             schema_generation_at_begin,
             portable_logical_changes,
             write_set: Mutex::new(WriteSet::new()),
@@ -4438,11 +4449,39 @@ pub struct WalPos {
     pub frame: u64,
 }
 
+/// The test seam's hook (see `MvStore::after_read_mark_hook`).
+#[cfg(test)]
+pub(crate) struct ReadMarkHook(pub(crate) Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl Debug for ReadMarkHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadMarkHook")
+    }
+}
+
+/// `durable_txid_max` values paired with the WAL position at which their rows are in the B-tree.
+#[derive(Debug, Clone, Copy)]
+struct DurableBound {
+    latest: (u64, WalPos),
+    previous: (u64, WalPos),
+}
+
+impl Default for DurableBound {
+    fn default() -> Self {
+        Self {
+            latest: (0, WalPos::ORIGIN),
+            previous: (0, WalPos::ORIGIN),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MvccReadSnapshot {
     pub(crate) tx_id: TxID,
     pub(crate) begin_ts: u64,
     pub(crate) read_mark: WalPos,
+    pub(crate) durable_at_begin: u64,
 }
 
 impl<A: RowVersionAllocator> From<&Transaction<A>> for MvccReadSnapshot {
@@ -4451,6 +4490,7 @@ impl<A: RowVersionAllocator> From<&Transaction<A>> for MvccReadSnapshot {
             tx_id: tx.tx_id,
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
+            durable_at_begin: tx.durable_at_begin,
         }
     }
 }
@@ -4548,6 +4588,159 @@ impl RootEntry {
     }
 }
 
+/// The versioned `table_id -> root_page` bindings and their reverse index `root_page -> table ids`.
+///
+/// The reverse index exists so that resolving a cursor's root page to its table id costs a probe
+/// of the page's owners (one live owner plus any retired earlier owners) instead of a walk over
+/// every table and index. Both maps are private and every mutation goes through the methods
+/// here, which hold `door` and change the two together, so the index cannot drift from the
+/// bindings. Readers take no lock: they read candidates from the index and re-read each
+/// candidate's binding from `entries`, so a reader racing a mutation resolves against either the
+/// state before or the state after it, exactly as a walk over `entries` did.
+#[derive(Debug)]
+pub struct RootBindings<A: ConcurrentAllocator = TursoAllocator> {
+    entries: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    /// One `(root_page, table_id)` key for every binding whose `root_page` is `Some`.
+    by_root: SkipMap<(u64, MVTableId), (), BasicComparator, A>,
+    /// Serializes mutations so the two maps change as one unit.
+    door: Mutex<()>,
+}
+
+impl<A: ConcurrentAllocator> RootBindings<A> {
+    fn new_in(alloc: A) -> Self {
+        Self {
+            entries: SkipMap::new_in(alloc.clone()),
+            by_root: SkipMap::new_in(alloc),
+            door: Mutex::new(()),
+        }
+    }
+
+    pub fn get(
+        &self,
+        table_id: &MVTableId,
+    ) -> Option<Entry<'_, MVTableId, RootEntry, BasicComparator, A>> {
+        self.entries.get(table_id)
+    }
+
+    pub fn iter(&self) -> crate::skiplist::map::Iter<'_, MVTableId, RootEntry, BasicComparator, A> {
+        self.entries.iter()
+    }
+
+    /// Bind `table_id` to `entry`, replacing any earlier binding of `table_id`.
+    pub fn insert(&self, table_id: MVTableId, entry: RootEntry) {
+        let _door = self.door.lock();
+        self.bind(table_id, entry);
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
+    }
+
+    /// As [`Self::insert`], reporting an allocation failure with both maps unchanged.
+    pub fn try_insert(&self, table_id: MVTableId, entry: RootEntry) -> Result<(), TryReserveError> {
+        let _door = self.door.lock();
+        let added = match entry.root_page {
+            Some(root) => {
+                self.by_root.try_insert((root, table_id), ())?;
+                true
+            }
+            None => false,
+        };
+        let previous = self.entries.get(&table_id).map(|e| *e.value());
+        if let Err(err) = self.entries.try_insert(table_id, entry) {
+            if added && previous.and_then(|p| p.root_page) != entry.root_page {
+                if let Some(root) = entry.root_page {
+                    self.by_root.remove(&(root, table_id));
+                }
+            }
+            return Err(err);
+        }
+        self.unindex_replaced(table_id, previous, entry.root_page);
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
+        Ok(())
+    }
+
+    pub fn remove(&self, table_id: &MVTableId) {
+        let _door = self.door.lock();
+        if let Some(removed) = self.entries.remove(table_id) {
+            if let Some(root) = removed.value().root_page {
+                self.by_root.remove(&(root, *table_id));
+            }
+        }
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
+    }
+
+    pub fn clear(&self) {
+        let _door = self.door.lock();
+        self.entries.clear();
+        self.by_root.clear();
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
+    }
+
+    /// The table ids with a binding on `root_page`, live or retired, in table-id order.
+    pub fn owners_of(&self, root_page: u64) -> Vec<MVTableId> {
+        self.by_root
+            .range((root_page, MVTableId::MIN)..=(root_page, MVTableId::MAX))
+            .map(|e| e.key().1)
+            .collect()
+    }
+
+    /// The table id owning `root_page` at `snapshot_ts`: among the bindings on the page that are
+    /// live or end after the snapshot, the one that ends first (ties by table id).
+    pub fn owner_at(&self, root_page: u64, snapshot_ts: u64) -> Option<MVTableId> {
+        self.by_root
+            .range((root_page, MVTableId::MIN)..=(root_page, MVTableId::MAX))
+            .filter_map(|candidate| {
+                let table_id = candidate.key().1;
+                let binding = self.entries.get(&table_id)?;
+                let binding = binding.value();
+                (binding.root_page == Some(root_page)
+                    && (binding.is_live() || snapshot_ts < binding.end))
+                    .then_some((binding.end, table_id))
+            })
+            .min()
+            .map(|(_, table_id)| table_id)
+    }
+
+    fn bind(&self, table_id: MVTableId, entry: RootEntry) {
+        let previous = self.entries.get(&table_id).map(|e| *e.value());
+        if let Some(root) = entry.root_page {
+            self.by_root.insert((root, table_id), ());
+        }
+        self.entries.insert(table_id, entry);
+        self.unindex_replaced(table_id, previous, entry.root_page);
+    }
+
+    fn unindex_replaced(&self, table_id: MVTableId, previous: Option<RootEntry>, now: Option<u64>) {
+        if let Some(old_root) = previous.and_then(|p| p.root_page) {
+            if Some(old_root) != now {
+                self.by_root.remove(&(old_root, table_id));
+            }
+        }
+    }
+
+    /// Whether the reverse index holds exactly one key per binding with a root page. The caller
+    /// holds `door` or has no concurrent mutator.
+    #[cfg(any(test, debug_assertions))]
+    fn index_is_exact(&self) -> bool {
+        let mut expected: Vec<(u64, MVTableId)> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.value().root_page.map(|root| (root, *e.key())))
+            .collect();
+        expected.sort();
+        let held: Vec<(u64, MVTableId)> = self.by_root.iter().map(|e| *e.key()).collect();
+        expected == held
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_matches_bindings(&self) -> bool {
+        let _door = self.door.lock();
+        self.index_is_exact()
+    }
+}
+
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
 /// Test-only harness data, not part of the public MVCC API.
 #[cfg(test)]
@@ -4587,7 +4780,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// been checkpointed yet have no real root page assigned yet.
     ///
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
-    pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    pub table_id_to_rootpage: RootBindings<A>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4681,6 +4874,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// cannot reach the un-backfilled WAL frame still needs the version-store copy. See
     /// `gc_version_chain` / `gc_floor_reader_mark`. `RwLock<WalPos>` mirrors `global_header`.
     backfill_floor: Arc<RwLock<WalPos>>,
+    /// The last two `durable_txid_max` values with the WAL position each became reachable at. A
+    /// reader captures its WAL mark before the clock and its durable bound under it, so a publish
+    /// can land between the two; the reader then takes the newest bound its own mark reaches.
+    durable_bound: RwLock<DurableBound>,
+    /// Test seam: runs once in the begin path between the reader's WAL mark capture and its clock
+    /// publication, where a checkpoint publish can land.
+    #[cfg(test)]
+    pub(crate) after_read_mark_hook: std::sync::Mutex<Option<ReadMarkHook>>,
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
@@ -4845,7 +5046,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         experimental_mvcc_passive_checkpoint: bool,
     ) -> Result<Self> {
         let logical_log_alloc = DynAllocator::new(alloc.clone());
-        let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
+        let table_id_to_rootpage = RootBindings::new_in(alloc.clone());
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
@@ -4870,6 +5071,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
+            durable_bound: RwLock::new(DurableBound::default()),
+            #[cfg(test)]
+            after_read_mark_hook: std::sync::Mutex::new(None),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
@@ -5110,15 +5314,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Not checkpointed table - table ID and root_page are both the same negative value
             return Some(root_page.into());
         }
-        let root_page = root_page as u64;
         self.table_id_to_rootpage
-            .iter()
-            .filter(|entry| {
-                let e = entry.value();
-                e.root_page == Some(root_page) && (e.is_live() || snapshot_ts < e.end)
-            })
-            .min_by_key(|entry| entry.value().end)
-            .map(|entry| *entry.key())
+            .owner_at(root_page as u64, snapshot_ts)
     }
 
     /// Snapshot timestamp (`begin_ts`) of the given transaction, or `u64::MAX` if it is not
@@ -5142,6 +5339,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             tx_id,
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
+            durable_at_begin: tx.durable_at_begin,
         })
     }
 
@@ -5216,12 +5414,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // else two live bindings resolve to one page (integrity_check: referenced twice).
         let stale: Vec<(MVTableId, RootEntry)> = self
             .table_id_to_rootpage
-            .iter()
-            .filter(|entry| {
-                let e = entry.value();
-                e.is_live() && e.root_page == Some(root_page) && *entry.key() != table_id
+            .owners_of(root_page)
+            .into_iter()
+            .filter(|key| *key != table_id)
+            .filter_map(|key| {
+                let binding = self.table_id_to_rootpage.get(&key)?;
+                let binding = *binding.value();
+                (binding.is_live() && binding.root_page == Some(root_page))
+                    .then_some((key, binding))
             })
-            .map(|entry| (*entry.key(), *entry.value()))
             .collect();
         for (key, mut entry) in stale {
             entry.end = begin_ts;
@@ -6317,7 +6518,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// SkipMap payload for `tx` while B-tree fallthrough is not allowed.
+    /// SkipMap payload for `tx` while B-tree fallthrough is not allowed. Under Passive a covered
+    /// chain's visible version is the very row the reader's B-tree holds, so the version store
+    /// answers it: a caller that takes "none" as "the row is not in the version store" (the
+    /// cursor's overwrite) then supersedes the live copy instead of adding a B-tree-resident one
+    /// beside it. Truncate falls through, as its B-tree may be newer than the chain.
     fn skipmap_row_while_uncovered(
         &self,
         tx: &Transaction<A>,
@@ -6327,7 +6532,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if versions.is_empty() {
             return None;
         }
-        if self.btree_covers_chain_for_tx(tx, id.table_id, versions) {
+        if !self.experimental_mvcc_passive_checkpoint
+            && self.btree_covers_chain_for_tx(tx, id.table_id, versions)
+        {
             return None;
         }
         versions
@@ -6493,12 +6700,118 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         false
     }
 
+    /// Whether a passive reader reads this chain's row from the B-tree: the version the reader sees
+    /// committed at or below the durable bound its read mark reaches (`durable_at_begin`). The
+    /// B-tree at that mark reflects a checkpoint snapshot at or past the bound and before the
+    /// reader began, and the key has no committed event between the two, so it holds exactly that
+    /// version. The answer turns on the reader's snapshot visibility and two values fixed at its
+    /// begin, never on the chain's shape, so it never changes under the reader whatever a
+    /// checkpoint stamps or a GC drops meanwhile: a scan sees the row from one side, once.
+    fn passive_chain_is_btree_equivalent(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &[RowVersion],
+    ) -> bool {
+        let mut resolved = None;
+        for version in versions.iter().rev() {
+            match version.is_visible_at(snapshot.begin_ts) {
+                Some(true) => {
+                    resolved = Some(version);
+                    break;
+                }
+                Some(false) => {}
+                None => {
+                    let Some(tx) = self.txs.get(&snapshot.tx_id) else {
+                        return false;
+                    };
+                    let tx = tx.value();
+                    resolved = versions.iter().rev().find(|version| {
+                        version.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
+                    });
+                    break;
+                }
+            }
+        }
+        let Some(visible) = resolved else {
+            return false;
+        };
+        let begin = match visible.begin() {
+            Some(TxTimestampOrID::Timestamp(ts)) => ts,
+            Some(TxTimestampOrID::TxID(id)) => {
+                match lookup_tx_state(&self.txs, &self.finalized_tx_states, id) {
+                    Some(TransactionState::Committed(ts)) => ts,
+                    _ => return false,
+                }
+            }
+            None => return false,
+        };
+        begin <= snapshot.durable_at_begin
+    }
+
+    /// The least `durable_at_begin` over the active and preparing transactions (`u64::MAX` when
+    /// none): a version committed at or below it is B-tree-equivalent for every live reader. A
+    /// reader that begins after this is sampled sees a durable maximum at least as large.
+    /// Advance `durable_txid_max` to `txid`, whose rows a reader reaches once its WAL mark is at or
+    /// past `at`. A repeat of the current value keeps its earlier, smaller position.
+    pub(crate) fn publish_durable_bound(&self, txid: u64, at: WalPos) {
+        let mut bound = self.durable_bound.write();
+        if txid != bound.latest.0 {
+            bound.previous = bound.latest;
+            bound.latest = (txid, at);
+        }
+        self.durable_txid_max.store(txid, Ordering::SeqCst);
+    }
+
+    /// The newest durable bound whose rows a reader at WAL `mark` reaches in the B-tree; 0 when
+    /// its mark predates both recorded bounds, so it reads every row from the version store.
+    #[inline]
+    fn run_after_read_mark_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.after_read_mark_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_at_begin_of(&self, tx_id: TxID) -> Option<u64> {
+        self.txs.get(&tx_id).map(|tx| tx.value().durable_at_begin)
+    }
+
+    fn durable_txid_for_mark(&self, mark: WalPos) -> u64 {
+        let bound = self.durable_bound.read();
+        if mark >= bound.latest.1 {
+            bound.latest.0
+        } else if mark >= bound.previous.1 {
+            bound.previous.0
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn compute_min_durable_at_begin(&self) -> u64 {
+        self.txs
+            .iter()
+            .filter_map(|entry| {
+                let tx = entry.value();
+                match tx.state.load() {
+                    TransactionState::Active | TransactionState::Preparing(_) => {
+                        Some(tx.durable_at_begin)
+                    }
+                    _ => None,
+                }
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     /// True when `tx` should ignore this SkipMap chain and read the key from B-tree.
     ///
-    /// Passive never falls through: it reclaims a chain only when no snapshot
-    /// is open, so a live passive reader always finds its row in the SkipMap.
-    /// Truncate may fall through for a sole materialized current when no
-    /// checkpoint is in progress.
+    /// Passive falls through for a chain that is B-tree-equivalent for the reader
+    /// ([`Self::passive_chain_is_btree_equivalent`]); Truncate for a sole materialized
+    /// current when no checkpoint is in progress.
     fn btree_covers_chain_for_tx(
         &self,
         tx: &Transaction<A>,
@@ -6515,7 +6828,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions: &[RowVersion],
     ) -> bool {
         if self.experimental_mvcc_passive_checkpoint {
-            return false;
+            return self.passive_chain_is_btree_equivalent(snapshot, versions)
+                && self.is_btree_readable_at(&table_id, snapshot.begin_ts, snapshot.read_mark);
         }
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return false;
@@ -6961,6 +7275,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.get_new_transaction_database_header(&pager);
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
+            self.run_after_read_mark_hook();
             let mut schema_stale = false;
             let begin_ts = self.clock.get_timestamp(|ts| {
                 let schema_generation = self.schema_generation();
@@ -6979,6 +7294,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         ts,
                         header,
                         read_mark,
+                        self.durable_txid_for_mark(read_mark),
                         schema_generation,
                         portable_logical_changes,
                     ),
@@ -7196,6 +7512,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // simply observes the bumped `schema_generation` and reprepares (below).
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
+        self.run_after_read_mark_hook();
         let mut schema_stale = false;
         let mut schema_change_unpublished = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
@@ -7228,6 +7545,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ts,
                     header,
                     read_mark,
+                    self.durable_txid_for_mark(read_mark),
                     schema_generation,
                     portable_logical_changes,
                 ),
@@ -7642,6 +7960,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ts,
                     header,
                     tx.read_mark,
+                    // The successor keeps its predecessor's view, so the B-tree it may read too.
+                    tx.durable_at_begin,
                     self.schema_generation(),
                     tx.portable_logical_changes,
                 ),
@@ -8741,10 +9061,45 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
     ) -> usize {
+        self.gc_chain_at_floor(versions, lwm, ckpt_max, min_reader_mark, drop_current_if_in_btree, true)
+    }
+
+    /// [`Self::gc_chain_now`] for an index chain. Its lone current copy is dropped only while no
+    /// snapshot is open, as Truncate does: an index read under an open snapshot has missed
+    /// entries whose copies were still present while the open-snapshot drop unlinked emptied index
+    /// slots beside it (vector staging, a covering-index count of 0 over 64 committed rows).
+    /// Containment only: the read path that misses them is not found yet.
+    pub(crate) fn gc_index_chain_now(
+        &self,
+        versions: &mut RowVersionChain<A>,
+        lwm: u64,
+        ckpt_max: u64,
+        min_reader_mark: WalPos,
+        drop_current_if_in_btree: bool,
+    ) -> usize {
+        self.gc_chain_at_floor(versions, lwm, ckpt_max, min_reader_mark, drop_current_if_in_btree, false)
+    }
+
+    fn gc_chain_at_floor(
+        &self,
+        versions: &mut RowVersionChain<A>,
+        lwm: u64,
+        ckpt_max: u64,
+        min_reader_mark: WalPos,
+        drop_current_if_in_btree: bool,
+        drops_under_open_snapshots: bool,
+    ) -> usize {
         let lwm = if lwm == u64::MAX {
             self.compute_lwm()
         } else {
             lwm
+        };
+        let covered_through = if !self.experimental_mvcc_passive_checkpoint || lwm == u64::MAX {
+            u64::MAX
+        } else if drops_under_open_snapshots {
+            self.compute_min_durable_at_begin()
+        } else {
+            0
         };
         Self::gc_version_chain(
             versions,
@@ -8753,6 +9108,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.experimental_mvcc_passive_checkpoint,
             min_reader_mark,
             drop_current_if_in_btree,
+            covered_through,
         )
     }
 
@@ -8965,7 +9321,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     break 'outer;
                 }
                 let mut versions = inner_entry.value().write();
-                dropped += self.gc_chain_now(
+                dropped += self.gc_index_chain_now(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -9092,7 +9448,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
-                dropped += self.gc_chain_now(
+                dropped += self.gc_index_chain_now(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -9167,6 +9523,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         passive: bool,
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
+        covered_through: u64,
     ) -> usize {
         let before = versions.len();
 
@@ -9203,18 +9560,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
 
         // Rule 3: drop the last current when the B-tree already has it.
-        // Idle-only for both Passive and Truncate: a dual-cursor scan can lose
-        // the row if the SkipMap empties mid-scan while the B-tree side has
-        // already skipped the key as shadowed. `lwm == MAX` is the proof that
-        // no snapshot (hence no dual-cursor) is open. Under load, Rule 2 still
-        // reclaims superseded history; last currents wait for quiescence.
+        // A dual-cursor scan loses a row if its SkipMap copy empties mid-scan
+        // while the B-tree side skipped the key as shadowed. Truncate stays
+        // idle-only (`lwm == MAX`: no snapshot, hence no dual cursor, is open).
+        // Passive drops it under open snapshots too once it is committed at or
+        // below every live reader's `durable_at_begin` (`covered_through`):
+        // each of them already treats this copy as B-tree-equivalent and reads
+        // the row from the B-tree, never shadowing it, so no scan can tell the
+        // copy is gone.
         if drop_current_if_in_btree && versions.len() == 1 {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
             {
                 let stamped_for_readers = materialized_for_readers(&versions[0]);
                 let in_durable_bound = passive || *b <= ckpt_max;
-                let removable = lwm == u64::MAX && stamped_for_readers && in_durable_bound;
+                let unseen = lwm == u64::MAX || (passive && *b <= covered_through);
+                let removable = unseen && stamped_for_readers && in_durable_bound;
                 if removable {
                     versions.clear();
                 }
@@ -10287,8 +10648,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } else {
                         0
                     };
-                    self.durable_txid_max
-                        .store(persistent_tx_ts_max, Ordering::SeqCst);
+                    self.publish_durable_bound(persistent_tx_ts_max, WalPos::ORIGIN);
                     self.clock.reset(persistent_tx_ts_max + 1);
 
                     reader.plan(persistent_tx_ts_max)?;

@@ -2047,8 +2047,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     /// Fsync the logical log file
+    /// The truncate's sync runs beside commits' appends: none waits out its fsyncs.
     fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync(self.pager.get_sync_type())
+        self.mvstore
+            .storage
+            .sync_beside_appends(self.pager.get_sync_type())
     }
 
     fn truncate_logical_log(&self) -> Result<Completion> {
@@ -2346,8 +2349,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .publish_rootpage_visible(table_id, materialized_at);
         }
         self.mvstore
-            .durable_txid_max
-            .store(self.durable_txid_max_new, Ordering::SeqCst);
+            .publish_durable_bound(self.durable_txid_max_new, materialized_at);
         self.state = CheckpointState::CheckpointWal;
         self.lock_states.pager_read_tx = false;
         self.lock_states.pager_write_tx = false;
@@ -2356,7 +2358,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 "checkpoint header was not staged before pager commit".to_string(),
             )
         })?;
-        self.mvstore.global_header.write().replace(header);
+        {
+            // The header was staged from the global one before the pager commit; a passive
+            // checkpoint runs beside writers, so a transaction may have committed MVCC-authored
+            // fields since (a schema change's cookie, a PRAGMA's user_version). Those stay as the
+            // writers left them: publishing the staged copy would hand every later transaction an
+            // older schema cookie than the schema it reads, and a writer that began under it fails
+            // its commit with a schema conflict the next publish exposes. The cookie only grows.
+            let mut global = self.mvstore.global_header.write();
+            let mut header = header;
+            if let Some(current) = global.as_ref() {
+                header.schema_cookie = current
+                    .schema_cookie
+                    .get()
+                    .max(header.schema_cookie.get())
+                    .into();
+                header.user_version = current.user_version;
+                header.application_id = current.application_id;
+                header.vacuum_mode_largest_root_page = current.vacuum_mode_largest_root_page;
+                header.incremental_vacuum_enabled = current.incremental_vacuum_enabled;
+            }
+            global.replace(header);
+        }
         crate::without_allocation_faults!(self
             .publish_checkpointed_schema_roots()
             .expect(crate::alloc::ALLOC_ERR_MSG));
@@ -2537,7 +2560,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         snapshot_ts,
                     );
                 }
-                let dropped = self.mvstore.gc_chain_now(
+                let dropped = self.mvstore.gc_index_chain_now(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -3736,9 +3759,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     self.created_btrees.is_empty() && self.staged_roots.is_empty(),
                     "checkpoint finalized with un-published staged schema roots"
                 );
+                let at = WalPos::from_pair(self.pager.wal_pos());
                 self.mvstore
-                    .durable_txid_max
-                    .store(self.durable_txid_max_new, Ordering::SeqCst);
+                    .publish_durable_bound(self.durable_txid_max_new, at);
                 // Publish the WAL backfill boundary as the passive checkpoint GC floor: a version
                 // materialized at or below it is durable in the DB file, hence reachable by
                 // every snapshot. Un-backfilled ones stay retained for low-frame readers.

@@ -78,6 +78,19 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
+    /// Sync the log without holding it against appends while the fsyncs run: the checkpoint's
+    /// sync of its truncate, which no commit must wait out. What it makes durable is what
+    /// [`Self::sync`] would.
+    fn sync_beside_appends(&self, sync_type: FileSyncType) -> Result<Completion> {
+        self.sync(sync_type)
+    }
+
+    /// Test seam: park the next [`Self::sync_beside_appends`] at its fsyncs.
+    #[cfg(test)]
+    fn park_next_sync_beside_appends(&self, _hook: Box<dyn FnOnce() + Send>) {
+        unimplemented!("this storage has no sync seam")
+    }
+
     /// Called after a logical-log write completed successfully, before the
     /// transaction is made visible by advancing the logical-log offset.
     ///
@@ -205,6 +218,18 @@ pub struct Storage {
     /// The offset the last checkpoint covered; zero once the log is truncated.
     checkpoint_floor: AtomicU64,
     checkpoint_threshold: AtomicI64,
+    #[cfg(test)]
+    sync_beside_appends_hook: std::sync::Mutex<Option<SyncHook>>,
+}
+
+#[cfg(test)]
+struct SyncHook(Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl Debug for SyncHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SyncHook")
+    }
 }
 
 static LOG_SYNCS: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +280,8 @@ impl Storage {
             log_offset: AtomicU64::new(0),
             checkpoint_floor: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
+            #[cfg(test)]
+            sync_beside_appends_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -333,6 +360,29 @@ impl DurableStorage for Storage {
         LOG_SYNC_MICROS.fetch_add(micros, Ordering::Relaxed);
         LOG_SYNC_MICROS_MAX.fetch_max(micros, Ordering::Relaxed);
         completion
+    }
+
+    fn sync_beside_appends(&self, sync_type: FileSyncType) -> Result<Completion> {
+        let started = std::time::Instant::now();
+        let targets = self.logical_log.read().sync_targets();
+        #[cfg(test)]
+        {
+            let hook = self.sync_beside_appends_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+        }
+        let completion = logical_log::sync_files(targets, sync_type);
+        let micros = started.elapsed().as_micros() as u64;
+        LOG_SYNCS.fetch_add(1, Ordering::Relaxed);
+        LOG_SYNC_MICROS.fetch_add(micros, Ordering::Relaxed);
+        LOG_SYNC_MICROS_MAX.fetch_max(micros, Ordering::Relaxed);
+        completion
+    }
+
+    #[cfg(test)]
+    fn park_next_sync_beside_appends(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.sync_beside_appends_hook.lock().unwrap() = Some(SyncHook(hook));
     }
 
     fn update_header(&self) -> Result<Completion> {

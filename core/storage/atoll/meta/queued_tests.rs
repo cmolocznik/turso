@@ -258,7 +258,11 @@ fn a_frames_metadata_load_on_a_cold_file_is_opened_synced_and_read_on_an_io_thre
             let io: Arc<dyn IO> = counted.clone();
             let cache = cache(&counted, 4);
             let me = crate::thread::current().id();
+            // The IO thread held through the first call: a read it ran at once, landed before
+            // the call looked at the frame's status again, would have the call go on to the page.
+            let hold = counted.requests().hold_io_thread();
             let first = in_frame(&cache, 0);
+            drop(hold);
             let polled = probe.on(me);
             let returned_io = matches!(first, Ok(IOResult::IO(_)));
             let served = drive(&io, || cache.get(id(0))).is_ok();
@@ -323,7 +327,10 @@ fn a_frames_cold_load_over_the_ring_is_opened_and_read_on_an_io_thread() {
                 Arc::new(Epochs::new()),
                 0,
             ));
+            // Held as above: the IO thread or the ring's own delivery could land the read first.
+            let hold = counted.requests().hold_io_thread();
             let first = in_frame(&cache, 0);
+            drop(hold);
             let returned_io = matches!(first, Ok(IOResult::IO(_)));
             let served = drive(&io, || cache.get(id(0))).is_ok();
             let resident = cache.resident();

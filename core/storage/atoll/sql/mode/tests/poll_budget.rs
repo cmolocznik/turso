@@ -1129,6 +1129,13 @@ fn only_a_stop_for_the_budget_wakes_its_own_waker() {
                 }
                 c.finished()
             });
+            // The read's waker runs on the IO thread after its result is published. The thread
+            // held where it would mark itself idle has run every waker of what it served, and
+            // runs none in the windows below.
+            let held = crate::storage::atoll::testing::io_thread_held_before_idle_unregistered(
+                atoll.requests_for_test(),
+            )
+            .expect("the IO thread held after the read");
             let woken_after = wakes();
             // A stop for the budget, on a database outside Atoll mode, whose only stop is the
             // budget's.
@@ -1165,6 +1172,7 @@ fn only_a_stop_for_the_budget_wakes_its_own_waker() {
             };
             let nested_unconserved = unconserved_since(window);
             let woken_by_nested = wakes() - before_nested;
+            drop(held);
             drop((stmt, warm, fired));
             assert!(
                 matches!(cold, Ok(StepResult::IO)),

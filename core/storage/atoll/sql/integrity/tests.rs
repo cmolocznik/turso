@@ -455,10 +455,14 @@ fn walked_in_frames(
     db: &Database,
     stmt: &mut crate::Statement,
     bound: usize,
+    holder: Option<&Holder>,
 ) -> Walked {
     use crate::storage::atoll::sql::mode::WALKED_AT_IO;
     WALKED_AT_IO.with(|w| w.borrow_mut().clear());
     let taken = || WALKED_AT_IO.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    // With `holder`, the checkpointer's state held until the walk returns at its full checkpoint,
+    // so the worker cannot end that checkpoint before the walk looks at it; let go on every way out.
+    let holding = holder.map(Holding::new);
     chill(db);
     let mut rows = Vec::new();
     for calls in 1..=bound {
@@ -488,6 +492,18 @@ fn walked_in_frames(
             Ok(crate::StepResult::Yield) => {}
             Ok(crate::StepResult::IO) => {
                 let c = stmt.pending_io_for_test().expect("the statement's wait");
+                let at_checkpoint = WALKED_AT_IO.with(|w| {
+                    let w = w.borrow();
+                    w.len() > walked && w[w.len() - 1].0 == "checkpoint"
+                });
+                if let Some(h) = holding.as_ref().filter(|_| at_checkpoint) {
+                    if let Err(e) = h.let_go_after(&c) {
+                        return Walked {
+                            out: Err(format!("call {calls}: {e}")),
+                            at_io: taken(),
+                        };
+                    }
+                }
                 if !waited(io, &c) || !retired(db) {
                     return Walked {
                         out: Err(format!("call {calls}: its wait never finished")),
@@ -516,6 +532,54 @@ fn walked_in_frames(
     Walked {
         out: Err(format!("not done in {bound} calls")),
         at_io: taken(),
+    }
+}
+
+/// The checkpointer's state held for [`walked_in_frames`] until the walk's return at its full
+/// checkpoint, and let go there or when the walk ends.
+struct Holding<'a> {
+    holder: &'a Holder,
+    rested: bool,
+    held: bool,
+    let_go: std::cell::Cell<bool>,
+}
+
+impl<'a> Holding<'a> {
+    /// Holds the state, from the checkpoint worker at rest ([`Holder::worker_at_rest`]).
+    fn new(holder: &'a Holder) -> Self {
+        let rested = holder.worker_at_rest();
+        let held = rested && holder.hold(true);
+        Self {
+            holder,
+            rested,
+            held,
+            let_go: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Lets the state go at the walk's return at its full checkpoint, `wait` that return's: the
+    /// wait was found unfinished with the state still held, or why not.
+    fn let_go_after(&self, wait: &crate::Completion) -> std::result::Result<(), String> {
+        let unfinished = !wait.finished();
+        let let_go = !self.let_go.replace(true) && self.holder.hold(false);
+        if self.held && unfinished && let_go {
+            Ok(())
+        } else {
+            Err(format!(
+                "the full checkpoint not held at the walk's return: rested {}, held {}, \
+                 unfinished {unfinished}, let go {let_go}",
+                self.rested, self.held
+            ))
+        }
+    }
+}
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        if !self.let_go.replace(true) {
+            self.holder.hold(false);
+        }
     }
 }
 
@@ -585,9 +649,10 @@ fn a_cold_integrity_check_in_frames_returns_io_at_each_step_and_finds_what_the_s
         ),
         || {
             let (io, db, conn) = used_with_worker("/db/integrity-frames");
+            let holder = Holder::new(&db);
             let walk = |sql: &str| {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let walked = walked_in_frames(&io, &db, &mut stmt, 100_000);
+                let walked = walked_in_frames(&io, &db, &mut stmt, 100_000, Some(&holder));
                 drop(stmt);
                 walked
             };
@@ -604,6 +669,7 @@ fn a_cold_integrity_check_in_frames_returns_io_at_each_step_and_finds_what_the_s
             drive(atoll(&db).io(), || store.plant_miscount(first_page(), 0)).unwrap();
             let zero_sync = integrity(&conn);
             let zero = walk("PRAGMA integrity_check");
+            holder.end();
             let places: std::collections::BTreeSet<_> = [&clean, &found, &zero]
                 .iter()
                 .flat_map(|w| w.at_io.iter().map(|(at, _)| *at))
@@ -747,6 +813,38 @@ fn called_to(
     Err(format!("not at {place} in {bound} calls"))
 }
 
+/// [`called_to`] at the walk's full checkpoint, from the checkpoint worker at rest, the
+/// checkpointer's state held through its calls so the worker cannot end that checkpoint before the
+/// walk looks at it; the state let go after. The worker wakes a full checkpoint's waiters after it
+/// lets the state go, so with a wake still owed, the wait of a walk that registers under the hold
+/// would be finished by an earlier checkpoint's end. Its wait, found unfinished with the state
+/// still held, then waited for, or why not.
+fn called_to_checkpoint(
+    io: &Arc<dyn IO>,
+    db: &Database,
+    holder: &Holder,
+    stmt: &mut crate::Statement,
+) -> std::result::Result<crate::Completion, String> {
+    if !holder.worker_at_rest() {
+        return Err("the checkpoint worker never came to rest".into());
+    }
+    let held = holder.hold(true);
+    let at = called_to(io, db, stmt, "checkpoint", 1_000);
+    let unfinished = at.as_ref().is_ok_and(|c| !c.finished());
+    let let_go = holder.hold(false);
+    let c = at?;
+    if !(held && unfinished && let_go) {
+        return Err(format!(
+            "the full checkpoint not held at the walk's return: held {held}, unfinished \
+             {unfinished}, let go {let_go}"
+        ));
+    }
+    if !waited(io, &c) {
+        return Err("the walk's full checkpoint never ended".into());
+    }
+    Ok(c)
+}
+
 /// Calls `stmt` to its end, waiting for each return's IO: its rows, or why not.
 fn called_out(
     io: &Arc<dyn IO>,
@@ -775,14 +873,16 @@ fn called_out(
 struct Holder {
     tell: std::sync::mpsc::Sender<(bool, std::sync::mpsc::Sender<()>)>,
     thread: std::thread::JoinHandle<()>,
+    cp: Arc<crate::storage::atoll::checkpoint::Checkpointer>,
 }
 
 impl Holder {
     fn new(db: &Database) -> Self {
         let cp = atoll(db).atoll().checkpointer_shared().clone();
+        let holds = cp.clone();
         let (tell, orders) = std::sync::mpsc::channel::<(bool, std::sync::mpsc::Sender<()>)>();
         let thread = std::thread::spawn(move || {
-            let cp = cp;
+            let cp = holds;
             let mut held = None;
             for (hold, answer) in orders {
                 held = None;
@@ -793,12 +893,35 @@ impl Holder {
             }
             drop(held);
         });
-        Self { tell, thread }
+        Self { tell, thread, cp }
     }
 
     /// Holds the state, or lets it go: whether the thread answered.
     fn hold(&self, hold: bool) -> bool {
         order(&self.tell, hold)
+    }
+
+    /// Waits, with a deadline, for the checkpoint worker at rest: every full checkpoint asked for
+    /// done, and its task's last recorded step "idle". A step is recorded after its hold's drop,
+    /// which wakes the waiters of a full checkpoint it ended, so none of those wakes is still owed;
+    /// and nothing but this thread wakes the worker before the next hold. Whether it came to rest.
+    fn worker_at_rest(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let rests = self.cp.fulls_done() >= self.cp.fulls_requested()
+                && self
+                    .cp
+                    .task_steps_for_test()
+                    .last()
+                    .is_some_and(|(said, _)| *said == "idle");
+            if rests {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Lets the state go and ends the thread.
@@ -837,7 +960,7 @@ fn a_walk_meeting_the_checkpointers_state_held_waits_on_its_one_registered_wait(
             // Held across the ask.
             let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
             let checkpointed =
-                called_to(&io, &db, &mut stmt, "checkpoint", 1_000).map(|c| waited(&io, &c));
+                called_to_checkpoint(&io, &db, &holder, &mut stmt).map(|c| waited(&io, &c));
             let held = holder.hold(true);
             let asked = called(&db, &mut stmt);
             let (wait, at) = match &asked {
@@ -878,7 +1001,7 @@ fn a_walk_meeting_the_checkpointers_state_held_waits_on_its_one_registered_wait(
             // Let go between the try and the registration.
             let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
             let checkpointed_again =
-                called_to(&io, &db, &mut stmt, "checkpoint", 1_000).map(|c| waited(&io, &c));
+                called_to_checkpoint(&io, &db, &holder, &mut stmt).map(|c| waited(&io, &c));
             let held_again = holder.hold(true);
             let released = std::rc::Rc::new(std::cell::Cell::new(false));
             let (tell, seen) = (holder.tell.clone(), released.clone());
@@ -959,7 +1082,7 @@ fn a_reset_walk_takes_its_registered_wait_back() {
             for _ in 0..5 {
                 let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
                 let checkpointed =
-                    called_to(&io, &db, &mut stmt, "checkpoint", 1_000).map(|c| waited(&io, &c));
+                    called_to_checkpoint(&io, &db, &holder, &mut stmt).map(|c| waited(&io, &c));
                 let held = holder.hold(true);
                 let asked = called(&db, &mut stmt);
                 let wait = match &asked {
@@ -1124,7 +1247,7 @@ fn a_sibling_walk_is_refused_at_its_first_entry() {
             let holder = Holder::new(&db);
             let mut one = conn.prepare("PRAGMA integrity_check").unwrap();
             let checkpointed =
-                called_to(&io, &db, &mut one, "checkpoint", 1_000).map(|c| waited(&io, &c));
+                called_to_checkpoint(&io, &db, &holder, &mut one).map(|c| waited(&io, &c));
             let held = holder.hold(true);
             let asked = called(&db, &mut one);
             let wait = match &asked {
@@ -1204,8 +1327,8 @@ fn a_walk_after_an_ended_one_is_admitted() {
                 let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
                 let stopped = match end {
                     "done" => called_out(&io, &db, &mut stmt, 100_000).map(|_| ()),
-                    "checkpoint" => called_to(&io, &db, &mut stmt, "checkpoint", 1_000).map(|_| ()),
-                    "lease" => called_to(&io, &db, &mut stmt, "checkpoint", 1_000).and_then(|c| {
+                    "checkpoint" => called_to_checkpoint(&io, &db, &holder, &mut stmt).map(|_| ()),
+                    "lease" => called_to_checkpoint(&io, &db, &holder, &mut stmt).and_then(|c| {
                         let held = waited(&io, &c) && holder.hold(true);
                         let asked = called(&db, &mut stmt);
                         let let_go = holder.hold(false);
@@ -1355,7 +1478,7 @@ fn a_host_check_beside_a_cooperative_walk_is_refused() {
             let holder = Holder::new(&db);
             let mut x = conn.prepare("PRAGMA integrity_check").unwrap();
             let checkpointed =
-                called_to(&io, &db, &mut x, "checkpoint", 1_000).map(|c| waited(&io, &c));
+                called_to_checkpoint(&io, &db, &holder, &mut x).map(|c| waited(&io, &c));
             let held = holder.hold(true);
             let asked = called(&db, &mut x);
             let wait = match &asked {
@@ -2901,7 +3024,7 @@ fn a_page_walk_without_the_write_gate_exclusive_is_refused() {
             let mut x = conn
                 .prepare("INSERT INTO t VALUES (5000, 'fires')")
                 .unwrap();
-            let in_frames = walked_in_frames(&io, &db, &mut x, 10_000).out;
+            let in_frames = walked_in_frames(&io, &db, &mut x, 10_000, None).out;
             drop(x);
             let logged_in_frames = rows(&conn, "SELECT count(*) FROM log");
             let kept_in_frames = rows(&conn, "SELECT count(*) FROM t WHERE id = 5000");

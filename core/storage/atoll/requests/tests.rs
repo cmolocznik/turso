@@ -2,6 +2,7 @@ use super::*;
 use crate::io::crash::CrashIO;
 use crate::io::{MemoryIO, OpenFlags, DIRECT_IO_ALIGNMENT};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
+#[cfg(not(any(shuttle, atoll_loom)))]
 use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::log::{framed_len, Header, Kind};
 use crate::storage::atoll::testing::drive;
@@ -357,6 +358,7 @@ fn close_parks_on_the_ring_until_its_last_request_retires() {
 }
 
 /// Where the cancellation of close's request is paused.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[derive(Clone, Copy, Debug)]
 enum Paused {
     /// In its callback, before the callback submits a request of its own.
@@ -374,6 +376,7 @@ enum Paused {
 /// auditor's #4177; mutants: close stepping an empty backend spends the pause on empty steps;
 /// close parking whatever the backend holds, or not woken by a submission, never steps the new
 /// requests).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 fn close_parks_on_an_empty_backend_and_steps_what_is_submitted(paused: Paused) {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -439,8 +442,12 @@ fn close_parks_on_an_empty_backend_and_steps_what_is_submitted(paused: Paused) {
         })
     };
     started_rx.recv().unwrap();
-    // Long enough for close to reach its wait, which takes microseconds, and for a close that
-    // steps to step many times.
+    // Close's look made, waited for, not slept on; then long enough for a close that steps to
+    // step many times.
+    let deadline = std::time::Instant::now() + BOUND;
+    while stepping.steps() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     std::thread::sleep(Duration::from_millis(100));
     let mid = (stepping.steps(), done_rx.try_recv().is_ok());
     // A request submitted while close waits, the finish still paused: close wakes and steps it.
@@ -492,73 +499,101 @@ fn close_parks_on_an_empty_backend_and_steps_what_is_submitted(paused: Paused) {
     assert_eq!(requests.outstanding(), 0);
 }
 
+// Each runs in a child of its own: an assertion that fails while its counted file is alive ends
+// the process, and the child's words are the parent's failure.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submits() {
-    close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::InCallback);
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submits"
+        ),
+        || close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::InCallback),
+    );
 }
 
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn close_parks_while_a_counted_request_is_not_yet_submitted_and_steps_it_once_it_is() {
-    close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::CountedNotQueued);
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::close_parks_while_a_counted_request_is_not_yet_submitted_and_steps_it_once_it_is"
+        ),
+        || close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::CountedNotQueued),
+    );
 }
 
 /// Close takes back the registration its look left with the backend, however its wait ends: here
 /// its last request retires by a finish elsewhere that submits nothing, so no submission takes the
 /// registration (the auditor's P2-X69-2; mutant: close leaving it behind).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn close_takes_back_its_registration_when_a_finish_elsewhere_ends_its_wait() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-    const BOUND: Duration = Duration::from_secs(20);
-    let crash = Arc::new(CrashIO::new(1));
-    let (io, requests) = counted(crash.clone());
-    let file = io.open_file("/db/close", OpenFlags::Create, false).unwrap();
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (go_tx, go_rx) = mpsc::channel::<()>();
-    let go_rx = Mutex::new(go_rx);
-    let c = Completion::new_sync(move |res| {
-        if res.is_err() {
-            entered_tx.send(()).unwrap();
-            go_rx.lock().recv().unwrap();
-        }
-    });
-    let c = file.sync(c, crate::io::FileSyncType::Fsync).unwrap();
-    let cancel = {
-        let c = c.clone();
-        std::thread::spawn(move || c.abort())
-    };
-    entered_rx
-        .recv_timeout(BOUND)
-        .expect("the cancellation reached its callback");
-    crash.step().unwrap();
-    let let_go = crash.in_flight() == 0 && c.is_owned();
-    let (done_tx, done_rx) = mpsc::channel();
-    let closer = {
-        let (requests, io) = (requests.clone(), io.clone());
-        std::thread::spawn(move || {
-            requests.drain(&*io);
-            done_tx.send(()).unwrap();
-        })
-    };
-    // Long enough for close to look and park, which takes microseconds.
-    std::thread::sleep(Duration::from_millis(100));
-    let parked = (crash.registered(), done_rx.try_recv().is_ok());
-    go_tx.send(()).unwrap();
-    cancel.join().unwrap();
-    let ended = done_rx.recv_timeout(BOUND).is_ok();
-    closer.join().unwrap();
-    let left = crash.registered();
-    assert!(
-        let_go,
-        "the backend let the request go, its callback still running"
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::close_takes_back_its_registration_when_a_finish_elsewhere_ends_its_wait"
+        ),
+        || {
+            use std::sync::mpsc;
+            use std::time::Duration;
+            const BOUND: Duration = Duration::from_secs(20);
+            let crash = Arc::new(CrashIO::new(1));
+            let (io, requests) = counted(crash.clone());
+            let file = io.open_file("/db/close", OpenFlags::Create, false).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let go_rx = Mutex::new(go_rx);
+            let c = Completion::new_sync(move |res| {
+                if res.is_err() {
+                    entered_tx.send(()).unwrap();
+                    go_rx.lock().recv().unwrap();
+                }
+            });
+            let c = file.sync(c, crate::io::FileSyncType::Fsync).unwrap();
+            let cancel = {
+                let c = c.clone();
+                std::thread::spawn(move || c.abort())
+            };
+            entered_rx
+                .recv_timeout(BOUND)
+                .expect("the cancellation reached its callback");
+            crash.step().unwrap();
+            let let_go = crash.in_flight() == 0 && c.is_owned();
+            let (done_tx, done_rx) = mpsc::channel();
+            let closer = {
+                let (requests, io) = (requests.clone(), io.clone());
+                std::thread::spawn(move || {
+                    requests.drain(&*io);
+                    done_tx.send(()).unwrap();
+                })
+            };
+            // Close's look made and its registration taken, waited for, not slept on.
+            let deadline = std::time::Instant::now() + BOUND;
+            while crash.registered() == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let parked = (crash.registered(), done_rx.try_recv().is_ok());
+            go_tx.send(()).unwrap();
+            cancel.join().unwrap();
+            let ended = done_rx.recv_timeout(BOUND).is_ok();
+            closer.join().unwrap();
+            let left = crash.registered();
+            assert!(
+                let_go,
+                "the backend let the request go, its callback still running"
+            );
+            assert_eq!(
+                parked,
+                (1, false),
+                "(registrations, returned) while close waited"
+            );
+            assert!(ended, "close returned once its last request retired");
+            assert_eq!(left, 0, "a registration left behind by close");
+        },
     );
-    assert_eq!(
-        parked,
-        (1, false),
-        "(registrations, returned) while close waited"
-    );
-    assert!(ended, "close returned once its last request retired");
-    assert_eq!(left, 0, "a registration left behind by close");
 }
 
 struct AuditGroupFile(Arc<dyn File>);

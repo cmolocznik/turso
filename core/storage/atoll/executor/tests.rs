@@ -204,7 +204,10 @@ mod native {
     }
 
     /// On a pumped backend the workers deliver what tasks submit, with nothing else stepping it,
-    /// and once it holds nothing they park: no step taken over a quiet window. Closed, a worker
+    /// and once it holds nothing they park: at most one step over a quiet window, never a stream.
+    /// The one is the look a park may make at once: the task's request woke the registration the
+    /// worker's first look left while the worker ran, and a thread's unpark while it runs is kept
+    /// for its next park, one wake at most. Closed, a worker
     /// takes back the registration its last look left (22.5, 22.7; mutants: a worker that never
     /// steps the backend, so the task never ends; one that steps an empty backend without parking;
     /// one that leaves its registration behind, the auditor's P2-X69-2).
@@ -224,8 +227,13 @@ mod native {
             }),
         );
         let delivered = done_rx.recv_timeout(BOUND).is_ok();
-        // Long enough for the worker to find nothing and park.
-        std::thread::sleep(Duration::from_millis(50));
+        // The worker made a look and is listed idle, parked or parking: waited for, not slept on.
+        // Only a link, a request submitted or the one wake kept from before wakes it, and the
+        // window has no link and no request.
+        let deadline = std::time::Instant::now() + BOUND;
+        while ex.idle_runners() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let before = io.steps();
         std::thread::sleep(Duration::from_millis(100));
         let quiet = (before, io.steps());
@@ -233,9 +241,9 @@ mod native {
         ex.close();
         let left = crash.registered();
         assert!(delivered, "the worker delivered the task's sync");
-        assert_eq!(
-            quiet.1, quiet.0,
-            "steps taken by a worker with nothing to do"
+        assert!(
+            quiet.1 - quiet.0 <= 1,
+            "steps taken by a worker with nothing to do: {quiet:?}"
         );
         assert_eq!(parked, (0, 1), "(in flight, registrations) while parked");
         assert_eq!(left, 0, "a registration left behind by a closed worker");
@@ -1663,7 +1671,11 @@ mod native {
                 let _ = done_tx.send(());
             })
         };
-        // Long enough for the waiter to look and park, which takes microseconds.
+        // The waiter's look made, waited for, not slept on; then a while for any look after it.
+        let deadline = std::time::Instant::now() + BOUND;
+        while io.steps() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         std::thread::sleep(Duration::from_millis(100));
         let parked = (io.steps(), done_rx.try_recv().is_ok());
         let (task, ran_on) = finishes_after(0, &c);

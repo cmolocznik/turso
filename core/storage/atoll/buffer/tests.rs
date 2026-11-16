@@ -3181,6 +3181,20 @@ fn a_new_pages_first_release_tells_a_waiting_claim() {
     for b in backends() {
         let pool = open(&b, MIN_BUDGET);
         let page = drive(&b.io, || pool.allocate(class(0))).unwrap();
+        // Nothing left in flight on any backend that could change the supply before the release
+        // does: waited for, as the ring's delivery thread can retire a request of the allocation
+        // after its completion is finished.
+        let requests = pool.store.counted().requests();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while requests.outstanding() != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            requests.outstanding(),
+            0,
+            "{}: the allocation left a request outstanding",
+            b.name
+        );
         let waiting = pool.released_wait();
         assert!(!waiting.finished());
         drop(page);

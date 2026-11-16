@@ -2717,10 +2717,17 @@ fn a_held_lease_holds_the_workers_units_off_on_its_one_wait_until_released() {
             let db = Db::threaded();
             let (tree, _) = db.owed_tree();
             let cp = db.db.checkpointer_arc().clone();
-            // The writes' own checkpoints done first, so the task rests.
+            // The writes' own checkpoints done first, and the task rested after them: a step that
+            // went on (due again) could run a unit past the lease's gate before the lease is taken.
             let rested = {
                 let first = cp.request_full();
-                within_a_minute_polled(&|| cp.fulls_done() >= first.ticket())
+                within_a_minute_polled(&|| {
+                    cp.fulls_done() >= first.ticket()
+                        && cp
+                            .task_steps_for_test()
+                            .last()
+                            .is_some_and(|(said, _)| *said == "idle")
+                })
             };
             let before = cp.task_steps_for_test().len();
             let lease = match cp.lease_or_wait(&mut None) {

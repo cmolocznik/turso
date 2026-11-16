@@ -1134,6 +1134,21 @@ mod tests {
             "child",
         ),
         (
+            "requests/tests.rs",
+            "close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submits",
+            "child",
+        ),
+        (
+            "requests/tests.rs",
+            "close_parks_while_a_counted_request_is_not_yet_submitted_and_steps_it_once_it_is",
+            "child",
+        ),
+        (
+            "requests/tests.rs",
+            "close_takes_back_its_registration_when_a_finish_elsewhere_ends_its_wait",
+            "child",
+        ),
+        (
             "unwind.rs",
             "a_panic_in_an_entry_ends_the_process_at_its_edge",
             "child",

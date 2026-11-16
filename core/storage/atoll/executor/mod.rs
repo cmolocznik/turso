@@ -1509,6 +1509,13 @@ impl Executor {
         drop(self);
     }
 
+    /// How many of its runners are listed idle: each made its last look before parking, and no
+    /// link or backend wake has taken it off the list since.
+    #[cfg(all(test, not(atoll_loom)))]
+    pub(crate) fn idle_runners(&self) -> usize {
+        lock(&self.shared.queue).idle.len()
+    }
+
     /// Closes the executor in 22.12's order: `durable`, the end each open log had when close
     /// began made durable, waited for while every job still runs (step 1); closing published,
     /// every step in progress ended and every worker joined (2); each task's logical waits given

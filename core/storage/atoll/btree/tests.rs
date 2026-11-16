@@ -1432,3 +1432,130 @@ fn a_page_found_held_at_its_upgrade_or_read_waits_for_its_release() {
         );
     }
 }
+
+/// A remove whose merge finds its sibling cold returns IO at the sibling's read and, stepped
+/// again, goes on where it stopped: the key is removed once, before the IO, and not looked for
+/// again; the merge is done (the two leaves become one); the tree is whole and holds every other
+/// key (row 74, #5876; mutant `merge-from-top`: the merge thrown away at its IO, so the next call
+/// looks for the key again, finds it gone and reports nothing removed). Over a backend whose reads
+/// finish when it is stepped, the sibling evicted as the merge is about to fix it, for the right
+/// sibling and the left.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_merge_reading_its_sibling_cold_returns_io_and_goes_on_where_it_stopped() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_merge_reading_its_sibling_cold_returns_io_and_goes_on_where_it_stopped"
+        ),
+        || {
+            const VALUE: usize = 400;
+            for side in ["right", "left"] {
+                // Keys inserted rising for the right sibling and falling for the left, so the
+                // leaf whose keys are removed, the first one or the last, is the full one after
+                // the split.
+                let key = |i: usize| {
+                    let k = if side == "right" { i } else { 10_000 - i };
+                    format!("k{k:05}").into_bytes()
+                };
+                let crash = Arc::new(CrashIO::new(7));
+                let io: Arc<dyn IO> = crash;
+                let db = open(&io, MIN_DB_BUDGET, 1);
+                let run = drive_runner(&io);
+                let tree = create(&io, &db, &run, false);
+                let pool = db.pool().clone();
+                let root = tree.root;
+                let mut n = 0;
+                while level_of(&io, &pool, root) == 0 {
+                    let mut op = Put::new(&key(n), vec![n as u8; VALUE], Mode::Upsert);
+                    run_to(&run, || tree.put(&mut op));
+                    n += 1;
+                }
+                checkpoint(&db, &run);
+                let leaves = children(&io, &pool, root);
+                assert_eq!(leaves.len(), 2, "{side}: the root's children");
+                // The sibling the merge reads: the right of the first leaf, or the left of the
+                // last; the keys go in the order they came, from the full leaf.
+                let sibling = if side == "right" {
+                    leaves[1]
+                } else {
+                    leaves[0]
+                };
+                // Armed before each removal: every merge the removals try reads its sibling cold.
+                let evicted = std::rc::Rc::new(Cell::new(None));
+                let arm = || {
+                    if !crate::race::pending("btree.merge_siblings") {
+                        let (at_point, point_pool) = (evicted.clone(), pool.clone());
+                        crate::race::at("btree.merge_siblings", move || {
+                            at_point.set(Some(point_pool.evict_clean(sibling)));
+                        });
+                    }
+                };
+                let mut left: BTreeSet<usize> = (0..n).collect();
+                let mut tried = 0;
+                let mut merged_at = None;
+                for i in 0..n {
+                    arm();
+                    evicted.set(None);
+                    let mut op = Remove::new(&key(i));
+                    let mut calls = 0;
+                    let mut met = None;
+                    let removed = loop {
+                        calls += 1;
+                        let out = tree.remove(&mut op).unwrap();
+                        if met.is_none() && !crate::race::pending("btree.merge_siblings") {
+                            // The call that passed the point: what it came to, and where the
+                            // remove stood.
+                            met = Some((
+                                matches!(out, IOResult::IO(_)),
+                                get(&tree, &run, &key(i)).is_none(),
+                                op.merging_for_test(),
+                                evicted.get(),
+                            ));
+                        }
+                        match out {
+                            IOResult::Done(removed) => break removed,
+                            IOResult::IO(IOCompletions(c)) => {
+                                while !c.finished() {
+                                    io.step().unwrap();
+                                }
+                            }
+                        }
+                    };
+                    left.remove(&i);
+                    let Some((io_back, gone, merging, sibling_evicted)) = met else {
+                        continue;
+                    };
+                    tried += 1;
+                    assert_eq!(
+                    (io_back, gone, merging, sibling_evicted, removed, calls > 1),
+                    (true, true, Some(0), Some(true), true, true),
+                    "{side}, key {i}: (returned IO, the key already gone, the merge still owed, \
+                     the sibling evicted, removed, stepped again) at the merge's read of its \
+                     sibling"
+                );
+                    if level_of(&io, &pool, root) == 0 || children(&io, &pool, root).len() == 1 {
+                        merged_at = Some(i);
+                        break;
+                    }
+                }
+                assert!(
+                    merged_at.is_some(),
+                    "{side}: no merge after a cold sibling read merged the leaves ({tried} tried)"
+                );
+                let model: Vec<(Vec<u8>, Vec<u8>)> = left
+                    .iter()
+                    .map(|&i| (key(i), vec![i as u8; VALUE]))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                assert_eq!(
+                    scan(&tree, &run, true),
+                    model,
+                    "{side}: the tree against the model"
+                );
+                check_whole(&tree, &db, &run, side);
+            }
+        },
+    );
+}

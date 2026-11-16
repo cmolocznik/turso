@@ -1024,6 +1024,11 @@ mod tests {
             "child",
         ),
         (
+            "btree/tests.rs",
+            "a_merge_reading_its_sibling_cold_returns_io_and_goes_on_where_it_stopped",
+            "child",
+        ),
+        (
             "executor/tests.rs",
             "a_step_watching_a_signal_its_job_did_not_declare_ends_the_process",
             "child",

@@ -1316,6 +1316,7 @@ impl Tree {
         (left_pos, left, left_hint, right, right_hint): (usize, PageId, u32, PageId, u32),
         room: &mut RoomWait,
     ) -> Result<IOResult<Paired>> {
+        crate::race::point("btree.merge_siblings");
         let fix = |pid: PageId, hint: u32| -> Result<IOResult<Optimistic<'_>>> {
             if pid == node.pid() {
                 return Ok(IOResult::Done(node.clone()));
@@ -2336,6 +2337,12 @@ impl Remove {
     /// The key it removes.
     pub fn key(&self) -> &[u8] {
         &self.key
+    }
+
+    /// The level of the merge it has still to try after its removal, for a test.
+    #[cfg(all(test, unix, not(any(shuttle, atoll_loom, miri))))]
+    pub(in crate::storage::atoll) fn merging_for_test(&self) -> Option<u8> {
+        self.merging
     }
 
     pub fn new(key: &[u8]) -> Self {

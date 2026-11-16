@@ -634,42 +634,57 @@ fn a_bulk_statements_commit_brings_the_redo_point_within_twice_the_budget() {
 
 /// With a checkpointing thread, statements and commits do no checkpoint work, and a statement
 /// that finds one due wakes the thread to do it: small commits appending one and a half times the
-/// log budget, short of the twice past which a transaction's end waits for a full checkpoint, see
-/// a checkpoint done all the same, the thread's.
+/// log budget see a checkpoint done all the same, the thread's, and none of their ends asks for a
+/// full one. An end asks for a full checkpoint once the redo point trails by twice the budget,
+/// so the writer here does not outrun the thread: after a commit that leaves the redo point a
+/// budget behind, which has woken the thread (a checkpoint is due from half of that), it waits
+/// for the thread's checkpoint to bring the lag under the budget. The lag then never nears twice
+/// the budget, however slowly the thread runs.
 #[test]
 fn with_a_checkpointing_thread_a_due_checkpoint_is_the_threads_woken_by_a_statement() {
-    within_a_minute(|| {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_with(&io, "/db/thread-commits", threaded());
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
-            .unwrap();
-        let budget = config().log_budget.expect("a log budget");
-        let row = 8 << 10;
-        let atoll = db.atoll.as_ref().unwrap().atoll();
-        let (steps, first, fulls) = (
-            WRITER_STEPS.with(|n| n.get()),
-            atoll.checkpointer().superblock().checkpoint,
-            atoll.checkpointer().fulls_requested(),
-        );
-        for _ in 0..3 * budget / (2 * row) {
-            conn.execute(format!("INSERT INTO t (b) VALUES (zeroblob({row}))"))
-                .unwrap();
-        }
-        assert_eq!(
-            WRITER_STEPS.with(|n| n.get()),
-            steps,
-            "a writer stepped the checkpoint"
-        );
-        assert_eq!(
-            atoll.checkpointer().fulls_requested(),
-            fulls,
-            "a transaction's end asked for a full checkpoint"
-        );
-        while atoll.checkpointer().superblock().checkpoint == first {
-            std::thread::yield_now();
-        }
-    });
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::with_a_checkpointing_thread_a_due_checkpoint_is_the_threads_woken_by_a_statement"
+        ),
+        || {
+            within_a_minute(|| {
+                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                let db = open_with(&io, "/db/thread-commits", threaded());
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                    .unwrap();
+                let budget = config().log_budget.expect("a log budget");
+                let row = 8 << 10;
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                let (steps, first, fulls) = (
+                    WRITER_STEPS.with(|n| n.get()),
+                    atoll.checkpointer().superblock().checkpoint,
+                    atoll.checkpointer().fulls_requested(),
+                );
+                for _ in 0..3 * budget / (2 * row) {
+                    conn.execute(format!("INSERT INTO t (b) VALUES (zeroblob({row}))"))
+                        .unwrap();
+                    while atoll.checkpointer().lag() >= budget {
+                        std::thread::yield_now();
+                    }
+                }
+                assert_eq!(
+                    WRITER_STEPS.with(|n| n.get()),
+                    steps,
+                    "a writer stepped the checkpoint"
+                );
+                assert_eq!(
+                    atoll.checkpointer().fulls_requested(),
+                    fulls,
+                    "a transaction's end asked for a full checkpoint"
+                );
+                while atoll.checkpointer().superblock().checkpoint == first {
+                    std::thread::yield_now();
+                }
+            });
+        },
+    );
 }
 
 /// With a checkpointing thread, one bulk statement appending twenty times the log budget: its

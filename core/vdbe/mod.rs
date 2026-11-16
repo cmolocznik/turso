@@ -1182,6 +1182,19 @@ pub(crate) struct BudgetMarks {
     pub(crate) free: u64,
 }
 
+/// How far a statement is as its connection's top-level writer (ONE-TXN rule 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriterState {
+    /// No writer, or a writer that has not reached its Transaction instruction.
+    NotRegistered,
+    /// The connection's registered writer (`Connection::admit_writer`), from its Transaction
+    /// instruction's first entry. Its write has not begun.
+    Registered,
+    /// Its write has begun: it passed its Transaction instruction. Still the registered writer,
+    /// to its last return.
+    Begun,
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1392,12 +1405,8 @@ pub struct ProgramState {
     /// In Atoll mode, a facade read under way: a header or schema cookie read, the page count, or
     /// a Transaction opcode's read-set check (ASYNC1 D2e §2.2).
     pub(crate) atoll_read: Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
-    /// Whether this statement is its connection's registered top-level writer
-    /// (`Connection::admit_writer`), from its Transaction instruction's first entry to its last
-    /// return (ONE-TXN rule 1).
-    pub(crate) writer_admitted: bool,
-    /// Whether this statement's write has begun: it passed its Transaction instruction.
-    pub(crate) is_active_write: bool,
+    /// How far this statement is as its connection's top-level writer (ONE-TXN rule 1).
+    pub(crate) writer: WriterState,
     /// Write activity on the main database when this statement became an
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
@@ -1535,8 +1544,7 @@ impl ProgramState {
             atoll_create: None,
             atoll_retire: None,
             atoll_read: None,
-            writer_admitted: false,
-            is_active_write: false,
+            writer: WriterState::NotRegistered,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
@@ -1759,11 +1767,10 @@ impl ProgramState {
         }
         self.atoll_read = None;
         debug_assert!(
-            !self.writer_admitted,
+            !self.writer_admitted(),
             "a writer's state reset with its registration not let go"
         );
-        self.writer_admitted = false;
-        self.is_active_write = false;
+        self.writer = WriterState::NotRegistered;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
@@ -1824,6 +1831,33 @@ impl ProgramState {
         connection: &Connection,
         self_counted: bool,
     ) -> bool {
+        debug_assert!(
+            self.writer != WriterState::Registered,
+            "a statement halts as a registered writer whose write has not begun"
+        );
+        self.autocommit_decision(connection, self_counted, false)
+    }
+
+    /// [`can_autocommit_now`](Self::can_autocommit_now) at an abort, the one place a writer can
+    /// stand registered with its write not begun: its own registration is not another writer.
+    pub(crate) fn can_autocommit_at_abort(
+        &mut self,
+        connection: &Connection,
+        self_counted: bool,
+    ) -> bool {
+        let registered_not_begun = self.writer == WriterState::Registered;
+        self.autocommit_decision(connection, self_counted, registered_not_begun)
+    }
+
+    /// Inlined into both, so a halt, which passes `false`, tests the writer's state nowhere a
+    /// writer is registered.
+    #[inline(always)]
+    fn autocommit_decision(
+        &mut self,
+        connection: &Connection,
+        self_counted: bool,
+        registered_not_begun: bool,
+    ) -> bool {
         let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
         if is_already_committing {
             return true;
@@ -1833,20 +1867,12 @@ impl ProgramState {
             active_writers <= 1,
             "n_active_writes must be 0 or 1, got {active_writers}"
         );
-        if self.is_active_write {
+        if self.is_active_write() {
             turso_assert!(
                 active_writers == 1,
                 "active writer state without an active writer count"
             );
         }
-        // A writer is registered from its Transaction instruction's first entry and its write
-        // begins at that instruction's end, so a registered statement here has not begun: the
-        // shortcuts above returned for one that has. Its own registration is not another writer.
-        debug_assert!(
-            !self.is_active_write || self.writer_admitted,
-            "a write begun by a statement that is not its connection's registered writer"
-        );
-        let other_writers = active_writers - i32::from(self.writer_admitted);
         if self.mv_store(connection).is_some() {
             // MVCC keeps one tx id on the connection, shared by the
             // statements that take part in it (`Connection::take_txn_part`).
@@ -1856,15 +1882,15 @@ impl ProgramState {
             // statement taking part, with no writer active. A statement that
             // reads no database takes no part: nobody waits for it, and it
             // ends nothing.
-            if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+            if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write() {
                 return true;
             }
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && connection.n_active_txn_statements.load(Ordering::SeqCst)
                     == i32::from(self.txn_part.is_some())
-                && other_writers == 0;
+                && (active_writers == 0 || registered_not_begun);
         }
-        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write() {
             // Pager/WAL writers can finish while sibling readers remain
             // active, like SQLite commits when the halting statement is the
             // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
@@ -1897,7 +1923,10 @@ impl ProgramState {
         // an attached transaction a deferring sibling left behind — SQLite's
         // vdbeCommit visits every database on halt, so leftovers are closed
         // even by a statement that never started a transaction itself.
-        if other_writers != 0 {
+        // The connection's registered writer is another statement, or this one with its write
+        // begun, which ends its transaction only through the shortcuts above; or it is this one
+        // with its write not begun, which began the transaction and may end it.
+        if active_writers != 0 && !registered_not_begun {
             return false;
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
@@ -2305,11 +2334,17 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
-        let ends_write_statement = self.is_active_write;
-        self.is_active_write = false;
-        if self.writer_admitted {
+        // Registered, its write begun or not: a writer that has not begun has captured no
+        // change, so what follows finds the change log empty for it as for a begun one that
+        // changed nothing.
+        let ends_write_statement = self.writer_admitted();
+        debug_assert!(
+            self.writer != WriterState::Registered || connection.transaction_changes.is_empty(),
+            "a writer registered and not begun ends with changes captured"
+        );
+        if ends_write_statement {
             connection.release_writer();
-            self.writer_admitted = false;
+            self.writer = WriterState::NotRegistered;
         }
         // A write statement that keeps its changes must have applied them to
         // the materialized views first (see
@@ -2458,6 +2493,19 @@ impl ProgramState {
             p.stop_use_subjournal();
         }
         result
+    }
+
+    /// Whether this statement is its connection's registered top-level writer, from its
+    /// Transaction instruction's first entry to its last return.
+    #[inline]
+    pub(crate) fn writer_admitted(&self) -> bool {
+        self.writer != WriterState::NotRegistered
+    }
+
+    /// Whether this statement's write has begun: it passed its Transaction instruction.
+    #[inline]
+    pub(crate) fn is_active_write(&self) -> bool {
+        self.writer == WriterState::Begun
     }
 
     /// Gets or creates a bloom filter for the given cursor ID.
@@ -3815,7 +3863,7 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Result<IOResult<()>> {
-        if !state.is_active_write || self.connection.transaction_changes.is_empty() {
+        if !state.is_active_write() || self.connection.transaction_changes.is_empty() {
             return Ok(IOResult::Done(()));
         }
         self.apply_pending_view_deltas(state, false, pager)
@@ -4675,7 +4723,7 @@ impl Program {
             let unfinished_statement_reset_or_drop =
                 err.is_none() && state.execution_state.is_running();
             let inside_explicit_transaction = !self.connection.get_auto_commit();
-            let unfinished_writer = state.is_active_write;
+            let unfinished_writer = state.is_active_write();
             let can_rollback_just_this_statement =
                 state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
 
@@ -4698,7 +4746,7 @@ impl Program {
                 }
             }
 
-            let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
+            let can_autocommit_now = state.can_autocommit_at_abort(&self.connection, self_counted);
             let is_mvcc = state.mv_store(&self.connection).is_some();
             // Other statements still read the MVCC autocommit transaction: a rollback here undoes
             // this statement's writes alone, and they go on in a successor with the view they

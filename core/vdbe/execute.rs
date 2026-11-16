@@ -58,6 +58,7 @@ use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
     OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState, WriteBaseline,
+    WriterState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -4746,9 +4747,9 @@ pub fn op_transaction_inner(
     // its caller (ONE-TXN rule 1). A second writer is refused before it opens transaction or
     // savepoint state. An entry after a Busy return that let the registration go registers
     // again (`Statement::busy_has_not_begun`).
-    if statement_writes_db && !state.writer_admitted && !program.connection.is_nested_stmt() {
+    if statement_writes_db && !state.writer_admitted() && !program.connection.is_nested_stmt() {
         program.connection.admit_writer()?;
-        state.writer_admitted = true;
+        state.writer = WriterState::Registered;
     }
     let pager = pager_for_db(program, pager, *db)?;
     // Get the MvStore for the specific database (main or attached).
@@ -5340,24 +5341,27 @@ pub fn op_transaction_inner(
 
                 let is_top_level_statement = !program.connection.is_nested_stmt();
                 if statement_writes_db && is_top_level_statement {
-                    turso_assert!(
-                        state.writer_admitted,
-                        "a write statement past its begin is not its connection's registered writer"
-                    );
-                    if !state.is_active_write {
-                        turso_assert!(
-                            program.connection.transaction_changes.is_empty(),
-                            "write statement started with view changes left by an earlier statement"
-                        );
-                        state.is_active_write = true;
-                        state.tx_read_only_at_start = program.connection.is_tx_read_only();
-                        if is_main_db {
-                            state.write_baseline = WriteBaseline::capture(
-                                mv_store.as_deref(),
-                                &program.connection,
-                                &pager,
+                    match state.writer {
+                        WriterState::Begun => {}
+                        WriterState::Registered => {
+                            turso_assert!(
+                                program.connection.transaction_changes.is_empty(),
+                                "write statement started with view changes left by an earlier statement"
                             );
+                            state.writer = WriterState::Begun;
+                            state.tx_read_only_at_start = program.connection.is_tx_read_only();
+                            if is_main_db {
+                                state.write_baseline = WriteBaseline::capture(
+                                    mv_store.as_deref(),
+                                    &program.connection,
+                                    &pager,
+                                );
+                            }
                         }
+                        WriterState::NotRegistered => turso_assert!(
+                            false,
+                            "a write statement past its begin is not its connection's registered writer"
+                        ),
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;

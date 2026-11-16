@@ -476,9 +476,9 @@ impl Statement {
     #[cold]
     #[inline(never)]
     fn busy_has_not_begun(&mut self) {
-        if self.state.writer_admitted {
+        if self.state.writer_admitted() {
             self.program.connection.release_writer();
-            self.state.writer_admitted = false;
+            self.state.writer = vdbe::WriterState::NotRegistered;
         }
         if !std::mem::take(&mut self.state.atoll_taking) {
             return;
@@ -835,8 +835,7 @@ impl Statement {
         }
 
         if matches!(res, Ok(StepResult::Busy))
-            && (self.state.atoll_taking
-                || (self.state.writer_admitted && !self.state.is_active_write))
+            && (self.state.atoll_taking || self.state.writer == vdbe::WriterState::Registered)
         {
             self.busy_has_not_begun();
         }
@@ -855,13 +854,13 @@ impl Statement {
             let had_pending_tx = self.state.pending_fresh_tx.is_some() && !self.has_returned_row;
             self.rollback_pending_fresh_tx_if_needed();
             if had_pending_tx {
-                // reset(None, None) will set is_active_write = false, but the
+                // reset(None, None) will reset the writer's state, but the
                 // connection-level n_active_writes counter needs to be
                 // decremented first or the retry will see a spurious "writer
                 // already active" error at Insn::Transaction.
-                if self.state.writer_admitted {
+                if self.state.writer_admitted() {
                     self.program.connection.release_writer();
-                    self.state.writer_admitted = false;
+                    self.state.writer = vdbe::WriterState::NotRegistered;
                 }
                 self.state.reset(None, None);
             }
@@ -941,7 +940,7 @@ impl Statement {
     /// Whether this statement's write has begun: it passed its Transaction instruction, for a test.
     #[cfg(test)]
     pub(crate) fn write_begun_for_test(&self) -> bool {
-        self.state.is_active_write
+        self.state.is_active_write()
     }
 
     /// The instructions this statement's own program has dispatched, its nested programs' apart,
@@ -1931,7 +1930,7 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
-                statement_failed = self.state.is_active_write;
+                statement_failed = self.state.is_active_write();
                 if let Err(abort_err) = self.program.abort(
                     &self.pager,
                     None,
@@ -1963,11 +1962,10 @@ impl Statement {
         // Safety net: if end_statement wasn't reached (e.g. statement dropped
         // mid-execution), the writer's registration is let go before reset
         // clears the flag.
-        if self.state.writer_admitted {
+        if self.state.writer_admitted() {
             self.program.connection.release_writer();
-            self.state.writer_admitted = false;
+            self.state.writer = vdbe::WriterState::NotRegistered;
         }
-        self.state.is_active_write = false;
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted(statement_failed);
         }

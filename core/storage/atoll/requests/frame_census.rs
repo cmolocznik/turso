@@ -390,6 +390,109 @@ fn the_framed_step_census_sees_a_planted_stop_left_to_chance() {
     );
 }
 
+/// Functions that count the full checkpoints asked for beside a checkpointing thread and do not
+/// wait for the thread as they write, each with why the count is not the thread's speed to
+/// decide.
+const FULL_COUNTS_LEFT_TO_THE_THREAD: &[(&str, &str)] = &[];
+
+/// A test that opens its database with a checkpointing thread and reads how many full
+/// checkpoints were asked for waits for the thread as it writes (the auditor's #6000). A
+/// transaction's end asks for a full checkpoint once the redo point trails by twice the log
+/// budget, and whether it comes to that is the thread's speed to decide unless the writer waits
+/// for the thread's checkpoint: alone the thread keeps up, under load it does not. Every
+/// function that reads the count with no such wait is listed with its reason, and every one
+/// listed still does.
+#[test]
+fn every_count_of_full_checkpoints_beside_a_checkpointing_thread_waits_for_the_thread() {
+    let (mut readers, mut found) = (0, Vec::new());
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for path in crate::source_test::rust_sources(core) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (reading, unwaited) = full_counts_left_to_the_thread(&code_of(&text));
+        readers += reading;
+        found.extend(unwaited);
+    }
+    assert!(
+        readers > 0,
+        "the census found no count of full checkpoints beside a checkpointing thread"
+    );
+    let mut found: Vec<&str> = found.iter().map(String::as_str).collect();
+    let mut listed: Vec<&str> = FULL_COUNTS_LEFT_TO_THE_THREAD
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    found.sort();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "a function that counts full checkpoints beside a checkpointing thread with no wait for it and is not listed, or one listed that no longer does"
+    );
+}
+
+/// The census finds the count read with no wait in a planted file, passes the same function once
+/// it waits, and passes a count read with no checkpointing thread.
+#[test]
+fn the_full_count_census_sees_a_planted_count_left_to_the_thread() {
+    let planted = |wait: &str| {
+        code_of(&format!(
+            r#"
+        fn a_count_beside_a_thread() {{
+            let db = open_with(&io, path, threaded());
+            let fulls = atoll.checkpointer().fulls_requested();
+            for _ in 0..rows {{
+                conn.execute(insert).unwrap();
+                {wait}
+            }}
+            assert_eq!(atoll.checkpointer().fulls_requested(), fulls);
+        }}
+        fn a_count_with_no_thread() {{
+            let db = open(&io, path);
+            let fulls = atoll.checkpointer().fulls_requested();
+            assert_eq!(atoll.checkpointer().fulls_requested(), fulls);
+        }}
+        "#
+        ))
+    };
+    assert_eq!(
+        full_counts_left_to_the_thread(&planted("")),
+        (1, vec!["a_count_beside_a_thread".to_string()]),
+        "the census passes a count left to the thread"
+    );
+    let waiting = "while atoll.checkpointer().lag() >= budget { std::thread::yield_now(); }";
+    assert_eq!(
+        full_counts_left_to_the_thread(&planted(waiting)),
+        (1, Vec::new()),
+        "the census refuses a count whose writer waits for the thread"
+    );
+}
+
+/// How many functions of one file's `code` read the count of full checkpoints asked for with a
+/// checkpointing thread in the same function, and each that holds no wait for the thread.
+fn full_counts_left_to_the_thread(code: &str) -> (usize, Vec<String>) {
+    let (mut readers, mut unwaited) = (0, Vec::new());
+    for (name, body) in functions_of(code) {
+        let beside_a_thread = body.contains("threaded()") || body.contains("Checkpointing::Thread");
+        if !beside_a_thread || !body.contains(".fulls_requested()") {
+            continue;
+        }
+        readers += 1;
+        if !waits_for_the_thread(body) {
+            unwaited.push(name.to_string());
+        }
+    }
+    (readers, unwaited)
+}
+
+/// Whether `body` holds a loop that goes on while the checkpointer's lag is too large: a `while`
+/// whose condition reads `.lag()`.
+fn waits_for_the_thread(body: &str) -> bool {
+    body.match_indices("while ").any(|(at, _)| {
+        let condition = &body[at..];
+        let condition = &condition[..condition.find('{').unwrap_or(condition.len())];
+        condition.contains(".lag()")
+    })
+}
+
 /// How a function that steps a statement in a frame leaves a stop it reads to chance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LeftToChance {

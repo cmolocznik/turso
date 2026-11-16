@@ -473,6 +473,16 @@ mod tests {
         ),
         (
             "sql/mode/tests/one_writer.rs",
+            "a_writer_begun_in_a_readers_transaction_ends_done_and_not_committed",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "with_a_checkpointing_thread_a_due_checkpoint_is_the_threads_woken_by_a_statement",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
             "a_writer_reset_or_dropped_at_its_take_is_the_writer_no_more",
             "child",
         ),

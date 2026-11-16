@@ -976,3 +976,84 @@ fn a_reader_run_whole_at_every_stop_of_a_writer_stepped_cold_leaves_it_its_trans
         },
     );
 }
+
+/// Row 75's state with an attached database's read left open. A reader of main and of an attached
+/// table stands at a row; a schema change of its connection parks at its take; the reader is
+/// finished, and leaves the transaction and the attached read where they are, a writer being
+/// registered; the other connection commits; the schema change is stepped to its end. Its write
+/// began in a transaction it did not begin, so its halt, the last statement's, finds a writer
+/// registered, its own, and ends nothing: Done and not committed, as on 4.1. Commit 974a157f2
+/// (4.2a) committed here, by an accident of how it read the registration and only because the
+/// attached transaction was open. E1b gives the statement a transaction of its own, which it
+/// commits, and changes what this test expects.
+#[test]
+fn a_writer_begun_in_a_readers_transaction_ends_done_and_not_committed() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_writer_begun_in_a_readers_transaction_ends_done_and_not_committed"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open(
+                io.clone(),
+                "/db/one-writer-readers-transaction",
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .atoll(config())
+                    .db_opts(DatabaseOpts::default().with_attach(true)),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let other = db.connect(ConnectOpts::new()).unwrap();
+            let set = [
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, w TEXT)"),
+                conn.execute("INSERT INTO t VALUES (1, 'one')"),
+                conn.execute("ATTACH ':memory:' AS aux"),
+                conn.execute("CREATE TABLE aux.a(id INTEGER PRIMARY KEY)"),
+                conn.execute("INSERT INTO aux.a VALUES (1), (2)"),
+                other.execute("BEGIN"),
+                other.execute("INSERT INTO t VALUES (1000, 'w')"),
+            ]
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>();
+            let set = format!("{set:?}");
+            conn.set_busy_timeout(std::time::Duration::from_secs(30));
+            let mut reader = conn.prepare("SELECT a.id FROM aux.a AS a, t").unwrap();
+            let at_a_row = once(&mut reader);
+            let mut x = conn.prepare(CREATE_C).unwrap();
+            let parked = once(&mut x);
+            let read_on = stepped(&mut reader, None);
+            let after_the_reader = shows(&conn);
+            let committed = other.execute("COMMIT").map_err(|e| e.to_string());
+            let finished = stepped(&mut x, None);
+            let after = shows(&conn);
+            let seen = ran(
+                &other,
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'c'",
+            );
+            drop((x, reader));
+            drop((conn, other, db));
+            assert_eq!(set, "Ok([(), (), (), (), (), (), ()])");
+            assert_eq!(at_a_row, "Row", "the reader does not stand at a row");
+            assert_eq!(parked, "IO", "the schema change did not park at its take");
+            assert_eq!(read_on, "Done");
+            assert_eq!(
+                after_the_reader,
+                (true, true),
+                "the reader ended the transaction beside a registered writer"
+            );
+            assert_eq!(committed, Ok(()));
+            assert_eq!(finished, "Done");
+            assert_eq!(
+                after,
+                (true, true),
+                "a writer begun in a reader's transaction ended it at its halt"
+            );
+            assert_eq!(
+                seen, "[[Numeric(Integer(0))]]",
+                "a writer begun in a reader's transaction committed at its halt"
+            );
+        },
+    );
+}

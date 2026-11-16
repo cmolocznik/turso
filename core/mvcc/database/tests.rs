@@ -4926,14 +4926,14 @@ fn a_writer_registered_and_not_begun_decides_for_the_mvcc_transaction_it_began()
         .unwrap();
     let mut state = ProgramState::new(1, 0);
     conn.admit_writer().unwrap();
-    state.writer_admitted = true;
+    state.writer = crate::vdbe::WriterState::Registered;
     state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-    let alone = state.can_autocommit_now(&conn, false);
+    let alone = state.can_autocommit_at_abort(&conn, false);
     let part = conn.take_txn_part();
-    let beside = state.can_autocommit_now(&conn, false);
+    let beside = state.can_autocommit_at_abort(&conn, false);
     drop(part);
     conn.release_writer();
-    state.writer_admitted = false;
+    state.writer = crate::vdbe::WriterState::NotRegistered;
     state.auto_txn_cleanup = TxnCleanup::None;
     drop(state);
     assert!(

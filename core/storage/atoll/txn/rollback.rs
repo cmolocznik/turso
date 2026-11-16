@@ -31,6 +31,14 @@ use crate::types::IOResult;
 use crate::{LimboError, Result};
 use std::ops::Range;
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The writes the rollbacks on this thread began, each a put or a removal built at a key's
+    /// look: the root of the key's tree, and the key.
+    pub(crate) static WRITES_BEGUN: std::cell::RefCell<Vec<(PageId, Vec<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 macro_rules! done {
     ($e:expr) => {
         match $e? {
@@ -110,6 +118,20 @@ impl Rollback {
     #[cfg(test)]
     pub fn reading_back(&self) -> bool {
         self.back.reading()
+    }
+
+    /// What it is working on: "look", "put" or "remove" for a key's entry, "creation" for a
+    /// creation being undone, "failed" once a step failed, "none" between keys.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn working(&self) -> &'static str {
+        match &self.working {
+            None => "none",
+            Some(Working::Entry(Step::Look)) => "look",
+            Some(Working::Entry(Step::Put(_))) => "put",
+            Some(Working::Entry(Step::Remove(_))) => "remove",
+            Some(Working::Creation(_)) => "creation",
+            Some(Working::Failed) => "failed",
+        }
     }
 
     /// The keys it put back so far.
@@ -236,6 +258,13 @@ fn step(
                         ),
                         None => Step::Remove(Remove::new(key).expecting(&current)),
                     };
+                    #[cfg(test)]
+                    WRITES_BEGUN.with(|w| w.borrow_mut().push((tree.tree().root(), key.to_vec())));
+                    crate::race::point(if matches!(step, Step::Put(_)) {
+                        "rollback.put_back"
+                    } else {
+                        "rollback.remove"
+                    });
                 }
                 Step::Put(put) => match done!(tree.tree().put(put)) {
                     // Changed since the look: look again.

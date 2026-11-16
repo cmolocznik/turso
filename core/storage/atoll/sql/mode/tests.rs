@@ -12331,6 +12331,8 @@ mod in_frames {
             struct Swept {
                 /// The rollback's returns, made in frames.
                 returns: usize,
+                /// The writes the rollback began, a put or a removal for each key its looks chose.
+                writes_begun: u64,
                 /// The failure the rollback's driver came to, if it failed.
                 failed: Option<String>,
                 /// Whether the statement rollback owed was kept failed once its driver failed.
@@ -12349,6 +12351,25 @@ mod in_frames {
                 /// `r` as committed before the transaction, and as its kept statement left it.
                 base: Vec<Vec<Value>>,
                 kept: Vec<Vec<Value>>,
+                /// What the call that met the held leaf came to, when a leaf was held.
+                latched: Option<Latched>,
+            }
+
+            /// The call whose write met its leaf held by another thread, and what followed.
+            #[derive(Debug)]
+            struct Latched {
+                /// Whether it returned IO, and whether that wait was unfinished while held.
+                returned_io: bool,
+                unfinished: bool,
+                /// What the rollback was working on as it returned ([`Rollback::working`]).
+                working: Option<&'static str>,
+                /// Whether letting the leaf go finished the wait.
+                finished_on_let_go: bool,
+                /// How the next call came out: "done", "paused" (at a commit's pause), "io" (on a
+                /// wait of its own), "latch" (on the latch's wait again) or "failed".
+                next: Option<&'static str>,
+                /// The writes the rollback began for the held key.
+                key_writes: usize,
             }
 
             /// One run of the sweep. A transaction writes row 0, which it keeps, and the
@@ -12361,8 +12382,28 @@ mod in_frames {
             /// rollback finished (the commit failing, and so rolled back whole, once that rollback
             /// failed), or rolled back whole by the rollback's ending.
             fn swept(driver: Driver, k: usize, fail: bool) -> Swept {
+                swept_over(driver, k, fail, true)
+            }
+
+            /// [`swept`], with the pages written out and evicted before the rollback and at each
+            /// return when `cold`; with every page still in memory none of its writes returns IO.
+            fn swept_over(driver: Driver, k: usize, fail: bool, cold: bool) -> Swept {
+                swept_with(driver, k, fail, cold, None)
+            }
+
+            /// [`swept_over`], and with `latch` the leaf of the key the rollback's first write
+            /// past race point `latch` is for held by another thread there, until the call that
+            /// meets it returns; then let go.
+            fn swept_with(
+                driver: Driver,
+                k: usize,
+                fail: bool,
+                cold: bool,
+                latch: Option<&'static str>,
+            ) -> Swept {
                 use crate::storage::atoll::sql::mode::Ending;
-                let path = format!("/db/undo-swept-{driver:?}-{k}-{fail}");
+                use crate::storage::atoll::txn::rollback::WRITES_BEGUN;
+                let path = format!("/db/undo-swept-{driver:?}-{k}-{fail}-{cold}-{latch:?}");
                 let (crash, io, db, conn, cfg) = swept_db(&path);
                 let ct = conn.atoll().expect("Atoll mode");
                 let base = r_read(&conn);
@@ -12377,9 +12418,37 @@ mod in_frames {
                     })
                     .unwrap();
                 }
-                crate::storage::atoll::sql::mode::full_checkpoint(db.atoll.as_ref().unwrap())
-                    .unwrap();
-                chill(&db);
+                if cold {
+                    crate::storage::atoll::sql::mode::full_checkpoint(db.atoll.as_ref().unwrap())
+                        .unwrap();
+                    chill(&db);
+                }
+                let held_key = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let mut hold = latch.map(|point| {
+                    let seen = held_key.clone();
+                    let pool = db.atoll.as_ref().unwrap().atoll().pool().clone();
+                    crate::storage::atoll::testing::HoldAt::set_reading(
+                        point,
+                        &io,
+                        &pool,
+                        move || {
+                            let begun = WRITES_BEGUN
+                                .with(|w| w.borrow().last().cloned())
+                                .expect("a write begun at the point");
+                            *seen.borrow_mut() = Some(begun.clone());
+                            begun
+                        },
+                        |io, pool, (root, key)| {
+                            (
+                                vec![],
+                                vec![crate::storage::atoll::btree::leaf_of(io, pool, root, &key)],
+                            )
+                        },
+                    )
+                });
+                let mut latched: Option<Latched> = None;
+                let mut latch_wait: Option<crate::io::Completion> = None;
+                let begun = WRITES_BEGUN.with(|w| w.borrow().len());
                 let mut ending = match driver {
                     Driver::Settle => None,
                     Driver::CommitEnding => Some(ct.end(true).expect("a transaction to end")),
@@ -12410,6 +12479,46 @@ mod in_frames {
                         Ok(IOResult::IO(IOCompletions(c))) => Some(c.clone()),
                         _ => None,
                     };
+                    if let Some(l) = latched.as_mut().filter(|l| l.next.is_none()) {
+                        l.next = Some(match &out {
+                            Ok(IOResult::Done(())) => "done",
+                            Ok(IOResult::IO(_))
+                                if wait.as_ref().is_some_and(|c| c.ptr_eq(&pause)) =>
+                            {
+                                "paused"
+                            }
+                            Ok(IOResult::IO(_))
+                                if wait
+                                    .as_ref()
+                                    .zip(latch_wait.as_ref())
+                                    .is_some_and(|(c, l)| c.ptr_eq(l)) =>
+                            {
+                                "latch"
+                            }
+                            Ok(IOResult::IO(_)) => "io",
+                            Err(_) => "failed",
+                        });
+                    }
+                    if hold.as_ref().is_some_and(|h| h.versions().is_some()) {
+                        let working = match ending.as_ref() {
+                            None => {
+                                let slot = ct.cell.lock_for_test();
+                                slot.owed_for_test().map(|o| o.working_for_test())
+                            }
+                            Some(e) => e.working_for_test(),
+                        };
+                        let unfinished = wait.as_ref().is_some_and(|c| !c.finished());
+                        hold.take().expect("the leaf held").let_go();
+                        latch_wait = wait.clone();
+                        latched = Some(Latched {
+                            returned_io: wait.is_some(),
+                            unfinished,
+                            working,
+                            finished_on_let_go: wait.as_ref().is_some_and(|c| c.finished()),
+                            next: None,
+                            key_writes: 0,
+                        });
+                    }
                     if wait.as_ref().is_some_and(|c| c.ptr_eq(&pause)) {
                         drop(held);
                         break;
@@ -12428,7 +12537,9 @@ mod in_frames {
                         );
                     }
                     clear_faults(&crash);
-                    chill(&db);
+                    if cold {
+                        chill(&db);
+                    }
                     match out {
                         Ok(IOResult::IO(_)) => {}
                         Ok(IOResult::Done(())) => break,
@@ -12447,6 +12558,18 @@ mod in_frames {
                 };
                 if let Err(e) = &finished {
                     failed.get_or_insert_with(|| e.to_string());
+                }
+                let written = WRITES_BEGUN.with(|w| w.borrow_mut().split_off(begun));
+                let writes_begun = written.len() as u64;
+                if let Some(l) = latched.as_mut() {
+                    let key = held_key.borrow().clone().expect("the held key");
+                    l.key_writes = written.iter().filter(|w| **w == key).count();
+                }
+                if let Some(hold) = hold.take() {
+                    // The point never passed, or no call returned while it was held.
+                    if hold.versions().is_some() {
+                        hold.let_go();
+                    }
                 }
                 let kept_failed = owed(&conn).is_some_and(|(_, failed)| failed);
                 let ended = match ending.take() {
@@ -12482,6 +12605,7 @@ mod in_frames {
                 drop((io, crash));
                 Swept {
                     returns,
+                    writes_begun,
                     failed,
                     kept_failed,
                     ended,
@@ -12491,6 +12615,7 @@ mod in_frames {
                     rewritten,
                     base,
                     kept,
+                    latched,
                 }
             }
 
@@ -12509,8 +12634,10 @@ mod in_frames {
             /// `r` as the transaction's outcome leaves it, its index in step with its rows, the
             /// integrity check ok, and every key the transaction wrote writable again (a version
             /// of it left behind is unseen by a read once the transaction is gone, but fails a
-            /// write).
+            /// write). Each run begins as many writes as the run with every page in memory, where
+            /// no write returns IO: a write that returns IO is gone on with, never begun again.
             fn returning_at_each_wait(driver: Driver) {
+                let warm = swept_over(driver, 0, false, false);
                 let whole = swept(driver, usize::MAX, false);
                 let none = swept(driver, 0, false);
                 assert!(
@@ -12538,11 +12665,75 @@ mod in_frames {
                     );
                     assert_eq!(run.integrity, ok, "{driver:?}, {k} returns: integrity");
                     assert_eq!(
+                        run.writes_begun, warm.writes_begun,
+                        "{driver:?}, {k} returns: the writes the rollback began, against the run \
+                         with every page in memory"
+                    );
+                    assert_eq!(
                         run.rewritten,
                         Ok(()),
                         "{driver:?}, {k} returns: the keys the transaction wrote, written again"
                     );
                 }
+            }
+
+            /// A write a rollback begins and that returns IO goes on where it stopped, never begun
+            /// again (#5845, #5859). `driver`'s rollback runs over pages in memory, every call in a
+            /// frame; as it passes race point `point` ("rollback.remove" or "rollback.put_back")
+            /// for the first time, between a key's look and its write, another thread takes the
+            /// latch of the leaf that holds the key. The write returns IO on the latch's wait, its
+            /// step still the rollback's work, and letting the leaf go finishes that wait. The next
+            /// call goes on (to its end, the commit's pause, or a wait of its own, such as a part
+            /// read back from the log, never the latch's again), the rollback ends, the key's write
+            /// was begun once, and the transaction ends as the sweep's model says, its index in
+            /// step and the integrity check ok.
+            fn held_at_its_leaf(driver: Driver, point: &'static str) {
+                let run = swept_with(driver, usize::MAX, false, false, Some(point));
+                let ok = vec![vec![text("ok")]];
+                let latched = run
+                    .latched
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{driver:?}, {point}: no call met the held leaf"));
+                let work = if point == "rollback.remove" {
+                    "remove"
+                } else {
+                    "put"
+                };
+                assert_eq!(
+                    (latched.returned_io, latched.unfinished, latched.working),
+                    (true, true, Some(work)),
+                    "{driver:?}, {point}: (returned IO, its wait unfinished, the rollback's work) at \
+                     the held leaf"
+                );
+                assert!(
+                    latched.finished_on_let_go,
+                    "{driver:?}, {point}: letting the leaf go did not finish the write's wait"
+                );
+                assert_eq!(
+                    latched.key_writes, 1,
+                    "{driver:?}, {point}: the writes begun for the held key"
+                );
+                assert_eq!(
+                    (&run.failed, &run.ended, &run.left),
+                    (&None, &Ok(()), &None),
+                    "{driver:?}, {point}: how it ended"
+                );
+                assert_eq!(
+                    &run.after,
+                    swept_want(driver, &run),
+                    "{driver:?}, {point}: r once the transaction ended"
+                );
+                assert_eq!(run.integrity, ok, "{driver:?}, {point}: integrity");
+                assert_eq!(
+                    run.rewritten,
+                    Ok(()),
+                    "{driver:?}, {point}: the keys the transaction wrote, written again"
+                );
+                assert!(
+                    matches!(latched.next, Some("done" | "paused" | "io")),
+                    "{driver:?}, {point}: the call after the let-go came to {:?}",
+                    latched.next
+                );
             }
 
             /// The sweep with the reads of the `k`-th return's wait failing (#5843). Each driver
@@ -12629,6 +12820,24 @@ mod in_frames {
                         "::a_whole_rollback_returning_at_each_wait_ends_as_one_that_never_returned"
                     ),
                     || returning_at_each_wait(Driver::RollbackEnding),
+                );
+            }
+
+            #[test]
+            fn a_rollback_write_that_meets_its_leaf_held_goes_on_where_it_stopped() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_rollback_write_that_meets_its_leaf_held_goes_on_where_it_stopped"
+                    ),
+                    || {
+                        for driver in [Driver::Settle, Driver::CommitEnding, Driver::RollbackEnding]
+                        {
+                            for point in ["rollback.remove", "rollback.put_back"] {
+                                held_at_its_leaf(driver, point);
+                            }
+                        }
+                    },
                 );
             }
 

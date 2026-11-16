@@ -3205,6 +3205,16 @@ impl PollBudget {
         }
     }
 
+    /// Runs, once, what a test set to do with a stopped step's parked wait before the step sets
+    /// its waker on it.
+    #[cfg(test)]
+    pub fn before_waker_is_set_for_test(wait: &crate::Completion) {
+        let hook = crate::storage::atoll::cooperative::BEFORE_WAKER_IS_SET.with(|h| h.take());
+        if let Some(hook) = hook {
+            hook(wait);
+        }
+    }
+
     /// Records a periodic check at `vm_steps` on this thread, for a test (IV-2's proof).
     #[cfg(test)]
     pub fn count_check_for_test(vm_steps: u64) {
@@ -3401,6 +3411,17 @@ impl Ending {
     pub(in crate::storage::atoll) fn owed_wait_for_test(&self) -> Option<Completion> {
         match &self.step {
             Step::Owed { waiting, .. } => waiting.clone(),
+            _ => None,
+        }
+    }
+
+    /// What the rollback it steps is working on, the owed statement rollback's or the whole
+    /// transaction's, for a test; `None` in any other step.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn working_for_test(&self) -> Option<&'static str> {
+        match &self.step {
+            Step::Owed { rollback, .. } => Some(rollback.working()),
+            Step::Rollback(op, _) => Some(op.working()),
             _ => None,
         }
     }

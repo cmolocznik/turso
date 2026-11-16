@@ -513,6 +513,12 @@ impl Abort {
     pub fn reading_back(&self) -> bool {
         self.undo.reading_back()
     }
+
+    /// What its rollback is working on ([`Rollback::working`]).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn working(&self) -> &'static str {
+        self.undo.working()
+    }
 }
 
 /// A commit in progress: step it with [`Transactions::commit`].

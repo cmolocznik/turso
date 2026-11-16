@@ -247,13 +247,28 @@ impl HoldAt {
         pool: &Arc<BufferPool>,
         pick: impl FnOnce(&Arc<dyn IO>, &Arc<BufferPool>) -> (Vec<PageId>, Vec<PageId>) + Send + 'static,
     ) -> Self {
+        Self::set_reading(point, io, pool, || (), move |io, pool, ()| pick(io, pool))
+    }
+
+    /// [`set`](Self::set), `pick` given what `at` reads on the thread passing `point`, as it passes
+    /// it: what that thread is about to do there.
+    pub(super) fn set_reading<R: Send + 'static>(
+        point: &'static str,
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        at: impl FnOnce() -> R + 'static,
+        pick: impl FnOnce(&Arc<dyn IO>, &Arc<BufferPool>, R) -> (Vec<PageId>, Vec<PageId>)
+            + Send
+            + 'static,
+    ) -> Self {
         let taken = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (io, pool, slot) = (io.clone(), pool.clone(), taken.clone());
         crate::race::at(point, move || {
+            let at_point = at();
             let (held, read) = std::sync::mpsc::channel();
             let (let_go, wait) = std::sync::mpsc::channel::<()>();
             let thread = std::thread::spawn(move || {
-                let (watch, hold) = pick(&io, &pool);
+                let (watch, hold) = pick(&io, &pool, at_point);
                 let versions = watch
                     .iter()
                     .map(|&pid| {

@@ -949,6 +949,15 @@ impl OwedRollback {
         }
     }
 
+    /// What its rollback is working on, for a test; "failed" once it failed.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn working_for_test(&self) -> &'static str {
+        match &self.state {
+            Owed::Rolling { rollback, .. } => rollback.working(),
+            Owed::Failed(_) => "failed",
+        }
+    }
+
     /// The frame and metadata page its top keeps, for a test.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(in crate::storage::atoll) fn keeps_for_test(

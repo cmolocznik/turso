@@ -164,6 +164,36 @@ impl Near {
     }
 }
 
+/// The page of the leaf that holds `key`, or would, in the tree rooted at `root`: the page a write
+/// of `key` fixes, for a test to hold. Read on a thread that holds none of the tree's pages.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(in crate::storage::atoll) fn leaf_of(
+    io: &Arc<dyn IO>,
+    pool: &Arc<BufferPool>,
+    root: PageId,
+    key: &[u8],
+) -> PageId {
+    let mut pid = root;
+    loop {
+        let node = super::drive(io, || pool.fix_optimistic(pid, None)).expect("the node fixed");
+        let below = node
+            .read(|p| {
+                let v = View::new(p);
+                if v.is_leaf() {
+                    return Some(None);
+                }
+                let count = v.count()?;
+                Some(Some(v.child_of(v.route(key)?, count)?.0))
+            })
+            .flatten()
+            .expect("the node read whole");
+        match below {
+            None => return pid,
+            Some(child) => pid = child,
+        }
+    }
+}
+
 pub struct Tree {
     io: Arc<dyn IO>,
     pool: Arc<BufferPool>,

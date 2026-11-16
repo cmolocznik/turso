@@ -1260,6 +1260,11 @@ mod tests {
         ),
         (
             "sql/mode/tests.rs",
+            "a_rollback_write_that_meets_its_leaf_held_goes_on_where_it_stopped",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
             "an_owed_rollback_a_commit_finishes_returning_at_each_wait_ends_as_one_that_never_returned",
             "child",
         ),
@@ -1446,6 +1451,11 @@ mod tests {
         (
             "sql/mode/tests/poll_budget.rs",
             "drawn_statements_budgets_and_waits_keep_the_bound_and_conserve_the_units",
+            "child",
+        ),
+        (
+            "sql/mode/tests/poll_budget.rs",
+            "a_wait_that_lands_before_its_waker_is_set_still_wakes_it",
             "child",
         ),
     ];

@@ -1,12 +1,13 @@
 //! A cooperative frame's budget of work (ASYNC1 D2e (iv-a)): each call of a statement in a frame
-//! runs at most the budget in units, a unit being an instruction's first dispatch; the instruction
-//! a poll continues, at most one a program state, is not charged again. A call after a stop for
-//! the budget looks at once, frames inside a frame share the outer's budget, and outside any frame
-//! nothing stops. The budget is the VDBE's, so these use databases outside Atoll mode.
+//! runs at most the budget, every dispatch charged, or, when that is more, the chain of running
+//! program states it continues and one instruction, each running state's first dispatch in a
+//! poll's step made whatever the budget. A call after a stop for the budget looks at once, frames
+//! inside a frame share the outer's budget, and outside any frame nothing stops. The budget is the
+//! VDBE's, so most of these use databases outside Atoll mode.
 
 use super::*;
 use crate::storage::atoll::cooperative::{
-    Frame, BEFORE_PARENT_PARKS, CHARGED, CHECKS, CONTINUED, DISPATCHED, FREE,
+    Frame, BEFORE_PARENT_PARKS, BEFORE_WAKER_IS_SET, CHARGED, CHECKS, CONTINUED, DISPATCHED, FREE,
 };
 
 const DEFAULT_POLL_BUDGET: u32 = Frame::DEFAULT_BUDGET;
@@ -1213,6 +1214,135 @@ fn only_a_stop_for_the_budget_wakes_its_own_waker() {
                     unconserved, None,
                     "{call} call: the units charged were not its first dispatches"
                 );
+            }
+        },
+    );
+}
+
+/// A step parks its wait without the waker and sets the waker on it as it returns
+/// (`hand_waker_to_stop`): a wait that lands in between still wakes the waker, since setting it
+/// looks at whether the wait has landed (`Completion::set_keyed_waker`). On a database opened async
+/// in Atoll mode, a scan whose pages are cold, its IO thread held, stepped in a frame by
+/// `step_with_waker` and by `step_in_frame`: a hook lands the first wait after the park and before
+/// the waker is set. No
+/// waker is woken by the landing, the waker is woken as it is set, and the scan ends with the
+/// synchronous result (mutant `waker-unset`).
+#[test]
+fn a_wait_that_lands_before_its_waker_is_set_still_wakes_it() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_wait_that_lands_before_its_waker_is_set_still_wakes_it"
+        ),
+        || {
+            let (io, db, conn) = async_atoll("/db/waker-late", 200);
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            const SQL: &str = "SELECT sum(length(b)) FROM t";
+            let expected = rows(&conn, SQL);
+            let mut seen = Vec::new();
+            for polled in [false, true] {
+                let woken = Arc::new(Counted(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = std::task::Waker::from(woken.clone());
+                drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+                atoll.pool().evict_all_clean();
+                atoll.store().meta().evict_all();
+                let mut stmt = conn.prepare(SQL).unwrap();
+                let hold = crate::storage::atoll::testing::io_thread_held_before_idle_unregistered(
+                    atoll.requests_for_test(),
+                )
+                .expect("the IO thread held");
+                let hook_io = io.clone();
+                let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let saw_landed = landed.clone();
+                let woken_at_landing = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+                let saw_woken = woken_at_landing.clone();
+                let woken_in_hook = woken.clone();
+                BEFORE_WAKER_IS_SET.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |wait: &crate::Completion| {
+                        drop(hold);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(20);
+                        while !wait.finished() && std::time::Instant::now() < deadline {
+                            let _ = hook_io.step();
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        saw_landed.store(wait.finished(), std::sync::atomic::Ordering::SeqCst);
+                        saw_woken.store(
+                            woken_in_hook.0.load(std::sync::atomic::Ordering::SeqCst),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    }))
+                });
+                // Both in a frame, where a read is queued for the IO threads; `step_with_waker`
+                // carries no budget there.
+                let step = |stmt: &mut crate::Statement| {
+                    let _frame = Frame::with_budget(DEFAULT_POLL_BUDGET);
+                    if polled {
+                        stmt.step_in_frame(&waker)
+                    } else {
+                        stmt.step_with_waker(&waker)
+                    }
+                };
+                let first = step(&mut stmt);
+                let hook_ran = BEFORE_WAKER_IS_SET
+                    .with(|h| h.borrow_mut().take())
+                    .is_none();
+                let woken_at_set = woken.0.load(std::sync::atomic::Ordering::SeqCst);
+                let mut row = None;
+                for _ in 0..10_000_000 {
+                    match step(&mut stmt).unwrap() {
+                        StepResult::Done => break,
+                        StepResult::Row => {
+                            row = Some(vec![stmt.row().unwrap().get_values().cloned().collect()])
+                        }
+                        StepResult::IO | StepResult::Yield => {
+                            if let Some(c) = stmt.pending_io_for_test() {
+                                let deadline =
+                                    std::time::Instant::now() + std::time::Duration::from_secs(20);
+                                while !c.finished() {
+                                    assert!(
+                                        std::time::Instant::now() < deadline,
+                                        "a wait never finished"
+                                    );
+                                    let _ = io.step();
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                        }
+                        other => panic!("the scan came to {other:?}"),
+                    }
+                }
+                drop(stmt);
+                seen.push((
+                    polled,
+                    first,
+                    hook_ran,
+                    landed.load(std::sync::atomic::Ordering::SeqCst),
+                    woken_at_landing.load(std::sync::atomic::Ordering::SeqCst),
+                    woken_at_set,
+                    row,
+                ));
+            }
+            for (polled, first, hook_ran, landed, woken_at_landing, woken_at_set, row) in seen {
+                let how = if polled {
+                    "step_in_frame"
+                } else {
+                    "step_with_waker"
+                };
+                assert!(
+                    matches!(first, Ok(StepResult::IO)) && hook_ran,
+                    "{how}: the cold scan's first step did not park a wait: {first:?}, hook ran {hook_ran}"
+                );
+                assert!(landed, "{how}: the wait never landed in the hook");
+                assert_eq!(
+                    woken_at_landing, 0,
+                    "{how}: the waker was woken before it was set"
+                );
+                assert!(
+                    woken_at_set >= 1,
+                    "{how}: the wait landed before its waker was set, and the waker was not woken"
+                );
+                assert_eq!(row.as_ref(), Some(&expected), "{how}: the scan's row");
             }
         },
     );

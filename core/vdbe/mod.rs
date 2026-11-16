@@ -3063,26 +3063,17 @@ impl Program {
         let vdbe_trace = self.connection.get_vdbe_trace();
         let result = if enable_tracing || vdbe_trace {
             if POLLED {
-                dispatch_loop_traced_polled(
-                    self,
-                    state,
-                    pager,
-                    waker,
-                    running,
-                    enable_tracing,
-                    vdbe_trace,
-                )
+                dispatch_loop_traced_polled(self, state, pager, running, enable_tracing, vdbe_trace)
             } else {
-                dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+                dispatch_loop_traced(self, state, pager, enable_tracing, vdbe_trace)
             }
         } else if POLLED {
-            poll_step::<false>(self, state, pager, waker, running, false, false)
+            poll_step::<false>(self, state, pager, running, false, false)
         } else {
             dispatch_loop::<false, false>(
                 self,
                 state,
                 pager,
-                waker,
                 &mut BudgetMarks::default(),
                 false,
                 false,
@@ -3102,20 +3093,44 @@ impl Program {
             }
             _ => {}
         }
-        if !matches!(
+        if matches!(
             result,
             ProgramStep::IO | ProgramStep::Yield | ProgramStep::Sleep(_)
         ) {
+            hand_waker_to_stop(state, &result, waker);
+        } else {
             state.current_time = None;
         }
         return result;
+
+        /// A step that stopped hands its caller's waker over: registered on the wait it parked,
+        /// whose landing wakes it, or woken at once for an explicit yield and its sleep, which park
+        /// nothing. The dispatch loop parks without the waker, so the loop keeps none across its
+        /// instructions. The registration looks at whether the wait has landed
+        /// (`Completion::set_keyed_waker`), so a wait that lands between its park and this still
+        /// wakes the waker.
+        #[cold]
+        #[inline(never)]
+        fn hand_waker_to_stop(state: &mut ProgramState, stop: &ProgramStep, waker: Option<&Waker>) {
+            if matches!(stop, ProgramStep::IO) {
+                #[cfg(test)]
+                crate::storage::atoll::sql::mode::PollBudget::before_waker_is_set_for_test(
+                    &state
+                        .pending_io()
+                        .expect("a step that stops for IO parks a wait")
+                        .0,
+                );
+                state.set_pending_io_waker(waker);
+            } else if let Some(waker) = waker {
+                waker.wake_by_ref();
+            }
+        }
 
         #[inline(never)]
         fn dispatch_loop_traced(
             program: &Program,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
-            waker: Option<&Waker>,
             enable_tracing: bool,
             vdbe_trace: bool,
         ) -> ProgramStep {
@@ -3123,7 +3138,6 @@ impl Program {
                 program,
                 state,
                 pager,
-                waker,
                 &mut BudgetMarks::default(),
                 enable_tracing,
                 vdbe_trace,
@@ -3136,20 +3150,11 @@ impl Program {
             program: &Program,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
-            waker: Option<&Waker>,
             running: bool,
             enable_tracing: bool,
             vdbe_trace: bool,
         ) -> ProgramStep {
-            poll_step::<true>(
-                program,
-                state,
-                pager,
-                waker,
-                running,
-                enable_tracing,
-                vdbe_trace,
-            )
+            poll_step::<true>(program, state, pager, running, enable_tracing, vdbe_trace)
         }
 
         /// A poll's step (ASYNC1 D2e (iv)). Every dispatch is charged: at a check, before a
@@ -3168,7 +3173,6 @@ impl Program {
             program: &Program,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
-            waker: Option<&Waker>,
             running: bool,
             enable_tracing: bool,
             vdbe_trace: bool,
@@ -3183,7 +3187,6 @@ impl Program {
                 program,
                 state,
                 pager,
-                waker,
                 &mut marks,
                 enable_tracing,
                 vdbe_trace,
@@ -3197,7 +3200,6 @@ impl Program {
             program: &Program,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
-            waker: Option<&Waker>,
             marks: &mut BudgetMarks,
             enable_tracing: bool,
             vdbe_trace: bool,
@@ -3217,12 +3219,12 @@ impl Program {
             // instructions without re-inspecting the completion slot every time.
             'io_check: loop {
                 if state.io_completions.is_some() {
-                    if let Some(result) = program.finish_pending_io(state, pager, waker) {
+                    if let Some(result) = program.finish_pending_io(state, pager) {
                         return result;
                     }
                 }
                 if state.pending_fail_prepare_error.is_some() {
-                    match program.prepare_pending_fail(state, pager, waker) {
+                    match program.prepare_pending_fail(state, pager) {
                         Some(result) => return result,
                         None => continue 'io_check,
                     }
@@ -3231,7 +3233,7 @@ impl Program {
                 // at the top of the step, before any instruction and so before any operation's
                 // owner runs (R19, ASYNC1 D2e (iii-b)).
                 if program.connection.atoll_owes() {
-                    match program.settle_atoll(state, pager, waker) {
+                    match program.settle_atoll(state, pager) {
                         Some(result) => return result,
                         None => continue 'io_check,
                     }
@@ -3244,7 +3246,7 @@ impl Program {
                     .connection
                     .atoll_ending_elsewhere(state.ending_begun())
                 {
-                    if let Some(result) = program.serve_atoll_sibling(state, pager, waker) {
+                    if let Some(result) = program.serve_atoll_sibling(state, pager) {
                         return result;
                     }
                 }
@@ -3252,7 +3254,7 @@ impl Program {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
                         let checked = if POLLED {
-                            program.periodic_checks_polled(state, pager, waker, &mut marks.charged)
+                            program.periodic_checks_polled(state, pager, &mut marks.charged)
                         } else {
                             program.periodic_checks(state, pager)
                         };
@@ -3344,7 +3346,7 @@ impl Program {
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return ProgramStep::Row;
                     }
-                    match dispatch_cold(program, state, pager, waker, result) {
+                    match dispatch_cold(program, state, pager, result) {
                         Some(result) => return result,
                         None => continue 'io_check,
                     }
@@ -3356,7 +3358,6 @@ impl Program {
                 program: &Program,
                 state: &mut ProgramState,
                 pager: &Arc<Pager>,
-                waker: Option<&Waker>,
                 result: execute::InsnResult,
             ) -> Option<ProgramStep> {
                 match result {
@@ -3368,7 +3369,7 @@ impl Program {
                     }
                     Ok(InsnFunctionStepResult::IO) => {
                         let io = state.take_suspended_io();
-                        program.park_on_io(state, io, waker)
+                        program.park_on_io(state, io)
                     }
                     Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
@@ -3387,13 +3388,11 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-        waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
         let io = state
             .pending_io()
             .expect("the caller checked the completion slot");
         if !io.finished() {
-            state.set_pending_io_waker(waker);
             return Some(ProgramStep::IO);
         }
         if let Some(err) = io.get_error() {
@@ -3449,21 +3448,16 @@ impl Program {
     /// have met. None means the loop starts over, the rollback finished or its IO done inline.
     #[cold]
     #[inline(never)]
-    fn settle_atoll(
-        &self,
-        state: &mut ProgramState,
-        pager: &Arc<Pager>,
-        waker: Option<&Waker>,
-    ) -> Option<ProgramStep> {
+    fn settle_atoll(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
         let atoll = self.connection.atoll()?;
         #[cfg(test)]
         crate::storage::atoll::sql::mode::SETTLES_AT_STEP.with(|n| n.set(n.get() + 1));
         match atoll.settle() {
             Ok(IOResult::Done(())) => None,
             // A yield stores no wait.
-            Ok(IOResult::IO(io)) if io.is_explicit_yield() => self.park_on_io(state, io, waker),
+            Ok(IOResult::IO(io)) if io.is_explicit_yield() => self.park_on_io(state, io),
             Ok(IOResult::IO(io)) => {
-                state.set_pending_settle_io(io, waker);
+                state.set_pending_settle_io(io, None);
                 if !state.pending_io().expect("just parked").finished() {
                     return Some(ProgramStep::IO);
                 }
@@ -3487,12 +3481,11 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-        waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
         let atoll = self.connection.atoll()?;
         match atoll.serve_sibling() {
             Ok(IOResult::Done(())) => None,
-            Ok(IOResult::IO(io)) => self.park_on_io(state, io, waker),
+            Ok(IOResult::IO(io)) => self.park_on_io(state, io),
             Err(err) => self.fail_step(state, pager, err),
         }
     }
@@ -3509,7 +3502,6 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-        waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
         let fail_error = state
             .pending_fail_prepare_error
@@ -3530,10 +3522,9 @@ impl Program {
             Ok(IOResult::IO(io)) => {
                 state.pending_fail_prepare_error = Some(fail_error);
                 if io.is_explicit_yield() {
-                    io.set_waker(waker);
                     return Some(ProgramStep::Yield);
                 }
-                state.set_pending_io(io, waker);
+                state.set_pending_io(io, None);
                 if !state.pending_io().expect("just parked").finished() {
                     return Some(ProgramStep::IO);
                 }
@@ -3595,7 +3586,6 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
-        waker: Option<&Waker>,
         mark: &mut u64,
     ) -> Option<ProgramStep> {
         #[cfg(test)]
@@ -3607,7 +3597,7 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
-        if let Some(step) = Self::charge_budget(state, waker, mark) {
+        if let Some(step) = Self::charge_budget(state, mark) {
             return Some(step);
         }
         if self.connection.is_closed() {
@@ -3631,17 +3621,12 @@ impl Program {
     /// countdown takes its previous consultation to be one full interval back.
     #[cold]
     #[inline(never)]
-    fn charge_budget(
-        state: &mut ProgramState,
-        waker: Option<&Waker>,
-        mark: &mut u64,
-    ) -> Option<ProgramStep> {
+    fn charge_budget(state: &mut ProgramState, mark: &mut u64) -> Option<ProgramStep> {
         if state.charge_poll_budget(mark) {
             state.check_countdown = 1;
             state.io_completions = Some(PendingIO::new(IOCompletions(
                 crate::Completion::new_yield(),
             )));
-            state.set_pending_io_waker(waker);
             return Some(ProgramStep::IO);
         }
         state.clamp_to_poll_budget();
@@ -3704,14 +3689,8 @@ impl Program {
     /// means the IO already finished and the loop starts over to observe
     /// its outcome.
     #[inline(never)]
-    fn park_on_io(
-        &self,
-        state: &mut ProgramState,
-        io: IOCompletions,
-        waker: Option<&Waker>,
-    ) -> Option<ProgramStep> {
+    fn park_on_io(&self, state: &mut ProgramState, io: IOCompletions) -> Option<ProgramStep> {
         if io.is_explicit_yield() {
-            io.set_waker(waker);
             // Yield: return control to the cooperative scheduler so
             // other connections can make progress (e.g. release a
             // contended lock). Don't store in io_completions —
@@ -3722,7 +3701,7 @@ impl Program {
             }
             return Some(ProgramStep::Yield);
         }
-        state.set_pending_io(io, waker);
+        state.set_pending_io(io, None);
         if !state.pending_io().expect("just parked").finished() {
             return Some(ProgramStep::IO);
         }

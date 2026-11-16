@@ -36,6 +36,10 @@ crate::thread::thread_local! {
     /// What a test does with a subprogram's wait before its parent parks it, once.
     pub(crate) static BEFORE_PARENT_PARKS: std::cell::RefCell<Option<ParentParks>> =
         const { std::cell::RefCell::new(None) };
+    /// What a test does with a stopped step's parked wait before the step sets its waker on it,
+    /// once.
+    pub(crate) static BEFORE_WAKER_IS_SET: std::cell::RefCell<Option<ParentParks>> =
+        const { std::cell::RefCell::new(None) };
     /// The `vm_steps` of each periodic check on this thread, in order, for a test (IV-2's proof).
     pub(crate) static CHECKS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }

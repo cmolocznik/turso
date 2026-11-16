@@ -467,6 +467,29 @@ impl Statement {
         }
     }
 
+    /// A statement that came back Busy to its caller at its Transaction instruction, before its
+    /// write began, has not begun (ONE-TXN rule 2). A writer's registration is let go, and its
+    /// next step registers again. One that waited for Atoll's write gate holds nothing: its take
+    /// is given up, its count let go, and its next step begins again from its first instruction,
+    /// through `prepare_step`. The transaction its begin opened in autocommit stays in the
+    /// connection's cell for the next statement, which ends it at its halt.
+    #[cold]
+    #[inline(never)]
+    fn busy_has_not_begun(&mut self) {
+        if self.state.writer_admitted {
+            self.program.connection.release_writer();
+            self.state.writer_admitted = false;
+        }
+        if !std::mem::take(&mut self.state.atoll_taking) {
+            return;
+        }
+        if let Some(atoll) = self.program.connection.atoll() {
+            atoll.give_up();
+        }
+        self.release_active_root_if_counted(false);
+        self.state.reset(None, None);
+    }
+
     /// A step of the synchronous API, with a waker or without one. Not generic, so it is compiled
     /// once, in this crate, whichever crate calls `step` or `step_with_waker`: a generic one would
     /// be instantiated again in each calling crate and optimized there apart (ASYNC1 D2e (iv)).
@@ -811,6 +834,13 @@ impl Statement {
             self.cleanup_orphaned_seq_inner_tx();
         }
 
+        if matches!(res, Ok(StepResult::Busy))
+            && (self.state.atoll_taking
+                || (self.state.writer_admitted && !self.state.is_active_write))
+        {
+            self.busy_has_not_begun();
+        }
+
         // When the step returns Busy (no more busy-handler retries) and we
         // freshly opened an MVCC transaction for a Pending explicit tx,
         // roll it back so the next step gets a fresh snapshot.  Without
@@ -829,13 +859,9 @@ impl Statement {
                 // connection-level n_active_writes counter needs to be
                 // decremented first or the retry will see a spurious "writer
                 // already active" error at Insn::Transaction.
-                if self.state.is_active_write {
-                    let prev = self
-                        .program
-                        .connection
-                        .n_active_writes
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
+                if self.state.writer_admitted {
+                    self.program.connection.release_writer();
+                    self.state.writer_admitted = false;
                 }
                 self.state.reset(None, None);
             }
@@ -910,6 +936,12 @@ impl Statement {
     #[cfg(test)]
     pub(crate) fn ending_begun_for_test(&self) -> bool {
         self.state.ending_begun()
+    }
+
+    /// Whether this statement's write has begun: it passed its Transaction instruction, for a test.
+    #[cfg(test)]
+    pub(crate) fn write_begun_for_test(&self) -> bool {
+        self.state.is_active_write
     }
 
     /// The instructions this statement's own program has dispatched, its nested programs' apart,
@@ -1929,20 +1961,13 @@ impl Statement {
             }
         }
         // Safety net: if end_statement wasn't reached (e.g. statement dropped
-        // mid-execution), ensure n_active_writes is decremented before reset
+        // mid-execution), the writer's registration is let go before reset
         // clears the flag.
-        if self.state.is_active_write {
-            let previous = self
-                .program
-                .connection
-                .n_active_writes
-                .fetch_sub(1, Ordering::SeqCst);
-            turso_assert!(
-                previous == 1,
-                "resetting a writer with {previous} active writer(s)"
-            );
-            self.state.is_active_write = false;
+        if self.state.writer_admitted {
+            self.program.connection.release_writer();
+            self.state.writer_admitted = false;
         }
+        self.state.is_active_write = false;
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted(statement_failed);
         }

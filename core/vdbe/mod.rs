@@ -1392,7 +1392,11 @@ pub struct ProgramState {
     /// In Atoll mode, a facade read under way: a header or schema cookie read, the page count, or
     /// a Transaction opcode's read-set check (ASYNC1 D2e §2.2).
     pub(crate) atoll_read: Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
-    /// Whether this statement is an active write inside an explicit transaction.
+    /// Whether this statement is its connection's registered top-level writer
+    /// (`Connection::admit_writer`), from its Transaction instruction's first entry to its last
+    /// return (ONE-TXN rule 1).
+    pub(crate) writer_admitted: bool,
+    /// Whether this statement's write has begun: it passed its Transaction instruction.
     pub(crate) is_active_write: bool,
     /// Write activity on the main database when this statement became an
     /// active write; abort() compares against it to tell whether the
@@ -1531,6 +1535,7 @@ impl ProgramState {
             atoll_create: None,
             atoll_retire: None,
             atoll_read: None,
+            writer_admitted: false,
             is_active_write: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
@@ -1753,6 +1758,11 @@ impl ProgramState {
             self.atoll_retire = None;
         }
         self.atoll_read = None;
+        debug_assert!(
+            !self.writer_admitted,
+            "a writer's state reset with its registration not let go"
+        );
+        self.writer_admitted = false;
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
@@ -1829,6 +1839,14 @@ impl ProgramState {
                 "active writer state without an active writer count"
             );
         }
+        // A writer is registered from its Transaction instruction's first entry and its write
+        // begins at that instruction's end, so a registered statement here has not begun: the
+        // shortcuts above returned for one that has. Its own registration is not another writer.
+        debug_assert!(
+            !self.is_active_write || self.writer_admitted,
+            "a write begun by a statement that is not its connection's registered writer"
+        );
+        let other_writers = active_writers - i32::from(self.writer_admitted);
         if self.mv_store(connection).is_some() {
             // MVCC keeps one tx id on the connection, shared by the
             // statements that take part in it (`Connection::take_txn_part`).
@@ -1844,7 +1862,7 @@ impl ProgramState {
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && connection.n_active_txn_statements.load(Ordering::SeqCst)
                     == i32::from(self.txn_part.is_some())
-                && active_writers == 0;
+                && other_writers == 0;
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
             // Pager/WAL writers can finish while sibling readers remain
@@ -1868,6 +1886,9 @@ impl ProgramState {
             // shared attached transaction may only be finished by the last
             // active statement, like SQLite's btreeEndTransaction keeps the
             // transaction open while db->nVdbeRead > 1.
+            // No writer registered, this statement included: a writer whose write has not begun
+            // has changed nothing, and leaves the transaction to the statements still reading in
+            // it, the last of which ends it.
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && active_writers == 0
                 && !attached_txn_open();
@@ -1876,7 +1897,7 @@ impl ProgramState {
         // an attached transaction a deferring sibling left behind — SQLite's
         // vdbeCommit visits every database on halt, so leftovers are closed
         // even by a statement that never started a transaction itself.
-        if active_writers != 0 {
+        if other_writers != 0 {
             return false;
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
@@ -2285,13 +2306,10 @@ impl ProgramState {
         end_statement: EndStatement,
     ) -> Result<()> {
         let ends_write_statement = self.is_active_write;
-        if self.is_active_write {
-            let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
-            turso_assert!(
-                previous == 1,
-                "ending a writer with {previous} active writer(s)"
-            );
-            self.is_active_write = false;
+        self.is_active_write = false;
+        if self.writer_admitted {
+            connection.release_writer();
+            self.writer_admitted = false;
         }
         // A write statement that keeps its changes must have applied them to
         // the materialized views first (see

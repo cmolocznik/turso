@@ -1203,6 +1203,38 @@ impl Connection {
     pub fn is_nested_stmt(&self) -> bool {
         self.nestedness.load(Ordering::SeqCst) > 0
     }
+    /// Registers a statement as this connection's one top-level writer, or refuses it while
+    /// another is registered (ONE-TXN rule 1). The one place a statement becomes the writer;
+    /// [`release_writer`](Self::release_writer) is the one place it stops.
+    ///
+    /// This is stricter than SQLite. SQLite can run overlapping write statements on one
+    /// connection because sqlite3_step() does not return to the caller in the middle of built-in
+    /// write opcodes. Turso can suspend there for async I/O, so a second writer would make
+    /// reset/drop cleanup hard to get right.
+    pub(crate) fn admit_writer(&self) -> Result<()> {
+        match self
+            .n_active_writes
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Ok(()),
+            Err(active) => {
+                turso_assert!(active == 1, "n_active_writes must be 0 or 1, got {active}");
+                Err(LimboError::StatementsInProgress(
+                    "cannot start a write statement",
+                ))
+            }
+        }
+    }
+
+    /// Lets go of the registration [`admit_writer`](Self::admit_writer) made.
+    pub(crate) fn release_writer(&self) {
+        let previous = self.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(
+            previous == 1,
+            "letting go of a writer's registration with {previous} writer(s) registered"
+        );
+    }
+
     /// starts nested program execution
     pub fn start_nested(&self) {
         self.nestedness.fetch_add(1, Ordering::SeqCst);

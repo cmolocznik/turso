@@ -4741,6 +4741,15 @@ pub fn op_transaction_inner(
         }
         program.connection.ensure_temp_database()?;
     }
+    // One connection may have many active readers, but only one top-level writer, registered
+    // here, at its Transaction instruction's first entry, before the statement can return to
+    // its caller (ONE-TXN rule 1). A second writer is refused before it opens transaction or
+    // savepoint state. An entry after a Busy return that let the registration go registers
+    // again (`Statement::busy_has_not_begun`).
+    if statement_writes_db && !state.writer_admitted && !program.connection.is_nested_stmt() {
+        program.connection.admit_writer()?;
+        state.writer_admitted = true;
+    }
     let pager = pager_for_db(program, pager, *db)?;
     // Get the MvStore for the specific database (main or attached).
     let mv_store = mv_store_for_db(program, state, *db);
@@ -4759,24 +4768,6 @@ pub fn op_transaction_inner(
                     active_writers <= 1,
                     "n_active_writes must be 0 or 1, got {active_writers}"
                 );
-                // One connection may have many active readers, but only one
-                // top-level writer. A second writer on the same connection is
-                // rejected before it opens transaction or savepoint state.
-                //
-                // This is stricter than SQLite. SQLite can run overlapping
-                // write statements on one connection because sqlite3_step()
-                // does not return to the caller in the middle of built-in
-                // write opcodes. Turso can suspend there for async I/O, so a
-                // second writer would make reset/drop cleanup hard to get right.
-                if statement_writes_db
-                    && !conn.is_nested_stmt()
-                    && !state.is_active_write
-                    && active_writers > 0
-                {
-                    return Err(
-                        LimboError::StatementsInProgress("cannot start a write statement").into(),
-                    );
-                }
 
                 // Fast path: if checkpoint root publication already replaced the
                 // shared schema, force reprepare before opening any transaction state.
@@ -5349,15 +5340,11 @@ pub fn op_transaction_inner(
 
                 let is_top_level_statement = !program.connection.is_nested_stmt();
                 if statement_writes_db && is_top_level_statement {
+                    turso_assert!(
+                        state.writer_admitted,
+                        "a write statement past its begin is not its connection's registered writer"
+                    );
                     if !state.is_active_write {
-                        let previous = program
-                            .connection
-                            .n_active_writes
-                            .fetch_add(1, Ordering::SeqCst);
-                        turso_assert!(
-                            previous == 0,
-                            "starting a writer while {previous} writer(s) are already active"
-                        );
                         turso_assert!(
                             program.connection.transaction_changes.is_empty(),
                             "write statement started with view changes left by an earlier statement"

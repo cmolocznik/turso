@@ -16121,5 +16121,7 @@ mod reparse_failed_in_its_build {
 
 #[cfg(all(unix, not(miri)))]
 mod nested_by_call;
+#[cfg(all(unix, not(miri)))]
+mod one_writer;
 /// A cooperative frame's budget of work (ASYNC1 D2e (iv-a)).
 mod poll_budget;

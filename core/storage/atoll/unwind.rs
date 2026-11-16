@@ -422,6 +422,71 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "sql/mode/tests/one_writer.rs",
+            "inside_begin_a_commit_or_rollback_beside_a_parked_writer_leaves_the_transaction_whole",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_reset_between_its_begin_and_its_write_ends_the_transaction_it_began",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_reader_run_whole_at_every_stop_of_a_writer_stepped_cold_leaves_it_its_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_reset_between_its_begin_and_its_write_leaves_a_reader_its_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_prepared_write_prepared_again_for_a_schema_change_is_admitted_again",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_write_restarted_after_a_conflict_ends_done_and_is_the_writer_no_more",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_parked_at_its_take_refuses_a_second_writer_of_its_connection",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "inside_begin_a_writer_parked_at_its_take_refuses_a_second_writer_and_a_commit",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_that_came_back_busy_lets_a_second_writer_of_its_connection_run",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_busy_then_a_select_then_stepped_again_is_done_and_committed",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_reset_or_dropped_at_its_take_is_the_writer_no_more",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "inside_begin_a_writer_reset_or_dropped_at_its_take_leaves_the_transaction_whole",
+            "child",
+        ),
+        (
+            "sql/mode/tests/one_writer.rs",
+            "a_writer_interrupted_at_a_row_is_the_writer_no_more",
+            "child",
+        ),
+        (
             "sql/mode/tests.rs",
             "a_helper_stepped_beside_an_owned_pin_waits_for_it",
             "child",

@@ -4912,6 +4912,85 @@ fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
     );
 }
 
+/// A writer registered and not begun that began the MVCC transaction decides for it as the
+/// last statement taking part: its own registration is not another writer. A prepared write
+/// whose schema cookie is stale stands so when its Transaction instruction returns SchemaUpdated
+/// after its begin (`test_mvcc_cached_insert_reprepared_after_index_create`). With a statement
+/// taking part beside it, it decides nothing (mutant `own-registration-counted-in-mvcc`).
+#[test]
+fn a_writer_registered_and_not_begun_decides_for_the_mvcc_transaction_it_began() {
+    use crate::vdbe::{ProgramState, TxnCleanup};
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let mut state = ProgramState::new(1, 0);
+    conn.admit_writer().unwrap();
+    state.writer_admitted = true;
+    state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+    let alone = state.can_autocommit_now(&conn, false);
+    let part = conn.take_txn_part();
+    let beside = state.can_autocommit_now(&conn, false);
+    drop(part);
+    conn.release_writer();
+    state.writer_admitted = false;
+    state.auto_txn_cleanup = TxnCleanup::None;
+    drop(state);
+    assert!(
+        alone,
+        "a writer registered and not begun read its own registration as another writer's"
+    );
+    assert!(
+        !beside,
+        "a writer registered and not begun decided for a transaction another statement takes part in"
+    );
+}
+
+/// A writer reset where it yields before its MVCC transaction begins is registered as its
+/// connection's writer and has begun nothing. Its reset lets the registration go and leaves the
+/// connection's transaction state none, so the connection's next write is a statement of its own,
+/// committed at its halt and read by another connection.
+#[test]
+fn a_writer_reset_before_its_mvcc_begin_leaves_no_transaction_state() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut x = conn.prepare("INSERT INTO t VALUES (1, 'reset')").unwrap();
+    assert!(
+        matches!(x.step().unwrap(), crate::StepResult::Yield) && injector.is_empty(),
+        "the insert should yield before opening its MVCC transaction"
+    );
+    assert_eq!(
+        conn.n_active_writes.load(Ordering::SeqCst),
+        1,
+        "a writer at its Transaction instruction's yield is not registered"
+    );
+    x.reset().unwrap();
+    conn.set_yield_injector(None);
+    assert_eq!(conn.n_active_writes.load(Ordering::SeqCst), 0);
+    assert!(
+        matches!(conn.get_tx_state(), crate::TransactionState::None),
+        "a writer reset before its MVCC begin left its connection's transaction state: {:?}",
+        conn.get_tx_state()
+    );
+    conn.execute("INSERT INTO t VALUES (2, 'next')").unwrap();
+    drop(x);
+    let other = db.connect();
+    let rows = other
+        .prepare("SELECT id FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>(),
+        ["2"],
+        "the write after the reset was not committed, or the reset write was"
+    );
+}
+
 /// Steps:
 /// 1. Create an MVCC database with a table and unique index whose roots are still logical MVCC roots.
 /// 2. Open a deferred transaction on a second connection without starting its MVCC read transaction yet.
@@ -26302,16 +26381,16 @@ fn passive_overwrite_of_a_covered_row_supersedes_its_live_copy() {
         .rows
         .iter()
         .map(|entry| entry.key().clone())
-        .find(|id| {
-            id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID && id.row_id == RowKey::Int(5)
-        })
+        .find(|id| id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID && id.row_id == RowKey::Int(5))
         .expect("row 5 keeps its lone current copy");
 
     for round in 0..3 {
         let writer = db.connect();
         writer.execute("BEGIN CONCURRENT").unwrap();
         writer.execute("SELECT count(*) FROM t").unwrap();
-        let tx_id = writer.get_mv_tx_id().expect("the writer holds a transaction");
+        let tx_id = writer
+            .get_mv_tx_id()
+            .expect("the writer holds a transaction");
         let found = mv.read_from_table_or_index(tx_id, &id, None).unwrap();
         assert!(
             found.is_some(),
@@ -26324,7 +26403,10 @@ fn passive_overwrite_of_a_covered_row_supersedes_its_live_copy() {
                 None,
             )
             .unwrap();
-        assert!(updated, "round {round}: the update supersedes the live copy");
+        assert!(
+            updated,
+            "round {round}: the update supersedes the live copy"
+        );
         writer
             .execute("COMMIT")
             .unwrap_or_else(|e| panic!("round {round}: the overwrite commits: {e:?}"));
@@ -26380,7 +26462,8 @@ fn a_commit_lands_while_a_passive_checkpoint_is_parked_in_its_log_sync() {
     let writer_db = db_arc.clone();
     let writer = std::thread::spawn(move || {
         let conn = writer_db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("INSERT INTO t VALUES (1000, 'v01000')").unwrap();
+        conn.execute("INSERT INTO t VALUES (1000, 'v01000')")
+            .unwrap();
         done_tx.send(()).unwrap();
     });
     let landed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();

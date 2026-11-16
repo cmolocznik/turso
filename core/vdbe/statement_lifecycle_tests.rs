@@ -3441,3 +3441,113 @@ fn a_helper_dropped_with_no_statement_running_ends_no_attached_transaction() {
     );
     assert!(!conn.is_nested_stmt());
 }
+
+/// ONE-TXN rule 1 outside Atoll (4.2a): a writer is its connection's writer from its Transaction
+/// instruction's first entry. One waiting out its busy handler for another connection's write
+/// lock refuses a second writer of its own connection; once its Busy reaches the caller it has not
+/// begun, and a second writer is refused no more.
+#[test]
+fn a_writer_waiting_for_the_write_lock_refuses_a_second_writer_until_its_busy_returns() {
+    let db = SameConnectionWal::new("one-writer-wal.db");
+    db.setup_rows_table();
+    db.observer.execute("BEGIN IMMEDIATE").unwrap();
+    db.conn
+        .set_busy_timeout(std::time::Duration::from_millis(50));
+
+    let mut x = db.conn.prepare("INSERT INTO rows VALUES (1, 'x')").unwrap();
+    let waiting = x.step().unwrap();
+    assert!(
+        matches!(waiting, crate::StepResult::Sleep { .. }),
+        "the writer did not wait out its busy handler: {waiting:?}"
+    );
+    let beside = db.conn.execute("INSERT INTO rows VALUES (2, 'beside')");
+    assert!(
+        matches!(&beside, Err(LimboError::StatementsInProgress(_))),
+        "a second writer beside one waiting for the write lock was not refused: {beside:?}"
+    );
+
+    let busy = loop {
+        match x.step().unwrap() {
+            crate::StepResult::Sleep { duration } => std::thread::sleep(duration),
+            other => break other,
+        }
+    };
+    assert!(matches!(busy, crate::StepResult::Busy), "{busy:?}");
+    let mut y = db
+        .conn
+        .prepare("INSERT INTO rows VALUES (3, 'after')")
+        .unwrap();
+    let after = y.step();
+    assert!(
+        matches!(
+            after,
+            Ok(crate::StepResult::Sleep { .. } | crate::StepResult::Busy)
+        ),
+        "a writer that came back Busy stayed its connection's writer: {after:?}"
+    );
+    drop(y);
+
+    db.observer.execute("COMMIT").unwrap();
+    assert!(matches!(x.step().unwrap(), crate::StepResult::Done));
+    drop(x);
+    let rows = get_rows(&db.observer, "SELECT id FROM rows ORDER BY id");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+}
+
+/// A statement that writes two databases is its connection's writer once (4.2a): the first
+/// Transaction instruction of a database it writes admits it, the next finds it admitted, and it
+/// is let go once, at its end. Here an insert into a main table fires a TEMP trigger that writes
+/// an attached database.
+#[test]
+fn a_statement_writing_two_databases_is_admitted_once_and_let_go_once() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "one-writer-two-databases.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.log(id INTEGER)").unwrap();
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO log VALUES (new.id); END",
+    )
+    .unwrap();
+    let writers = || {
+        conn.n_active_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    let mut x = conn
+        .prepare("INSERT INTO t VALUES (1) RETURNING id")
+        .unwrap();
+    assert!(matches!(x.step().unwrap(), crate::StepResult::Row));
+    assert_eq!(
+        writers(),
+        1,
+        "a writer standing at a row is not registered once"
+    );
+    let beside = conn.execute("INSERT INTO t VALUES (9)");
+    assert!(
+        matches!(&beside, Err(LimboError::StatementsInProgress(_))),
+        "{beside:?}"
+    );
+    assert!(matches!(x.step().unwrap(), crate::StepResult::Done));
+    assert_eq!(
+        writers(),
+        0,
+        "a finished writer's registration was not let go once"
+    );
+    drop(x);
+
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert_eq!(writers(), 0);
+    let logged = get_rows(&conn, "SELECT id FROM aux.log ORDER BY id");
+    assert_eq!(logged.len(), 2, "{logged:?}");
+}

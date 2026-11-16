@@ -90,6 +90,23 @@ COMMIT; -- Alice with balance 1000 is committed
 
 A few failures cannot be undone statement-by-statement (for example running out of space mid-write); those roll back the whole transaction, and a later COMMIT reports that no transaction is active. A failure while undoing a failed statement (for example an I/O error reading back what it wrote) also rolls back the whole transaction, as in SQLite.
 
+## One Write Statement at a Time
+
+A connection runs one write statement at a time. A write statement is the connection's writer from the moment it starts until it finishes, fails, or is reset or finalized. That includes the time it spends waiting: for another connection's lock, for I/O, or between the rows of a `RETURNING` clause.
+
+While a write statement is still in progress on a connection:
+
+| Statement on the same connection | Result |
+|----------------------------------|--------|
+| Another `INSERT`, `UPDATE`, `DELETE` or schema change | `cannot start a write statement - SQL statements in progress` |
+| `COMMIT` | `cannot commit transaction - SQL statements in progress` |
+| `ROLLBACK` | `cannot rollback transaction - SQL statements in progress` |
+| `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` | `cannot open savepoint`, `cannot release savepoint` or `cannot rollback savepoint`, each followed by `- SQL statements in progress` |
+
+A refused statement changes nothing: the transaction stays open with everything it held. Finish, reset or finalize the write statement first, then run the statement again.
+
+A write statement that returns busy has not started. It holds nothing, the connection can run another write statement, and stepping the busy statement again starts it afresh.
+
 ## Implicit Transactions
 
 When no explicit transaction is active, Turso wraps each individual statement in an implicit transaction. This is called autocommit mode. Each statement is automatically committed after it executes successfully, or automatically rolled back if it fails.

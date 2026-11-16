@@ -6287,7 +6287,6 @@ fn run_program<const POLLED: bool>(
                             QueryMode::Normal,
                             0,
                             crate::statement::StatementOrigin::Subprogram,
-                            false,
                         ))
                     };
 
@@ -16513,18 +16512,9 @@ pub struct OpParseSchemaInner {
     materialized_view_info: crate::HashMap<String, crate::schema::StoredMaterializedView>,
     trigger_target_database_id: Option<usize>,
     db: usize,
-    previous_auto_commit: bool,
 }
 
 pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
-
-impl OpParseSchemaInner {
-    /// The connection's `auto_commit` value saved at ParseSchema entry, so
-    /// abort paths can restore it when the op never reached its Done arm.
-    pub(crate) fn previous_auto_commit(&self) -> bool {
-        self.previous_auto_commit
-    }
-}
 
 pub fn op_parse_schema(
     program: &Program,
@@ -16547,11 +16537,6 @@ pub fn op_parse_schema(
     if state.active_op_state.parse_schema().is_some() {
         return op_parse_schema_step(state, &conn);
     }
-
-    // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
-    // and we use the same connection for nested query.
-    let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
-    conn.auto_commit.store(false, Ordering::SeqCst);
 
     // For attached databases, qualify the sqlite_schema table with the database name
     let schema_table = if *db != crate::MAIN_DB_ID {
@@ -16595,8 +16580,6 @@ pub fn op_parse_schema(
         let fallback_schema = {
             let attached_dbs = conn.attached_databases.read();
             let Some(entry) = attached_dbs.index_to_data.get(db) else {
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::InternalError(format!(
                     "stale reference to detached database (index {db})"
                 ))
@@ -16626,7 +16609,6 @@ pub fn op_parse_schema(
         materialized_view_info: Default::default(),
         trigger_target_database_id: *trigger_target_database_id,
         db: *db,
-        previous_auto_commit,
     }));
 
     // Now begin stepping through the schema rows
@@ -16703,7 +16685,6 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     materialized_view_info,
                     trigger_target_database_id: _,
                     db,
-                    previous_auto_commit,
                 } = *state
                     .active_op_state
                     .parse_schema()
@@ -16749,8 +16730,6 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     *conn.schema.write() = schema_arc;
                 }
                 drop(stmt);
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
                 populate_result?;
 
                 state.pc += 1;
@@ -16758,33 +16737,23 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 return Ok(InsnFunctionStepResult::Step);
             }
             StepResult::Interrupt => {
-                let OpParseSchemaInner {
-                    stmt,
-                    previous_auto_commit,
-                    ..
-                } = *state
-                    .active_op_state
-                    .parse_schema()
-                    .take()
-                    .expect("parse schema state should exist");
-                drop(stmt);
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
+                drop(
+                    state
+                        .active_op_state
+                        .parse_schema()
+                        .take()
+                        .expect("parse schema state should exist"),
+                );
                 return Err(LimboError::Interrupt.into());
             }
             StepResult::Busy => {
-                let OpParseSchemaInner {
-                    stmt,
-                    previous_auto_commit,
-                    ..
-                } = *state
-                    .active_op_state
-                    .parse_schema()
-                    .take()
-                    .expect("parse schema state should exist");
-                drop(stmt);
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
+                drop(
+                    state
+                        .active_op_state
+                        .parse_schema()
+                        .take()
+                        .expect("parse schema state should exist"),
+                );
                 return Err(LimboError::Busy.into());
             }
         }
@@ -17090,7 +17059,6 @@ pub fn op_populate_materialized_views(
                 crate::QueryMode::Normal,
                 0,
                 crate::statement::StatementOrigin::Subprogram,
-                false,
             )));
         }
 

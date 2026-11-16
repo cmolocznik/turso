@@ -47,7 +47,12 @@ type StepResult = vdbe::StepResult;
 /// separate helper statement on the same connection, for example helper SQL in
 /// schema parsing or CDC setup. This is separately prepared SQL with its own
 /// `prepare`/`step`/`reset`/`drop` lifecycle, but it is owned by a parent root
-/// statement, so it stays nested and does not count as another root statement.
+/// statement, so it does not count as another root statement. It marks its
+/// connection nested only while one of its own calls runs: its prepare, each of
+/// its steps and its drop. Between them its parent may return to the caller
+/// with the helper kept (a pragma's table-valued form at a row, a schema parse
+/// waiting for IO), and another statement of the connection the caller steps
+/// then is not nested (rows 69 and 70, ONE-TXN 4.1).
 ///
 /// Use [`StatementOrigin::Subprogram`] only for bytecode subprograms that are
 /// already compiled into a parent statement and entered through `OP_Program`,
@@ -205,9 +210,8 @@ pub struct Statement {
     /// explicit checkpoints can subtract it — an open blob handle must not
     /// block checkpointing for its whole lifetime.
     is_blob_handle: bool,
-    /// True if this statement called `Connection::start_nested()` during
-    /// construction and therefore must call `end_nested()` on drop.
-    nested_guard_active: bool,
+    /// True while one of this helper's own calls holds its connection's nested count.
+    holds_nested: bool,
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
     reprepare_cmd: Option<Cmd>,
@@ -253,7 +257,6 @@ impl Statement {
             query_mode,
             tail_offset,
             StatementOrigin::Root,
-            false,
         )
     }
 
@@ -264,7 +267,6 @@ impl Statement {
         query_mode: QueryMode,
         tail_offset: usize,
         origin: StatementOrigin,
-        nested_guard_active: bool,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -292,7 +294,7 @@ impl Statement {
             origin,
             counted_as_active_root: false,
             is_blob_handle: false,
-            nested_guard_active,
+            holds_nested: false,
             analyze_refresh: None,
             reprepare_cmd: None,
         }
@@ -578,17 +580,21 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
-            self.program.connection.start_root_statement()?;
-            self.counted_as_active_root = true;
-            self.began_in_autocommit = self.program.connection.get_auto_commit();
-            // After the root count, so the checkpoint guard's subtraction
-            // can only read stale-high (see release_active_root_if_counted).
-            if self.is_blob_handle {
-                self.program
-                    .connection
-                    .n_active_blob_statements
-                    .fetch_add(1, Ordering::SeqCst);
+        if !self.counted_as_active_root {
+            if matches!(self.origin, StatementOrigin::Root) {
+                self.program.connection.start_root_statement()?;
+                self.counted_as_active_root = true;
+                self.began_in_autocommit = self.program.connection.get_auto_commit();
+                // After the root count, so the checkpoint guard's subtraction
+                // can only read stale-high (see release_active_root_if_counted).
+                if self.is_blob_handle {
+                    self.program
+                        .connection
+                        .n_active_blob_statements
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+            } else if self.origin == StatementOrigin::InternalHelper && !self.holds_nested {
+                return self.step_as_helper(waker).map(Some);
             }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
@@ -628,6 +634,18 @@ impl Statement {
             }
         }
         Ok(None)
+    }
+
+    /// One step of a helper statement, which holds its connection's nested count while it runs.
+    #[cold]
+    #[inline(never)]
+    fn step_as_helper(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.program.connection.start_nested();
+        self.holds_nested = true;
+        let stepped = self._step(waker);
+        self.holds_nested = false;
+        self.program.connection.end_nested();
+        stepped
     }
 
     /// Everything [`Self::_step`] does after the interpreter returned something
@@ -899,6 +917,12 @@ impl Statement {
     #[cfg(test)]
     pub(crate) fn own_vm_steps_for_test(&self) -> u64 {
         self.state.metrics.vm_steps
+    }
+
+    /// Whether this statement stands inside a ParseSchema that keeps its helper, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn parse_schema_kept_for_test(&self) -> bool {
+        self.state.parse_schema_kept_for_test()
     }
 
     /// The pending completion, for tests that count this statement's waiter registrations.
@@ -1613,6 +1637,10 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        debug_assert!(
+            self.origin != StatementOrigin::InternalHelper || self.holds_nested,
+            "a helper statement reset outside its own calls"
+        );
         self.reset_internal(None, None, false)
             .map_err(|error| self.format_error(error))
     }
@@ -1989,15 +2017,29 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        // Keep helper statements nested while drop-time reset/abort cleanup runs.
-        // That cleanup consults `is_nested_stmt()` to decide whether top-level
-        // transaction/savepoint finalization belongs to this statement or to its
-        // parent, so we release the nested guard only after reset completes.
-        self.reset_best_effort();
-        if self.nested_guard_active {
-            self.program.connection.end_nested();
-            self.nested_guard_active = false;
+        if self.origin == StatementOrigin::InternalHelper {
+            return self.drop_as_helper();
         }
+        self.reset_best_effort();
+    }
+}
+
+impl Statement {
+    /// A helper's drop-time reset runs nested: its cleanup consults `is_nested_stmt()` to leave
+    /// the transaction's finalization to the parent, whatever the connection holds then (with
+    /// no statement counted, an abort that is not nested ends a transaction left open on an
+    /// attached database). A helper dropped while unwinding from its own step already holds the
+    /// count.
+    #[cold]
+    #[inline(never)]
+    fn drop_as_helper(&mut self) {
+        if !self.holds_nested {
+            self.program.connection.start_nested();
+            self.holds_nested = true;
+        }
+        self.reset_best_effort();
+        self.holds_nested = false;
+        self.program.connection.end_nested();
     }
 }
 

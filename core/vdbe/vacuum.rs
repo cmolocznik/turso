@@ -1173,9 +1173,9 @@ pub(crate) fn vacuum_target_build_step(
 /// System tables (sqlite_stat1, sqlite_sequence, __turso_internal_*, etc.)
 /// have reserved names that user SQL may not create or modify. Mark the target
 /// connection as nested during prepare() so those checks are bypassed at
-/// compile time. Can't use prepare_internal() because the nested guard must
-/// not persist into step(): a nested statement's Transaction opcode skips
-/// write setup.
+/// compile time. Can't use prepare_internal(): a helper is nested inside its
+/// own steps too, and a nested statement's Transaction opcode skips write
+/// setup.
 fn prepare_on_target(
     target_conn: &Arc<Connection>,
     table_name: &str,
@@ -3514,7 +3514,9 @@ mod tests {
         let pager = target_conn.pager.load();
 
         assert!(!target_conn.get_auto_commit());
-        assert!(target_conn.is_nested_stmt());
+        // The helper is kept between its calls: it marks its connection nested only inside
+        // them (ONE-TXN 4.1).
+        assert!(!target_conn.is_nested_stmt());
 
         context.cleanup_after_error()?;
 

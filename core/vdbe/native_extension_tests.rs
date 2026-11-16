@@ -338,7 +338,9 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                 }
                 let mut statement = conn.prepare("INSERT INTO parent VALUES (7)").unwrap();
                 assert!(matches!(statement.step().unwrap(), StepResult::IO));
-                assert!(conn.is_nested_stmt());
+                // The native function's helper is parked between its calls: it marks its
+                // connection nested only inside them (ONE-TXN 4.1).
+                assert!(!conn.is_nested_stmt());
                 match cancellation {
                     "reset" => statement.reset().unwrap(),
                     "drop" => drop(statement),

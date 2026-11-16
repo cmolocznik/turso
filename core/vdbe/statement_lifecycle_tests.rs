@@ -3349,3 +3349,95 @@ fn resetting_or_dropping_statement_state_cancels_its_checkpoint_timer() {
         assert!(!c.finished());
     }
 }
+
+/// A pragma's table-valued form keeps its helper statement across the rows it returns. While it
+/// stands at a row, a statement of its connection stepped by the caller is not the helper's: it is
+/// compiled and run as a top-level statement (ONE-TXN 4.1, row 70).
+#[test]
+fn a_statement_beside_a_pragma_scan_standing_at_a_row_is_not_nested() {
+    let db = SameConnectionWal::new("nested-beside-pragma-scan.db");
+    db.conn
+        .execute("CREATE TABLE t(a INTEGER, b TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE TABLE plain(x)").unwrap();
+    db.conn
+        .execute("INSERT INTO plain VALUES (1), (2)")
+        .unwrap();
+
+    let mut plain_scan = db.conn.prepare("SELECT x FROM plain").unwrap();
+    assert!(matches!(plain_scan.step().unwrap(), crate::StepResult::Row));
+    let beside_plain = db
+        .conn
+        .execute("INSERT INTO t VALUES (1, 'beside a plain scan')");
+    drop(plain_scan);
+
+    let mut pragma_scan = db
+        .conn
+        .prepare("SELECT name FROM pragma_table_info('t')")
+        .unwrap();
+    assert!(matches!(
+        pragma_scan.step().unwrap(),
+        crate::StepResult::Row
+    ));
+    assert!(
+        !db.conn.is_nested_stmt(),
+        "a pragma scan standing at a row leaves its connection nested"
+    );
+    let beside_pragma = db
+        .conn
+        .execute("INSERT INTO t VALUES (2, 'beside a pragma scan')");
+    drop(pragma_scan);
+
+    assert_eq!(
+        format!("{beside_plain:?}"),
+        format!("{beside_pragma:?}"),
+        "a write beside a pragma scan ends as one beside a plain scan"
+    );
+    let seen = get_rows(&db.observer, "SELECT a FROM t ORDER BY a");
+    let mine = get_rows(&db.conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(
+        seen, mine,
+        "another connection sees what the writer's connection sees"
+    );
+}
+
+/// A helper's drop holds its connection's nested count, so its drop-time reset leaves the
+/// transaction's finalization alone, whatever the connection holds then. With no statement
+/// counted and a read transaction left open on an attached database, an abort that is not nested
+/// ends that transaction; a helper dropped at a row does not (ONE-TXN 4.1).
+#[test]
+fn a_helper_dropped_with_no_statement_running_ends_no_attached_transaction() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "nested-helper-drop.db",
+        crate::OpenFlags::Create,
+        crate::DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
+    conn.execute("CREATE TABLE aux.t(x)").unwrap();
+    let mut helper = conn.prepare_internal("SELECT 1").unwrap();
+    assert!(matches!(helper.step().unwrap(), crate::StepResult::Row));
+    let attached = conn.with_all_attached_pagers_with_index(|pagers| {
+        pagers
+            .iter()
+            .find(|(id, _)| *id != crate::TEMP_DB_ID)
+            .expect("the attached database's pager")
+            .1
+            .clone()
+    });
+    attached.begin_read_tx().unwrap();
+    assert!(attached.holds_read_lock());
+    drop(helper);
+    let kept = attached.holds_read_lock();
+    attached.end_read_tx();
+    assert!(
+        kept,
+        "a helper's drop ended a transaction left open on an attached database"
+    );
+    assert!(!conn.is_nested_stmt());
+}

@@ -242,3 +242,290 @@ fn every_site_that_queues_a_request_for_the_io_threads_is_listed() {
         "a record published outside `impl Dispatch`"
     );
 }
+
+/// Functions that make pages cold and step a statement in a frame with the IO thread left free,
+/// each with why its stops need no hold. A cold read stops a call in a frame only while it is
+/// unfinished when the statement looks whether to park, and a free IO thread may finish it first:
+/// alone the IO thread is the slower, under load the statement's thread is.
+const COLD_STEPS_WITH_THE_IO_THREAD_FREE: &[(&str, &str)] = &[];
+
+/// Functions with a match arm for a framed step's IO stop and none for its yield, each with why
+/// no yield reaches it. A look-again yield an instruction returns reaches the statement's caller
+/// as a yield, and so does the stop for the budget of a nested program (a trigger's, stepped in
+/// the poll's own dispatch loop). A helper statement, stepped with `step()`, has no stop for the
+/// budget.
+const IO_ARMS_WITHOUT_A_YIELD_ARM: &[(&str, &str)] = &[(
+    "a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction",
+    "a statement outside Atoll mode that runs no nested program, so no instruction of it returns \
+     a yield, and its match ends the test at any result it has no arm for",
+)];
+
+/// A test that steps a statement in a cooperative frame (`Statement::step_in_frame`) makes the
+/// stops it asserts on (the auditor's #5966, after 4.1's first gate): one that makes pages cold
+/// holds the IO thread through the call, and one with an arm for an IO stop has one for a yield.
+/// Every function that breaks either rule is listed with its reason, and every one listed still
+/// breaks it.
+#[test]
+fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
+    let (mut steppers, mut found) = (0, Vec::new());
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for path in crate::source_test::rust_sources(core) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (stepping, broken) = stops_left_to_chance(&code_of(&text));
+        steppers += stepping;
+        found.extend(broken);
+    }
+    assert!(steppers > 0, "the census found no step in a frame at all");
+    for (rule, listed) in [
+        (
+            LeftToChance::ColdStepWithTheIoThreadFree,
+            COLD_STEPS_WITH_THE_IO_THREAD_FREE,
+        ),
+        (
+            LeftToChance::IoArmWithoutAYieldArm,
+            IO_ARMS_WITHOUT_A_YIELD_ARM,
+        ),
+    ] {
+        let mut found: Vec<&str> = found
+            .iter()
+            .filter(|(r, _)| *r == rule)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        let mut listed: Vec<&str> = listed.iter().map(|(name, _)| *name).collect();
+        found.sort();
+        listed.sort();
+        assert_eq!(
+            found, listed,
+            "{rule:?}: a function that steps in a frame and is not listed, or one listed that no longer does"
+        );
+    }
+}
+
+/// The census finds each rule broken in a planted file: the shape of 4.1's first schema-parse
+/// test, a cold step reached through a helper, and neither in a function that holds the IO thread
+/// itself or steps through one that does.
+#[test]
+fn the_framed_step_census_sees_a_planted_stop_left_to_chance() {
+    let planted = code_of(
+        r#"
+        fn chill(db: &Database) {
+            atoll.pool().evict_all_clean();
+        }
+        fn polled(stmt: &mut Statement) -> Result<StepResult> {
+            stmt.step_in_frame(Waker::noop())
+        }
+        fn held(db: &Database, stmt: &mut Statement) -> Option<Result<StepResult>> {
+            let hold = io_thread_held_before_idle_unregistered(atoll.requests_for_test())?;
+            let step = stmt.step_in_frame(Waker::noop());
+            drop(hold);
+            Some(step)
+        }
+        fn the_first_gates_shape() {
+            let chilled = chill(&db);
+            loop {
+                match x.step_in_frame(Waker::noop()) {
+                    Ok(crate::StepResult::IO) => stops += 1,
+                    Ok(other) => break,
+                    Err(e) => break,
+                }
+            }
+        }
+        fn cold_through_a_helper() {
+            chill(&db);
+            assert!(matches!(polled(&mut x), Ok(StepResult::IO)));
+        }
+        fn warm_with_no_arm_for_a_yield() {
+            match polled(&mut x) {
+                Ok(StepResult::Row | StepResult::IO) => {}
+                other => panic!(),
+            }
+        }
+        fn holding_through_its_helper() {
+            chill(&db);
+            match held(&db, &mut x) {
+                Some(Ok(StepResult::IO | StepResult::Yield)) => {}
+                other => panic!(),
+            }
+        }
+        fn holding_itself() {
+            chill(&db);
+            let hold = io_thread_held_before_idle(atoll.requests_for_test());
+            let first = polled(&mut x);
+        }
+        fn stepping_nothing_in_a_frame() {
+            chill(&db);
+            match x.step() {
+                Ok(StepResult::IO) => {}
+                other => panic!(),
+            }
+        }
+        "#,
+    );
+    let (stepping, mut broken) = stops_left_to_chance(&planted);
+    broken.sort();
+    assert_eq!(
+        stepping, 7,
+        "polled, held and the five that step through them or themselves"
+    );
+    assert_eq!(
+        broken,
+        [
+            (
+                LeftToChance::ColdStepWithTheIoThreadFree,
+                "cold_through_a_helper".to_string()
+            ),
+            (
+                LeftToChance::ColdStepWithTheIoThreadFree,
+                "the_first_gates_shape".to_string()
+            ),
+            (
+                LeftToChance::IoArmWithoutAYieldArm,
+                "the_first_gates_shape".to_string()
+            ),
+            (
+                LeftToChance::IoArmWithoutAYieldArm,
+                "warm_with_no_arm_for_a_yield".to_string()
+            ),
+        ]
+    );
+}
+
+/// How a function that steps a statement in a frame leaves a stop it reads to chance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LeftToChance {
+    /// It makes pages cold and steps with the IO thread free to finish the read first.
+    ColdStepWithTheIoThreadFree,
+    /// It has a match arm for an IO stop and none for a yield.
+    IoArmWithoutAYieldArm,
+}
+
+/// How many functions of one file's `code` step a statement in a frame, themselves or through
+/// another function of the file, and each that breaks a rule. A function that takes the hold of
+/// the IO thread itself covers every step it makes or reaches.
+fn stops_left_to_chance(code: &str) -> (usize, Vec<(LeftToChance, String)>) {
+    let functions = functions_of(code);
+    if !functions.iter().any(|(_, body)| steps_itself(body)) {
+        return (0, Vec::new());
+    }
+    let calls: Vec<Vec<usize>> = functions
+        .iter()
+        .map(|(_, body)| {
+            (0..functions.len())
+                .filter(|&j| calls_function(body, functions[j].0))
+                .collect()
+        })
+        .collect();
+    // Each property spreads from a function to its callers until nothing changes.
+    let spread = |holds_stop: bool, own: &dyn Fn(&str) -> bool| -> Vec<bool> {
+        let stopped = |i: usize| holds_stop && holds_the_io_thread(functions[i].1);
+        let mut has: Vec<bool> = (0..functions.len())
+            .map(|i| !stopped(i) && own(functions[i].1))
+            .collect();
+        loop {
+            let before = has.clone();
+            for i in 0..functions.len() {
+                if !stopped(i) && calls[i].iter().any(|&j| j != i && before[j]) {
+                    has[i] = true;
+                }
+            }
+            if has == before {
+                return has;
+            }
+        }
+    };
+    let steps = spread(false, &steps_itself);
+    let steps_unheld = spread(true, &steps_itself);
+    let cold = spread(false, &|body| body.contains(".evict_all"));
+    let mut broken = Vec::new();
+    for (i, (name, body)) in functions.iter().enumerate() {
+        if cold[i] && steps_unheld[i] {
+            broken.push((LeftToChance::ColdStepWithTheIoThreadFree, name.to_string()));
+        }
+        if steps[i] && has_an_arm_for_io(body) && !body.contains("StepResult::Yield") {
+            broken.push((LeftToChance::IoArmWithoutAYieldArm, name.to_string()));
+        }
+    }
+    (steps.iter().filter(|s| **s).count(), broken)
+}
+
+fn steps_itself(body: &str) -> bool {
+    body.contains(".step_in_frame(")
+}
+
+fn holds_the_io_thread(body: &str) -> bool {
+    body.contains("io_thread_held_before_idle")
+}
+
+/// Whether `body` calls a function or method named `name`: the name, then `(`, after anything
+/// that is not part of a longer name, and not where a nested function of that name is declared.
+fn calls_function(body: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    body.match_indices(name).any(|(at, _)| {
+        body[at + name.len()..].starts_with('(')
+            && !body[..at].chars().next_back().is_some_and(ident)
+            && !body[..at].ends_with("fn ")
+    })
+}
+
+/// Whether `body` has a match arm whose pattern names an IO stop: `StepResult::IO`, then the
+/// pattern's closing parentheses, then `=>` or another alternative.
+fn has_an_arm_for_io(body: &str) -> bool {
+    body.match_indices("StepResult::IO").any(|(at, found)| {
+        let after =
+            body[at + found.len()..].trim_start_matches(|c: char| c == ')' || c.is_whitespace());
+        after.starts_with("=>") || after.starts_with('|')
+    })
+}
+
+/// Every function `code` declares, at any depth, by name, with its body, braces included. A
+/// function declared inside another is in the outer's body too.
+fn functions_of(code: &str) -> Vec<(&str, &str)> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let (mut functions, mut from) = (Vec::new(), 0);
+    while let Some(at) = code[from..].find("fn ").map(|i| from + i) {
+        from = at + 3;
+        if code[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let name = &code[from..];
+        let name = &name[..name.find(|c: char| !ident(c)).unwrap_or(name.len())];
+        if name.is_empty() {
+            continue;
+        }
+        // The body opens at the first brace outside the signature's parentheses and brackets; a
+        // semicolon there first is a declaration with none.
+        let mut depth = 0i32;
+        for (i, c) in code[from..].char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ';' if depth == 0 => break,
+                '{' if depth == 0 => {
+                    let open = from + i;
+                    functions.push((name, &code[open..open + braced(&code[open..])]));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    functions
+}
+
+/// The length of the braced block `code` opens with, its closing brace included.
+fn braced(code: &str) -> usize {
+    let mut depth = 0usize;
+    for (i, c) in code.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("a block that never closes")
+}

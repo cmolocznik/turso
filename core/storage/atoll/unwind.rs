@@ -422,6 +422,26 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "sql/mode/tests.rs",
+            "a_helper_stepped_beside_an_owned_pin_waits_for_it",
+            "child",
+        ),
+        (
+            "sql/mode/tests/nested_by_call.rs",
+            "a_write_beside_a_pragma_scan_standing_at_a_row_is_committed",
+            "child",
+        ),
+        (
+            "sql/mode/tests/nested_by_call.rs",
+            "a_schema_parse_waiting_for_a_read_leaves_its_connection_top_level",
+            "child",
+        ),
+        (
+            "sql/mode/tests/nested_by_call.rs",
+            "a_create_table_dropped_inside_its_schema_parse_leaves_the_database_as_before",
+            "child",
+        ),
+        (
             "sql/lifecycle/tests.rs",
             "undone_creations_drain_once_handed_over_and_kept_ones_stay",
             "child",

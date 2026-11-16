@@ -13519,12 +13519,12 @@ mod in_frames {
             );
         }
 
-        /// The admission composed with a live internal helper (#5665): a helper statement marks
-        /// its connection nested for its whole life, and a nested statement begins no
-        /// transaction, so it must still meet a pin that owns its view. With a fresh pin held and
-        /// an internal helper alive, an unrelated statement stepped in a frame waits on the pin's
-        /// unfinished phase wait instead of reading in its view; a statement carrying the pin's
-        /// permit reads on (mutant `nested-unadmitted`, no admission on the nested path).
+        /// The admission composed with a live internal helper (#5665): a helper marks its
+        /// connection nested only inside its own calls (ONE-TXN 4.1), so an unrelated statement
+        /// beside a helper kept between its calls is a top-level statement and meets a pin that
+        /// owns its view at its begin. With a fresh pin held and an internal helper alive, an
+        /// unrelated statement stepped in a frame waits on the pin's unfinished phase wait
+        /// instead of reading in its view; a statement carrying the pin's permit reads on.
         #[test]
         fn a_statement_beside_a_live_internal_helper_still_waits_for_an_owned_pin() {
             crate::storage::atoll::testing::cleanly(
@@ -13545,8 +13545,8 @@ mod in_frames {
                     );
                     let helper = conn.prepare_internal("SELECT 1").unwrap();
                     assert!(
-                        conn.is_nested_stmt(),
-                        "the helper did not mark its connection nested"
+                        !conn.is_nested_stmt(),
+                        "a helper between its calls left its connection nested"
                     );
                     let mut unrelated = conn.prepare("SELECT count(*) FROM t").unwrap();
                     let stepped = {
@@ -13581,6 +13581,54 @@ mod in_frames {
                     assert!(
                         matches!(read, Ok(crate::StepResult::Row)),
                         "the permitted statement did not read on: {read:?}"
+                    );
+                },
+            );
+        }
+
+        /// The nested path's admission (#5665): a helper stepped is nested inside its own step and
+        /// begins no transaction, so it must still meet a pin that owns its view. With a fresh pin
+        /// held, a helper of the connection stepped in a frame waits on the pin's unfinished phase
+        /// wait instead of reading in its view (mutant `nested-unadmitted`, no admission on the
+        /// nested path).
+        #[test]
+        fn a_helper_stepped_beside_an_owned_pin_waits_for_it() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_helper_stepped_beside_an_owned_pin_waits_for_it"
+                ),
+                || {
+                    let (_io, _db, conn) = slotted("/db/pin-helper-stepped", 4);
+                    let atoll = ct(&conn);
+                    let mut hold = PinHold::new();
+                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    let mut helper = conn.prepare_internal("SELECT count(*) FROM t").unwrap();
+                    let stepped = {
+                        let _frame = Frame::enter();
+                        helper.step()
+                    };
+                    let nested_after = conn.is_nested_stmt();
+                    let waited_on = helper.pending_io_for_test();
+                    let signal = ct(&conn).cell.pin_signal_for_test();
+                    let on_signal = match (&waited_on, &signal) {
+                        (Some(w), Some(s)) => Some((w.ptr_eq(s), w.finished())),
+                        _ => None,
+                    };
+                    drop(helper);
+                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    assert!(
+                        matches!(stepped, Ok(crate::StepResult::IO)),
+                        "a helper stepped beside a pin read in a view the pin owns: {stepped:?}"
+                    );
+                    assert!(
+                        !nested_after,
+                        "a helper's step left its connection nested after it returned"
+                    );
+                    assert_eq!(
+                        on_signal,
+                        Some((true, false)),
+                        "the helper's wait was not the pin's unfinished phase wait"
                     );
                 },
             );
@@ -16071,5 +16119,7 @@ mod reparse_failed_in_its_build {
     }
 }
 
+#[cfg(all(unix, not(miri)))]
+mod nested_by_call;
 /// A cooperative frame's budget of work (ASYNC1 D2e (iv-a)).
 mod poll_budget;

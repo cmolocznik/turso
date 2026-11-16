@@ -1406,10 +1406,10 @@ impl Connection {
                 mode,
                 byte_offset_end,
                 origin,
-                needs_nested_guard,
             ))
         })();
-        if result.is_err() && needs_nested_guard {
+        // A helper is nested while it is prepared, and again only inside its own steps and drop.
+        if needs_nested_guard {
             self.end_nested();
         }
         result
@@ -1456,16 +1456,10 @@ impl Connection {
         }
         let result = (|| {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
-            Ok(Statement::new_with_origin(
-                program,
-                pager,
-                mode,
-                0,
-                origin,
-                needs_nested_guard,
-            ))
+            Ok(Statement::new_with_origin(program, pager, mode, 0, origin))
         })();
-        if result.is_err() && needs_nested_guard {
+        // A helper is nested while it is prepared, and again only inside its own steps and drop.
+        if needs_nested_guard {
             self.end_nested();
         }
         result

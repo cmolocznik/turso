@@ -238,7 +238,6 @@ pub(crate) fn step_view_delta_batch(
                         crate::QueryMode::Normal,
                         0,
                         crate::statement::StatementOrigin::Subprogram,
-                        false,
                     )));
                 }
 
@@ -1040,6 +1039,12 @@ impl ActiveOpStateSlot {
         None
     );
 
+    /// Whether a ParseSchema keeps its helper statement across a return, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    fn parse_schema_kept(&self) -> bool {
+        matches!(&self.state, ActiveOpState::ParseSchema(Some(_)))
+    }
+
     /// Take the ParseSchema op state if it is the active one, without
     /// touching (or panicking on) any other live op state. Used by abort
     /// cleanup, which runs regardless of which opcode was executing.
@@ -1441,6 +1446,12 @@ unsafe impl Sync for ProgramState {}
 crate::assert::assert_send_sync!(ProgramState);
 
 impl ProgramState {
+    /// Whether this state's ParseSchema keeps its helper statement across a return, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn parse_schema_kept_for_test(&self) -> bool {
+        self.active_op_state.parse_schema_kept()
+    }
+
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_databases = vec![None; max_cursors];
@@ -2193,16 +2204,10 @@ impl ProgramState {
 
     /// Close all virtual table cursors owned by this program.
     ///
-    /// A virtual table cursor can own a nested helper statement on the same
-    /// connection (e.g. `PragmaVirtualTableCursor` runs `PRAGMA ...` via
-    /// `Connection::prepare_internal`), and that helper holds the
-    /// connection's nested-statement guard until it is dropped. Both
-    /// `commit_txn` and `abort` consult `Connection::is_nested_stmt()` to
-    /// decide whether the current statement owns top-level transaction
-    /// finalization, so the helpers must be dropped first — otherwise a root
-    /// statement that scanned a pragma virtual table misclassifies itself as
-    /// nested, skips ending its implicit read transaction, and subsequent
-    /// writes on the connection never auto-commit (issue #7466).
+    /// A virtual table cursor can own a helper statement on the same connection (e.g.
+    /// `PragmaVirtualTableCursor` runs `PRAGMA ...` via `Connection::prepare_internal`), dropped
+    /// with the cursor. The helper marks its connection nested only inside its own calls
+    /// (ONE-TXN 4.1), so `commit_txn` and `abort` read this statement's own state either way.
     pub(crate) fn close_virtual_table_cursors(&mut self) {
         for slot in self.cursors.iter_mut() {
             if matches!(slot, Some(Cursor::Virtual(_))) {
@@ -3820,10 +3825,8 @@ impl Program {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
             IOResult::Done(_) => {}
         }
-        // Drop virtual table cursors before the `is_nested_stmt()` check
-        // below: a pragma virtual table cursor owns a nested helper statement
-        // whose guard would otherwise make this top-level statement classify
-        // itself as nested and skip transaction finalization entirely.
+        // Virtual table cursors are closed before the transaction ends: a pragma's table-valued
+        // form owns a helper statement, dropped with its cursor.
         program_state.close_virtual_table_cursors();
         let tx_state = self.connection.get_tx_state();
         if tx_state == TransactionState::None
@@ -4555,25 +4558,14 @@ impl Program {
             .commit_state
             .cleanup_abandoned_mvcc_commit(&self.connection);
 
-        // ParseSchema owns a nested helper statement on this connection and
-        // stores `auto_commit=false` for its duration. If the program aborts
-        // while that state is live (error mid-schema-row), release it here:
-        // restore the saved auto_commit and drop the inner statement so its
-        // nested guard is released BEFORE the `is_nested_stmt()` check below.
-        // Otherwise this top-level statement misclassifies itself as nested,
-        // skips transaction rollback, and leaks the DDL's exclusive MVCC tx
-        // (and the cleared auto_commit) into subsequent statements — which
-        // then appear to succeed without ever committing.
-        if let Some(inner) = state.active_op_state.take_parse_schema_if_active() {
-            self.connection
-                .auto_commit
-                .store(inner.previous_auto_commit(), Ordering::SeqCst);
-            drop(inner);
-        }
+        // ParseSchema owns a helper statement on this connection; an abort while it is live (an
+        // error mid-schema-row) drops it here, with the parse's state. The helper is nested only
+        // inside its own calls, its drop included, so the `is_nested_stmt()` check below reads
+        // this statement's own state either way (ONE-TXN 4.1).
+        drop(state.active_op_state.take_parse_schema_if_active());
 
-        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
-        // releases nested guards. Clean it before checking whether this program
-        // is itself nested; otherwise abort could skip top-level cleanup.
+        // VACUUM (and VACUUM INTO) state can own internal helper statements; they are dropped
+        // with it here, before the commit decision below.
         if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
             capture_abort_error(
                 &mut abort_error,
@@ -4582,9 +4574,8 @@ impl Program {
             );
         }
 
-        // Virtual table cursors (pragma table-valued functions) also own
-        // nested helper statements whose drop releases nested guards. Drop
-        // them before the `is_nested_stmt()` check below for the same reason.
+        // Virtual table cursors (pragma table-valued functions) also own helper statements,
+        // dropped here with them.
         state.close_virtual_table_cursors();
         // RAISE(IGNORE) rolls nothing back — halt() already staged the
         // trigger's index-method writes and the kept rows keep their index

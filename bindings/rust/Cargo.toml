@@ -22,6 +22,8 @@ stacker = ["turso_core/stacker"]
 test_helper = ["turso_core/test_helper", "turso_sdk_kit/test_helper"]
 # Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.
 io_memory_yield = ["turso_core/io_memory_yield"]
+# The raw WAL API a replicator drives: read committed frames, append frames to a restore.
+conn_raw_api = ["turso_core/conn_raw_api"]
 sync = [
     "dep:hyper",
     "dep:tokio",

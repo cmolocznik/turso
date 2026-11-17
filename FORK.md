@@ -1539,6 +1539,18 @@ as given, then the `should` terms as given, repeats dropped), and cuts by that s
 key. Proof: `many_term_queries_sum_in_clause_order_bit_for_bit`, 3 to 12 terms against an f32
 oracle built on Tantivy's `Bm25Weight`.
 
+### The raw WAL API through `turso::Connection` (`conn_raw_api`)
+2026-11-17. `bindings/rust/Cargo.toml`, `bindings/rust/src/connection.rs`, `sdk-kit/src/rsapi.rs`. Core's raw WAL
+API (`wal_state`, `wal_get_frame`, `wal_insert_begin`, `wal_insert_frame`, `wal_insert_end`, behind core's
+`conn_raw_api`) was reachable only through `turso_core::Connection`; a program that opens its databases through the
+`turso` crate held no road to it, because `turso::Connection` keeps its sdk-kit connection private and the sdk-kit
+connection keeps its core one. WorkReef cognition ships each brain's committed WAL frames to object storage and
+restores from them, over databases it opens through `turso`. The binding gains a `conn_raw_api` feature whose five
+methods forward to the core connection (`TursoConnection::core_connection`, the one accessor added to sdk-kit), each
+with core's own semantics; nothing else changes and nothing is on by default.
+Test: `bindings/rust/tests/wal_raw_api.rs` (`cargo test -p turso --features conn_raw_api --test wal_raw_api`): twenty
+committed rows' frames read from one database and inserted into a fresh one read back whole.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

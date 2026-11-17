@@ -1172,6 +1172,10 @@ impl TursoConnection {
     fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
         map_sync_transient_error(self.sync_busy.as_ref(), error)
     }
+    /// The core connection, for the raw WAL API a replicator drives (`conn_raw_api`).
+    pub fn core_connection(&self) -> &Arc<Connection> {
+        &self.connection
+    }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);

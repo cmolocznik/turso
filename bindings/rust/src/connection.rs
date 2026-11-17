@@ -471,6 +471,56 @@ impl Connection {
         conn.last_insert_rowid()
     }
 
+    /// The WAL's checkpoint sequence and its last frame.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_state(&self) -> Result<turso_core::types::WalState> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn
+            .core_connection()
+            .wal_state()
+            .map_err(turso_sdk_kit::rsapi::TursoError::from)?)
+    }
+
+    /// Read WAL frame `frame_no` (header included) into `frame`.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<turso_core::types::WalFrameInfo> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn
+            .core_connection()
+            .wal_get_frame(frame_no, frame)
+            .map_err(turso_sdk_kit::rsapi::TursoError::from)?)
+    }
+
+    /// Begin a WAL session: a read and write transaction frames are inserted under.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_begin(&self) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn
+            .core_connection()
+            .wal_insert_begin()
+            .map_err(turso_sdk_kit::rsapi::TursoError::from)?)
+    }
+
+    /// Insert `frame` (header included) at `frame_no` inside the WAL session.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<turso_core::types::WalFrameInfo> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn
+            .core_connection()
+            .wal_insert_frame(frame_no, frame)
+            .map_err(turso_sdk_kit::rsapi::TursoError::from)?)
+    }
+
+    /// End the WAL session; frames past the last commit frame roll back.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_insert_end(&self, force_commit: bool) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn
+            .core_connection()
+            .wal_insert_end(force_commit)
+            .map_err(turso_sdk_kit::rsapi::TursoError::from)?)
+    }
+
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL.
     pub fn cacheflush(&self) -> Result<()> {

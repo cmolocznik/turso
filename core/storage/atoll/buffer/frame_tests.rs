@@ -488,7 +488,7 @@ fn pages_in_a_cold_file(
     drop((first, first_io, first_counted));
     let (counted, pool) = pool_on(io, base, opened_async);
     for &(pid, slot) in &slots {
-        pool.store.set_swap(pid, slot);
+        pool.store.set_swap(pid, slot, u64::MAX);
     }
     (
         slots.into_iter().map(|(pid, _)| pid).collect(),
@@ -1377,7 +1377,7 @@ fn a_frames_cold_load_and_write_out_over_the_ring_run_on_an_io_thread() {
             drop((first, first_io, first_counted));
             let (counted, pool) = pool_on(ring, &base, true);
             let io: Arc<dyn IO> = counted.clone();
-            pool.store.set_swap(pid, slot);
+            pool.store.set_swap(pid, slot, u64::MAX);
             let read =
                 in_frames(&io, || pool.fix_exclusive(pid, None)).map(|g| stamped(g.page(), pid));
             // A temporary page's write-out in a frame: its cold file's open and the write.

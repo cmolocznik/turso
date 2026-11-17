@@ -16419,6 +16419,87 @@ fn a_dropped_connection_ends_the_group_its_transaction_still_has() {
     assert!(!runs_on, "a dropped connection's group runs on");
 }
 
+/// VALUE-LOST1 through SQL, at four sizes of value stored out of line: rows written one autocommit
+/// insert each while the checkpoint thread runs under the default page cache, a clean close, an
+/// open, and every row read back. Before the fix a value whose page a settle found no frame for was
+/// left out of every later checkpoint's map, and the open's replay gave the page to another row.
+#[test]
+fn values_of_60000_bytes_read_back_after_a_close_and_an_open() {
+    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-60000", 60_000, 6_000);
+    assert_eq!(lost, Vec::<i64>::new(), "rows lost");
+}
+
+#[test]
+fn values_of_20000_bytes_read_back_after_a_close_and_an_open() {
+    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-20000", 20_000, 6_000);
+    assert_eq!(lost, Vec::<i64>::new(), "rows lost");
+}
+
+#[test]
+fn values_of_6000_bytes_read_back_after_a_close_and_an_open() {
+    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-6000", 6_000, 120_000);
+    assert_eq!(lost, Vec::<i64>::new(), "rows lost");
+}
+
+#[test]
+fn values_of_1500_bytes_read_back_after_a_close_and_an_open() {
+    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-1500", 1_500, 80_000);
+    assert_eq!(lost, Vec::<i64>::new(), "rows lost");
+}
+
+/// Writes `rows` rows of `size` bytes, one autocommit insert each, into a database at `path` in
+/// memory with the default configuration, closes it, opens it again, and reads every row: the keys
+/// of the rows that did not read back as written.
+fn rows_lost_after_a_close_and_an_open(path: &str, size: usize, rows: i64) -> Vec<i64> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let config = crate::storage::atoll::sql::mode::config_for(None);
+    let value = |k: i64| {
+        let mut v = vec![0u8; size];
+        v[..8].copy_from_slice(&k.to_be_bytes());
+        for (i, b) in v[8..].iter_mut().enumerate() {
+            *b = ((k as usize).wrapping_mul(31).wrapping_add(i) % 251 + 1) as u8;
+        }
+        v
+    };
+    {
+        let db = open_with(&io, path, config.clone());
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB)")
+            .unwrap();
+        let mut insert = conn.prepare("INSERT INTO t VALUES (?1, ?2)").unwrap();
+        for k in 1..=rows {
+            insert.reset().unwrap();
+            insert
+                .bind_at(1.try_into().unwrap(), Value::from_i64(k))
+                .unwrap();
+            insert
+                .bind_at(2.try_into().unwrap(), Value::from_blob(value(k)))
+                .unwrap();
+            insert.run_ignore_rows().unwrap();
+        }
+        drop(insert);
+        conn.close().unwrap();
+    }
+    let db = open_with(&io, path, config);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let mut select = conn.prepare("SELECT v FROM t WHERE k = ?1").unwrap();
+    let lost = (1..=rows)
+        .filter(|&k| {
+            select.reset().unwrap();
+            select
+                .bind_at(1.try_into().unwrap(), Value::from_i64(k))
+                .unwrap();
+            !matches!(
+                select.run_collect_rows(),
+                Ok(r) if r.len() == 1 && r[0][0] == Value::from_blob(value(k))
+            )
+        })
+        .collect();
+    drop(select);
+    conn.close().unwrap();
+    lost
+}
+
 #[cfg(all(unix, not(miri)))]
 mod nested_by_call;
 #[cfg(all(unix, not(miri)))]

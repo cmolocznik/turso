@@ -101,6 +101,13 @@ pub enum Deferred {
 /// Swap copies, sharded by page id: per page, its slot.
 const SWAP_SHARDS: usize = 64;
 
+/// A page's swap copy: its slot, and the change count of the page it holds.
+#[derive(Debug, Clone, Copy)]
+struct SwapCopy {
+    slot: u64,
+    count: u64,
+}
+
 /// The places of a class's data files a walk of them looks at a call, at most: as many as one page
 /// of their cells holds (DESIGN.md 22.1).
 const FILE_RUN: u64 =
@@ -139,8 +146,8 @@ pub struct PageStore {
     /// The checkpoint the changes made now belong to: the one after the checkpoint in charge, or
     /// after the one cut and not yet in charge.
     epoch: AtomicU64,
-    /// Swap copies.
-    swap: Box<[Mutex<BTreeMap<PageId, u64>>]>,
+    /// Swap copies, each page's with the change count it holds.
+    swap: Box<[Mutex<BTreeMap<PageId, SwapCopy>>]>,
     /// The zeros an erasure writes over a slot no hole can be punched in, a block per class made
     /// at its first need and only ever read: every such write of the class shares it, holding it
     /// until its request retires, so what they hold is a class's size at most however many are in
@@ -322,6 +329,9 @@ pub struct CutKey {
     n: u64,
     pid: PageId,
     slot: Option<u64>,
+    /// A value's page left out because no image of the checkpoint names it, which must have no
+    /// checkpoint copy: one with a copy holds a live value.
+    uncopied: bool,
 }
 
 impl CutKey {
@@ -331,7 +341,12 @@ impl CutKey {
     }
 
     fn of(n: u64, pid: PageId, slot: Option<u64>) -> Self {
-        Self { n, pid, slot }
+        Self {
+            n,
+            pid,
+            slot,
+            uncopied: false,
+        }
     }
 }
 
@@ -806,21 +821,25 @@ impl PageStore {
 
     // ---------------------------------------------------------------- swap copies
 
-    fn swap_shard(&self, pid: PageId) -> &Mutex<BTreeMap<PageId, u64>> {
+    fn swap_shard(&self, pid: PageId) -> &Mutex<BTreeMap<PageId, SwapCopy>> {
         let h = pid.raw().wrapping_mul(0x9e37_79b9_7f4a_7c15);
         &self.swap[(h >> 58) as usize % SWAP_SHARDS]
     }
 
     /// The slot of `pid`'s swap copy, if it has one: a read takes it before the checkpoint copy.
     pub fn swap_slot(&self, pid: PageId) -> Option<u64> {
-        self.swap_shard(pid).lock().get(&pid).copied()
+        self.swap_shard(pid).lock().get(&pid).map(|copy| copy.slot)
     }
 
-    /// `slot`, which holds a whole copy of `pid` written since its frame changed last, is its swap
-    /// copy now; the one it replaces is given up.
-    pub fn set_swap(&self, pid: PageId, slot: u64) {
-        if let Some(old) = self.swap_shard(pid).lock().insert(pid, slot) {
-            self.give_up_swap(pid.class(), old);
+    /// `slot`, which holds a whole copy of `pid` at change count `count`, written since its frame
+    /// changed last, is its swap copy now; the one it replaces is given up.
+    pub fn set_swap(&self, pid: PageId, slot: u64, count: u64) {
+        if let Some(old) = self
+            .swap_shard(pid)
+            .lock()
+            .insert(pid, SwapCopy { slot, count })
+        {
+            self.give_up_swap(pid.class(), old.slot);
         }
     }
 
@@ -852,8 +871,36 @@ impl PageStore {
     /// held in memory again.
     pub fn drop_swap(&self, pid: PageId) {
         if let Some(old) = self.swap_shard(pid).lock().remove(&pid) {
-            self.give_up_swap(pid.class(), old);
+            self.give_up_swap(pid.class(), old.slot);
         }
+    }
+
+    /// A checkpoint wrote `pid`'s checkpoint copy at change count `count` while `pid` had no frame:
+    /// its swap copy, if no newer, is given up. `unloaded` says, under the swap table's lock,
+    /// whether the page still has no frame; false, with nothing given up, if one appeared. A load
+    /// takes its frame before it asks for the swap copy under the same lock, so it either is seen
+    /// here or finds the swap copy gone and comes in clean.
+    pub fn drop_swap_through(
+        &self,
+        pid: PageId,
+        count: u64,
+        unloaded: impl FnOnce() -> bool,
+    ) -> bool {
+        let given_up = {
+            let mut shard = self.swap_shard(pid).lock();
+            if !unloaded() {
+                return false;
+            }
+            match shard.get(&pid) {
+                Some(copy) if copy.count <= count => shard.remove(&pid),
+                _ => None,
+            }
+        };
+        crate::race::point("store.swap_given_up");
+        if let Some(old) = given_up {
+            self.give_up_swap(pid.class(), old.slot);
+        }
+        true
     }
 
     /// A swap slot no copy needs: free once no step that may have looked it up is left.
@@ -1306,6 +1353,23 @@ impl PageStore {
         edit.poll(key, |state| self.edit_cut(key, heights, state))
     }
 
+    /// [`left_out`](Self::left_out) for a value's page owed to checkpoint `n` that no image of
+    /// `n` names: a value whose commit `n`'s snapshot does not hold, which no checkpoint has
+    /// copied. One with a checkpoint copy is live, and is never left out.
+    pub fn left_out_unnamed_value(
+        self: &Arc<Self>,
+        n: u64,
+        heights: &[[u8; CLASS_COUNT]; TREES],
+        pid: PageId,
+        edit: &mut CutEdit,
+    ) -> Result<IOResult<Edited>> {
+        let key = CutKey {
+            uncopied: true,
+            ..CutKey::of(n, pid, None)
+        };
+        edit.poll(key, |state| self.edit_cut(key, heights, state))
+    }
+
     /// One poll of the edit `key` names, at the cut's heights as they stand, its pages kept in
     /// `state` across its waits for a page's read and for a latch (DESIGN.md 22.18): pages both
     /// heights name are kept where the cut's free space grew between two polls.
@@ -1315,7 +1379,7 @@ impl PageStore {
         heights: &[[u8; CLASS_COUNT]; TREES],
         state: &mut CutState,
     ) -> Result<IOResult<Edited>> {
-        let CutKey { n, pid, slot } = key;
+        let CutKey { n, pid, slot, .. } = key;
         let (class, number) = (pid.class(), pid.number());
         let cut_map = heights[Tree::Map as usize][class.index()];
         let cut_space = heights[Tree::Space as usize][class.index()];
@@ -1360,6 +1424,15 @@ impl PageStore {
             }
         };
         let old_slot = old.checked_sub(SLOT_BASE);
+        // In every build: the process ends before the cut's map frees the value, and the map
+        // in charge, which the next open recovers from, still names the page's copy.
+        if let (true, Some(copy)) = (key.uncopied, old_slot) {
+            panic!(
+                "checkpoint {n} would leave {pid:?} out of its map as a value no image names, but \
+                 the page has a checkpoint copy in slot {copy}: the value is live, and leaving the \
+                 page out would free it"
+            );
+        }
         let cut_path = radix::path(Tree::Map, class, cut_map, number);
         let spaces = [slot, old_slot].map(|s| s.map(|s| radix::path(Tree::Space, class, space, s)));
         // The cut's roots, from the one it had up: each new one counts what the one below counts.

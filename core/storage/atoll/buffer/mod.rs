@@ -3293,28 +3293,48 @@ impl BufferPool {
     /// A checkpoint wrote, as `pid`'s checkpoint copy, the page as it stood at change count
     /// `count`, or an image that reads to every reader as that page does: if the page is still at
     /// that count, it is owed nothing and is clean, the copy standing for it once it is evicted,
-    /// and its swap copy, which is no newer, is given up. A page changed since keeps its swap copy,
-    /// which a later eviction may have made the newest.
-    pub fn settled(&self, pid: PageId, count: u64) {
-        let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) else {
-            return;
-        };
-        let h = self.header(frame);
-        let Some(hold) = Held::try_take(self.frame_ref(frame)) else {
-            // Changing: it differs from the copy, and stays owed.
-            return;
-        };
-        if h.status() != RESIDENT
-            || h.pid() != pid.raw()
-            || h.changes.load(Ordering::Acquire) != count
-        {
+    /// and its swap copy, which is no newer, is given up, whether or not the page is in memory. A
+    /// swap copy left behind would keep the page owed at every cut, and a value's page owed with no
+    /// image naming it is left out of the cut's map (VALUE-LOST1). A page changed since keeps its
+    /// swap copy, which a later eviction may have made the newest. A frame another holds is
+    /// followed as an exclusive fix follows it: its read or write in flight, or its latch, is
+    /// waited for. Step it until done.
+    pub fn settled(self: &Arc<Self>, pid: PageId, count: u64) -> Result<IOResult<()>> {
+        crate::race::point("buffer.settle_begins");
+        let step = self.store.epochs().enter();
+        loop {
+            let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) else {
+                crate::race::point("buffer.settle_found_no_frame");
+                let unloaded = || self.table.find(&self.frames.headers, pid.raw()).is_none();
+                if self.store.drop_swap_through(pid, count, unloaded) {
+                    return Ok(IOResult::Done(()));
+                }
+                continue;
+            };
+            let hold = match self.follow(frame, pid, Mode::Exclusive, &step)? {
+                Followed::Fixed(Some((_, Some(hold)))) => hold,
+                Followed::Fixed(Some((_, None))) => unreachable!("an exclusive follow holds"),
+                // The frame no longer holds the page: look again.
+                Followed::Fixed(None) => continue,
+                Followed::Wait(c) => return Ok(IOResult::IO(IOCompletions(c))),
+            };
+            let h = self.header(frame);
+            if h.changes.load(Ordering::Acquire) == count {
+                h.imaged.store(count, Ordering::Release);
+                h.written.fetch_max(count, Ordering::AcqRel);
+                self.store.drop_swap(pid);
+            }
             hold.release_unchanged();
-            return;
+            return Ok(IOResult::Done(()));
         }
-        h.imaged.store(count, Ordering::Release);
-        h.written.fetch_max(count, Ordering::AcqRel);
-        self.store.drop_swap(pid);
-        hold.release_unchanged();
+    }
+
+    /// Whether `pid`'s frame holds changes no checkpoint copy has, for a test; `None` with no frame.
+    #[cfg(all(test, unix, not(any(shuttle, atoll_loom, miri))))]
+    pub fn frame_owed(&self, pid: PageId) -> Option<bool> {
+        let frame = self.table.find(&self.frames.headers, pid.raw())?;
+        let h = self.header(frame);
+        Some(h.imaged.load(Ordering::Acquire) != h.changes.load(Ordering::Acquire))
     }
 
     /// A sweep writing back every dirty page, for a test ([`sweep`]).

@@ -699,7 +699,7 @@ fn a_swap_copy_does_not_wait_for_the_metadata_entry_it_bypasses() {
     let class = class(0);
     let pid = drive(&db.io, || db.store().allocate(class)).unwrap();
     let slot = drive(&db.io, || db.store().take_swap_slot(class)).unwrap();
-    db.store().set_swap(pid, slot);
+    db.store().set_swap(pid, slot, u64::MAX);
     let frame = drive(&db.io, || db.store().leaf(pid))
         .unwrap()
         .expect("allocated leaf");
@@ -1289,7 +1289,7 @@ fn a_swap_shard_is_listed_a_run_at_a_time_from_where_the_last_ended() {
         .into_iter()
         .collect();
     for (i, &pid) in pages.iter().enumerate() {
-        store.set_swap(pid, i as u64 + 1);
+        store.set_swap(pid, i as u64 + 1, u64::MAX);
     }
     let shard = (0..store.swap_shards())
         .find(|&i| std::ptr::eq(&store.swap[i], target))

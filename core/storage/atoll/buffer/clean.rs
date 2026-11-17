@@ -171,7 +171,7 @@ impl Writeback {
                 // A copy that landed is the page's swap copy; one that did not gives its slot up.
                 match &res {
                     Ok(()) => {
-                        pool.store.set_swap(self.pids[i], slot);
+                        pool.store.set_swap(self.pids[i], slot, self.counts[i]);
                         pool.swap_written
                             .fetch_add(self.class.size() as u64, Ordering::Relaxed);
                     }

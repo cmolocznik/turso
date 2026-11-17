@@ -161,6 +161,21 @@ impl Db {
         out
     }
 
+    /// What a transaction begun now reads of `key`, or the error its read ended with.
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let txns = self.db.transactions();
+        let mut txn = self.begin();
+        let mut op = Get::new(key.as_bytes());
+        let read = drive(&self.io, || {
+            self.tree.get(txns, &self.versions, &mut txn, &mut op)
+        })
+        .map_err(|e| e.to_string());
+        let mut commit = Commit::new(txn);
+        drive(&self.io, || txns.commit(&mut commit)).unwrap();
+        read
+    }
+
     fn checkpoint(&self) {
         let checkpointer = self.db.checkpointer();
         let mut ticket = checkpointer.request_full();
@@ -307,6 +322,409 @@ fn crashes_recover_every_commit_acknowledged_with_durable_writes() {
 #[test]
 fn crashes_recover_every_commit_acknowledged_with_writes_then_syncs() {
     crashes_recover_every_commit_acknowledged(false);
+}
+
+/// VALUE-LOST1: a value's page imaged by a checkpoint from its swap copy, its frame evicted before the
+/// checkpoint settles it, is settled all the same: its swap copy given up, so no later cut owes it
+/// and leaves it out of its map. After a crash, a recovery from a later checkpoint replays values
+/// committed since, which take pages free in the map in charge, and the first still reads whole.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_value_whose_frame_is_evicted_before_its_settle_keeps_its_page_through_a_crash() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_value_whose_frame_is_evicted_before_its_settle_keeps_its_page_through_a_crash"
+        ),
+        || evicted_before_its_settle(Ending::Crash),
+    );
+}
+
+/// The same with a clean close and an open: the open replays what the last checkpoint does not
+/// hold, as a recovery does.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_value_whose_frame_is_evicted_before_its_settle_keeps_its_page_through_a_close() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_value_whose_frame_is_evicted_before_its_settle_keeps_its_page_through_a_close"
+        ),
+        || evicted_before_its_settle(Ending::Close),
+    );
+}
+
+/// How a database is left before it is opened again.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[derive(Clone, Copy)]
+enum Ending {
+    Crash,
+    Close,
+}
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn evicted_before_its_settle(ending: Ending) {
+    let crash_io = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = Db::create(io.clone());
+    let root = db.tree.root();
+    let pool = db.db.pool().clone();
+    let store = db.db.store().clone();
+    let first = vec![b'a'; 60_000];
+    db.put("a", &first);
+    // Written back and evicted: the value's page lives in its swap copy alone.
+    let mut sweep = pool.sweep();
+    drive(&db.io, || sweep.step(&pool)).unwrap();
+    pool.evict_all_clean();
+    let values: Vec<PageId> = store
+        .swap_pages()
+        .into_iter()
+        .filter(|p| p.class().size() >= first.len())
+        .collect();
+    let value = values[0];
+    // The checkpoint reads it in to image it; its frame goes once its image landed, before its
+    // settle.
+    let evicted = std::rc::Rc::new(Cell::new(false));
+    evict_at_its_settle(&pool, &store, value, evicted.clone());
+    db.checkpoint();
+    let evicted_at_its_checkpoint = evicted.get();
+    let swap_after_settle = store.swap_slot(value).is_some();
+    let mut entries = Vec::new();
+    for _ in 0..3 {
+        db.checkpoint();
+        entries.push(drive(&db.io, || store.entry(value)).unwrap());
+    }
+    // Values committed past the last checkpoint: the next open replays them, their values taking
+    // pages free in the map in charge.
+    for i in 0..8u8 {
+        db.put(&format!("c{i}"), &vec![b'c' + i; 60_000]);
+    }
+    let read_live = db.read("a");
+    drop(pool);
+    drop(store);
+    let reopened = match ending {
+        Ending::Crash => {
+            let image = crash_io.crash(0);
+            drop(db);
+            Db::recover(Arc::new(image), root, 1).unwrap()
+        }
+        Ending::Close => {
+            drop(db);
+            Db::recover(io, root, 1).unwrap()
+        }
+    };
+    reopened.put("d", &vec![b'd'; 60_000]);
+    let read_reopened = reopened.read("a");
+    drop(reopened);
+    assert_eq!(
+        values.len(),
+        1,
+        "the value's pages in swap alone: {values:?}"
+    );
+    assert!(
+        evicted_at_its_checkpoint,
+        "the value's frame evicted before its settle"
+    );
+    assert!(
+        !swap_after_settle,
+        "the settle gave up the value's swap copy"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|&e| e != crate::storage::atoll::radix::FREE),
+        "the value's page free in the map after its settle: {entries:?}"
+    );
+    assert_eq!(read_live, Ok(Some(first.clone())), "the first value, live");
+    assert_eq!(
+        read_reopened,
+        Ok(Some(first)),
+        "the first value, opened again"
+    );
+}
+
+/// A load of a value's page that claims its frame after its settle looked at the table under the
+/// swap table's lock, and gave the swap copy up, finds no swap copy: it reads the checkpoint's
+/// copy, which the image named before the settle, and comes in owed nothing.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_load_after_the_settle_gave_the_swap_copy_up_reads_the_checkpoint_copy_and_is_owed_nothing() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_load_after_the_settle_gave_the_swap_copy_up_reads_the_checkpoint_copy_and_is_owed_nothing"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(CrashIO::new(0));
+            let db = Db::create(io);
+            let pool = db.db.pool().clone();
+            let store = db.db.store().clone();
+            let first = vec![b'a'; 60_000];
+            db.put("a", &first);
+            let value = value_in_swap_alone(&db, first.len());
+            let evicted = std::rc::Rc::new(Cell::new(false));
+            evict_at_its_settle(&pool, &store, value, evicted.clone());
+            let loading = std::rc::Rc::new(Cell::new(false));
+            load_once_its_swap_copy_is_given_up(&pool, &store, value, loading.clone());
+            db.checkpoint();
+            let swap_after = store.swap_slot(value);
+            let landed = drive(&db.io, || pool.fix_exclusive(value, None))
+                .map(|g| drop(g.release_unchanged()))
+                .map_err(|e| e.to_string());
+            let owed = pool.frame_owed(value);
+            let read = db.read("a");
+            drop(pool);
+            drop(store);
+            drop(db);
+            assert!(evicted.get(), "the value's frame evicted before its settle");
+            assert!(loading.get(), "the load began after the swap copy was given up");
+            assert_eq!(swap_after, None, "the swap copy outlived the settle");
+            assert_eq!(landed, Ok(()), "the load");
+            assert_eq!(owed, Some(false), "the page the load brought in is owed");
+            assert_eq!(read, Ok(Some(first)), "the value");
+        },
+    );
+}
+
+/// A value's frame another thread holds at its settle, as an evictor's try or a fix may: the
+/// settle waits for the latch and settles the page once it is let go, so the page is owed nothing
+/// and its swap copy goes. Before, the settle returned at once and left the page owed, and the
+/// next cut left it out (VALUE-LOST1's second way, with no eviction).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_value_whose_frame_is_held_at_its_settle_is_settled_once_let_go() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_value_whose_frame_is_held_at_its_settle_is_settled_once_let_go"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(CrashIO::new(0));
+            let db = Db::create(io.clone());
+            let pool = db.db.pool().clone();
+            let store = db.db.store().clone();
+            let first = vec![b'a'; 60_000];
+            db.put("a", &first);
+            let value = value_in_swap_alone(&db, first.len());
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holding = Holding {
+                held: std::rc::Rc::new(Cell::new(false)),
+                waited: std::rc::Rc::new(Cell::new(false)),
+                holder: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            };
+            hold_at_its_settle(
+                &pool,
+                &store,
+                &io,
+                value,
+                released,
+                release.clone(),
+                holding.clone(),
+            );
+            db.checkpoint();
+            // The settle never waited: the holder still waits to let go.
+            let _ = release.send(());
+            if let Some(holder) = holding.holder.borrow_mut().take() {
+                holder.join().unwrap();
+            }
+            let swap_after = store.swap_slot(value);
+            let owed = pool.frame_owed(value);
+            let read = db.read("a");
+            drop(pool);
+            drop(store);
+            drop(db);
+            assert!(
+                holding.held.get(),
+                "another thread held the frame at its settle"
+            );
+            assert!(
+                holding.waited.get(),
+                "the settle went on past a frame another held"
+            );
+            assert_eq!(swap_after, None, "the swap copy outlived the settle");
+            assert_eq!(owed, Some(false), "the page is owed after its settle");
+            assert_eq!(read, Ok(Some(first)), "the value");
+        },
+    );
+}
+
+/// The check behind VALUE-LOST1, in every build: a checkpoint that would leave a value's page out
+/// of its map as unnamed while the page has a checkpoint copy, so freeing a live value, ends the
+/// process with its words instead. A value's page marked changed after its checkpoint, its bytes as
+/// they were, is owed at the next cut with no image naming it, as a settle that kept its swap copy
+/// left one.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_checkpoint_that_would_free_a_live_values_page_ends_the_process() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_checkpoint_that_would_free_a_live_values_page_ends_the_process"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(CrashIO::new(0));
+            let db = Db::create(io);
+            let pool = db.db.pool().clone();
+            let store = db.db.store().clone();
+            db.put("a", &vec![b'a'; 60_000]);
+            let mut sweep = pool.sweep();
+            drive(&db.io, || sweep.step(&pool)).unwrap();
+            pool.evict_all_clean();
+            let value = store
+                .swap_pages()
+                .into_iter()
+                .find(|p| p.class().size() >= 60_000)
+                .expect("the value's page in swap alone");
+            db.checkpoint();
+            // Owed again with its bytes unchanged: written to a new swap copy, its frame gone.
+            let mut fixed = drive(&db.io, || pool.fix_exclusive(value, None)).unwrap();
+            fixed.changed();
+            drop(fixed);
+            let mut sweep = pool.sweep();
+            drive(&db.io, || sweep.step(&pool)).unwrap();
+            pool.evict_all_clean();
+            db.checkpoint();
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert_ne!(
+        ended.code,
+        Some(0),
+        "the checkpoint went on:\n{}",
+        ended.stderr
+    );
+    assert!(
+        ended.stderr.contains(
+            "out of its map as a value no image names, but the page has a checkpoint copy in slot"
+        ),
+        "{}",
+        ended.stderr
+    );
+}
+
+/// Evicts `pid`'s frame at its own settle: the first settle after a checkpoint copy of it landed
+/// (its entry set to the copy just before), `evicted` then set. Its frame not evictable there,
+/// `evicted` stays unset.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn evict_at_its_settle(
+    pool: &Arc<super::buffer::BufferPool>,
+    store: &Arc<super::store::PageStore>,
+    pid: PageId,
+    evicted: std::rc::Rc<Cell<bool>>,
+) {
+    let (pool_at, store_at) = (pool.clone(), store.clone());
+    crate::race::at("buffer.settle_begins", move || {
+        let copied = matches!(
+            store_at.entry(pid),
+            Ok(IOResult::Done(e)) if e >= crate::storage::atoll::radix::SLOT_BASE
+        );
+        if copied {
+            evicted.set(pool_at.evict_clean(pid));
+        } else {
+            evict_at_its_settle(&pool_at, &store_at, pid, evicted);
+        }
+    });
+}
+
+/// Starts a load of `pid` once a settle has given its swap copy up and let go of the swap table's
+/// lock, its read left in flight; `began` set then.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn load_once_its_swap_copy_is_given_up(
+    pool: &Arc<super::buffer::BufferPool>,
+    store: &Arc<super::store::PageStore>,
+    pid: PageId,
+    began: std::rc::Rc<Cell<bool>>,
+) {
+    let (pool_at, store_at) = (pool.clone(), store.clone());
+    crate::race::at("store.swap_given_up", move || {
+        if store_at.swap_slot(pid).is_none() {
+            began.set(matches!(
+                pool_at.fix_exclusive(pid, None),
+                Ok(IOResult::IO(_))
+            ));
+        } else {
+            load_once_its_swap_copy_is_given_up(&pool_at, &store_at, pid, began);
+        }
+    });
+}
+
+/// What [`hold_at_its_settle`] saw: the holder's thread, whether it held the frame, and whether
+/// the settle waited for it.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[derive(Clone)]
+struct Holding {
+    held: std::rc::Rc<Cell<bool>>,
+    waited: std::rc::Rc<Cell<bool>>,
+    holder: std::rc::Rc<std::cell::RefCell<Option<std::thread::JoinHandle<()>>>>,
+}
+
+/// At `pid`'s own settle (the first after its checkpoint copy's entry is set), another thread
+/// fixes its frame exclusively and holds it until `released` gets a word: `release` sends it once
+/// that settle has waited.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn hold_at_its_settle(
+    pool: &Arc<super::buffer::BufferPool>,
+    store: &Arc<super::store::PageStore>,
+    io: &Arc<dyn IO>,
+    pid: PageId,
+    released: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    holding: Holding,
+) {
+    let (pool_at, store_at, io_at) = (pool.clone(), store.clone(), io.clone());
+    crate::race::at("buffer.settle_begins", move || {
+        let copied = matches!(
+            store_at.entry(pid),
+            Ok(IOResult::Done(e)) if e >= crate::storage::atoll::radix::SLOT_BASE
+        );
+        if !copied {
+            return hold_at_its_settle(
+                &pool_at, &store_at, &io_at, pid, released, release, holding,
+            );
+        }
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (pool_thread, io_thread) = (pool_at.clone(), io_at.clone());
+        let thread = std::thread::spawn(move || {
+            let fixed = drive(&io_thread, || pool_thread.fix_exclusive(pid, None)).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = released.recv();
+            drop(fixed.release_unchanged());
+        });
+        holding.held.set(
+            held_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_ok(),
+        );
+        *holding.holder.borrow_mut() = Some(thread);
+        let waited = holding.waited.clone();
+        crate::race::at("checkpoint.settle_waits", move || {
+            waited.set(true);
+            let _ = release.send(());
+        });
+    });
+}
+
+/// Writes back the value of `len` bytes just put and evicts every clean page: the value's page
+/// then lives in its swap copy alone. That page.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn value_in_swap_alone(db: &Db, len: usize) -> PageId {
+    let pool = db.db.pool().clone();
+    let mut sweep = pool.sweep();
+    drive(&db.io, || sweep.step(&pool)).unwrap();
+    pool.evict_all_clean();
+    let values: Vec<PageId> = db
+        .db
+        .store()
+        .swap_pages()
+        .into_iter()
+        .filter(|p| p.class().size() >= len)
+        .collect();
+    assert_eq!(
+        values.len(),
+        1,
+        "the value's pages in swap alone: {values:?}"
+    );
+    values[0]
 }
 
 #[test]

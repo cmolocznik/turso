@@ -422,6 +422,31 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "tests.rs",
+            "a_load_after_the_settle_gave_the_swap_copy_up_reads_the_checkpoint_copy_and_is_owed_nothing",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_value_whose_frame_is_held_at_its_settle_is_settled_once_let_go",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_checkpoint_that_would_free_a_live_values_page_ends_the_process",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_value_whose_frame_is_evicted_before_its_settle_keeps_its_page_through_a_crash",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_value_whose_frame_is_evicted_before_its_settle_keeps_its_page_through_a_close",
+            "child",
+        ),
+        (
             "sql/mode/tests/one_writer.rs",
             "inside_begin_a_commit_or_rollback_beside_a_parked_writer_leaves_the_transaction_whole",
             "child",

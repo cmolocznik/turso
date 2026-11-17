@@ -780,6 +780,8 @@ struct Flying {
     /// The change count of the page the image settles, if it does: the page as it stood then,
     /// or what reads to every reader as it does.
     settles: Option<u64>,
+    /// Its copy entered in the cut's map, once it landed: a settle that waits comes back to it.
+    copied: bool,
 }
 
 impl Checkpointer {
@@ -2543,10 +2545,12 @@ impl Run {
                     // No image written names it: a value no committed version at or below the
                     // snapshot reaches.
                     unit::visit();
-                    match cp
-                        .store
-                        .left_out(self.n, &self.heights, pid, &mut self.leaving)?
-                    {
+                    match cp.store.left_out_unnamed_value(
+                        self.n,
+                        &self.heights,
+                        pid,
+                        &mut self.leaving,
+                    )? {
                         IOResult::Done(edited) => self.meta.extend(edited.iter().copied()),
                         IOResult::IO(IOCompletions(c)) => {
                             self.queue.push_front(pid);
@@ -2766,6 +2770,7 @@ impl Run {
             outcome,
             bytes: image.len(),
             settles,
+            copied: false,
         });
         counters
             .flying_writes_peak
@@ -2804,20 +2809,26 @@ impl Run {
             }
         }
         unit::visit();
-        let edited =
-            match cp
-                .store
-                .copied(self.n, &self.heights, f.pid, f.slot, &mut self.landing)?
-            {
-                IOResult::Done(edited) => edited,
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            };
-        self.meta.extend(edited.iter().copied());
-        // The cut's free space as the edit left it, grown to reach the copy's slot if it had to:
-        // the height every later edit and the superblock take.
-        self.heights[super::meta::Tree::Space as usize][f.pid.class().index()] = edited.space;
+        if !f.copied {
+            let edited =
+                match cp
+                    .store
+                    .copied(self.n, &self.heights, f.pid, f.slot, &mut self.landing)?
+                {
+                    IOResult::Done(edited) => edited,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                };
+            self.meta.extend(edited.iter().copied());
+            // The cut's free space as the edit left it, grown to reach the copy's slot if it had
+            // to: the height every later edit and the superblock take.
+            self.heights[super::meta::Tree::Space as usize][f.pid.class().index()] = edited.space;
+            f.copied = true;
+        }
         if let Some(count) = f.settles {
-            cp.pool.settled(f.pid, count);
+            if let IOResult::IO(io) = cp.pool.settled(f.pid, count)? {
+                crate::race::point("checkpoint.settle_waits");
+                return Ok(IOResult::IO(io));
+            }
         }
         self.flying_bytes -= f.bytes;
         self.flying.swap_remove(i);
@@ -3341,6 +3352,7 @@ mod tests {
                 outcome: Arc::new(Mutex::new(Some(Ok(())))),
                 bytes: 0,
                 settles: None,
+                copied: false,
             }
         };
         let mut run = Run::new(n, None);

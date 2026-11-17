@@ -353,13 +353,169 @@ fn a_page_settled_at_a_count_it_has_moved_past_keeps_its_newer_swap_copy() {
         pool.store.swap_slot(pid).is_some(),
         "written to a swap copy"
     );
-    pool.settled(pid, imaged);
+    assert!(
+        matches!(pool.settled(pid, imaged).unwrap(), IOResult::Done(())),
+        "a resident frame settles at once"
+    );
     assert!(
         pool.store.swap_slot(pid).is_some(),
         "the newer swap copy was given up"
     );
     assert!(pool.evict_clean(pid), "the page left its frame");
     model.check(0, false);
+}
+
+/// VALUE-LOST1: a page settled at the count of its swap copy while no frame holds it gives the
+/// copy up, as it would with a frame: its checkpoint copy stands for it, and no later cut finds it
+/// owed.
+#[test]
+fn a_page_settled_with_no_frame_at_its_swap_copys_count_gives_the_copy_up() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/settled-unloaded", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    model.allocate(class(0));
+    let pid = model.pages[0].pid;
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let written = pool.header(frame).written.load(Ordering::Acquire);
+    let evicted = pool.evict_clean(pid);
+    let swapped = pool.store.swap_slot(pid).is_some();
+    let settled = matches!(pool.settled(pid, written).unwrap(), IOResult::Done(()));
+    let kept = pool.store.swap_slot(pid).is_some();
+    drop(model);
+    drop(pool);
+    assert!(evicted, "the page left its frame");
+    assert!(swapped, "written to a swap copy");
+    assert!(settled, "a page with no frame settles at once");
+    assert!(!kept, "the swap copy outlived the settle");
+}
+
+/// A page settled with no frame at a count it has moved past keeps its newer swap copy, written by
+/// the eviction that took its frame, and reads back as it stands.
+#[test]
+fn a_page_settled_with_no_frame_at_a_count_it_has_moved_past_keeps_its_newer_swap_copy() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/settled-moved", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    model.allocate(class(0));
+    let pid = model.pages[0].pid;
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    let imaged = pool.header(frame).changes.load(Ordering::Acquire);
+    model.update(0);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    let settled = matches!(pool.settled(pid, imaged).unwrap(), IOResult::Done(()));
+    let kept = pool.store.swap_slot(pid).is_some();
+    let read = stamp_read(&io, &pool, pid);
+    let version = model.pages[0].version;
+    drop(model);
+    drop(pool);
+    assert!(evicted, "the page left its frame");
+    assert!(settled, "a page with no frame settles at once");
+    assert!(kept, "the newer swap copy was given up");
+    assert_eq!(read, Ok(Some(version)), "the page read back");
+}
+
+/// A settle that finds no frame, then a load of the page beginning before the settle gives the swap
+/// copy up: the load claims its frame before it asks the swap table, so the settle, looking again
+/// under the swap table's lock, sees it and keeps the copy the load reads. It waits on the load's
+/// read, as a fix of a loading page does, then settles the page the load brought in.
+#[test]
+fn a_settle_gives_up_no_swap_copy_a_load_begun_after_its_look_reads() {
+    // Reads complete only at a step, so the load's stays in flight across the settle.
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
+    let pool = open_on(&io, "/db/settle-load", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    model.allocate(class(0));
+    let pid = model.pages[0].pid;
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let written = pool.header(frame).written.load(Ordering::Acquire);
+    let evicted = pool.evict_clean(pid);
+    let slot = pool.store.swap_slot(pid);
+    let loading = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (began, loader) = (loading.clone(), pool.clone());
+    crate::race::at("buffer.settle_found_no_frame", move || {
+        let fix = loader.fix_exclusive(pid, None).unwrap();
+        began.set(matches!(fix, IOResult::IO(_)));
+    });
+    let wait = match pool.settled(pid, written).unwrap() {
+        IOResult::IO(IOCompletions(c)) => Some(c),
+        IOResult::Done(()) => None,
+    };
+    let waited_unfinished = wait.as_ref().map(|c| !c.finished());
+    let kept_while_loading = pool.store.swap_slot(pid);
+    let read = stamp_read(&io, &pool, pid);
+    let wait_ended = wait.as_ref().map(|c| c.finished());
+    drive(&io, || pool.settled(pid, written)).unwrap();
+    let after = pool.store.swap_slot(pid);
+    let header = pool
+        .table
+        .find(&pool.frames.headers, pid.raw())
+        .map(|f| pool.header(f));
+    let owed =
+        header.map(|h| h.imaged.load(Ordering::Acquire) != h.changes.load(Ordering::Acquire));
+    let version = model.pages[0].version;
+    drop(model);
+    drop(pool);
+    assert!(evicted, "the page left its frame");
+    assert!(slot.is_some(), "written to a swap copy");
+    assert!(loading.get(), "the load began, its read in flight");
+    assert!(
+        wait.is_some(),
+        "the settle went on while the load was in flight"
+    );
+    assert_eq!(
+        waited_unfinished,
+        Some(true),
+        "the settle's wait was a yield, not the load's read"
+    );
+    assert_eq!(
+        wait_ended,
+        Some(true),
+        "the load landed and its read's wait did not end"
+    );
+    assert_eq!(
+        kept_while_loading, slot,
+        "the swap copy the load reads was given up"
+    );
+    assert_eq!(read, Ok(Some(version)), "the page the load read");
+    assert_eq!(after, None, "the swap copy outlived the second settle");
+    assert_eq!(
+        owed,
+        Some(false),
+        "the page loaded is owed after its settle"
+    );
+}
+
+/// The stamp `pid` reads back with, fixed exclusively, or the fix's error.
+fn stamp_read(
+    io: &Arc<dyn IO>,
+    pool: &Arc<BufferPool>,
+    pid: PageId,
+) -> Result<Option<u64>, String> {
+    drive(io, || pool.fix_exclusive(pid, None))
+        .map(|g| {
+            let seen = stamped(g.page(), pid);
+            drop(g.release_unchanged());
+            seen
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Marks `pid` retired, as a versioned write that replaces its value does.
@@ -7106,7 +7262,7 @@ fn a_cut_lists_the_swap_table_a_run_a_call_and_every_swapped_page_once() {
         .map(|i| PageId::new(class(0), (1 << 20) + i))
         .collect();
     for (i, &pid) in pages.iter().enumerate() {
-        pool.store.set_swap(pid, (1 << 30) + i as u64);
+        pool.store.set_swap(pid, (1 << 30) + i as u64, u64::MAX);
     }
     let fullest = (0..pool.store.swap_shards())
         .map(|i| pool.store.swap_shard_pages(i, None, usize::MAX).len())

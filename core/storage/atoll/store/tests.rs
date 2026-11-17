@@ -666,6 +666,66 @@ fn a_slot_freed_and_not_yet_erased_between_a_walk_and_its_claim_is_not_taken() {
     );
 }
 
+/// A slot freed between a claim's read of its free-space bit and its read of unerased is still
+/// held: the bit is read first, and a free marks the slot unerased before it clears the bit
+/// (mutant: the two reads swapped).
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn a_slot_freed_between_a_claims_two_reads_is_still_held() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (io, store) = slot_store("/db/slot-claims-read-order");
+    let class = class(0);
+    let pid = drive(&io, || store.allocate(class)).unwrap();
+    let found = Rc::new(Cell::new(None));
+    let freed = Rc::new(Cell::new(false));
+    {
+        let (store, io, found, freed) = (store.clone(), io.clone(), found.clone(), freed.clone());
+        crate::race::at("store.slot_found", move || {
+            let at = store.cursors[class.index()].load(Ordering::Relaxed) - 1;
+            store.cursors[class.index()].store(at, Ordering::Relaxed);
+            let mut mark = MarkEdit::default();
+            let (_, heights) = store.begin_cut(1);
+            let first = drive(&io, || store.take_copy_slot(class, &mut mark)).unwrap();
+            drive(&io, || {
+                store.copied(1, &heights, pid, first, &mut CutEdit::default())
+            })
+            .unwrap();
+            store.meta().end_cut(1, &[]);
+            found.set(Some(first));
+            let (store, io) = (store.clone(), io.clone());
+            crate::race::at("store.space_bit_read", move || {
+                let mut mark = MarkEdit::default();
+                let (_, heights) = store.begin_cut(2);
+                let second = drive(&io, || store.take_copy_slot(class, &mut mark)).unwrap();
+                drive(&io, || {
+                    store.copied(2, &heights, pid, second, &mut CutEdit::default())
+                })
+                .unwrap();
+                store.meta().end_cut(2, &[]);
+                drive(&io, || store.after(2, &mut FreeEdit::default())).unwrap();
+                freed.set(true);
+            });
+        });
+    }
+    let swap = drive(&io, || store.take_swap_slot(class)).ok();
+    let unerased = found
+        .get()
+        .is_some_and(|s| store.unerased[class.index()].get(s));
+    drop(store);
+    assert!(found.get().is_some(), "the swap's walk never found a slot");
+    assert!(
+        freed.get(),
+        "the slot was not freed between the claim's two reads"
+    );
+    assert!(unerased, "the freed slot is erased already");
+    assert_ne!(
+        swap,
+        found.get(),
+        "a take got a slot freed between its two reads"
+    );
+}
+
 /// In every build: a checkpoint copy that lands in a slot a claim holds, a swap copy's that would
 /// write over it, ends the process with its words (ROWS-LOST1's double take caught at the copy).
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]

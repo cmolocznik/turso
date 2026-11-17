@@ -831,6 +831,11 @@ impl PageStore {
         self.swap_shard(pid).lock().get(&pid).map(|copy| copy.slot)
     }
 
+    /// The change count of `pid`'s swap copy, if it has one.
+    pub fn swap_count(&self, pid: PageId) -> Option<u64> {
+        self.swap_shard(pid).lock().get(&pid).map(|copy| copy.count)
+    }
+
     /// `slot`, which holds a whole copy of `pid` at change count `count`, written since its frame
     /// changed last, is its swap copy now; the one it replaces is given up.
     pub fn set_swap(&self, pid: PageId, slot: u64, count: u64) {
@@ -1291,8 +1296,15 @@ impl PageStore {
         let leaf = ready
             .frame(path[0])
             .expect("a ready set holds every page it names");
+        // The bit is read before unerased, and the order is the rule. A free marks the slot
+        // unerased and then clears its bit, so a look that reads the bit clear reads unerased set
+        // until the slot is erased. Read the other way round, a free between the two reads hides
+        // the slot from both.
         match leaf.read(|b| radix::space_bit(b, slot)) {
-            Some(marked) => Ok(IOResult::Done(marked || !self.erased(class, slot))),
+            Some(marked) => {
+                crate::race::point("store.space_bit_read");
+                Ok(IOResult::Done(marked || !self.erased(class, slot)))
+            }
             None => Ok(IOResult::IO(IOCompletions(leaf.wait_while_held()))),
         }
     }

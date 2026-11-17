@@ -433,6 +433,21 @@ mod tests {
         ),
         (
             "tests.rs",
+            "a_checkpoint_that_would_image_a_page_past_its_cut_ends_the_process",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_put_during_the_cuts_walk_committed_after_it_comes_back_by_replay",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_put_during_the_cuts_walk_never_committed_does_not_come_back",
+            "child",
+        ),
+        (
+            "tests.rs",
             "a_number_taken_with_no_frame_at_a_cut_is_free_after_a_recovery",
             "child",
         ),

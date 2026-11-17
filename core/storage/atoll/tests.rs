@@ -595,6 +595,98 @@ fn a_number_taken_before_a_cut_and_never_changed_is_free_after_a_recovery() {
     );
 }
 
+/// A put made while a checkpoint's cut walks the frames, by a writer that commits after the cut, is
+/// in no image of that checkpoint, whose snapshot does not see it, and comes back by replay after a
+/// crash (OPEN-CORRUPT1, point 4: a leaf put does not enter the change gate).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_put_during_the_cuts_walk_committed_after_it_comes_back_by_replay() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_put_during_the_cuts_walk_committed_after_it_comes_back_by_replay"
+        ),
+        || {
+            let after = put_during_the_walk(true);
+            assert_eq!(
+                after,
+                Ok(Some(b"two".to_vec())),
+                "a put during the walk, committed after the cut, after a crash"
+            );
+        },
+    );
+}
+
+/// A put made while a checkpoint's cut walks the frames, by a writer that never commits, is in no
+/// image of that checkpoint and does not come back after a crash.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_put_during_the_cuts_walk_never_committed_does_not_come_back() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_put_during_the_cuts_walk_never_committed_does_not_come_back"
+        ),
+        || {
+            let after = put_during_the_walk(false);
+            assert_eq!(
+                after,
+                Ok(Some(b"one".to_vec())),
+                "a put during the walk, never committed, after a crash"
+            );
+        },
+    );
+}
+
+/// A database with `a` committed as `one`; a checkpoint whose cut's first run of the frame walk
+/// is where a writer puts `a` as `two`; that writer committed after the checkpoint if `commits`,
+/// else left open; then a crash and a recovery: what a read of `a` after the recovery gives.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn put_during_the_walk(commits: bool) -> Result<Option<Vec<u8>>, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let crash_io = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = Rc::new(Db::create(io));
+    let root = db.tree.root();
+    db.put("a", b"one");
+    let writer = Rc::new(RefCell::new(Some(db.begin())));
+    {
+        let (db, writer) = (db.clone(), writer.clone());
+        crate::race::at("buffer.cut_run_listing", move || {
+            let txns = db.db.transactions();
+            let mut op = WriteOp::put(b"a", b"two".to_vec(), Mode::Upsert);
+            let mut guard = writer.borrow_mut();
+            let txn = guard.as_mut().expect("the writer");
+            let write = drive(&db.io, || db.tree.write(txns, &db.versions, txn, &mut op));
+            assert!(matches!(write, Ok(Write::Done(_))), "the put: {write:?}");
+        });
+    }
+    db.checkpoint();
+    assert!(
+        !crate::race::pending("buffer.cut_run_listing"),
+        "the cut's walk never reached its listing"
+    );
+    let txn = writer.borrow_mut().take().expect("the writer");
+    let txns = db.db.transactions();
+    let image = if commits {
+        let mut commit = Commit::new(txn);
+        drive(&db.io, || txns.commit(&mut commit)).unwrap();
+        crash_io.crash(0)
+    } else {
+        let image = crash_io.crash(0);
+        let mut abort = super::txn::Abort::new(txn);
+        drive(&db.io, || txns.rollback(&db.versions, &mut abort)).unwrap();
+        image
+    };
+    drop(writer);
+    drop(Rc::try_unwrap(db).ok().expect("the database held once"));
+    let recovered = Db::recover(Arc::new(image), root, 1).unwrap();
+    let after = recovered.read("a");
+    drop(recovered);
+    after
+}
+
 /// VALUE-LEAK1: a number taken at the page store with no frame yet when a checkpoint cuts, as
 /// between a take and the frame's install, is in no image and left out by none. After a crash, a
 /// recovery from that checkpoint must find it free.
@@ -747,6 +839,50 @@ fn a_number_left_out_at_one_cut_and_written_after_is_copied_by_the_next_checkpoi
             assert_eq!(after, live_after_second, "its entry after a recovery");
             assert_eq!(read, Ok(written), "the page after a recovery");
         },
+    );
+}
+
+/// The check behind OPEN-CORRUPT1, in every build: a checkpoint that would image a node page past
+/// the change count its cut found it at, a change since the cut having kept no copy, ends the
+/// process with its words instead of writing a map no open can use. The mark is taken off the
+/// tree's leaf once the cut has ended, as the missed mark left it, and the leaf changed.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_checkpoint_that_would_image_a_page_past_its_cut_ends_the_process() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_checkpoint_that_would_image_a_page_past_its_cut_ends_the_process"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(CrashIO::new(0));
+            let db = Db::create(io);
+            db.put("a", b"one");
+            let pool = db.db.pool().clone();
+            let leaf = db.tree.root();
+            {
+                let (pool, io) = (pool.clone(), db.io.clone());
+                crate::race::at("checkpoint.cut_ended", move || {
+                    assert!(pool.forget_cut_mark(leaf), "the leaf has no frame");
+                    let mut fixed = drive(&io, || pool.fix_exclusive(leaf, None)).unwrap();
+                    fixed.changed();
+                    drop(fixed);
+                });
+            }
+            db.checkpoint();
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert_ne!(
+        ended.code,
+        Some(0),
+        "the checkpoint went on:\n{}",
+        ended.stderr
+    );
+    assert!(
+        ended.stderr.contains("a change since the cut kept no copy"),
+        "{}",
+        ended.stderr
     );
 }
 
@@ -1862,7 +1998,7 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("btree/value.rs", "directory", "Completion::new_yield", 1, "change: a chunk page moved or evicted while read"),
     ("buffer/cell.rs", "current_with", "Completion::new_yield", 1, "change: the cell changed during its read"),
     ("buffer/lend.rs", "provide", "Completion::new_yield", 1, "change: a batch changed hands, or drains for another"),
-    ("buffer/mod.rs", "cut_run", "Completion::new_yield", 1, "change: an outgoing frame freed or reused while read"),
+    ("buffer/mod.rs", "cut_run", "Completion::new_yield", 2, "change: an outgoing frame freed or reused while read, at the walk and at the late look"),
     ("buffer/mod.rs", "claim", "look_again", 3, "change: work of the claim's own started, a latch it found changed, a horizon reached"),
     ("buffer/mod.rs", "free_page", "Completion::new_yield", 1, "change: its own write landed (settle_writes)"),
     ("buffer/mod.rs", "look_again", "Completion::new_yield", 1, "the helper itself"),

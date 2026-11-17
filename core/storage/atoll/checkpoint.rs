@@ -55,7 +55,7 @@ use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::ops::{Deref, DerefMut};
 
@@ -651,6 +651,8 @@ struct Run {
     set_aside: HashSet<PageId>,
     /// The pending pages still to image, and the value pages, judged once every node page is.
     queue: VecDeque<PageId>,
+    /// The change count the cut found each page owed at: what its image must stand at.
+    counts: HashMap<PageId, u64>,
     values: Vec<PageId>,
     /// The value pages an image written names.
     named: HashSet<PageId>,
@@ -1915,6 +1917,7 @@ impl Run {
             meta_at: None,
             set_aside: HashSet::new(),
             queue: VecDeque::new(),
+            counts: HashMap::new(),
             values: Vec::new(),
             named: HashSet::new(),
             imaging: None,
@@ -2078,10 +2081,12 @@ impl Run {
                     // those a tree's root was registered before the walk took its latch.
                     self.creations_end = cp.store.last_creation();
                     cp.store.open_gate();
+                    crate::race::point("checkpoint.cut_ended");
                     self.heights = heights;
                     self.dirty = dirty;
                     // Handed over whole, no copy made: a vector becomes a queue in place.
                     self.queue = VecDeque::from(std::mem::take(&mut self.scan.owed));
+                    self.counts = std::mem::take(&mut self.scan.counts);
                     self.phase = Phase::Creations;
                     return Ok(Unit::Again);
                 }
@@ -2627,6 +2632,16 @@ impl Run {
                             "page {pid:?}, owed an image, is neither a node nor a value's"
                         )));
                     }
+                    // A change since the cut that kept no copy would image the page past it,
+                    // beside pages imaged as the cut found them: stop here instead.
+                    let at = live.unwrap_or_else(|| page::seq(bytes));
+                    let listed = self.counts.get(&pid).copied();
+                    assert!(
+                        listed == Some(at),
+                        "checkpoint {} images {pid:?} at change count {at}, its cut found it at \
+                         {listed:?}: a change since the cut kept no copy",
+                        self.n
+                    );
                     if self.set_aside.contains(&v.root()) {
                         // A tree whose creation the snapshot does not see: left out whole.
                         unit::visit();
@@ -3493,6 +3508,7 @@ mod tests {
         const ONE_FREE: &[&str] = &[
             "set_aside",
             "queue",
+            "counts",
             "values",
             "named",
             "early",

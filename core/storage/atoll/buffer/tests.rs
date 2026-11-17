@@ -5757,7 +5757,7 @@ fn a_cut_rejects_an_outgoing_header_if_the_frame_was_reused() {
         });
     }
     let mut owed = Vec::new();
-    let accepted = pool.record_outgoing(frame, &mut owed);
+    let accepted = pool.record_outgoing(frame, &mut owed, &mut HashMap::new());
     let hooked = !crate::race::pending("buffer.cut_outgoing_seen");
     if !hooked {
         crate::race::point("buffer.cut_outgoing_seen");
@@ -7157,6 +7157,372 @@ fn a_checkpoint_step_inside_an_operations_call_leaves_the_operations_owner_alone
         "the operation's owner took the checkpoint's demand"
     );
     assert!(named, "the checkpoint's claim named no demand of its own");
+}
+
+/// A page the cut's walk marks owed, written back and evicted once the cut has listed its swap
+/// shard, and read back in before the cut has listed the rest, still owes the cut its copy: its
+/// first change after the cut keeps it as the cut found it, and the checkpoint images that copy
+/// (OPEN-CORRUPT1). Before, it was read back unmarked, the list of pages owed not yet set, so its
+/// change kept nothing and the checkpoint imaged the page as it stood after the change: a leaf
+/// split after the cut, beside its parent as the cut found it.
+#[test]
+fn a_page_read_back_in_during_the_cut_still_owes_the_cut_its_copy() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-read-back", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    let shards = pool.store.swap_shards();
+    let pid = owed_page_before_the_last_shard(&io, &pool);
+    // The cut, run by run, until every shard but the last is listed.
+    let mut scan = CutScan::default();
+    let mut ran = true;
+    while ran && scan.shard + 1 < shards {
+        ran = matches!(pool.cut_run(N, &mut scan), IOResult::Done(false));
+    }
+    let marked = marked_for(&pool, pid, N);
+    // Written back, evicted and read in again, its swap copy landing after its shard was listed.
+    let evicted = read_back_in(&io, &pool, pid);
+    let ended = finish_cut(&pool, N, &mut scan);
+    let (kept, imaged) = first_change_and_image(&io, &pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(
+        ran && ended,
+        "the cut waited or ended before its last shard"
+    );
+    assert!(marked, "the walk did not mark the page owed");
+    assert!(evicted, "the page was not evicted");
+    assert!(kept, "the change found no room for its copy");
+    assert_eq!(
+        imaged,
+        ("kept", Some(1)),
+        "the checkpoint's image of a page read back in during the cut"
+    );
+}
+
+/// A run of the cut's walk that stops at a frame another holds lists the pages it marked before
+/// it stopped: one of them read back in after the cut still owes the cut its copy (mutant: the
+/// pages listed only when a run ends at its last frame).
+#[test]
+fn a_page_marked_by_a_run_that_stops_at_a_held_frame_still_owes_the_cut_its_copy() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-run-stopped", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    let pid = owed_page(&io, &pool, 1);
+    // A second page, later in the same run of frames, held as the run reaches it.
+    let frame_of = |pid: PageId| pool.table.find(&pool.frames.headers, pid.raw()).unwrap();
+    let held = loop {
+        let other = owed_page(&io, &pool, 1);
+        let (a, b) = (frame_of(pid), frame_of(other));
+        if b > a && a as usize / CUT_RUN == b as usize / CUT_RUN {
+            break other;
+        }
+    };
+    let holder = drive(&io, || pool.fix_exclusive(held, None)).unwrap();
+    let mut scan = CutScan::default();
+    let mut stopped = false;
+    while !stopped && scan.next < pool.memory.grains() {
+        stopped = matches!(pool.cut_run(N, &mut scan), IOResult::IO(_));
+    }
+    let marked = marked_for(&pool, pid, N);
+    holder.release_unchanged();
+    let ended = finish_cut(&pool, N, &mut scan);
+    let evicted = read_back_in(&io, &pool, pid);
+    let (kept, imaged) = first_change_and_image(&io, &pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(stopped, "the run did not stop at the held frame");
+    assert!(ended, "the cut waited with no holder");
+    assert!(marked, "the run did not mark the page before it stopped");
+    assert!(evicted, "the page was not evicted");
+    assert!(kept, "the change found no room for its copy");
+    assert_eq!(
+        imaged,
+        ("kept", Some(1)),
+        "the checkpoint's image of a page a stopped run marked"
+    );
+}
+
+/// A page owed with no frame at the cut, its swap copy listed by a shard's run, read in after the
+/// cut still owes the cut its copy (mutant: the shards' pages not listed).
+#[test]
+fn a_page_owed_in_its_swap_copy_alone_read_in_after_the_cut_still_owes_the_cut_its_copy() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-swapped", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    let pid = owed_page(&io, &pool, 1);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    let mut scan = CutScan::default();
+    let ended = finish_cut(&pool, N, &mut scan);
+    let listed = scan.owed.contains(&pid);
+    let g = drive(&io, || pool.fix_exclusive(pid, None)).unwrap();
+    g.release_unchanged();
+    let (kept, imaged) = first_change_and_image(&io, &pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(evicted, "the page was not evicted");
+    assert!(ended, "the cut waited with no holder");
+    assert!(listed, "the cut did not find the page owed");
+    assert!(kept, "the change found no room for its copy");
+    assert_eq!(
+        imaged,
+        ("kept", Some(1)),
+        "the checkpoint's image of a page owed in its swap copy alone"
+    );
+}
+
+/// A page the walk marks and that is evicted and read in again before its run lists it, the run
+/// not yet returned, still owes the cut its copy: its swap copy landed before the shards are
+/// listed, so the cut marks it again once they are (mutant: the swapped pages not marked again).
+#[test]
+fn a_page_read_back_in_before_its_run_lists_it_still_owes_the_cut_its_copy() {
+    use crate::race;
+    use std::{cell::Cell, rc::Rc};
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-before-listing", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    let pid = owed_page(&io, &pool, 1);
+    let frame = pool.table.find(&pool.frames.headers, pid.raw()).unwrap();
+    let mut scan = CutScan::default();
+    // Runs until the one that walks the page's frame.
+    let mut walked = true;
+    while walked && (scan.next as usize) / CUT_RUN < frame as usize / CUT_RUN {
+        walked = matches!(pool.cut_run(N, &mut scan), IOResult::Done(false));
+    }
+    let evicted = Rc::new(Cell::new(false));
+    {
+        let (io, pool, evicted) = (io.clone(), pool.clone(), evicted.clone());
+        race::at("buffer.cut_run_listing", move || {
+            evicted.set(read_back_in(&io, &pool, pid));
+        });
+    }
+    let ended = finish_cut(&pool, N, &mut scan);
+    let ran = !race::pending("buffer.cut_run_listing");
+    let (kept, imaged) = first_change_and_image(&io, &pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(walked && ended, "the cut waited with no holder");
+    assert!(ran, "the run never reached its listing");
+    assert!(evicted.get(), "the page was not evicted");
+    assert!(kept, "the change found no room for its copy");
+    assert_eq!(
+        imaged,
+        ("kept", Some(1)),
+        "the checkpoint's image of a page read back in before its run listed it"
+    );
+}
+
+/// A page read in from its swap copy during the cut, its read landed before the cut lists it and
+/// the page made resident only after the cut's last look at its frame, still owes the cut its
+/// copy: the read makes the page resident before it reads the list, so either it finds the page
+/// listed or the cut finds the frame resident and held and marks it once the read lets go (mutant:
+/// the list read before the page is resident).
+#[test]
+fn a_page_made_resident_after_the_cuts_last_look_at_its_frame_still_owes_the_cut_its_copy() {
+    use crate::race;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-last-look", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    // Owed, in its swap copy alone.
+    let pid = owed_page(&io, &pool, 1);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    // The walk over the frames, then the read: the rest of the cut runs once the read has landed,
+    // its page not yet resident.
+    let scan = Rc::new(RefCell::new(CutScan::default()));
+    let mut walked = true;
+    while walked && scan.borrow().next < pool.memory.grains() {
+        walked = matches!(
+            pool.cut_run(N, &mut scan.borrow_mut()),
+            IOResult::Done(false)
+        );
+    }
+    let ended = Rc::new(Cell::new(false));
+    {
+        let (pool, scan, ended) = (pool.clone(), scan.clone(), ended.clone());
+        race::at("buffer.loaded_resident", move || {
+            ended.set(finish_cut(&pool, N, &mut scan.borrow_mut()));
+        });
+    }
+    let g = drive(&io, || pool.fix_exclusive(pid, None)).unwrap();
+    g.release_unchanged();
+    let ran = !race::pending("buffer.loaded_resident");
+    let listed = scan.borrow().owed.contains(&pid);
+    let (kept, imaged) = first_change_and_image(&io, &pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(evicted, "the page was not evicted");
+    assert!(walked, "the walk over the frames waited");
+    assert!(
+        ran && ended.get(),
+        "the cut did not end where the read landed"
+    );
+    assert!(listed, "the cut did not find the page owed");
+    assert!(kept, "the change found no room for its copy");
+    assert_eq!(
+        imaged,
+        ("kept", Some(1)),
+        "the checkpoint's image of a page made resident after the cut's last look"
+    );
+}
+
+/// A page owed in its swap copy alone, read in and changed while the cut walks the frames, before
+/// a shard's run lists it, as a leaf put may (it does not enter the change gate), is listed at the
+/// count its swap copy holds and marked by the late look at the count it stands at then: the count
+/// its image must stand at (mutant: the late look leaves the count the shard's run listed).
+#[test]
+fn a_page_changed_during_the_walk_before_its_shard_lists_it_is_owed_at_its_count_then() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-changed-in-walk", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    let pid = owed_page(&io, &pool, 1);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    let swapped_at = pool.store.swap_count(pid);
+    let mut scan = CutScan::default();
+    let mut walked = true;
+    while walked && scan.next < pool.memory.grains() {
+        walked = matches!(pool.cut_run(N, &mut scan), IOResult::Done(false));
+    }
+    // Read in and changed with no copy: not yet listed, so not pending.
+    let mut g = drive(&io, || pool.fix_exclusive(pid, None)).unwrap();
+    let kept = pool.keep(&[&g], &mut RoomWait::default()).is_ok();
+    stamp(&mut g.page_mut(), pid, 2);
+    g.changed();
+    let now = pool.header(g.frame).changes.load(Ordering::Acquire);
+    drop(g);
+    let ended = finish_cut(&pool, N, &mut scan);
+    let counted = scan.counts.get(&pid).copied();
+    let marked = marked_for(&pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(evicted, "the page was not evicted");
+    assert!(walked && ended, "the cut waited with no holder");
+    assert!(kept, "the change found no room");
+    assert!(marked, "the late look did not mark the page");
+    assert_ne!(
+        swapped_at,
+        Some(now),
+        "the change moved the page past its swap copy"
+    );
+    assert_eq!(
+        counted,
+        Some(now),
+        "the count a page changed during the walk is to be imaged at"
+    );
+}
+
+/// A page owed in its swap copy alone, freed as unreferenced with no cut in effect, is read in
+/// before its free: a cut that began after the free looked would owe it, and an unread free keeps
+/// no copy (OPEN-CORRUPT1; mutant: the swap copy not asked about).
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn a_page_in_its_swap_copy_alone_is_read_in_before_an_unreferenced_free() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/unreferenced-swapped", MIN_KEEPING_BUDGET);
+    let pid = owed_page(&io, &pool, 1);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    let swapped = pool.store.swap_slot(pid).is_some();
+    let before = pool.loaded_pages().len();
+    let freed = drive(&io, || pool.free_unreferenced(pid)).is_ok();
+    let read_in = pool.loaded_pages()[before..].contains(&pid.raw());
+    drop(pool);
+    assert!(evicted && swapped, "the page is not in its swap copy alone");
+    assert!(freed, "the free failed");
+    assert!(read_in, "the page was freed unread");
+}
+
+/// A new page stamped `version` and changed, so owed an image: resident, no swap copy.
+fn owed_page(io: &Arc<dyn IO>, pool: &Arc<BufferPool>, version: u64) -> PageId {
+    let mut g = drive(io, || pool.allocate(class(0))).unwrap();
+    let pid = g.pid();
+    stamp(&mut g.page_mut(), pid, version);
+    g.changed();
+    drop(g);
+    pid
+}
+
+/// An owed page, resident with no swap copy, whose swap copy would go in a shard the cut lists
+/// before its last: written back once to learn its shard, that copy then given up.
+fn owed_page_before_the_last_shard(io: &Arc<dyn IO>, pool: &Arc<BufferPool>) -> PageId {
+    let shards = pool.store.swap_shards();
+    loop {
+        let pid = owed_page(io, pool, 1);
+        let mut sweep = pool.sweep();
+        drive(io, || sweep.step(pool)).unwrap();
+        let shard = (0..shards)
+            .find(|&i| {
+                pool.store
+                    .swap_shard_pages(i, None, usize::MAX)
+                    .contains(&pid)
+            })
+            .expect("written back");
+        pool.store.drop_swap(pid);
+        let mut g = drive(io, || pool.fix_exclusive(pid, None)).unwrap();
+        stamp(&mut g.page_mut(), pid, 1);
+        g.changed();
+        drop(g);
+        if shard + 1 < shards {
+            return pid;
+        }
+    }
+}
+
+/// Whether `pid`'s frame is marked owed a copy for cut `n`.
+fn marked_for(pool: &Arc<BufferPool>, pid: PageId, n: u64) -> bool {
+    let frame = pool.table.find(&pool.frames.headers, pid.raw()).unwrap();
+    pool.owes_copy(frame, pid, n)
+}
+
+/// Writes `pid` back, evicts it and reads it in again: whether it was evicted.
+fn read_back_in(io: &Arc<dyn IO>, pool: &Arc<BufferPool>, pid: PageId) -> bool {
+    let mut sweep = pool.sweep();
+    drive(io, || sweep.step(pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    let g = drive(io, || pool.fix_exclusive(pid, None)).unwrap();
+    g.release_unchanged();
+    evicted
+}
+
+/// Runs cut `n` to its end: whether it got there with no wait.
+fn finish_cut(pool: &Arc<BufferPool>, n: u64, scan: &mut CutScan) -> bool {
+    loop {
+        match pool.cut_run(n, scan) {
+            IOResult::Done(true) => return true,
+            IOResult::Done(false) => {}
+            IOResult::IO(_) => return false,
+        }
+    }
+}
+
+/// `pid`'s first change after cut `n`, as every change makes it (its copies first, then version
+/// 2), then what checkpoint `n` images of it: whether the change had room for its copies, and
+/// whether the image is the kept copy or the page as it stands, with its version.
+fn first_change_and_image(
+    io: &Arc<dyn IO>,
+    pool: &Arc<BufferPool>,
+    pid: PageId,
+    n: u64,
+) -> (bool, (&'static str, Option<u64>)) {
+    let mut g = drive(io, || pool.fix_exclusive(pid, None)).unwrap();
+    let kept = pool.keep(&[&g], &mut RoomWait::default()).is_ok();
+    stamp(&mut g.page_mut(), pid, 2);
+    g.changed();
+    drop(g);
+    let imaged = match drive(io, || pool.image_source(n, pid)).unwrap() {
+        Source::Kept(copy) => ("kept", stamped(&copy[..], pid)),
+        Source::Live { bytes, .. } => ("live", stamped(&bytes[..], pid)),
+    };
+    (kept, imaged)
 }
 
 /// A cut walks the frames a run at a time (DESIGN.md 22.1, 22.9 item 1): the frame headers one

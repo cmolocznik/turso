@@ -421,9 +421,7 @@ impl FrameOwner for BufferPool {
         BufferPool::record_retired(self, class, frame);
     }
 }
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// What a round of making room did: started work that makes room (a drain of a batch no drain had,
 /// an eviction, a write-out), and what it did about the resident pages it found latched (DESIGN.md
@@ -1247,14 +1245,18 @@ impl BufferPool {
                 let owed = !pid.is_temporary() && self.store.swap_slot(pid).is_some();
                 h.imaged
                     .store(if owed { 0 } else { count }, Ordering::Release);
+                self.close_group(frame);
+                crate::race::point("buffer.loaded_resident");
+                h.status.store(RESIDENT, Ordering::Release);
+                crate::race::point("buffer.loaded_published");
                 // Evicted owed at a cut and not yet imaged: still the page as the cut found it.
+                // Resident before the list is read, under the list's lock: a cut that lists the
+                // page after this read finds its frame resident and held, and marks it once the
+                // hold is let go (OPEN-CORRUPT1).
                 let n = self.memory.cutting.load(Ordering::Acquire);
                 let pending = n != 0 && owed && self.cut_owed.lock().contains(&pid);
                 h.pending
                     .store(if pending { n } else { 0 }, Ordering::Release);
-                self.close_group(frame);
-                h.status.store(RESIDENT, Ordering::Release);
-                crate::race::point("buffer.loaded_published");
                 drop(hold);
                 if let Some(c) = waiting {
                     notify::finish(&c, Ok(0));
@@ -1694,9 +1696,13 @@ impl BufferPool {
         let _step = self.store.epochs().enter();
         loop {
             // During a cut the page is read in: a checkpoint may owe its image, which its free
-            // keeps.
-            let cut = self.memory.cutting.load(Ordering::Acquire) != 0 && !pid.is_temporary();
-            if cut || self.table.find(&self.frames.headers, pid.raw()).is_some() {
+            // keeps. So is a page with a swap copy, the one kind a cut can owe with no frame: a
+            // cut that begins after this look would find it owed with its free under way unread
+            // and no copy kept (OPEN-CORRUPT1).
+            let owed_unread = !pid.is_temporary()
+                && (self.memory.cutting.load(Ordering::Acquire) != 0
+                    || self.store.swap_slot(pid).is_some());
+            if owed_unread || self.table.find(&self.frames.headers, pid.raw()).is_some() {
                 return match self.fix_exclusive(pid, None)? {
                     IOResult::Done(page) => self.free_page(page, wait_out_a_cut),
                     IOResult::IO(io) => Ok(IOResult::IO(io)),
@@ -3099,8 +3105,9 @@ impl BufferPool {
     /// The cut of checkpoint `n`, under the store's closed change gate: every page owed an image
     /// is marked pending, under its latch, so its first change from then on keeps it as it
     /// stands. `scan` collects them, those with a swap copy and no frame included. Eviction goes
-    /// on meanwhile, so the swap copies are listed after the frames, and every page owed stays
-    /// listed until it is imaged or kept: one read in again comes in pending. Each call does one
+    /// on meanwhile, so the swap copies are listed after the frames, and every page owed is in the
+    /// list of pages owed from the run that finds it until it is imaged or kept: one read in again
+    /// comes in pending, during the walk as after it (OPEN-CORRUPT1). Each call does one
     /// run of the walk (DESIGN.md 22.1, 22.9 item 1): the frame headers one page of the header
     /// table holds ([`CUT_RUN`]), or one shard of the swap table, or [`CUT_RUN`] of the swapped
     /// pages looked at again. Done(true) once the cut has found every page owed.
@@ -3108,32 +3115,38 @@ impl BufferPool {
         self.memory.cutting.store(n, Ordering::SeqCst);
         let grains = self.memory.grains();
         if scan.next < grains {
+            let from = scan.owed.len();
             let end = grains.min(scan.next.saturating_add(CUT_RUN as u32));
-            while scan.next < end {
+            let stopped = loop {
+                if scan.next == end {
+                    break None;
+                }
                 let h = self.header(scan.next);
                 if h.status() == RESIDENT {
                     // A change holds it for a moment: come back.
                     let Some(hold) = Held::try_take(self.frame_ref(scan.next)) else {
-                        return IOResult::IO(IOCompletions(
-                            self.wait_for_resident_latch(scan.next),
-                        ));
+                        break Some(self.wait_for_resident_latch(scan.next));
                     };
-                    let listed = scan.owed.len();
-                    self.mark_owed(scan.next, n, &mut scan.owed);
+                    self.mark_owed(scan.next, n, &mut scan.owed, &mut scan.counts);
                     hold.release_unchanged();
-                    scan.seen.extend(scan.owed[listed..].iter().copied());
-                } else if h.status() == OUTGOING {
-                    let listed = scan.owed.len();
-                    if !self.record_outgoing(scan.next, &mut scan.owed) {
-                        // The write-out finished or the frame changed hands while its header was
-                        // read.
-                        return IOResult::IO(IOCompletions(Completion::new_yield()));
-                    }
-                    scan.seen.extend(scan.owed[listed..].iter().copied());
+                } else if h.status() == OUTGOING
+                    && !self.record_outgoing(scan.next, &mut scan.owed, &mut scan.counts)
+                {
+                    // The write-out finished or the frame changed hands while its header was read.
+                    break Some(Completion::new_yield());
                 }
                 scan.next += 1;
-            }
-            return IOResult::Done(false);
+            };
+            crate::race::point("buffer.cut_run_listing");
+            // Listed before the run returns: a page it marked and that is evicted and read in
+            // again before the walk ends comes in pending.
+            let found = &scan.owed[from..];
+            scan.seen.extend(found.iter().copied());
+            self.cut_owed.lock().extend(found.iter().copied());
+            return match stopped {
+                None => IOResult::Done(false),
+                Some(c) => IOResult::IO(IOCompletions(c)),
+            };
         }
         let shards = self.store.swap_shards();
         if scan.shard < shards {
@@ -3143,12 +3156,19 @@ impl BufferPool {
             let pages = self
                 .store
                 .swap_shard_pages(scan.shard, scan.shard_after, CUT_RUN);
+            let from = scan.owed.len();
             for &pid in &pages {
                 if scan.seen.insert(pid) {
                     scan.owed.push(pid);
+                    if let Some(count) = self.store.swap_count(pid) {
+                        scan.counts.insert(pid, count);
+                    }
                 }
                 scan.swapped.push(pid);
             }
+            self.cut_owed
+                .lock()
+                .extend(scan.owed[from..].iter().copied());
             if pages.len() < CUT_RUN {
                 scan.shard += 1;
                 scan.shard_after = None;
@@ -3156,29 +3176,57 @@ impl BufferPool {
                 scan.shard_after = pages.last().copied();
             }
             if scan.shard == shards {
-                *self.cut_owed.lock() = std::mem::take(&mut scan.seen);
+                // Every page owed is in the list already, but those imaged or kept since.
+                drop(std::mem::take(&mut scan.seen));
             }
             return IOResult::Done(false);
         }
-        // A page with a swap copy read in after the walk passed its frame, before the list was
-        // set: unchanged since, the gate being closed.
-        // Only a resident page is marked here: one loading marks itself pending as it lands, the
-        // list being set, and one leaving leaves its frame, read back in pending. Their latches
-        // are held until IO no one here steps ends.
+        // A page with a swap copy read in after the walk passed its frame, before a shard's run
+        // listed it, and still owed (no copy kept): marked now, at the count it stands at. A leaf
+        // put does not enter the gate, so it may have changed since its swap copy was written.
+        // Only a resident page is marked here: one loading marks itself pending as it lands, and
+        // one leaving leaves its frame, read back in pending; their latches are held until IO no
+        // one here steps ends. Their counts are taken again too: the copy being read, or the one
+        // being written.
         for _ in 0..CUT_RUN {
             let Some(&pid) = scan.swapped.last() else {
                 return IOResult::Done(true);
             };
-            if let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) {
-                let h = self.header(frame);
-                if h.status() == RESIDENT {
+            let frame = self.table.find(&self.frames.headers, pid.raw());
+            match frame.map(|f| (f, self.header(f).status())) {
+                Some((frame, RESIDENT)) => {
+                    let h = self.header(frame);
                     let Some(hold) = Held::try_take(self.frame_ref(frame)) else {
                         return IOResult::IO(IOCompletions(self.wait_for_resident_latch(frame)));
                     };
-                    if h.status() == RESIDENT && h.pid() == pid.raw() {
+                    if h.status() == RESIDENT
+                        && h.pid() == pid.raw()
+                        && self.cut_owed.lock().contains(&pid)
+                    {
                         h.pending.store(n, Ordering::Release);
+                        scan.counts.insert(pid, h.changes.load(Ordering::Relaxed));
                     }
                     hold.release_unchanged();
+                }
+                Some((frame, OUTGOING)) => {
+                    let mut leaving = Vec::new();
+                    let mut count = HashMap::new();
+                    if !self.record_outgoing(frame, &mut leaving, &mut count) {
+                        // The write-out finished or the frame changed hands: look again.
+                        return IOResult::IO(IOCompletions(Completion::new_yield()));
+                    }
+                    if let Some(&c) = count.get(&pid) {
+                        if self.cut_owed.lock().contains(&pid) {
+                            scan.counts.insert(pid, c);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(c) = self.store.swap_count(pid) {
+                        if self.cut_owed.lock().contains(&pid) {
+                            scan.counts.insert(pid, c);
+                        }
+                    }
                 }
             }
             scan.swapped.pop();
@@ -3231,7 +3279,12 @@ impl BufferPool {
     /// Records an owed page frozen by its write-out, even before its first swap copy exists.
     /// The frame's hold stays at one version until the write frees it. The version check rejects
     /// a header read across that free and a reuse of the frame.
-    fn record_outgoing(&self, frame: u32, owed: &mut Vec<PageId>) -> bool {
+    fn record_outgoing(
+        &self,
+        frame: u32,
+        owed: &mut Vec<PageId>,
+        counts: &mut HashMap<PageId, u64>,
+    ) -> bool {
         let h = self.header(frame);
         let seen = match h.latch.look() {
             Look::Held(seen) => seen,
@@ -3241,6 +3294,8 @@ impl BufferPool {
         let pid = PageId::from_raw(h.pid());
         let needed = !pid.is_temporary() && h.owed();
         let outgoing = h.status() == OUTGOING;
+        // Frozen by the write-out's hold, read before the check that the hold is the same.
+        let count = h.changes.load(Ordering::Relaxed);
         crate::sync::atomic::fence(Ordering::Acquire);
         let same_hold =
             matches!(h.latch.look(), Look::Held(now) if now.version() == seen.version());
@@ -3249,16 +3304,25 @@ impl BufferPool {
         }
         if needed {
             owed.push(pid);
+            counts.insert(pid, count);
         }
         true
     }
 
-    fn mark_owed(&self, frame: u32, n: u64, owed: &mut Vec<PageId>) {
+    fn mark_owed(
+        &self,
+        frame: u32,
+        n: u64,
+        owed: &mut Vec<PageId>,
+        counts: &mut HashMap<PageId, u64>,
+    ) {
         let h = self.header(frame);
         let pid = PageId::from_raw(h.pid());
         if h.status() == RESIDENT && !pid.is_temporary() && h.owed() {
             h.pending.store(n, Ordering::Release);
             owed.push(pid);
+            // Relaxed: under the frame's latch. No change from here on goes without a copy.
+            counts.insert(pid, h.changes.load(Ordering::Relaxed));
         }
     }
 
@@ -3327,6 +3391,18 @@ impl BufferPool {
             hold.release_unchanged();
             return Ok(IOResult::Done(()));
         }
+    }
+
+    /// Takes `pid` off the cut in effect as a lost mark would, for a test: its frame no longer
+    /// pending, and out of the list of pages owed. Whether it has a frame.
+    #[cfg(all(test, unix, not(any(shuttle, atoll_loom, miri))))]
+    pub fn forget_cut_mark(&self, pid: PageId) -> bool {
+        let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) else {
+            return false;
+        };
+        self.header(frame).pending.store(0, Ordering::Release);
+        self.cut_owed.lock().remove(&pid);
+        true
     }
 
     /// Whether `pid`'s frame holds changes no checkpoint copy has, for a test; `None` with no frame.
@@ -3498,6 +3574,9 @@ impl EndCut {
 pub struct CutScan {
     next: u32,
     pub owed: Vec<PageId>,
+    /// The change count each page owed is to be imaged at: as the walk found it, or as the late
+    /// look at the swapped pages found it.
+    pub counts: HashMap<PageId, u64>,
     /// The next shard of the swap table to list, the pages owed listed so far, and the swapped
     /// pages still to look at again.
     shard: usize,

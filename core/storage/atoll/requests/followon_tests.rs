@@ -249,6 +249,7 @@ fn superblock(seq: u64) -> Superblock {
         seq,
         redo: 0,
         segment_bytes: 1 << 20,
+        segment_growth: 0,
         file_bytes: 1 << 30,
         database_id: [3; 16],
         heights: [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],

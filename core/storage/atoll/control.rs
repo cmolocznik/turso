@@ -2,7 +2,7 @@
 //! is in charge, so a superblock torn by a crash leaves the one before it in charge.
 //!
 //! ```text
-//! magic: u64 | version: u32 | reserved: u32 | seq: u64 | redo: u64 | segment_bytes: u64 |
+//! magic: u64 | version: u32 | segment_growth: u32 | seq: u64 | redo: u64 | segment_bytes: u64 |
 //! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 2] | clock: u64 |
 //! snapshot: u64 | checkpoint: u64 | continuations: u64 | (ended: u64, resumed: u64) *
 //! continuations | zeros |
@@ -49,7 +49,11 @@ pub struct Superblock {
     pub seq: u64,
     /// Where recovery starts reading the log: every commit before it is at or below `snapshot`.
     pub redo: Lsn,
+    /// Bytes of the largest log segment, every segment's from the `segment_growth`-th on.
     pub segment_bytes: u64,
+    /// How many log segments come before the first of `segment_bytes`, the first of
+    /// `segment_bytes >> segment_growth` bytes and each next twice the one before (DISK-MIN1).
+    pub segment_growth: u32,
     pub file_bytes: u64,
     pub database_id: [u8; 16],
     /// Levels of the page table (`[0]`) and free space (`[1]`) of each size class, at the cut.
@@ -73,6 +77,7 @@ impl Superblock {
         let mut out = vec![0u8; SIZE];
         out[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         out[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        out[12..16].copy_from_slice(&self.segment_growth.to_le_bytes());
         out[16..24].copy_from_slice(&self.seq.to_le_bytes());
         out[24..32].copy_from_slice(&self.redo.to_le_bytes());
         out[32..40].copy_from_slice(&self.segment_bytes.to_le_bytes());
@@ -134,6 +139,20 @@ impl Superblock {
                 )))
             }
         };
+        let (segment_bytes, segment_growth) = (
+            word(32),
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        );
+        let first = segment_bytes.checked_shr(segment_growth).unwrap_or(0);
+        if first == 0
+            || first << segment_growth != segment_bytes
+            || !first.is_multiple_of(super::log::BLOCK)
+        {
+            return Err(LimboError::Corrupt(format!(
+                "a superblock naming log segments of {segment_bytes} bytes after {segment_growth} \
+                 smaller ones, which no whole first segment begins"
+            )));
+        }
         let mut heights = [[0u8; CLASS_COUNT]; TREES];
         for (t, heights) in heights.iter_mut().enumerate() {
             let at = HEIGHTS + t * CLASS_COUNT;
@@ -153,7 +172,8 @@ impl Superblock {
         Ok(Some(Self {
             seq: word(16),
             redo: word(24),
-            segment_bytes: word(32),
+            segment_bytes,
+            segment_growth,
             file_bytes: word(40),
             database_id: bytes[48..64].try_into().unwrap(),
             heights,
@@ -416,6 +436,7 @@ mod tests {
             seq,
             redo: 12_288,
             segment_bytes: 1 << 28,
+            segment_growth: 8,
             file_bytes: 1 << 40,
             database_id: [9; 16],
             heights: [[2; CLASS_COUNT], [1; CLASS_COUNT]],

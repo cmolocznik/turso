@@ -461,6 +461,7 @@ fn on(calls: &[Call], thread: &str) -> Vec<(&'static str, usize)> {
 fn small() -> LogConfig {
     LogConfig {
         segment_bytes: 64 << 10,
+        first_segment_bytes: 64 << 10,
         buffer_bytes: 32 << 10,
         chunk_bytes: 8 << 10,
         writes_in_flight: 3,
@@ -945,6 +946,7 @@ fn one_plans_chunk_loads_are_at_most_the_rings() {
     let chunk = 8 << 10;
     let config = LogConfig {
         segment_bytes: 1 << 20,
+        first_segment_bytes: 1 << 20,
         buffer_bytes: 76 * chunk,
         chunk_bytes: chunk,
         writes_in_flight: 8,
@@ -1313,6 +1315,7 @@ fn a_sync_group_wider_than_a_word_is_made_whole() {
     let chunk = 8 << 10;
     let config = LogConfig {
         segment_bytes: chunk,
+        first_segment_bytes: chunk,
         buffer_bytes: 70 * chunk,
         chunk_bytes: chunk,
         writes_in_flight: 70,
@@ -1376,6 +1379,7 @@ fn a_sync_group_wider_than_a_word_is_made_whole() {
 fn padding_past_the_buffer_leaves_every_sync_group_within_its_cap() {
     let config = LogConfig {
         segment_bytes: BLOCK,
+        first_segment_bytes: BLOCK,
         buffer_bytes: BLOCK,
         chunk_bytes: BLOCK,
         writes_in_flight: 1,

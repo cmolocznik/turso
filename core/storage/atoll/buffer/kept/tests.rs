@@ -49,6 +49,7 @@ fn config() -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 1 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 256 << 10,
             chunk_bytes: 16 << 10,
             writes_in_flight: 3,
@@ -1096,6 +1097,7 @@ fn a_checkpoints_intent_needing_a_segment_is_prepared_by_its_claimant_with_no_wo
     // Segments a quarter of the log's buffer: all the room before the prepared end can be held
     // and the intent record still fit the buffer once the next segment is published.
     config.log.segment_bytes = 64 << 10;
+    config.log.first_segment_bytes = 64 << 10;
     let db = Db::with(crash.clone(), Some(crash.clone()), config);
     let tree = db.create(node_class());
     for k in 0..64 {

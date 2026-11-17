@@ -107,6 +107,9 @@ pub(super) struct Room {
     durable: CachePadded<AtomicU64>,
     /// Records may be written below this: every segment before it is prepared.
     prepared_end: AtomicU64,
+    /// Bytes of the segment that ends at the prepared end, set before the end moves: a reach
+    /// within it makes the next segment due.
+    last_prepared: AtomicU64,
     /// Bytes appended and not yet durable, past which nothing more is granted.
     buffer: u64,
 }
@@ -130,7 +133,7 @@ pub(super) enum Pad {
 }
 
 impl Room {
-    pub(super) fn new(start: u64, prepared_end: u64, buffer: u64) -> Self {
+    pub(super) fn new(start: u64, prepared_end: u64, last_prepared: u64, buffer: u64) -> Self {
         Self {
             ends: CachePadded::new(Ends {
                 insert: AtomicU64::new(start),
@@ -138,6 +141,7 @@ impl Room {
             }),
             durable: CachePadded::new(AtomicU64::new(start)),
             prepared_end: AtomicU64::new(prepared_end),
+            last_prepared: AtomicU64::new(last_prepared),
             buffer,
         }
     }
@@ -164,7 +168,15 @@ impl Room {
         self.prepared_end.load(Ordering::SeqCst)
     }
 
-    pub(super) fn set_prepared_end(&self, end: u64) {
+    /// Bytes of the segment that ends at the prepared end. Read after the end, it is that end's
+    /// segment's or a later one's, which only makes the next segment due sooner.
+    pub(super) fn last_prepared(&self) -> u64 {
+        self.last_prepared.load(Ordering::Relaxed)
+    }
+
+    /// The prepared end moved to `end`, the end of a segment of `last` bytes.
+    pub(super) fn set_prepared_end(&self, end: u64, last: u64) {
+        self.last_prepared.store(last, Ordering::Relaxed);
         self.prepared_end.store(end, Ordering::SeqCst);
     }
 
@@ -270,7 +282,7 @@ mod loom_tests {
         model.check(|| {
             let at = BLOCK - 64;
             // Room for the padding or the grant, not both.
-            let room = Arc::new(Room::new(at, BLOCK + 32, u64::MAX));
+            let room = Arc::new(Room::new(at, BLOCK + 32, BLOCK + 32, u64::MAX));
             let granter = {
                 let room = room.clone();
                 thread::spawn(move || room.grant(96, true))
@@ -298,7 +310,7 @@ mod loom_tests {
         model.preemption_bound = Some(3);
         model.check(|| {
             // A buffer of 64 bytes, which the giver's admission holds whole.
-            let room = Arc::new(Room::new(0, u64::MAX, 64));
+            let room = Arc::new(Room::new(0, u64::MAX, u64::MAX, 64));
             assert!(room.grant(64, true));
             let waiting = Arc::new(Admitters::<Arc<AtomicBool>>::default());
             let giver = {

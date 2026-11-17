@@ -43,6 +43,9 @@ mod sync {
 pub(super) struct Fields<S> {
     pub(super) start: u64,
     pub(super) end: u64,
+    /// The segment it lies in, and where that segment starts: a write lies within one segment.
+    pub(super) segment: u64,
+    pub(super) segment_start: u64,
     /// The block it is written from, and where in it `start` lies; `None` for the ring's.
     pub(super) source: Option<S>,
     /// The bytes its parts have written so far: at most `end - start`, which the take bounds by
@@ -89,6 +92,8 @@ impl<S> Writes<S> {
                     Plain::new(Fields {
                         start: 0,
                         end: 0,
+                        segment: 0,
+                        segment_start: 0,
                         source: None,
                         done: 0,
                         told: false,

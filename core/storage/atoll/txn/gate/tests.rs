@@ -29,6 +29,7 @@ fn open(slots: usize) -> Db {
     let config = AtollConfig {
         log: LogConfig {
             segment_bytes: 1 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 256 << 10,
             chunk_bytes: 16 << 10,
             writes_in_flight: 3,

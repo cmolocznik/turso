@@ -133,9 +133,14 @@ pub fn ring_bytes(config: &LogConfig) -> usize {
 
 #[derive(Debug, Clone)]
 pub struct LogConfig {
-    /// Bytes per segment file, a multiple of [`BLOCK`]. At the 1 GB/s log rate Umbra measured
-    /// (Freitag et al., VLDB 2022 §4), the default of 256 MiB lasts a quarter of a second.
+    /// Bytes of the largest segment file, a multiple of [`BLOCK`]. At the 1 GB/s log rate Umbra
+    /// measured (Freitag et al., VLDB 2022 §4), the default of 256 MiB lasts a quarter of a second.
     pub segment_bytes: u64,
+    /// Bytes of the first segment file, a multiple of [`BLOCK`]; each next segment is twice the one
+    /// before until one is `segment_bytes`, which must be a power of two times this (DISK-MIN1). By
+    /// default 1 MiB: a new database writes 1 MiB of zeros for its first segment and 2 MiB for the
+    /// one prepared ahead, not two of the largest.
+    pub first_segment_bytes: u64,
     /// Bytes appended and not yet durable, past which new operations wait to be admitted. The
     /// default is what the device may be writing at once, `writes_in_flight` chunks: the ring
     /// holds them and the chunk filling while they land, in frames of the engine's one memory,
@@ -152,10 +157,18 @@ pub struct LogConfig {
     pub direct: bool,
 }
 
+impl LogConfig {
+    /// The first segment's bytes and the largest's.
+    pub(crate) fn segment_sizes(&self) -> (u64, u64) {
+        (self.first_segment_bytes, self.segment_bytes)
+    }
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
             segment_bytes: 256 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 4 * (256 << 10),
             chunk_bytes: 256 << 10,
             writes_in_flight: 4,
@@ -175,6 +188,48 @@ struct Slot {
     block: Arc<AlignedBlock>,
     /// Bytes copied into this slot over all the chunks it has held.
     copied: AtomicU64,
+}
+
+/// The segment a flush turn's writes go to: the turn's own, read and written only while the turn
+/// is held, so relaxed.
+#[derive(Default)]
+struct TurnSegment {
+    number: AtomicU64,
+    start: AtomicU64,
+    end: AtomicU64,
+}
+
+/// A segment's number and the log positions it starts and ends at.
+#[derive(Clone, Copy)]
+struct SegmentAt {
+    number: u64,
+    start: Lsn,
+    end: Lsn,
+}
+
+impl TurnSegment {
+    fn load(&self) -> SegmentAt {
+        SegmentAt {
+            number: self.number.load(Ordering::Relaxed),
+            start: self.start.load(Ordering::Relaxed),
+            end: self.end.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The turn's writes moved on to the segment `at` lies in: kept for the turns after.
+    #[cold]
+    fn moved_to(&self, segments: &Segments<Typed>, at: Lsn) -> SegmentAt {
+        let number = segments.number(at);
+        let moved = SegmentAt {
+            number,
+            start: segments.start(number),
+            end: segments.start(number + 1),
+        };
+        self.number.store(moved.number, Ordering::Relaxed);
+        self.start.store(moved.start, Ordering::Relaxed);
+        self.end.store(moved.end, Ordering::Relaxed);
+        moved
+    }
 }
 
 pub struct Log {
@@ -198,6 +253,9 @@ pub struct Log {
     input: CachePadded<AtomicBool>,
     /// Where the flush taking its turn writes from next: the turn's own.
     submitted: CachePadded<AtomicU64>,
+    /// The segment the turn's writes went to last: the turn's own, worked out again only when a
+    /// write starts past its end, as the turn writes in log order (DISK-MIN1).
+    turn_segment: CachePadded<TurnSegment>,
     /// Writes submitted and not yet retired, the records of [`writes`](Self::writes) not at rest:
     /// a place is taken with its record and given back when the record rests, at its last part's
     /// retirement ([`part_retired`](Self::part_retired)), never at its result's publication. Moved
@@ -514,6 +572,12 @@ impl Log {
     ) -> Result<Arc<Self>> {
         assert!(
             config.segment_bytes.is_multiple_of(BLOCK)
+                && config.first_segment_bytes.is_multiple_of(BLOCK)
+                && config.first_segment_bytes > 0
+                && config
+                    .segment_bytes
+                    .is_multiple_of(config.first_segment_bytes)
+                && (config.segment_bytes / config.first_segment_bytes).is_power_of_two()
                 && config.chunk_bytes.is_multiple_of(BLOCK)
                 && config.segment_bytes > 0
                 && config.chunk_bytes > 0
@@ -525,7 +589,7 @@ impl Log {
             "a log buffer smaller than one chunk"
         );
         let io: Arc<dyn IO> = counted.clone();
-        let segments = Segments::counted(counted, base, config.segment_bytes, config.direct);
+        let segments = Segments::counted(counted, base, config.segment_sizes(), config.direct);
         segments.adopt_spares()?;
         let start = Self::resumes_at(end);
         let current = segments.number(start);
@@ -544,12 +608,18 @@ impl Log {
             io,
             durable_writes,
             ring,
-            room: Room::new(start, segments.start(current + 1), config.buffer_bytes),
+            room: Room::new(
+                start,
+                segments.start(current + 1),
+                segments.size_of(current),
+                config.buffer_bytes,
+            ),
             // The writes in flight lie within the ring of the position, in whole blocks.
             landed: CachePadded::new(Prefix::new(start, span, BLOCK)),
             wanted: CachePadded::new(AtomicU64::new(0)),
             input: CachePadded::new(AtomicBool::new(true)),
             submitted: CachePadded::new(AtomicU64::new(start)),
+            turn_segment: CachePadded::new(TurnSegment::default()),
             in_flight: CachePadded::new(AtomicUsize::new(0)),
             writes: Writes::new(config.writes_in_flight),
             flushes: CachePadded::default(),
@@ -625,10 +695,11 @@ impl Log {
             None => segments.create(current)?,
         };
         let from = start - segments.start(current);
-        let zeros = Arc::new(AlignedBlock::zeroed((1 << 20).min(segments.size as usize)));
+        let size = segments.size_of(current);
+        let zeros = Arc::new(AlignedBlock::zeroed((1 << 20).min(size as usize)));
         let mut at = from;
-        while at < segments.size {
-            let len = (segments.size - at).min(zeros.len() as u64);
+        while at < size {
+            let len = (size - at).min(zeros.len() as u64);
             let (write, zeroed) = whole_write(len as usize);
             drop(file.pwrite(at, zeros.region(0, len as usize), write)?);
             crate::storage::atoll::park::wait_for_completion(io.as_ref(), zeroed)?;
@@ -662,6 +733,13 @@ impl Log {
     /// Where the next record will start.
     pub fn end(&self) -> Lsn {
         self.room.end()
+    }
+
+    /// The segment `lsn` lies in and its size, for a test.
+    #[cfg(test)]
+    pub(crate) fn segment_at(&self, lsn: Lsn) -> (u64, u64) {
+        let number = self.segments.number(lsn);
+        (number, self.segments.size_of(number))
     }
 
     /// A record other than a checkpoint's own was reserved: the input mark set, if clear. After the
@@ -761,7 +839,7 @@ impl Log {
         // One read of the prepared end for the test and the trigger: what the trigger promotes is
         // the end the admission found itself within a segment of.
         let end = self.room.prepared_end();
-        if end.saturating_sub(self.room.reach()) <= self.segments.size {
+        if end.saturating_sub(self.room.reach()) <= self.room.last_prepared() {
             self.trigger_short(end);
             let preparer = self.preparer();
             // Only with work queued: an admission's room handed over takes no executor mutex
@@ -1290,13 +1368,13 @@ impl Log {
         self.flush_turn() && self.flushes.asked()
     }
 
-    /// How far the prepared segments reach past what is admitted, and a segment's size, for a test
-    /// to bring an admission within a segment of the prepared end.
+    /// How far the prepared segments reach past what is admitted, and the size of the last of
+    /// them, for a test to bring an admission within that segment.
     #[cfg(test)]
     pub(crate) fn prepared_ahead(&self) -> (u64, u64) {
         (
             self.room.prepared_end().saturating_sub(self.room.reach()),
-            self.segments.size,
+            self.room.last_prepared(),
         )
     }
 
@@ -1418,6 +1496,7 @@ impl Log {
             self.extents.lock()
         });
         let mut cursor = 0;
+        let mut segment = self.turn_segment.load();
         while self.in_flight.load(Ordering::Acquire) < limit {
             let mut end = complete - complete % BLOCK;
             let someone_waits = wanted > start || admitting;
@@ -1466,7 +1545,14 @@ impl Log {
                 break;
             }
             let chunk_end = (start / self.config.chunk_bytes + 1) * self.config.chunk_bytes;
-            let segment_end = self.segments.start(self.segments.number(start) + 1);
+            debug_assert!(
+                start >= segment.start,
+                "the turn's writes went back in the log"
+            );
+            if start >= segment.end {
+                segment = self.turn_segment.moved_to(&self.segments, start);
+            }
+            let segment_end = segment.end;
             let (write_end, from) = match extent {
                 Some((s, e, block)) if s <= start => {
                     let write_end = end.min(e).min(segment_end);
@@ -1507,6 +1593,8 @@ impl Log {
                 self.writes.with(j, |f| {
                     f.start = start;
                     f.end = write_end;
+                    f.segment = segment.number;
+                    f.segment_start = segment.start;
                     f.source = from.map(|(block, s)| (block, (start - s) as usize));
                     f.done = 0;
                 });
@@ -1547,7 +1635,7 @@ impl Log {
         #[cfg(test)]
         self.note_part(j);
         // SAFETY: owned by this thread: taken by its plan, or claimed by the unit's owed pass.
-        let (from, end, buffer) = unsafe {
+        let (from, end, segment, segment_start, buffer) = unsafe {
             self.writes.with(j, |f| {
                 f.told = false;
                 let from = f.start + u64::from(f.done);
@@ -1559,10 +1647,14 @@ impl Log {
                         slot.block.region(offset, len)
                     }
                 };
-                (from, f.end, buffer)
+                (from, f.end, f.segment, f.segment_start, buffer)
             })
         };
-        let segment = self.segments.number(from);
+        debug_assert_eq!(
+            segment,
+            self.segments.number(from),
+            "a part outside its segment"
+        );
         let file = self.segments.file(segment);
         let me = self.held();
         let c = Completion::new_write(move |res| {
@@ -1571,7 +1663,7 @@ impl Log {
             }
         });
         debug_assert!(end > from, "a part of a write with nothing left to write");
-        let at = from - self.segments.start(segment);
+        let at = from - segment_start;
         let durable = self.durable_writes;
         let retired = self.held();
         let submitted = file.submit_then(
@@ -1752,7 +1844,7 @@ impl Log {
         if landed > durable {
             let cap = self
                 .segments
-                .start(self.segments.number(durable) + self.sync_members_bound());
+                .start(self.segments.number(durable) + self.sync_members_bound(durable));
             self.submit_sync(durable, landed.min(cap));
             return false;
         }
@@ -1760,12 +1852,14 @@ impl Log {
         self.landed.at() > self.durable()
     }
 
-    /// The members a sync group has at most, `M = ceil(buffer_bytes / segment_bytes) + 1`: a
-    /// bound by construction, since its covers is capped at `M` segments from the durable
-    /// position's (D1b §4). Padding is granted outside the buffer (`Room::pad`), so the bytes
-    /// landed and not durable can exceed the buffer, and no bound may rest on that.
-    fn sync_members_bound(&self) -> u64 {
-        self.config.buffer_bytes.div_ceil(self.segments.size) + 1
+    /// The members a sync group has at most, `M = ceil(buffer_bytes / S) + 1`, `S` the bytes of
+    /// the durable position's segment, which no later segment is smaller than: a bound by
+    /// construction, since its covers is capped at `M` segments from the durable position's (D1b
+    /// §4). Padding is granted outside the buffer (`Room::pad`), so the bytes landed and not
+    /// durable can exceed the buffer, and no bound may rest on that.
+    fn sync_members_bound(&self, durable: Lsn) -> u64 {
+        let size = self.segments.size_of(self.segments.number(durable));
+        self.config.buffer_bytes.div_ceil(size) + 1
     }
 
     /// Syncs the segments the writes from `from` to `covers` went to, `covers` capped by
@@ -1875,7 +1969,7 @@ impl Log {
     /// admitted, or an admission waiting for a prepared end past the one published.
     fn short_of_segments(&self) -> bool {
         let end = self.room.prepared_end();
-        end.saturating_sub(self.room.reach()) <= self.segments.size
+        end.saturating_sub(self.room.reach()) <= self.room.last_prepared()
             || self.wanted_end.load(Ordering::SeqCst) > end
     }
 
@@ -1995,7 +2089,12 @@ impl Log {
     pub fn reader(io: Arc<dyn IO>, base: &str, config: &LogConfig, start: Lsn) -> LogReader {
         LogReader::new(
             io.clone(),
-            Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
+            Arc::new(Segments::new(
+                io,
+                base,
+                config.segment_sizes(),
+                config.direct,
+            )),
             start,
         )
     }
@@ -2004,7 +2103,7 @@ impl Log {
     pub fn rereader(io: Arc<dyn IO>, base: &str, config: &LogConfig) -> Rereader {
         Rereader::new(
             io.clone(),
-            Segments::new(io, base, config.segment_bytes, config.direct),
+            Segments::new(io, base, config.segment_sizes(), config.direct),
         )
     }
 
@@ -2059,7 +2158,12 @@ impl Log {
     ) -> Result<Vec<OwnedRecord>> {
         LogReader::group_at(
             io.clone(),
-            Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
+            Arc::new(Segments::new(
+                io,
+                base,
+                config.segment_sizes(),
+                config.direct,
+            )),
             at,
         )
     }

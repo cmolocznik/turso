@@ -28,6 +28,9 @@ pub(super) fn config() -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 512 << 10,
+            // Segments of 16, 32, 64, 128 and 256 KiB before those of 512 (DISK-MIN1): every crash
+            // test here recovers across segments of several sizes.
+            first_segment_bytes: 16 << 10,
             buffer_bytes: 128 << 10,
             chunk_bytes: 16 << 10,
             writes_in_flight: 3,
@@ -56,7 +59,11 @@ fn class(i: usize) -> SizeClass {
 
 /// Opens the database on `threads` threads, the way an embedder lends them to recovery.
 fn try_open(io: Arc<dyn IO>, threads: usize) -> Result<Atoll> {
-    let opening = Opening::new(io, BASE, config(), None)?;
+    try_open_with(io, threads, config())
+}
+
+fn try_open_with(io: Arc<dyn IO>, threads: usize, config: AtollConfig) -> Result<Atoll> {
+    let opening = Opening::new(io, BASE, config, None)?;
     let worked: Vec<Result<()>> = std::thread::scope(|s| {
         let others: Vec<_> = (1..threads).map(|_| s.spawn(|| opening.work())).collect();
         let mut worked = vec![opening.work()];
@@ -189,6 +196,7 @@ pub(super) fn ending_inside_a_block(io: Arc<dyn IO>) {
     let from = db.db.log().end();
     db.put("k", &value(1));
     let to = db.db.log().end();
+    let segments = segments_to(db.db.log(), to);
     drop(db);
     let block_end = from.next_multiple_of(BLOCK);
     assert!(
@@ -196,25 +204,30 @@ pub(super) fn ending_inside_a_block(io: Arc<dyn IO>) {
         "the commit [{from}, {to}) is not inside one block"
     );
     let log = config().log;
+    let first_record = |io: Arc<dyn IO>| {
+        Log::reader(io, BASE, &log, from)
+            .next_record()
+            .unwrap()
+            .map(|r| r.start)
+    };
+    assert_eq!(first_record(io.clone()), Some(from), "no record at {from}");
+    let (number, at) = place(&segments, from);
     let file = io
-        .open_file(
-            &format!("{BASE}.log.{:016x}", from / log.segment_bytes),
-            OpenFlags::None,
-            false,
-        )
+        .open_file(&format!("{BASE}.log.{number:016x}"), OpenFlags::None, false)
         .unwrap();
     let len = (block_end - from) as usize;
     let zeros = Arc::new(AlignedBlock::zeroed(len.next_multiple_of(BLOCK as usize)));
     let c = file
-        .pwrite(
-            from % log.segment_bytes,
-            zeros.region(0, len),
-            Completion::new_write(|_| {}),
-        )
+        .pwrite(at, zeros.region(0, len), Completion::new_write(|_| {}))
         .unwrap();
     io.wait_for_completion(c).unwrap();
     let c = file.sync_data(Completion::new_sync(|_| {})).unwrap();
     io.wait_for_completion(c).unwrap();
+    assert_eq!(
+        first_record(io.clone()),
+        None,
+        "the zeros at {from} were not its record's"
+    );
 }
 
 fn value(i: usize) -> Vec<u8> {
@@ -253,6 +266,11 @@ fn crashes_recover_every_commit_acknowledged(durable_writes: bool) {
         rounds.push(crash_io.crash(round));
     }
     let after = db.state(&keys);
+    let (last, size) = db.db.log().segment_at(db.db.log().end());
+    assert!(
+        last >= 3 && size >= 128 << 10,
+        "the log reached segment {last} of {size} bytes: the crashes met too few sizes"
+    );
     drop(db);
     let mid = crash_io.captured();
     assert!(!mid.is_empty(), "no image mid-round");
@@ -317,6 +335,7 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
     }
     let redo = db.db.checkpointer().superblock().redo;
     let whole = crash_io.crash(0);
+    let segments = segments_to(db.db.log(), db.db.log().end());
     drop(db);
     let log = config().log;
     let read_to = |io: Arc<dyn IO>, from: Lsn| {
@@ -340,16 +359,12 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
                 return None;
             }
             let torn = whole.crash(0);
+            let (number, at) = place(&segments, from);
             let file = torn
-                .open_file(
-                    &format!("{BASE}.log.{:016x}", from / log.segment_bytes),
-                    OpenFlags::None,
-                    false,
-                )
+                .open_file(&format!("{BASE}.log.{number:016x}"), OpenFlags::None, false)
                 .unwrap();
             let len = (restart - from) as usize;
             let zeros = Arc::new(AlignedBlock::zeroed(len.next_multiple_of(BLOCK as usize)));
-            let at = from % log.segment_bytes;
             let c = file
                 .pwrite(at, zeros.region(0, len), Completion::new_write(|_| {}))
                 .unwrap();
@@ -357,7 +372,9 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
             let c = file.sync_data(Completion::new_sync(|_| {})).unwrap();
             torn.wait_for_completion(c).unwrap();
             let torn = Arc::new(torn);
-            let (_, end) = read_to(torn.clone(), redo);
+            let (kept, end) = read_to(torn.clone(), redo);
+            let before: Vec<Lsn> = starts.iter().copied().take_while(|&s| s < from).collect();
+            assert_eq!(kept, before, "the zeros at {from} were not its record's");
             (end % BLOCK != 0 && Log::resumes_at(end) == restart).then_some((torn, end, restart))
         })
         .expect("a block a crash can tear with whole records after it");
@@ -415,6 +432,37 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
         assert_eq!(db.state(&keys), expected, "{label}");
     }
     assert!(gapped > 0, "none of {count} images holds the gap");
+}
+
+/// The log's segments from the first to the one `end` lies in: each one's number, start and
+/// size, as the log's own arithmetic names them.
+fn segments_to(log: &Log, end: Lsn) -> Vec<(u64, Lsn, u64)> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    loop {
+        let (number, size) = log.segment_at(start);
+        segments.push((number, start, size));
+        if end < start + size {
+            return segments;
+        }
+        start += size;
+    }
+}
+
+/// The segment `lsn` lies in and its offset there.
+fn place(segments: &[(u64, Lsn, u64)], lsn: Lsn) -> (u64, u64) {
+    assert!(
+        segments
+            .iter()
+            .zip(0..)
+            .all(|(&(number, ..), n)| number == n),
+        "segments numbered out of turn: {segments:?}"
+    );
+    let &(number, start, _) = segments
+        .iter()
+        .find(|&&(_, start, size)| (start..start + size).contains(&lsn))
+        .unwrap_or_else(|| panic!("{lsn} lies past the segments {segments:?}"));
+    (number, lsn - start)
 }
 
 /// A checkpoint whose image write fails leaves the checkpoint in charge in charge, and none runs
@@ -1459,5 +1507,56 @@ fn a_recovery_pins_a_page_many_intent_records_name_once() {
         "{} frames pinned for {} distinct pages: {pinned:?}",
         pinned.len(),
         distinct.len()
+    );
+}
+
+/// A new database in the default configuration writes and allocates its first log segment, 1 MiB,
+/// and the one prepared ahead, 2 MiB, not two of the largest, 256 MiB each (DISK-MIN1); and
+/// opened again it keeps the sizes its superblock records, whatever the configuration given
+/// says. On files of its own, so the lengths read are what the file system allocated.
+#[test]
+fn a_new_database_writes_small_first_log_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("db").to_str().unwrap().to_string();
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let open = |config: AtollConfig| {
+        let opening = Opening::new(io.clone(), &base, config, None)?;
+        opening.work()?;
+        opening.finish()
+    };
+    let default = super::sql::mode::config_for(None);
+    assert_eq!(
+        (default.log.first_segment_bytes, default.log.segment_bytes),
+        (1 << 20, 256 << 20),
+        "the default configuration's first and largest log segment sizes"
+    );
+    let db = open(default.clone()).unwrap();
+    for _ in 0..10_000 {
+        if db.log().run_preparer().is_none() {
+            break;
+        }
+    }
+    drop(db);
+    let sizes: Vec<(u64, u64)> = (0..4)
+        .filter_map(|n| {
+            std::fs::metadata(format!("{base}.log.{n:016x}"))
+                .ok()
+                .map(|m| (n, m.len()))
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        vec![(0, 1 << 20), (1, 2 << 20)],
+        "the log segments a new database made"
+    );
+    let mut other = default;
+    other.log.first_segment_bytes = 256 << 20;
+    let reopened = open(other).unwrap();
+    let first = reopened.log().segment_at(0);
+    drop(reopened);
+    assert_eq!(
+        first,
+        (0, 1 << 20),
+        "the reopened database took the configuration's sizes over its superblock's"
     );
 }

@@ -537,6 +537,11 @@ mod tests {
             "child",
         ),
         (
+            "log/tests.rs",
+            "growing_segments_are_released_and_only_the_largest_come_back_as_spares",
+            "child",
+        ),
+        (
             "log/unit_tests.rs",
             "over_the_ring_an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted",
             "child",

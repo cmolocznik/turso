@@ -19,6 +19,7 @@ fn config(chunk_bytes: u64) -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 1 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 256 << 10,
             chunk_bytes,
             writes_in_flight: 3,

@@ -1,4 +1,8 @@
-//! Log segment files: `{base}.log.{n}` holds the log's bytes from `n·size` to `(n+1)·size`.
+//! Log segment files: `{base}.log.{n}` holds the log's bytes from segment `n`'s start to the
+//! next's. The first segment is `first` bytes and each next one twice the one before, up to
+//! `size`; every segment from there on is `size` bytes (DISK-MIN1). A new database so writes the
+//! zeros of a small segment, not of a full one. Segment `n < growth` starts at
+//! `first · (2^n - 1)`; the segments of `size` start at `size - first`, one every `size` bytes.
 //!
 //! The files open are cells by segment number, in an array that grows to the highest number
 //! reached: a cell each, of one word, per segment the log has ever had. A file is put in its cell
@@ -74,7 +78,14 @@ impl Opens for Typed {
 pub(super) struct Segments<O: Opens = Plain> {
     opens: O,
     base: String,
+    /// Bytes of the largest segment, every segment's from the `growth`-th on.
     pub size: u64,
+    /// Bytes of the first segment.
+    first: u64,
+    /// How many segments are smaller than `size`: `log2(size / first)`.
+    growth: u64,
+    /// Where the first segment of `size` starts: `size - first`.
+    steady: u64,
     direct: bool,
     files: Segmented<ArcCell<Arc<O::File>>>,
     releasing: Releasing<Arc<O::File>>,
@@ -83,15 +94,15 @@ pub(super) struct Segments<O: Opens = Plain> {
 }
 
 impl Segments<Plain> {
-    pub fn new(io: Arc<dyn IO>, base: &str, size: u64, direct: bool) -> Self {
-        Self::with(Plain(io), base, size, direct)
+    pub fn new(io: Arc<dyn IO>, base: &str, sizes: (u64, u64), direct: bool) -> Self {
+        Self::with(Plain(io), base, sizes, direct)
     }
 }
 
 impl Segments<Typed> {
-    pub fn counted(counted: Arc<Counted>, base: &str, size: u64, direct: bool) -> Self {
+    pub fn counted(counted: Arc<Counted>, base: &str, sizes: (u64, u64), direct: bool) -> Self {
         let io: Arc<dyn IO> = counted.clone();
-        Self::with(Typed { counted, io }, base, size, direct)
+        Self::with(Typed { counted, io }, base, sizes, direct)
     }
 
     /// The counted IO the segments are opened through.
@@ -101,11 +112,20 @@ impl Segments<Typed> {
 }
 
 impl<O: Opens> Segments<O> {
-    fn with(opens: O, base: &str, size: u64, direct: bool) -> Self {
+    /// `sizes`: the first segment's bytes and the largest's, the largest a power of two times the
+    /// first.
+    fn with(opens: O, base: &str, (first, size): (u64, u64), direct: bool) -> Self {
+        assert!(
+            first > 0 && size.is_multiple_of(first) && (size / first).is_power_of_two(),
+            "log segments of {first} bytes first and {size} at most"
+        );
         Self {
             opens,
             base: base.to_string(),
             size,
+            first,
+            growth: u64::from((size / first).ilog2()),
+            steady: size - first,
             direct,
             files: Segmented::default(),
             releasing: Releasing::new(Arc::new(Epochs::new())),
@@ -113,12 +133,31 @@ impl<O: Opens> Segments<O> {
         }
     }
 
+    /// The segment `lsn` lies in.
     pub fn number(&self, lsn: u64) -> u64 {
-        lsn / self.size
+        if lsn >= self.steady {
+            self.growth + (lsn - self.steady) / self.size
+        } else {
+            u64::from((lsn / self.first + 1).ilog2())
+        }
     }
 
+    /// Where segment `number` starts.
     pub fn start(&self, number: u64) -> u64 {
-        number * self.size
+        if number >= self.growth {
+            self.steady + (number - self.growth) * self.size
+        } else {
+            self.first * ((1 << number) - 1)
+        }
+    }
+
+    /// Bytes of segment `number`.
+    pub fn size_of(&self, number: u64) -> u64 {
+        if number >= self.growth {
+            self.size
+        } else {
+            self.first << number
+        }
     }
 
     pub(super) fn path(&self, number: u64) -> String {
@@ -225,9 +264,13 @@ impl<O: Opens> Segments<O> {
         Ok(())
     }
 
-    /// Releases segment `number`, which nothing needs any more: kept as a spare if a spare's name
-    /// is free and the backend renames, else removed. Durable once the directory is synced.
+    /// Releases segment `number`, which nothing needs any more: kept as a spare if it is of the
+    /// largest size, which every later segment has, a spare's name is free and the backend
+    /// renames; else removed. Durable once the directory is synced.
     pub fn release(&self, number: u64) -> Result<()> {
+        if self.size_of(number) != self.size {
+            return self.remove(number);
+        }
         let free = self.spares.iter().enumerate().find(|(_, s)| {
             // Acquire: a spare taken before is renamed away before its name reads free.
             s.compare_exchange(EMPTY, FILLING, Ordering::AcqRel, Ordering::Relaxed)
@@ -256,9 +299,13 @@ impl<O: Opens> Segments<O> {
         self.remove(number)
     }
 
-    /// Segment `number` made of a spare, if there is one: its file, whole, its old bytes never the
-    /// log where they now lie. Durable once the directory is synced.
+    /// Segment `number` made of a spare, if it is of the largest size, a spare's, and there is one:
+    /// its file, whole, its old bytes never the log where they now lie. Durable once the
+    /// directory is synced.
     pub fn reuse(&self, number: u64) -> Result<Option<Arc<O::File>>> {
+        if self.size_of(number) != self.size {
+            return Ok(None);
+        }
         let Some((k, state)) = self.spares.iter().enumerate().find(|(_, s)| {
             // Acquire: pairs with the release that made it full, after its rename.
             s.compare_exchange(FULL, TAKING, Ordering::AcqRel, Ordering::Relaxed)
@@ -278,5 +325,92 @@ impl<O: Opens> Segments<O> {
             .get_or_make(number)
             .replace(Some(Arc::new(file.clone())), &self.releasing);
         Ok(Some(file))
+    }
+}
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::storage::atoll::log::BLOCK;
+
+    /// Every position lies in the segment whose start is at or below it and whose next start is
+    /// above it, each segment's size is the distance to the next start, and the sizes double from
+    /// the first to the largest and stay there (DISK-MIN1).
+    #[test]
+    fn a_position_lies_in_one_segment_and_the_sizes_double_to_the_largest() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        // Recorded with the table alive, asserted once it is dropped: it holds an Atoll lock.
+        let mut wrong = Vec::new();
+        for (first, size) in [(BLOCK, BLOCK), (BLOCK, 8 * BLOCK), (2 * BLOCK, 64 * BLOCK)] {
+            let segments = Segments::new(io.clone(), "/table", (first, size), false);
+            let mut expected = first;
+            for n in 0..40 {
+                if segments.size_of(n) != expected {
+                    wrong.push(format!(
+                        "segment {n} of ({first}, {size}) is {}",
+                        segments.size_of(n)
+                    ));
+                }
+                if segments.start(n + 1) - segments.start(n) != expected {
+                    wrong.push(format!("segment {n}'s span of ({first}, {size})"));
+                }
+                expected = (expected * 2).min(size);
+            }
+            if segments.start(0) != 0 {
+                wrong.push(format!("segment 0 of ({first}, {size}) starts past 0"));
+            }
+            for lsn in (0..segments.start(40)).step_by(BLOCK as usize / 4) {
+                let n = segments.number(lsn);
+                if !(segments.start(n) <= lsn && lsn < segments.start(n + 1)) {
+                    wrong.push(format!("{lsn} placed in segment {n} of ({first}, {size})"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{}",
+            wrong[..wrong.len().min(3)].join("; ")
+        );
+    }
+
+    /// A segment smaller than the largest is removed at its release, never kept as a spare: a
+    /// spare becomes a later segment, which is of the largest size. One of the largest size is
+    /// kept, and the next segment of that size is made of it.
+    #[test]
+    fn only_a_segment_of_the_largest_size_is_kept_as_a_spare() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let segments = Segments::new(io.clone(), "/spares", (BLOCK, 4 * BLOCK), false);
+        for n in 0..4 {
+            segments.create(n).unwrap();
+        }
+        segments.release(0).unwrap();
+        segments.release(1).unwrap();
+        // Recorded with the table alive, asserted once it is dropped: it holds an Atoll lock.
+        let spare_files = |k: usize| io.open_file(&segments.spare_path(k), OpenFlags::None, false);
+        let no_small_spare = spare_files(0).is_err() && spare_files(1).is_err();
+        let small_removed =
+            segments.open(0).unwrap().is_none() && segments.open(1).unwrap().is_none();
+        let file = segments.file(2);
+        let (write, written) = crate::storage::atoll::whole_write(4 * BLOCK as usize);
+        let zeros = Arc::new(crate::storage::atoll::aligned::AlignedBlock::zeroed(
+            4 * BLOCK as usize,
+        ));
+        drop(
+            file.pwrite(0, zeros.region(0, 4 * BLOCK as usize), write)
+                .unwrap(),
+        );
+        crate::storage::atoll::park::wait_for_completion(io.as_ref(), written).unwrap();
+        segments.release(2).unwrap();
+        let largest_kept = spare_files(0).is_ok();
+        let reused = segments.reuse(4).unwrap().is_some();
+        drop((file, segments));
+        assert!(no_small_spare, "a smaller segment was kept as a spare");
+        assert!(small_removed, "a smaller segment's file was left");
+        assert!(largest_kept, "a segment of the largest size was not kept");
+        assert!(
+            reused,
+            "the next segment of the largest size was not made of the spare"
+        );
     }
 }

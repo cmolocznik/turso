@@ -32,6 +32,7 @@ fn config() -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 1 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 256 << 10,
             chunk_bytes: 16 << 10,
             writes_in_flight: 3,
@@ -926,6 +927,7 @@ fn rolled_back_reading_its_parts_back(seed: u64, segment_bytes: u64) {
     let io: Arc<dyn IO> = crash_io.clone();
     let mut small = config();
     small.log.segment_bytes = segment_bytes;
+    small.log.first_segment_bytes = segment_bytes;
     let db = Db::create_with(io.clone(), small);
     let keys: Vec<String> = (0..120).map(|i| format!("k{i:03}")).collect();
     committed(&db, &keys[..20]);

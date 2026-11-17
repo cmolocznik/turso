@@ -64,6 +64,7 @@ impl AtollConfig {
     pub fn small() -> Self {
         let log = LogConfig {
             segment_bytes: 1 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 256 << 10,
             chunk_bytes: 16 << 10,
             writes_in_flight: 3,
@@ -396,6 +397,7 @@ impl Opening {
         };
         // What the database was created with holds, whatever this configuration says.
         config.log.segment_bytes = superblock.segment_bytes;
+        config.log.first_segment_bytes = superblock.segment_bytes >> superblock.segment_growth;
         config.store.file_bytes = superblock.file_bytes;
         let store = PageStore::open(
             counted.clone(),
@@ -441,6 +443,7 @@ impl Opening {
             seq: 1,
             redo: 0,
             segment_bytes: config.log.segment_bytes,
+            segment_growth: (config.log.segment_bytes / config.log.first_segment_bytes).ilog2(),
             file_bytes: config.store.file_bytes,
             database_id,
             heights: [[1; CLASS_COUNT]; TREES],

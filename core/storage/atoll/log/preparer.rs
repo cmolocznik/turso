@@ -243,7 +243,7 @@ impl Log {
                     }
                     *at += len;
                 }
-                if *at == self.segments.size {
+                if *at == self.segments.size_of(*number) {
                     let me = self.held();
                     let sync = Completion::new_sync(move |res| {
                         if let (Some(me), Err(e)) = (me.upgrade(), res) {
@@ -262,7 +262,7 @@ impl Log {
                     };
                     return Unit::Wait(retired);
                 }
-                let len = (self.segments.size - *at).min(self.zeros.len() as u64);
+                let len = (self.segments.size_of(*number) - *at).min(self.zeros.len() as u64);
                 let me = self.held();
                 let c = Completion::new_write(move |res| {
                     if let (Some(me), Err(e)) = (me.upgrade(), whole(len as usize, res)) {
@@ -321,7 +321,7 @@ impl Log {
             return Unit::Failed;
         }
         // Space reserved where the backend can; one that cannot still takes the zeros written next.
-        let _ = file.allocate(0, self.segments.size);
+        let _ = file.allocate(0, self.segments.size_of(number));
         if self.failure().is_some() {
             return Unit::Failed;
         }
@@ -347,7 +347,10 @@ impl Log {
         if self.failure().is_some() {
             return Unit::Failed;
         }
-        self.room.set_prepared_end(self.segments.start(number + 1));
+        self.room.set_prepared_end(
+            self.segments.start(number + 1),
+            self.segments.size_of(number),
+        );
         self.preparation.done();
         self.wake_admitters();
         *turn_owed = self.flush_one_turn();

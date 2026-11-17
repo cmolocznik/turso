@@ -135,6 +135,7 @@ fn commits() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let log = LogConfig {
             segment_bytes: 64 << 20,
+            first_segment_bytes: 64 << 20,
             buffer_bytes: 4 << 20,
             chunk_bytes: 64 << 10,
             writes_in_flight: 4,
@@ -1105,6 +1106,7 @@ fn bench_config() -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 256 << 20,
+            first_segment_bytes: 256 << 20,
             buffer_bytes: 16 << 20,
             chunk_bytes: 64 << 10,
             writes_in_flight: 4,

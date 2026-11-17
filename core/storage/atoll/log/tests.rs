@@ -12,6 +12,7 @@ const BASE: &str = "/db/x";
 fn small() -> LogConfig {
     LogConfig {
         segment_bytes: 64 << 10,
+        first_segment_bytes: 64 << 10,
         buffer_bytes: 32 << 10,
         chunk_bytes: 8 << 10,
         writes_in_flight: 3,
@@ -103,7 +104,12 @@ fn payload(writer: u64, seq: u64) -> Vec<u8> {
 }
 
 fn read_all(io: Arc<dyn IO>, start: Lsn) -> (Vec<OwnedRecord>, Lsn) {
-    let mut reader = Log::reader(io, BASE, &small(), start);
+    read_all_with(io, &small(), start)
+}
+
+/// [`read_all`] of a log of `config`'s segments.
+fn read_all_with(io: Arc<dyn IO>, config: &LogConfig, start: Lsn) -> (Vec<OwnedRecord>, Lsn) {
+    let mut reader = Log::reader(io, BASE, config, start);
     let mut records = Vec::new();
     while let Some(r) = reader.next_record().unwrap() {
         records.push(r);
@@ -569,6 +575,125 @@ fn released_segments_come_back_as_spares_whose_old_records_never_read() {
     }
 }
 
+/// DISK-MIN1: segments of 16, 32 and then 64 KiB each, released as a checkpoint releases them.
+/// Each smaller segment is written with zeros once and removed at its release, never kept as a
+/// spare, so every spare is of the largest size and later segments are made of spares; a reader
+/// from the kept position reads every record after it, in the log and in each crash image, and a
+/// log reopened on an image appends where it ended.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn growing_segments_are_released_and_only_the_largest_come_back_as_spares() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::growing_segments_are_released_and_only_the_largest_come_back_as_spares"
+        ),
+        growing_segments_released,
+    );
+}
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn growing_segments_released() {
+    let crash_io = Arc::new(CrashIO::new(5));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let mut config = small();
+    config.first_segment_bytes = 16 << 10;
+    let (first_size, size) = (config.first_segment_bytes, config.segment_bytes);
+    let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
+    let mut lsns = Vec::new();
+    let (mut from, mut first) = (0, 0);
+    let mut acknowledged = 0;
+    for seq in 0..3_000u64 {
+        let p = payload(0, seq);
+        let mut admitted = drive(&io, || {
+            log.admit(&mut LogWait::default(), framed_len(p.len()))
+        })
+        .unwrap();
+        lsns.push(log.append(&mut admitted, &header(0), &[&p]));
+        if seq % 50 == 49 {
+            let lsn = *lsns.last().unwrap();
+            drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
+            acknowledged = lsns.len();
+            if let Some(i) = lsns.iter().rposition(|&l| l + 2 * size <= lsn) {
+                (from, first) = (lsns[i], i + 1);
+                log.release_before(from).unwrap();
+            }
+        }
+    }
+    let used = log.segments.number(log.end()) + 1;
+    assert!(used >= 8, "only {used} segments used");
+    assert_eq!(
+        (0..3).map(|n| log.segments.size_of(n)).collect::<Vec<_>>(),
+        [first_size, 2 * first_size, size],
+        "the segments' sizes"
+    );
+    let segment = |n: u64| format!("{BASE}.log.{n:016x}");
+    let written: u64 = (0..used)
+        .flat_map(|n| crash_io.writes_to(&segment(n)))
+        .map(|(_, len)| len as u64)
+        .sum();
+    let flushed = log.durable().next_multiple_of(BLOCK);
+    let zeroed = written - flushed;
+    // The two smaller segments' zeros once each, then whole segments of the largest size, made fresh
+    // only until spares came back: most of the largest are made of spares, as with one size.
+    let smaller = size - first_size;
+    assert!(
+        zeroed >= smaller && (zeroed - smaller) % size == 0,
+        "{zeroed} bytes of zeros written over {used} segments"
+    );
+    let fresh = (zeroed - smaller) / size;
+    let growth = 2;
+    assert!(
+        fresh + 2 < used - growth,
+        "{fresh} of the {} segments of the largest size were prepared with zeros",
+        used - growth
+    );
+    for k in 0..super::segment::SPARES {
+        if let Ok(spare) = io.open_file(&format!("{BASE}.log.spare{k}"), OpenFlags::None, false) {
+            assert_eq!(
+                spare.size().unwrap(),
+                size,
+                "spare {k} is not of the largest size"
+            );
+        }
+    }
+    let expect = |records: &[OwnedRecord], label: &str| {
+        for (k, r) in records.iter().enumerate() {
+            assert_eq!(
+                r.payload,
+                payload(0, (first + k) as u64),
+                "{label}: record {k}"
+            );
+        }
+    };
+    let (records, _) = read_all_with(io.clone(), &config, from);
+    assert_eq!(records.len(), lsns.len() - first);
+    expect(&records, "the log");
+    for c in 0..16 {
+        let crashed: Arc<dyn IO> = Arc::new(crash_io.crash(c));
+        let (records, end) = read_all_with(crashed.clone(), &config, from);
+        assert!(
+            records.len() >= acknowledged - first,
+            "crash {c}: {} records from {from}",
+            records.len()
+        );
+        expect(&records, &format!("crash {c}"));
+        let reopened = Log::open(crashed.clone(), BASE, config.clone(), end).unwrap();
+        let p = payload(1, 0);
+        let mut admitted = drive(&crashed, || {
+            reopened.admit(&mut LogWait::default(), framed_len(p.len()))
+        })
+        .unwrap();
+        let lsn = reopened.append(&mut admitted, &header(1), &[&p]);
+        drive(&crashed, || {
+            reopened.wait_durable(&mut LogWait::default(), lsn)
+        })
+        .unwrap();
+        let (again, _) = read_all_with(crashed, &config, from);
+        assert_eq!(again[..records.len()], records[..], "crash {c}: reopened");
+    }
+}
+
 #[test]
 fn a_failed_write_fails_its_waiters_and_every_later_operation() {
     let crash_io = Arc::new(CrashIO::new(3));
@@ -897,6 +1022,7 @@ fn a_segment_of_many_chunks_fills_on_a_small_stack_when_writes_complete_inline()
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let config = LogConfig {
                 segment_bytes: 4 << 20,
+                first_segment_bytes: 4 << 20,
                 buffer_bytes: 64 << 10,
                 chunk_bytes: 4 << 10,
                 writes_in_flight: 3,
@@ -2093,6 +2219,7 @@ fn waits_given_up_while_the_log_stands_still_never_outnumber_twice_the_most_that
 fn wide() -> LogConfig {
     LogConfig {
         segment_bytes: 64 << 10,
+        first_segment_bytes: 64 << 10,
         buffer_bytes: 256 << 10,
         chunk_bytes: 8 << 10,
         writes_in_flight: 3,
@@ -2387,7 +2514,7 @@ fn read_back_step(
 #[test]
 fn a_read_back_makes_its_next_read_only_once_the_last_one_retired() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let segments = super::segment::Segments::new(io, "/held-reads", BLOCK, false);
+    let segments = super::segment::Segments::new(io, "/held-reads", (BLOCK, BLOCK), false);
     // One record across two segments of a block each.
     let (reads, ends) = HeldReads::of(&[BLOCK as usize]);
     let mut back = ReadBack::default();
@@ -2428,7 +2555,7 @@ fn a_read_back_makes_its_next_read_only_once_the_last_one_retired() {
 #[test]
 fn a_read_back_of_another_record_waits_for_the_last_ones_read_to_retire() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let segments = super::segment::Segments::new(io, "/held-reads", BLOCK, false);
+    let segments = super::segment::Segments::new(io, "/held-reads", (BLOCK, BLOCK), false);
     let (reads, ends) = HeldReads::of(&[64, 64]);
     let mut back = ReadBack::default();
     let _ = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
@@ -2459,7 +2586,7 @@ fn a_read_back_of_another_record_waits_for_the_last_ones_read_to_retire() {
 #[test]
 fn a_read_back_whose_read_failed_reports_it_once_the_read_retired() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let segments = super::segment::Segments::new(io, "/held-reads", BLOCK, false);
+    let segments = super::segment::Segments::new(io, "/held-reads", (BLOCK, BLOCK), false);
     let (reads, ends) = HeldReads::of(&[64]);
     let mut back = ReadBack::default();
     let _ = read_back_step(&mut back, &segments, &reads, 0, ends[0]);

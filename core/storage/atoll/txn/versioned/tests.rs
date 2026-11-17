@@ -45,6 +45,7 @@ fn open_sized(slots: usize, budget: usize, class: SizeClass, log_budget: Option<
     let config = AtollConfig {
         log: LogConfig {
             segment_bytes: 1 << 20,
+            first_segment_bytes: 1 << 20,
             buffer_bytes: 256 << 10,
             chunk_bytes: 16 << 10,
             writes_in_flight: 3,
@@ -509,6 +510,7 @@ impl Db {
             BASE,
             &LogConfig {
                 segment_bytes: 1 << 20,
+                first_segment_bytes: 1 << 20,
                 buffer_bytes: 256 << 10,
                 chunk_bytes: 16 << 10,
                 writes_in_flight: 3,

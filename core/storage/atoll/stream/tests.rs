@@ -11,6 +11,7 @@ const BASE: &str = "/db/stream-p0";
 fn config() -> LogConfig {
     LogConfig {
         segment_bytes: 256 << 10,
+        first_segment_bytes: 256 << 10,
         buffer_bytes: 64 << 10,
         chunk_bytes: 16 << 10,
         writes_in_flight: 3,
@@ -355,6 +356,7 @@ fn a_read_under_way_keeps_the_segments_retention_lets_go_until_it_is_done() {
     let io: Arc<dyn IO> = backing.clone();
     let config = LogConfig {
         segment_bytes: 64 << 10,
+        first_segment_bytes: 64 << 10,
         ..config()
     };
     let p = Partition::open(io.clone(), BASE, config).unwrap();

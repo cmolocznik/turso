@@ -16,6 +16,7 @@ const BASE: &str = "/db/store";
 fn config() -> AtollConfig {
     let log = LogConfig {
         segment_bytes: 256 << 10,
+        first_segment_bytes: 256 << 10,
         buffer_bytes: 64 << 10,
         chunk_bytes: 16 << 10,
         writes_in_flight: 3,

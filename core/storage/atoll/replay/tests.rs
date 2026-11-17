@@ -551,6 +551,7 @@ fn a_commit_at_or_below_the_snapshot_whose_parts_precede_the_redo_start_is_skipp
     let path = "/db/replay-cut";
     let cfg = LogConfig {
         segment_bytes: 1 << 20,
+        first_segment_bytes: 1 << 20,
         buffer_bytes: 64 << 10,
         chunk_bytes: 8 << 10,
         writes_in_flight: 3,

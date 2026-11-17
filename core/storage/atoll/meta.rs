@@ -1548,6 +1548,18 @@ impl MetaCache {
         cell.get(&step, &self.cells).is_some()
     }
 
+    /// What `f` reads of `id`'s page if the page is in memory and read, with no load and no wait:
+    /// `None` if it is not, or while a change holds it.
+    pub fn read_if_resident<R>(&self, id: MetaId, f: impl Fn(&Shared) -> R) -> Option<R> {
+        let cell = self.files[id.file_index()].frames.get(id.index)?;
+        let step = self.epochs.enter();
+        let frame = cell.get(&step, &self.cells)?;
+        if frame.status.load(Ordering::Acquire) != READY {
+            return None;
+        }
+        frame.read(f)
+    }
+
     /// The pins holding `id`'s page while it is in memory, this look's own not counted, for a
     /// test.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]

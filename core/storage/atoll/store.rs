@@ -834,6 +834,7 @@ impl PageStore {
     /// `slot`, which holds a whole copy of `pid` at change count `count`, written since its frame
     /// changed last, is its swap copy now; the one it replaces is given up.
     pub fn set_swap(&self, pid: PageId, slot: u64, count: u64) {
+        self.assert_unmarked(pid, slot);
         if let Some(old) = self
             .swap_shard(pid)
             .lock()
@@ -854,6 +855,24 @@ impl PageStore {
     /// The shards of the swap table, which a cut lists one at a time.
     pub fn swap_shards(&self) -> usize {
         SWAP_SHARDS
+    }
+
+    /// In every build: a swap copy's slot is not marked in the free space, where only a checkpoint
+    /// copy's is (ROWS-LOST1). Looked at when the slot's leaf is in memory, as it is after the
+    /// claim's own look; a landing cannot wait to read it in.
+    fn assert_unmarked(&self, pid: PageId, slot: u64) {
+        let class = pid.class();
+        let height = self.height(Tree::Space, class);
+        let leaf = radix::path(Tree::Space, class, height, slot)[0];
+        if let Some(marked) = self
+            .meta
+            .read_if_resident(leaf, |b| radix::space_bit(b, slot))
+        {
+            assert!(
+                !marked,
+                "the swap copy of {pid:?} landed in slot {slot}, which the free space holds"
+            );
+        }
     }
 
     /// The pages with a swap copy in shard `i` of the swap table after `after`, in order, `max` at
@@ -1213,8 +1232,15 @@ impl PageStore {
             };
             self.cursors[class.index()].store(slot + 1, Ordering::Relaxed);
             crate::race::point("store.slot_found");
-            if self.claimed[class.index()].set(slot) {
-                return Ok(IOResult::Done(slot));
+            match Self::claim_unmarked(&self.claimed[class.index()], slot, || {
+                self.slot_taken(class, slot, pages)
+            })? {
+                IOResult::Done(true) => return Ok(IOResult::Done(slot)),
+                IOResult::Done(false) => {}
+                IOResult::IO(io) => {
+                    walk.from = Some(slot);
+                    return Ok(IOResult::IO(io));
+                }
             }
             // Claimed by another since the walk found it: on past it.
             walk.from = Some(slot + 1);
@@ -1222,6 +1248,59 @@ impl PageStore {
                 return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
             }
         }
+    }
+
+    /// Claims `slot`, which a walk read free, for its taker: claimed only if no other holds a claim
+    /// of it and, under the claim, the free space does not hold it (`taken`). A checkpoint copy's
+    /// take marks its slot before it lets its claim go, and a free marks its slot unerased before
+    /// it clears its bit, so a claim won after either reads it (ROWS-LOST1). Done(false): the
+    /// slot is another's, a claim won given back; a look that waits gives it back too.
+    fn claim_unmarked(
+        claimed: &GrowBits,
+        slot: u64,
+        taken: impl FnOnce() -> Result<IOResult<bool>>,
+    ) -> Result<IOResult<bool>> {
+        if !claimed.set(slot) {
+            return Ok(IOResult::Done(false));
+        }
+        let look = taken();
+        if !matches!(look, Ok(IOResult::Done(false))) {
+            claimed.clear(slot);
+        }
+        Ok(match look? {
+            IOResult::Done(taken) => IOResult::Done(!taken),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+
+    /// Whether `slot` of `class` is held by the free space as it stands: marked in use, or freed
+    /// and not yet erased. Step it until done.
+    fn slot_taken(
+        &self,
+        class: SizeClass,
+        slot: u64,
+        pages: &mut PageSet<SLOT_PAGES>,
+    ) -> Result<IOResult<bool>> {
+        let height = self.height(Tree::Space, class);
+        let path = radix::path(Tree::Space, class, height, slot);
+        pages.aim(path.iter().copied())?;
+        let ready = match pages.poll(&self.meta)? {
+            Polled::Ready(ready) => ready,
+            Polled::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
+        };
+        let leaf = ready
+            .frame(path[0])
+            .expect("a ready set holds every page it names");
+        match leaf.read(|b| radix::space_bit(b, slot)) {
+            Some(marked) => Ok(IOResult::Done(marked || !self.erased(class, slot))),
+            None => Ok(IOResult::IO(IOCompletions(leaf.wait_while_held()))),
+        }
+    }
+
+    /// Whether `slot` of `class`, its free-space bit clear, has been erased since its last copy
+    /// was freed: the test a walk and a claim's look both make.
+    fn erased(&self, class: SizeClass, slot: u64) -> bool {
+        !self.unerased[class.index()].get(slot)
     }
 
     /// A slot for a swap copy of a page of `class`: claimed in memory alone, so a crash frees it.
@@ -1381,6 +1460,14 @@ impl PageStore {
     ) -> Result<IOResult<Edited>> {
         let CutKey { n, pid, slot, .. } = key;
         let (class, number) = (pid.class(), pid.number());
+        // In every build: a claim of a landed copy's slot is a swap copy's, whose write would
+        // land over the copy (ROWS-LOST1).
+        if let Some(s) = slot {
+            assert!(
+                !self.claimed[class.index()].get(s),
+                "checkpoint {n}'s copy of {pid:?} landed in slot {s}, which a claim holds"
+            );
+        }
         let cut_map = heights[Tree::Map as usize][class.index()];
         let cut_space = heights[Tree::Space as usize][class.index()];
         // A new copy's slot is taken from the free space as it stands, which may have grown since
@@ -2025,8 +2112,7 @@ impl PageStore {
                             break None;
                         };
                         if skip_unerased
-                            && (self.unerased[class.index()].get(u)
-                                || self.claimed[class.index()].get(u))
+                            && (!self.erased(class, u) || self.claimed[class.index()].get(u))
                         {
                             at = u + 1;
                             continue;
@@ -2483,5 +2569,115 @@ impl PageStore {
                 count,
             );
         })
+    }
+}
+
+#[cfg(all(test, atoll_loom))]
+mod loom_tests {
+    //! ROWS-LOST1's decision over every schedule: the real claim ([`PageStore::claim_unmarked`])
+    //! between two takers and a reclaim, or a free, over two slots whose free space is a word of
+    //! bits.
+    use super::*;
+    use loom::sync::atomic::AtomicU64;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Two slots: their claims, their marks in the free space, and which are unerased.
+    #[derive(Default)]
+    struct Slots {
+        claimed: GrowBits,
+        marked: AtomicU64,
+        unerased: AtomicU64,
+    }
+
+    impl Slots {
+        fn held(&self, slot: u64) -> bool {
+            (self.marked.load(Ordering::Acquire) | self.unerased.load(Ordering::Acquire))
+                & 1 << slot
+                != 0
+        }
+
+        /// A take: a walk for a slot neither held nor claimed, then the claim; a copy's take marks
+        /// its slot and then lets its claim go, as take_copy_slot does.
+        fn take(&self, copy: bool) -> Option<u64> {
+            for slot in 0..2 {
+                if self.held(slot) || self.claimed.get(slot) {
+                    continue;
+                }
+                let won = PageStore::claim_unmarked(&self.claimed, slot, || {
+                    Ok(IOResult::Done(self.held(slot)))
+                })
+                .unwrap();
+                if matches!(won, IOResult::Done(true)) {
+                    if copy {
+                        self.marked.fetch_or(1 << slot, Ordering::AcqRel);
+                        self.claimed.clear(slot);
+                    }
+                    return Some(slot);
+                }
+            }
+            None
+        }
+    }
+
+    fn check(f: impl Fn() + Sync + Send + 'static) {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(f);
+    }
+
+    /// A swap's take and a copy's take, with slot 1's claim a given-up swap copy's that a reclaim
+    /// clears meanwhile: never one slot for both.
+    #[test]
+    fn a_swap_take_a_copy_take_and_a_reclaim_never_give_one_slot_twice() {
+        check(|| {
+            let slots = Arc::new(Slots::default());
+            slots.claimed.set(1);
+            let swap = {
+                let slots = slots.clone();
+                thread::spawn(move || slots.take(false))
+            };
+            let reclaim = {
+                let slots = slots.clone();
+                thread::spawn(move || {
+                    slots.claimed.clear(1);
+                })
+            };
+            let copy = slots.take(true);
+            let swap = swap.join().unwrap();
+            reclaim.join().unwrap();
+            if let (Some(a), Some(b)) = (swap, copy) {
+                assert_ne!(a, b, "a swap copy and a checkpoint copy given one slot");
+            }
+        });
+    }
+
+    /// A copy's slot 0 freed (unerased, then its mark cleared, as free_slot does) while a swap's
+    /// take and a copy's take run: neither gets slot 0 before its erasure.
+    #[test]
+    fn a_slot_being_freed_is_taken_by_none_before_its_erasure() {
+        check(|| {
+            let slots = Arc::new(Slots::default());
+            slots.marked.store(1, Ordering::Release);
+            let free = {
+                let slots = slots.clone();
+                thread::spawn(move || {
+                    slots.unerased.fetch_or(1, Ordering::AcqRel);
+                    slots.marked.fetch_and(!1, Ordering::AcqRel);
+                })
+            };
+            let swap = {
+                let slots = slots.clone();
+                thread::spawn(move || slots.take(false))
+            };
+            let copy = slots.take(true);
+            let swap = swap.join().unwrap();
+            free.join().unwrap();
+            assert_ne!(swap, Some(0), "a swap took a slot being freed");
+            assert_ne!(copy, Some(0), "a copy took a slot being freed");
+            if let (Some(a), Some(b)) = (swap, copy) {
+                assert_ne!(a, b, "a swap copy and a checkpoint copy given one slot");
+            }
+        });
     }
 }

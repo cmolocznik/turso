@@ -422,6 +422,16 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "store/tests.rs",
+            "a_copy_landing_in_a_claimed_slot_ends_the_process",
+            "child",
+        ),
+        (
+            "store/tests.rs",
+            "a_swap_copy_landing_in_a_marked_slot_ends_the_process",
+            "child",
+        ),
+        (
             "tests.rs",
             "a_number_taken_with_no_frame_at_a_cut_is_free_after_a_recovery",
             "child",

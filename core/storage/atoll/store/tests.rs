@@ -487,6 +487,267 @@ fn a_copy_slot_take_whose_walk_waits_on_a_metadata_read_holds_no_claim() {
 
 /// Frees waiting for a checkpoint that a yield interrupts are all still waiting: freeing the first
 /// slot yields on its free-space leaf, and the second slot's free is kept, then done.
+/// A swap copy's slot found free by its walk, then claimed, marked in the free space and let go by a
+/// checkpoint copy's take before the swap's claim, is not the swap's: its claim reads the free
+/// space again and walks on (ROWS-LOST1). Before, the swap took the slot the copy had been written
+/// to, and its write landed over the copy: a page whose copy on disk was another page's.
+#[test]
+fn a_swap_slot_taken_for_a_copy_between_its_walk_and_its_claim_is_not_the_swaps() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let store = PageStore::open(
+        counted_for_test(io.clone()),
+        "/db/slot-claims",
+        StoreConfig::default(),
+        [[1; CLASS_COUNT]; TREES],
+        0,
+    );
+    let class = class(0);
+    let copy = Rc::new(Cell::new(None));
+    {
+        let (store, io, copy) = (store.clone(), io.clone(), copy.clone());
+        crate::race::at("store.slot_found", move || {
+            // The copy's walk starts where the swap's found its slot.
+            let found = store.cursors[class.index()].load(Ordering::Relaxed) - 1;
+            store.cursors[class.index()].store(found, Ordering::Relaxed);
+            let mut mark = MarkEdit::default();
+            copy.set(drive(&io, || store.take_copy_slot(class, &mut mark)).ok());
+        });
+    }
+    let swap = drive(&io, || store.take_swap_slot(class)).ok();
+    let ran = !crate::race::pending("store.slot_found");
+    // The claim the swap won and gave back holds the copy's slot no longer.
+    let stray = copy
+        .get()
+        .is_some_and(|s| store.claimed[class.index()].get(s));
+    drop(store);
+    assert!(ran, "the swap's walk never found a slot");
+    assert!(!stray, "the swap's claim of the copy's slot was kept");
+    assert!(
+        copy.get().is_some() && swap.is_some(),
+        "a take failed: {:?} {swap:?}",
+        copy.get()
+    );
+    assert_ne!(
+        swap,
+        copy.get(),
+        "the swap's slot and the checkpoint copy's"
+    );
+}
+
+/// The mirror: a checkpoint copy's slot found free by its walk, then claimed by a swap copy's take
+/// before the copy's claim, is not the copy's: its claim fails and it walks on.
+#[test]
+fn a_copy_slot_claimed_for_a_swap_between_its_walk_and_its_claim_is_not_the_copys() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (io, store) = slot_store("/db/slot-claims-mirror");
+    let class = class(0);
+    let swap = Rc::new(Cell::new(None));
+    {
+        let (store, io, swap) = (store.clone(), io.clone(), swap.clone());
+        crate::race::at("store.slot_found", move || {
+            let found = store.cursors[class.index()].load(Ordering::Relaxed) - 1;
+            store.cursors[class.index()].store(found, Ordering::Relaxed);
+            swap.set(drive(&io, || store.take_swap_slot(class)).ok());
+        });
+    }
+    let mut mark = MarkEdit::default();
+    let copy = drive(&io, || store.take_copy_slot(class, &mut mark)).ok();
+    let ran = !crate::race::pending("store.slot_found");
+    drop(store);
+    assert!(ran, "the copy's walk never found a slot");
+    assert!(copy.is_some() && swap.get().is_some(), "a take failed");
+    assert_ne!(copy, swap.get(), "the copy's slot and the swap copy's");
+}
+
+/// A checkpoint copy's take holds its claim until the free space marks its slot: a swap copy's
+/// take between the claim and the mark walks past the slot (mutant: the claim let go before the
+/// mark).
+#[test]
+fn a_swap_take_between_a_copys_claim_and_its_mark_walks_past_the_slot() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (io, store) = slot_store("/db/slot-claims-mark");
+    let class = class(0);
+    let swap = Rc::new(Cell::new(None));
+    {
+        let (store, io, swap) = (store.clone(), io.clone(), swap.clone());
+        crate::race::at("store.copy_slot_claimed", move || {
+            let found = store.cursors[class.index()].load(Ordering::Relaxed) - 1;
+            store.cursors[class.index()].store(found, Ordering::Relaxed);
+            swap.set(drive(&io, || store.take_swap_slot(class)).ok());
+        });
+    }
+    let mut mark = MarkEdit::default();
+    let copy = drive(&io, || store.take_copy_slot(class, &mut mark)).ok();
+    let ran = !crate::race::pending("store.copy_slot_claimed");
+    drop(store);
+    assert!(ran, "the copy never claimed a slot");
+    assert!(copy.is_some() && swap.get().is_some(), "a take failed");
+    assert_ne!(copy, swap.get(), "the copy's slot and the swap copy's");
+}
+
+/// A swap copy's slot given up is taken again by one taker: the next take reclaims the claim it held
+/// and may take the slot, and a take after that walks past it. A walk passes a claimed slot, so a
+/// reclaim between another take's walk and its claim gives that take nothing it had not found.
+#[test]
+fn a_given_up_swap_slot_is_taken_again_by_one_taker() {
+    let (io, store) = slot_store("/db/slot-claims-reclaim");
+    let class = class(0);
+    let first = drive(&io, || store.take_swap_slot(class)).unwrap();
+    store.untake_swap_slot(class, first);
+    let at = |s: u64| store.cursors[class.index()].store(s, Ordering::Relaxed);
+    at(first);
+    let copy = drive(&io, || {
+        store.take_copy_slot(class, &mut MarkEdit::default())
+    })
+    .ok();
+    at(first);
+    let swap = drive(&io, || store.take_swap_slot(class)).ok();
+    let held_by_copy = copy == Some(first);
+    drop(store);
+    assert!(copy.is_some() && swap.is_some(), "a take failed");
+    assert!(
+        held_by_copy,
+        "the copy's take did not take the slot given up: {copy:?}"
+    );
+    assert_ne!(swap, Some(first), "a swap took the slot the copy holds");
+}
+
+/// A slot found free and erased by a take's walk, then taken for a copy, replaced and freed through
+/// the free that waited for a durable checkpoint before the take's claim, stands free and unerased:
+/// the take does not get it, since its erasure would land over the take's copy (the auditor's #6188;
+/// mutant: the look asks the bit alone).
+#[test]
+fn a_slot_freed_and_not_yet_erased_between_a_walk_and_its_claim_is_not_taken() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (io, store) = slot_store("/db/slot-claims-unerased");
+    let class = class(0);
+    let pid = drive(&io, || store.allocate(class)).unwrap();
+    let freed = Rc::new(Cell::new(None));
+    {
+        let (store, io, freed) = (store.clone(), io.clone(), freed.clone());
+        crate::race::at("store.slot_found", move || {
+            let found = store.cursors[class.index()].load(Ordering::Relaxed) - 1;
+            store.cursors[class.index()].store(found, Ordering::Relaxed);
+            let mut mark = MarkEdit::default();
+            let (_, heights) = store.begin_cut(1);
+            let first = drive(&io, || store.take_copy_slot(class, &mut mark)).unwrap();
+            drive(&io, || {
+                store.copied(1, &heights, pid, first, &mut CutEdit::default())
+            })
+            .unwrap();
+            store.meta().end_cut(1, &[]);
+            let (_, heights) = store.begin_cut(2);
+            let second = drive(&io, || store.take_copy_slot(class, &mut mark)).unwrap();
+            drive(&io, || {
+                store.copied(2, &heights, pid, second, &mut CutEdit::default())
+            })
+            .unwrap();
+            store.meta().end_cut(2, &[]);
+            drive(&io, || store.after(2, &mut FreeEdit::default())).unwrap();
+            freed.set(Some(first));
+        });
+    }
+    let swap = drive(&io, || store.take_swap_slot(class)).ok();
+    let unerased = freed
+        .get()
+        .is_some_and(|s| store.unerased[class.index()].get(s));
+    drop(store);
+    assert!(freed.get().is_some(), "the swap's walk never found a slot");
+    assert!(unerased, "the freed slot is erased already");
+    assert_ne!(
+        swap,
+        freed.get(),
+        "a take got a slot freed and not yet erased"
+    );
+}
+
+/// In every build: a checkpoint copy that lands in a slot a claim holds, a swap copy's that would
+/// write over it, ends the process with its words (ROWS-LOST1's double take caught at the copy).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_copy_landing_in_a_claimed_slot_ends_the_process() {
+    let ended = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_copy_landing_in_a_claimed_slot_ends_the_process"
+        ),
+        || {
+            let (io, store) = slot_store("/db/slot-claims-copy-assert");
+            let class = class(0);
+            let pid = drive(&io, || store.allocate(class)).unwrap();
+            let (_, heights) = store.begin_cut(1);
+            let slot = drive(&io, || {
+                store.take_copy_slot(class, &mut MarkEdit::default())
+            })
+            .unwrap();
+            store.claimed[class.index()].set(slot);
+            let _ = drive(&io, || {
+                store.copied(1, &heights, pid, slot, &mut CutEdit::default())
+            });
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert_ne!(ended.code, Some(0), "the copy landed:\n{}", ended.stderr);
+    assert!(
+        ended.stderr.contains("which a claim holds"),
+        "{}",
+        ended.stderr
+    );
+}
+
+/// In every build: a swap copy that lands in a slot the free space marks, a checkpoint copy's,
+/// ends the process with its words (ROWS-LOST1's double take caught at the swap copy).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_swap_copy_landing_in_a_marked_slot_ends_the_process() {
+    let ended = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_swap_copy_landing_in_a_marked_slot_ends_the_process"
+        ),
+        || {
+            let (io, store) = slot_store("/db/slot-claims-swap-assert");
+            let class = class(0);
+            let pid = drive(&io, || store.allocate(class)).unwrap();
+            let slot = drive(&io, || {
+                store.take_copy_slot(class, &mut MarkEdit::default())
+            })
+            .unwrap();
+            store.set_swap(pid, slot, 1);
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert_ne!(
+        ended.code,
+        Some(0),
+        "the swap copy landed:\n{}",
+        ended.stderr
+    );
+    assert!(
+        ended.stderr.contains("which the free space holds"),
+        "{}",
+        ended.stderr
+    );
+}
+
+/// A store on memory with one level of metadata a class, for the slot takes' tests.
+fn slot_store(base: &str) -> (Arc<dyn IO>, Arc<PageStore>) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let store = PageStore::open(
+        counted_for_test(io.clone()),
+        base,
+        StoreConfig::default(),
+        [[1; CLASS_COUNT]; TREES],
+        0,
+    );
+    (io, store)
+}
+
 #[test]
 fn a_yield_while_doing_the_frees_a_checkpoint_let_go_keeps_every_one_still_owed() {
     let db = Db::open();

@@ -351,6 +351,24 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         }
     }
 
+    if loop_err.is_none() {
+        match whopper.taken_frames_census() {
+            Some((read, census)) if census.is_empty() => println!(
+                "census of taken frames at the run's end: {read} Atoll databases, every taken \
+                 frame in exactly one place"
+            ),
+            Some((_, census)) => {
+                loop_err = Some(anyhow::anyhow!(
+                    "the buffer pool's census of taken frames at the run's end (SHORT-HOLD1) named \
+                     {} frames in no place or in more than one:\n{}",
+                    census.len(),
+                    census.join("\n")
+                ));
+            }
+            None => {}
+        }
+    }
+
     if loop_err.is_none() && FtsProfile::from_mode(&args.mode).is_some() {
         if let Err(error) = whopper.reopen() {
             loop_err = Some(error);

@@ -31,9 +31,13 @@
 //! miss fails until the database is reopened and recovered.
 
 pub(super) mod cell;
+#[cfg(any(test, feature = "simulator"))]
+mod census;
 mod clean;
 mod frame;
 mod group;
+#[cfg(any(test, feature = "simulator"))]
+mod keepers;
 mod kept;
 mod lend;
 mod lent;
@@ -619,6 +623,10 @@ pub struct BufferPool {
     /// to show while another thread steps it.
     #[cfg(test)]
     stepped: Mutex<HashMap<u64, String>>,
+    /// Who keeps the frames an operation's top or the checkpoint's demand holds between calls,
+    /// for the census of taken frames and the park report.
+    #[cfg(any(test, feature = "simulator"))]
+    keepers: keepers::Keepers,
 }
 
 /// What a claimed frame is for.
@@ -729,6 +737,8 @@ impl BufferPool {
             protecting: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             stepped: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "simulator"))]
+            keepers: keepers::Keepers::new(),
         });
         pool.lends.set_pool(&pool);
         // A database opened async queues a frame's requests in its record, one per grain, and the

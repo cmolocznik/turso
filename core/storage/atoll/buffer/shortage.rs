@@ -7,6 +7,8 @@
 //! as any caller holding nothing does. The frame is kept for the claim it was reserved for, which
 //! takes it when the operation runs again; the gate passes on when the operation ends.
 
+#[cfg(any(test, feature = "simulator"))]
+use super::keepers::{Keeper, Serial};
 use super::supply::{Handoff, Supply};
 use super::{BufferPool, PageId, Purpose, SizeClass};
 use crate::io::{Completion, WakerKey};
@@ -666,6 +668,46 @@ impl Queue {
         }
         n
     }
+
+    /// Every place, head first, copied out under the mutex, for the census of taken frames and
+    /// the park report.
+    #[cfg(any(test, feature = "simulator"))]
+    pub(super) fn places(&self) -> Vec<PlaceSeen> {
+        let s = self.slots.lock();
+        let mut out = Vec::new();
+        let mut at = s.head;
+        while let Some(i) = at {
+            let node = &s.nodes[i];
+            out.push(PlaceSeen {
+                slot: i,
+                generation: node.generation,
+                conn: node.conn.as_ref().map_or(0, |c| Arc::as_ptr(c).addr()),
+                running: node.running,
+                holds_gate: s.head == Some(i)
+                    && node.turn.as_ref().is_some_and(Completion::finished),
+                demand: node.demand,
+                reserved: node.reserved,
+                published: node.published,
+            });
+            at = node.next;
+        }
+        out
+    }
+}
+
+/// A place in the queue as its node read under the mutex.
+#[cfg(any(test, feature = "simulator"))]
+pub(super) struct PlaceSeen {
+    pub(super) slot: usize,
+    pub(super) generation: u64,
+    /// Its connection's address (the `Arc<Conn>`), 0 for none.
+    pub(super) conn: usize,
+    pub(super) running: bool,
+    /// At the head, its turn finished.
+    pub(super) holds_gate: bool,
+    pub(super) demand: Option<(SizeClass, Purpose)>,
+    pub(super) reserved: Option<(SizeClass, Purpose, u32)>,
+    pub(super) published: bool,
 }
 
 // ------------------------------------------------------------------------------------ owner
@@ -684,6 +726,9 @@ pub(crate) struct Owner {
     /// build, that wait is an error at the place it would begin.
     #[cfg(test)]
     serves_owed: bool,
+    /// The number the registry of keepers names it by.
+    #[cfg(any(test, feature = "simulator"))]
+    serial: Serial,
 }
 
 /// What an operation's top keeps between its calls (ASYNC1 D2e §2.2b): at most one reference in a
@@ -721,11 +766,18 @@ pub(super) struct Kept {
     pool: Arc<BufferPool>,
     frame: u32,
     pid: PageId,
+    /// Its slot in the pool's registry of keepers, if the registry had a free one.
+    #[cfg(any(test, feature = "simulator"))]
+    entry: Option<usize>,
 }
 
 impl Drop for Kept {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
+        #[cfg(any(test, feature = "simulator"))]
+        if let Some(slot) = self.entry {
+            self.pool.keepers.remove(slot);
+        }
         self.pool.release_kept(self.frame, self.pid);
     }
 }
@@ -784,6 +836,8 @@ impl Owner {
             keeps: Keeps::default(),
             #[cfg(test)]
             serves_owed: false,
+            #[cfg(any(test, feature = "simulator"))]
+            serial: Serial::default(),
         }
     }
 
@@ -953,6 +1007,12 @@ impl Owner {
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(crate) fn kept_frame(&self) -> Option<u32> {
         self.keeps.pool.as_ref().map(|k| k.frame)
+    }
+
+    /// The number the registry of keepers names the owner by, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial.0
     }
 
     /// Whether the owner keeps a metadata page, for a test.
@@ -1216,11 +1276,15 @@ pub(super) fn let_go_kept() {
 /// The running owner's reference in the group its loader just opened for `pid` in `frame`, its
 /// slot empty since its miss.
 pub(super) fn keep_loaded(pool: &Arc<BufferPool>, frame: u32, pid: PageId) {
+    #[cfg(any(test, feature = "simulator"))]
+    let keeper = running_keeper();
     let old = running_keeps(|k| {
         k.pool.replace(Kept {
             pool: pool.clone(),
             frame,
             pid,
+            #[cfg(any(test, feature = "simulator"))]
+            entry: keeper.and_then(|keeper| pool.keepers.add(frame, pid.raw(), keeper)),
         })
     });
     crate::turso_assert!(old.flatten().is_none(), "a loader kept two loads' pages");
@@ -1245,14 +1309,41 @@ pub(super) fn keep_joined(
     };
     drop(other);
     if join() {
+        #[cfg(any(test, feature = "simulator"))]
+        let keeper = running_keeper();
         running_keeps(|k| {
             k.pool = Some(Kept {
                 pool: pool.clone(),
                 frame,
                 pid,
+                #[cfg(any(test, feature = "simulator"))]
+                entry: keeper.and_then(|keeper| pool.keepers.add(frame, pid.raw(), keeper)),
             })
         });
     }
+}
+
+/// The running owner as the registry of keepers names it, while its call runs: `None` outside any
+/// owner's call.
+#[cfg(any(test, feature = "simulator"))]
+fn running_keeper() -> Option<Keeper> {
+    let owner = OWNER.with(Cell::get);
+    if owner.is_null() {
+        return None;
+    }
+    // SAFETY: the owner installed itself for the duration of its call, which is still running;
+    // nothing changes its connection or its number meanwhile, and no borrow of it is alive here.
+    let (conn, serial) = unsafe {
+        (
+            (*owner).conn.as_ref().map_or(0, |c| Arc::as_ptr(c).addr()),
+            (*owner).serial.0,
+        )
+    };
+    Some(Keeper::Owner {
+        conn,
+        serial,
+        at: owner.addr(),
+    })
 }
 
 /// The page the running owner keeps in a load's group, and its frame's hint (the frame plus one),

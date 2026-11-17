@@ -829,6 +829,11 @@ mod tests {
             "child",
         ),
         (
+            "buffer/tests.rs",
+            "a_read_drains_the_only_batch_of_a_class_whose_one_frame_a_suspended_owner_keeps",
+            "child",
+        ),
+        (
             "sql/mode/tests.rs",
             "a_statement_reset_while_its_header_read_waits_lets_the_reads_page_go",
             "child",

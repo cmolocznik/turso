@@ -101,6 +101,13 @@ fn before_writes() {
 }
 
 impl VersionedLatch {
+    /// The latch's word as read now: its exclusive bit, its waited bit and its version, for the
+    /// park report.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn word(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
     /// The version to validate against later, or `None` while a writer holds the latch.
     pub fn optimistic(&self) -> Option<u64> {
         let word = self.0.load(Ordering::Acquire);

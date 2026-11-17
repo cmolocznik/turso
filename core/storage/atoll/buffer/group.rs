@@ -116,6 +116,25 @@ impl GroupWord {
     pub(super) fn references(&self) -> u32 {
         self.0.load(Ordering::Acquire) / REFERENCE
     }
+
+    /// The word as read now, `2 × references + open`, for the census of taken frames and the park
+    /// report.
+    #[cfg(any(test, feature = "simulator"))]
+    pub(super) fn word(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Whether a group word says its load is under way.
+#[cfg(any(test, feature = "simulator"))]
+pub(super) fn word_open(word: u32) -> bool {
+    word & OPEN != 0
+}
+
+/// The references a group word counts, the guard's included.
+#[cfg(any(test, feature = "simulator"))]
+pub(super) fn word_references(word: u32) -> u32 {
+    word / REFERENCE
 }
 
 /// A load's group and its frame's record word under loom, on the primitives themselves: the close,

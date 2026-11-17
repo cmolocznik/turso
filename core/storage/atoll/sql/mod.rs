@@ -225,6 +225,22 @@ impl AtollDb {
         &self.atoll
     }
 
+    /// What a claim parked on the buffer pool's memory waits behind, for the simulator's watchdog
+    /// (`BufferPool::park_report`).
+    #[cfg(feature = "simulator")]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn park_report(&self) -> String {
+        self.atoll.pool().park_report()
+    }
+
+    /// Every taken frame of the buffer pool in no place or in more than one, for the simulator's
+    /// check at a run's end (`BufferPool::taken_frames_census`).
+    #[cfg(feature = "simulator")]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn taken_frames_census(&self) -> Vec<String> {
+        self.atoll.pool().taken_frames_census()
+    }
+
     pub(in crate::storage::atoll) fn versions(&self) -> &Versions {
         &self.versions
     }

@@ -212,7 +212,8 @@ impl Supply {
         );
         Ticket {
             stepped: self.cells[STEPPED].current_with(domain, crate::storage::atoll::notify::wait),
-            remote: self.cells[REMOTE].current_with(domain, crate::storage::atoll::notify::remote_wait),
+            remote: self.cells[REMOTE]
+                .current_with(domain, crate::storage::atoll::notify::remote_wait),
         }
     }
 
@@ -549,7 +550,9 @@ mod tests {
         // notification does): one delivery runs them in turn (the auditor's direct-signal chain).
         let depth = Arc::new(AtomicUsize::new(0));
         let deepest = Arc::new(AtomicUsize::new(0));
-        let waits: Vec<_> = (0..24).map(|_| crate::storage::atoll::notify::wait()).collect();
+        let waits: Vec<_> = (0..24)
+            .map(|_| crate::storage::atoll::notify::wait())
+            .collect();
         for i in 0..waits.len() {
             let next = waits.get(i + 1).cloned();
             let (d, m) = (depth.clone(), deepest.clone());
@@ -661,6 +664,18 @@ impl Handoff {
                 .0
                 .compare_exchange(wanted(class), handed, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
+    }
+
+    /// The class of the demand that stands and the frame handed to it, as read now, for the census
+    /// of taken frames and the park report.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn seen(&self) -> (Option<SizeClass>, Option<u32>) {
+        let word = self.0.load(Ordering::SeqCst);
+        let class = ((word & 0xff) as usize)
+            .checked_sub(1)
+            .and_then(SizeClass::new);
+        let handed = (word & HANDED != 0).then_some((word >> 32) as u32);
+        (class, handed)
     }
 
     /// Whether a frame was handed to the demand and not yet adopted or withdrawn.

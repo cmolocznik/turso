@@ -196,6 +196,14 @@ fn pages_keep_their_contents_through_eviction_writeback_and_moves_between_classe
             .unwrap();
         }
         model.check_all();
+        let census = pool.taken_frames_census();
+        drop(model);
+        drop(pool);
+        assert!(
+            census.is_empty(),
+            "{}: the census of taken frames at the end: {census:#?}",
+            b.name
+        );
     }
 }
 
@@ -751,7 +759,14 @@ fn a_lend_batch_taken_at_open_is_never_drained_and_no_cache_claim_takes_it() {
         for f in frames {
             pool.free_frame(class(0), f, pool.take_free_latch(f));
         }
+        let census = pool.taken_frames_census();
         drop(ring);
+        drop(pool);
+        assert!(
+            census.is_empty(),
+            "{}: the census with the ring's frames lent: {census:#?}",
+            b.name
+        );
     }
 }
 
@@ -5058,6 +5073,11 @@ fn reserved_frame_goes_to_its_demand() -> std::result::Result<(), String> {
     );
     check!(owner.queued(), "the owner holds a tenure");
     check!(free(&pool) == before - 1, "one frame reserved");
+    let census = pool.taken_frames_census();
+    check!(
+        census.is_empty(),
+        "the census with a frame reserved for the shortage: {census:#?}"
+    );
     // Inside the operation: a claim of another purpose does not take it; the claim of its demand
     // does, and nothing more leaves the free frames for it.
     let (other, own, free_then, free_after) = match owner
@@ -7069,7 +7089,7 @@ fn a_frame_handed_to_the_checkpoint_not_quiet_gives_it_one_wait() {
     let mut taken = take_every_frame(&pool, c);
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (leave_tx, leave_rx) = mpsc::channel::<()>();
-    let (waited, one, early, finished_at_end, freed) = std::thread::scope(|s| {
+    let (waited, one, early, finished_at_end, freed, census) = std::thread::scope(|s| {
         let pool_ref = &pool;
         let reader = s.spawn(move || {
             let step = pool_ref.store.epochs().enter();
@@ -7094,12 +7114,15 @@ fn a_frame_handed_to_the_checkpoint_not_quiet_gives_it_one_wait() {
             && early
                 .iter()
                 .all(|w| !w.finished() && w.addr() == early[0].addr());
+        let census = pool.taken_frames_census();
         drop(upkeep);
         let finished_at_end = early.iter().filter(|w| w.finished()).count();
         let _ = leave_tx.send(());
         let _ = reader.join();
-        (waited, one, early.len(), finished_at_end, freed)
+        (waited, one, early.len(), finished_at_end, freed, census)
     });
+    let mut unplaced = taken.clone();
+    unplaced.sort_unstable();
     let back = match pool.claim(c, Purpose::New, &[]).unwrap() {
         IOResult::Done(f) => Some(f),
         IOResult::IO(_) => None,
@@ -7118,6 +7141,18 @@ fn a_frame_handed_to_the_checkpoint_not_quiet_gives_it_one_wait() {
         back,
         Some(freed),
         "the handed frame did not go back with the demand"
+    );
+    // The frames the test took for itself are in no place; the one kept for the checkpoint's
+    // demand is in its place.
+    let named: Vec<u32> = census
+        .iter()
+        .filter(|line| line.contains(": taken and in no place [];"))
+        .filter_map(|line| line.strip_prefix("frame ")?.split(' ').next()?.parse().ok())
+        .collect();
+    assert!(
+        named == unplaced && census.len() == unplaced.len(),
+        "the census with frame {freed} kept for the checkpoint's demand names other than the \
+         frames the test took, {unplaced:?}: {census:#?}"
     );
 }
 
@@ -8015,6 +8050,7 @@ fn a_frames_record_holds_its_load_and_its_write_out_until_each_retires() {
     let settled = matches!(pool.settle_writes(), Ok(IOResult::Done(())));
     let freed_while_written = pool.header(f).status() == FREE;
     let free_while_written = pool.memory.free_frames(class(0)).contains(&f);
+    let census_while_written = pool.taken_frames_census();
     let _ = pool.fix_optimistic(q, None).unwrap();
     let q_frame = pool.table.find(&pool.frames.headers, q.raw());
     watch(&[f], &mut most_over_one_frame);
@@ -8037,6 +8073,7 @@ fn a_frames_record_holds_its_load_and_its_write_out_until_each_retires() {
     }
     let free_while_cancelled =
         g_frame.is_some_and(|g| pool.memory.free_frames(class(0)).contains(&g));
+    let census_while_cancelled = pool.taken_frames_census();
     if let Some(g) = g_frame {
         watch(&[g], &mut most_over_one_frame);
     }
@@ -8101,6 +8138,14 @@ fn a_frames_record_holds_its_load_and_its_write_out_until_each_retires() {
     );
     assert_eq!(q_back, Some(Some(2)));
     assert!(failure.is_none(), "the pool failed: {failure:?}");
+    assert!(
+        census_while_written.is_empty(),
+        "the census while the write-out's request was owned: {census_while_written:#?}"
+    );
+    assert!(
+        census_while_cancelled.is_empty(),
+        "the census while the cancelled read's request was owned: {census_while_cancelled:#?}"
+    );
 }
 
 /// Counts the wakes a claim's wait gets.
@@ -8479,6 +8524,62 @@ fn a_load_whose_read_filled_its_page_judges_its_own_read_not_its_frames_next_pag
 // ------------------------------------------------- a load's group (ASYNC1 D2e §2.2b)
 
 /// A load's group (ASYNC1 D2e §2.2b), natively: each test's body in a child of its own.
+/// The census names a frame taken from its batch and put in no place, and a resident page's
+/// frame also named kept for the checkpoint's demand, in two; with the frame given back and the
+/// entry cleared it names nothing, and the report of a pool with no batch leaving says so
+/// (SHORT-HOLD1).
+#[test]
+fn the_census_names_a_frame_taken_and_put_in_no_place_and_one_put_in_two() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/census-places", MIN_BUDGET);
+    let page = drive(&io, || pool.allocate(class(0))).unwrap();
+    let (pid, resident) = (page.pid(), page.frame);
+    drop(page);
+    let before = pool.taken_frames_census();
+    let report = pool.park_report();
+    let lost = pool.memory.take(class(0)).expect("a free 4 KiB frame");
+    let in_no_place = pool.taken_frames_census();
+    pool.memory.put(class(0), lost);
+    let entry = pool
+        .keepers
+        .add(resident, pid.raw(), super::keepers::Keeper::Checkpoint);
+    let in_two = pool.taken_frames_census();
+    if let Some(slot) = entry {
+        pool.keepers.remove(slot);
+    }
+    let after = pool.taken_frames_census();
+    drop(pool);
+    assert!(
+        before.is_empty(),
+        "the census of a pool holding one page: {before:#?}"
+    );
+    assert!(
+        report.contains("leaving batches: none\n"),
+        "the report of a pool with no batch leaving: {report}"
+    );
+    assert!(
+        in_no_place.len() == 1
+            && in_no_place[0].starts_with(&format!(
+                "frame {lost} of class 0: taken and in no place [];"
+            )),
+        "the census did not name frame {lost}, taken and put in no place, alone: {in_no_place:#?}"
+    );
+    assert!(entry.is_some(), "the registry of keepers had no free slot");
+    assert!(
+        in_two.len() == 1
+            && in_two[0].starts_with(&format!(
+                "frame {resident} of class 0: taken and in more than one place [kept for the \
+                 checkpoint's demand, the page table];"
+            )),
+        "the census did not name frame {resident}, in the page table and kept for the \
+         checkpoint's demand, alone: {in_two:#?}"
+    );
+    assert!(
+        after.is_empty(),
+        "the census once the frame is back and the entry cleared: {after:#?}"
+    );
+}
+
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 mod group {
     use super::*;
@@ -8813,6 +8914,12 @@ mod group {
                         0,
                         "joiner first {joiner_first}: the frame was freed while the loader kept it"
                     );
+                    let census = pool.taken_frames_census();
+                    assert!(
+                        census.is_empty(),
+                        "joiner first {joiner_first}: the census with the frame deferred for the \
+                         loader's reference: {census:#?}"
+                    );
                     drop(a);
                     assert_eq!(
                         free_times(&pool, class(0), frame),
@@ -8851,6 +8958,11 @@ mod group {
                     IOResult::Done(_) => panic!("a frame its group keeps was evicted"),
                 };
                 assert!(!parked.finished(), "the claim parks behind the kept frames");
+                let census = pool.taken_frames_census();
+                assert!(
+                    census.is_empty(),
+                    "the census with every frame kept by its loader: {census:#?}"
+                );
                 drop(owners.pop());
                 assert!(
                     parked.finished(),
@@ -8991,6 +9103,165 @@ mod group {
                     "B kept the frame L's group had let go"
                 );
                 assert!(quiet_after, "the frame stayed unquiet after B's step ended");
+            },
+        );
+    }
+
+    /// SHORT-HOLD1's park, built in a small pool. Owner A's load of a 32 KiB page (class 3) lands
+    /// after A's call returned, so A keeps its reference in the load's group, the page it last
+    /// loaded, and is never called again: a statement whose call returned in a cooperative frame
+    /// while its only thread waits elsewhere. Class 3 holds one batch and class 4 none, and every
+    /// other batch went to class 0 while a step that began before is under way, so a drain passes
+    /// them over. Owner B's read of a 64 KiB page (class 4, a version arena's) then drains class
+    /// 3's only batch for class 4 and comes back waiting. The drain's choice does not look at the
+    /// group's reference, so the batch's one taken frame stays: resident, clean and unlatched, its
+    /// record waited and grouped, its group closed with one reference, A's, which the registry of
+    /// keepers names. The census finds the frame in the page table alone.
+    ///
+    /// SHORT-HOLD1's fix turns over the first assertion, that the drain chose class 3's only
+    /// batch: a choice that looks at group references passes over a batch whose taken frame is
+    /// kept, which then does not drain for class 4 with A's frame in it.
+    #[test]
+    fn a_read_drains_the_only_batch_of_a_class_whose_one_frame_a_suspended_owner_keeps() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_read_drains_the_only_batch_of_a_class_whose_one_frame_a_suspended_owner_keeps"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/short-hold");
+                let kept = PageId::new(class(3), 1);
+                let wanted = PageId::new(class(4), 1);
+                let mut a = Owner::new();
+                let a_waited = !fixed_as(&mut a, &pool, kept);
+                let landed = land(&reads, Ok(()));
+                let frame = frame_of(&pool, kept);
+                // Every free batch to class 0, handed over while a step that began before is under
+                // way: held for class 0 until the step ends, so B's claim drains none of them.
+                let step = pool.store.epochs().enter();
+                let to_class_0 = pool.hold_free_batches(class(0));
+                let mut b = Owner::new();
+                let mut read = || {
+                    b.call(|| {
+                        Ok(match pool.fix_optimistic(wanted, None)? {
+                            IOResult::Done(_) => IOResult::Done(()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    })
+                };
+                // The call that chooses the drain; the next ones, with the step ended, come short
+                // and reserve at the top, holding nothing.
+                let first = read();
+                drop(step);
+                let mut parked = None;
+                for _ in 0..8 {
+                    match read() {
+                        Ok(IOResult::IO(IOCompletions(wait))) if !wait.finished() => {
+                            parked = Some(wait);
+                            break;
+                        }
+                        Ok(IOResult::IO(_)) => {}
+                        Ok(IOResult::Done(())) | Err(_) => break,
+                    }
+                }
+                let report = pool.park_report();
+                let census = pool.taken_frames_census();
+                let leaving = pool.memory.leaving();
+                let keepers: Vec<_> = pool
+                    .keepers
+                    .entries()
+                    .into_iter()
+                    .filter(|e| e.frame == frame)
+                    .map(|e| e.keeper)
+                    .collect();
+                let h = pool.header(frame);
+                let latched = h.latch.word() & 1 != 0;
+                let (status, dirty) = (h.status(), h.dirty());
+                let a_serial = a.serial();
+                let b_parked = parked.is_some();
+                drop(parked);
+                drop(b);
+                drop(a);
+                drop((pool, reads));
+                assert!(
+                    leaving.len() == 1
+                        && leaving[0].holder == class(3)
+                        && leaving[0].draining
+                        && leaving[0].beneficiary == Some(memory::Beneficiary::Class(class(4))),
+                    "the drain chose class 3's only batch for class 4: {leaving:?}\n{report}"
+                );
+                assert!(
+                    a_waited && landed == 1,
+                    "A's load waited and its read landed"
+                );
+                assert_eq!(to_class_0, 4, "the batches handed to class 0\n{report}");
+                assert!(
+                    matches!(first, Ok(IOResult::IO(_))),
+                    "B's first call was done"
+                );
+                assert!(b_parked, "B's read never came back waiting\n{report}");
+                let batch = format!(
+                    "batch {} of class 3 (32 KiB frames): draining for class 4, 1 of 64 frames \
+                     taken",
+                    leaving[0].batch
+                );
+                assert!(
+                    report.contains(&batch),
+                    "the report's batch is not `{batch}`\n{report}"
+                );
+                let frames: Vec<&str> = report
+                    .lines()
+                    .filter(|l| l.starts_with("  frame "))
+                    .collect();
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "the frames the report shows taken\n{report}"
+                );
+                let line = frames[0];
+                assert!(
+                    line.starts_with(&format!("  frame {frame}: page {:#x} ", kept.raw()))
+                        && line.contains("resident, clean"),
+                    "the taken frame is A's page, resident and clean\n{report}"
+                );
+                assert!(
+                    status == RESIDENT && !dirty && !latched,
+                    "the taken frame: status {status}, dirty {dirty}, latched {latched}"
+                );
+                assert!(
+                    line.contains("record 0xc (waited|group)"),
+                    "the frame's record is waited and grouped\n{report}"
+                );
+                assert!(
+                    line.contains("group 0x2 (closed, references 1)"),
+                    "the frame's group holds one reference\n{report}"
+                );
+                assert!(
+                    matches!(
+                        keepers.as_slice(),
+                        [super::keepers::Keeper::Owner { conn: 0, serial, .. }] if *serial == a_serial
+                    ),
+                    "the registry's keepers of the frame: {keepers:?}, not A (#{a_serial}) alone"
+                );
+                assert!(
+                    line.contains(&format!("keepers [owner #{a_serial} (connection 0x0, ")),
+                    "the report names A as the frame's keeper\n{report}"
+                );
+                assert!(
+                    line.ends_with("R of a place: no"),
+                    "the frame is no place's R\n{report}"
+                );
+                assert!(
+                    report.contains(
+                        "holds the gate, suspended, connection 0x0, demand class 4 for a read, \
+                         reserved none"
+                    ),
+                    "B's place holds the gate, its demand class 4 for a read\n{report}"
+                );
+                assert!(
+                    census.is_empty(),
+                    "the census of taken frames: {census:#?}\n{report}"
+                );
             },
         );
     }

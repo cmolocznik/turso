@@ -39,6 +39,7 @@ pub mod operations;
 pub mod properties;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod protocol;
+mod watchdog;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod worker;
 pub mod workloads;
@@ -720,6 +721,9 @@ struct SimulatorContext {
 
 /// The Whopper deterministic simulator.
 pub struct Whopper {
+    /// In Atoll mode, what prints the buffer pools' park reports while a step does not return.
+    /// First, so it stops before any database drops.
+    watchdog: Option<watchdog::Watchdog>,
     context: SimulatorContext,
     io: Arc<SimulatorIO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
@@ -808,6 +812,7 @@ impl Whopper {
             None
         };
 
+        let watchdog = opts.atoll.then(|| watchdog::Watchdog::start(seed));
         let db = {
             let db_opts = DatabaseOpts::new()
                 .with_encryption(encryption_opts.is_some())
@@ -832,6 +837,9 @@ impl Whopper {
                 }
             }
         };
+        if let Some(watchdog) = &watchdog {
+            watchdog.opened(&db);
+        }
 
         let bootstrap_conn = match db.connect(ConnectOpts::new()) {
             Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
@@ -899,6 +907,7 @@ impl Whopper {
         let total_weight: u32 = opts.workloads.iter().map(|(w, _)| w).sum();
 
         let mut whopper = Self {
+            watchdog,
             context,
             rng,
             io,
@@ -956,6 +965,7 @@ impl Whopper {
             return Ok(StepResult::Ok);
         }
 
+        let _watched = self.watchdog.as_ref().map(watchdog::Watchdog::watch);
         let _cache_override =
             fts::FtsCacheOverride::new(self.fts_profile == Some(fts::FtsProfile::Snapshots));
         let fiber_idx = self.current_step % self.context.fibers.len();
@@ -1434,6 +1444,15 @@ impl Whopper {
     }
 
     /// Finalize all properties (e.g., export Elle history).
+    /// In Atoll mode, the open databases read and every taken frame of their buffer pools that is
+    /// in no place or in more than one (SHORT-HOLD1): what the run checks after its last step.
+    /// `None` outside Atoll mode.
+    pub fn taken_frames_census(&self) -> Option<(usize, Vec<String>)> {
+        self.watchdog
+            .as_ref()
+            .map(watchdog::Watchdog::taken_frames_census)
+    }
+
     pub fn finalize_properties(&self) -> anyhow::Result<()> {
         for property in &self.properties {
             let mut property = property.lock().unwrap();
@@ -1617,7 +1636,11 @@ impl Whopper {
             self.context.fibers.len()
         );
 
+        let _watched = self.watchdog.as_ref().map(watchdog::Watchdog::watch);
         self.drain_active_statements("reopen")?;
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.closing();
+        }
         // Close and drop all fiber connections to release database Arc references
         {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
@@ -1793,6 +1816,9 @@ impl Whopper {
             self.atoll,
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.opened(&db);
+        }
 
         if self.disable_mvcc_auto_checkpoint {
             if let Some(mv_store) = db.get_mv_store().as_ref() {

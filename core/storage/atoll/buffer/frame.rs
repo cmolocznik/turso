@@ -165,6 +165,13 @@ impl FrameHeader {
         self.record.load(Ordering::Acquire) & RECORD_HELD != 0
     }
 
+    /// The record's word as read now ([`record_marks`]), for the census of taken frames and the
+    /// park report.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn record_word(&self) -> u8 {
+        self.record.load(Ordering::Acquire)
+    }
+
     /// Whether the frame's record holds a request or its load's group keeps it: either way an
     /// eviction passes it over.
     pub fn record_keeps(&self) -> bool {
@@ -320,6 +327,33 @@ pub struct Retired {
     pub freed: bool,
     /// A claim passed over the frame for the record: it is told.
     pub waited: bool,
+}
+
+/// Whether a record word says its frame was freed and is held back until its request retires and
+/// its load's group lets it go ([`FrameHeader::free_deferred`]).
+#[cfg(any(test, feature = "simulator"))]
+pub fn record_freed(word: u8) -> bool {
+    word & RECORD_FREED != 0
+}
+
+/// The marks a record word holds, by name.
+#[cfg(any(test, feature = "simulator"))]
+pub fn record_marks(word: u8) -> String {
+    let marks: Vec<&str> = [
+        (RECORD_HELD, "held"),
+        (RECORD_FREED, "freed"),
+        (RECORD_WAITED, "waited"),
+        (RECORD_GROUP, "group"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| word & bit != 0)
+    .map(|(_, name)| name)
+    .collect();
+    if marks.is_empty() {
+        "none".to_string()
+    } else {
+        marks.join("|")
+    }
 }
 
 /// The IO state of the hold taken at `version`, handed over: a latch's version has 62 bits.

@@ -1896,6 +1896,118 @@ impl Memory {
     }
 }
 
+/// A frame of a batch a class or a lend holds, as its batch's words read now: what the census of
+/// taken frames goes through.
+#[cfg(any(test, feature = "simulator"))]
+#[derive(Clone, Copy, Debug)]
+pub struct SeenFrame {
+    pub frame: u32,
+    pub class: SizeClass,
+    /// Its free bit is clear.
+    pub taken: bool,
+    /// Its batch is a lend batch ([`LENT`]).
+    pub lend: bool,
+}
+
+/// A batch that is leaving its class, draining or released, as its state word read now.
+#[cfg(any(test, feature = "simulator"))]
+#[derive(Clone, Copy, Debug)]
+pub struct Leaving {
+    pub batch: u32,
+    /// The class that holds it.
+    pub holder: SizeClass,
+    pub draining: bool,
+    pub releasing: bool,
+    /// Whom it goes to once empty: a class, the lend road, or `None` for back to the free runs.
+    pub beneficiary: Option<Beneficiary>,
+    /// Frames taken or promised.
+    pub taken: u32,
+    pub word: u64,
+}
+
+/// The run held for a large class while its batches are emptied ([`Reservation`]), as read now.
+#[cfg(any(test, feature = "simulator"))]
+#[derive(Clone, Copy, Debug)]
+pub struct ReservedRun {
+    pub start: u32,
+    pub batches: u32,
+    pub class: SizeClass,
+    /// Its batches not free yet.
+    pub missing: u32,
+}
+
+#[cfg(any(test, feature = "simulator"))]
+impl Memory {
+    /// Every frame of every batch a class or a lend holds, by that class, as read now.
+    pub fn seen_frames(&self) -> Vec<SeenFrame> {
+        let mut out = Vec::new();
+        let mut batch = 0;
+        while batch < self.batches {
+            let s = self.state(batch);
+            let held = if s.owner() == LENT {
+                self.lend_word(batch).class().map(|c| (c, true))
+            } else {
+                s.class().map(|c| (c, false))
+            };
+            let Some((class, lend)) = held else {
+                batch += 1;
+                continue;
+            };
+            for i in 0..frames_per_batch(class) {
+                let frame = frame_at(class, batch, i);
+                out.push(SeenFrame {
+                    frame,
+                    class,
+                    taken: !self.is_free(class, frame),
+                    lend,
+                });
+            }
+            batch += if lend { 1 } else { 1 << order(class) };
+        }
+        out
+    }
+
+    /// Every batch draining or released, with the class that holds it.
+    pub fn leaving(&self) -> Vec<Leaving> {
+        (0..self.batches)
+            .filter_map(|batch| {
+                let s = self.state(batch);
+                let holder = s.class()?;
+                let beneficiary = if s.lend_road() {
+                    Some(Beneficiary::LendRoad)
+                } else {
+                    s.beneficiary().map(Beneficiary::Class)
+                };
+                (s.draining() || s.releasing()).then_some(Leaving {
+                    batch,
+                    holder,
+                    draining: s.draining(),
+                    releasing: s.releasing(),
+                    beneficiary,
+                    taken: s.taken(),
+                    word: s.0,
+                })
+            })
+            .collect()
+    }
+
+    /// Who holds the rare path's token: [`FREE_TOKEN`], [`LEND_TOKEN`] or [`RUN_TOKEN`].
+    pub fn rare_token(&self) -> u64 {
+        self.rare.load(Ordering::Acquire)
+    }
+
+    /// The run held for a large class, if one is.
+    pub fn reserved_run(&self) -> Option<ReservedRun> {
+        let r = Reservation(self.reserved.load(Ordering::Acquire));
+        (r.0 & HELD != 0).then(|| ReservedRun {
+            start: r.start(),
+            batches: 1 << r.order(),
+            class: r.class(),
+            missing: r.missing(),
+        })
+    }
+}
+
 /// Of `bits`, a word of free batches, the first bit of each free run of exactly order `exact`:
 /// aligned and wholly free, in an aligned run of the next order that is not. A run of a lower order
 /// is taken from its start.

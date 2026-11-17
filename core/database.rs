@@ -3615,6 +3615,25 @@ impl Database {
         }
     }
 
+    /// What a claim parked on the memory of an Atoll database's buffer pool waits behind: its
+    /// draining batches and their taken frames, its shortage queue and its demands. `None` for a
+    /// database not in Atoll mode. Safe to call from another thread while the one stepping the
+    /// database waits.
+    #[cfg(feature = "simulator")]
+    pub fn atoll_park_report(&self) -> Option<String> {
+        self.atoll.as_ref().map(|atoll| atoll.park_report())
+    }
+
+    /// Every taken frame of an Atoll database's buffer pool that is in no place or in more than
+    /// one (the page table, the shortage queue, the lend road, deferred, the checkpoint's demand),
+    /// named: empty when each is in exactly one, and for a database not in Atoll mode.
+    #[cfg(feature = "simulator")]
+    pub fn atoll_taken_frames_census(&self) -> Vec<String> {
+        self.atoll
+            .as_ref()
+            .map_or_else(Vec::new, |atoll| atoll.taken_frames_census())
+    }
+
     pub(crate) fn build_wal(
         &self,
         last_checksum_and_max_frame: ((u32, u32), u64),

@@ -35,6 +35,10 @@ pub(crate) struct Upkeep {
     quiet: Option<Completion>,
     /// Whether a claim reached the demand in the current step.
     claimed: bool,
+    /// The slot naming the frame `reserved` keeps in the pool's registry of keepers, if the
+    /// registry had a free one.
+    #[cfg(any(test, feature = "simulator"))]
+    entry: Option<usize>,
 }
 
 crate::thread::thread_local! {
@@ -111,6 +115,8 @@ impl Upkeep {
                     if let Some(handed) = self.withdraw(pool) {
                         pool.give_back_reserved(class, found);
                         self.reserved = Some((class, purpose, handed));
+                        #[cfg(any(test, feature = "simulator"))]
+                        self.name_kept(pool, handed);
                     } else {
                         return Ok(IOResult::Done(found));
                     }
@@ -137,6 +143,8 @@ impl Upkeep {
             }
         }
         self.reserved = None;
+        #[cfg(any(test, feature = "simulator"))]
+        self.unname_kept(pool);
         self.quiet = None;
         Ok(IOResult::Done(frame))
     }
@@ -151,6 +159,8 @@ impl Upkeep {
             Some(frame) => {
                 self.demand = None;
                 self.reserved = Some((class, purpose, frame));
+                #[cfg(any(test, feature = "simulator"))]
+                self.name_kept(pool, frame);
                 self.grant_done();
                 Some(frame)
             }
@@ -226,10 +236,32 @@ impl Upkeep {
         }
         self.grant_done();
         if let Some((class, _, frame)) = self.reserved.take() {
+            #[cfg(any(test, feature = "simulator"))]
+            self.unname_kept(&pool);
             pool.give_back_reserved(class, frame);
         }
         if let Some(quiet) = self.quiet.take() {
             notify::finish(&quiet, Ok(0));
+        }
+    }
+}
+
+#[cfg(any(test, feature = "simulator"))]
+impl Upkeep {
+    /// Names `frame`, now kept for the demand, in the pool's registry of keepers.
+    fn name_kept(&mut self, pool: &BufferPool, frame: u32) {
+        self.unname_kept(pool);
+        self.entry = pool.keepers.add(
+            frame,
+            super::frame::NO_PAGE,
+            super::keepers::Keeper::Checkpoint,
+        );
+    }
+
+    /// Clears the registry's entry for the frame kept for the demand, if it has one.
+    fn unname_kept(&mut self, pool: &BufferPool) {
+        if let Some(slot) = self.entry.take() {
+            pool.keepers.remove(slot);
         }
     }
 }

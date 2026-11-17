@@ -27,6 +27,11 @@ fn stepped(stmt: &mut crate::Statement, bound: Option<std::time::Duration>) -> S
                 }
             }
             Ok(crate::StepResult::Row) => {}
+            Ok(crate::StepResult::Yield) => {
+                if let Err(e) = stmt._io().step() {
+                    return format!("io error: {e}");
+                }
+            }
             Ok(other) => return format!("{other:?}"),
             Err(e) => return format!("error: {e}"),
         }

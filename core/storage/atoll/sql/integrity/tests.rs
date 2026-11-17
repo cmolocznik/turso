@@ -371,6 +371,7 @@ fn an_integrity_check_waits_for_an_open_writer() {
     let busy = loop {
         match check.step() {
             Ok(crate::StepResult::IO) => check._io().step().unwrap(),
+            Ok(crate::StepResult::Yield) => check._io().step().unwrap(),
             other => break other,
         }
     };
@@ -2311,6 +2312,7 @@ fn a_walk_beside_a_suspended_statement_of_its_connection_is_refused() {
                     Ok(crate::StepResult::Row) => {}
                     Ok(crate::StepResult::Done) => break Ok(()),
                     Ok(crate::StepResult::IO) => stmt._io().step().unwrap(),
+                    Ok(crate::StepResult::Yield) => stmt._io().step().unwrap(),
                     Ok(other) => break Err(format!("{other:?}")),
                     Err(e) => break Err(e.to_string()),
                 }
@@ -2929,6 +2931,7 @@ fn checked(conn: &Arc<Connection>, sql: &str) -> std::result::Result<Vec<Vec<Val
             Ok(crate::StepResult::Busy) | Err(crate::LimboError::Busy) => {
                 return Err("busy".to_string())
             }
+            Ok(crate::StepResult::Yield) => stmt._io().step().unwrap(),
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }

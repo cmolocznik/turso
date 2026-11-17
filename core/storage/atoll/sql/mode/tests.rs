@@ -2264,6 +2264,7 @@ fn a_commit_during_a_schema_writers_drain_fails_it_once_held() {
     let err = loop {
         match index.step() {
             Ok(crate::StepResult::IO) => index._io().step().unwrap(),
+            Ok(crate::StepResult::Yield) => index._io().step().unwrap(),
             Ok(other) => panic!("{other:?}"),
             Err(e) => break e,
         }
@@ -4456,6 +4457,7 @@ fn drop_at_its_ending_closing(
                 crash.step().unwrap();
             }
             Ok(crate::StepResult::Done) => break (false, None),
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break (false, Some(format!("{other:?}"))),
             Err(e) => break (false, Some(e.to_string())),
         }
@@ -4529,6 +4531,7 @@ fn run_on(conn: &Arc<Connection>, crash: &crate::io::crash::CrashIO, sql: &str) 
         match statement.step().unwrap() {
             crate::StepResult::IO => crash.step().unwrap(),
             crate::StepResult::Done => break,
+            crate::StepResult::Yield => crash.step().unwrap(),
             other => panic!("{sql} stepped to {other:?}"),
         }
     }
@@ -4654,6 +4657,7 @@ fn a_create_table_dropped_at_its_ending_beside_a_scan_finishes_and_the_scan_read
                 );
                 break;
             }
+            crate::StepResult::Yield => crash.step().unwrap(),
             other => panic!("the scan stepped to {other:?}"),
         }
     }
@@ -4669,6 +4673,7 @@ fn a_create_table_dropped_at_its_ending_beside_a_scan_finishes_and_the_scan_read
                     .collect::<Vec<_>>(),
             ),
             Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -4724,6 +4729,7 @@ fn a_close_at_a_create_tables_ending_is_refused_and_the_commit_finishes_as_it_dr
                 }
                 crash.step().unwrap();
             }
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -4793,6 +4799,7 @@ fn a_create_table_whose_published_commit_then_fails_publishes_its_table() {
                 }
                 crash.step().unwrap();
             }
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -4811,6 +4818,11 @@ fn a_create_table_whose_published_commit_then_fails_publishes_its_table() {
                 }
             }
             Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(crate::StepResult::Yield) => {
+                if let Err(e) = crash.step() {
+                    break Err(e.to_string());
+                }
+            }
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -4846,6 +4858,7 @@ fn ran_on(
             Ok(crate::StepResult::IO) => crash.step().map_err(|e| e.to_string())?,
             Ok(crate::StepResult::Done) => return Ok(()),
             Ok(crate::StepResult::Row) => {}
+            Ok(crate::StepResult::Yield) => crash.step().map_err(|e| e.to_string())?,
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }
@@ -4913,6 +4926,7 @@ fn a_published_commit_whose_log_fails(seed: u64, dropped: bool) {
                 }
                 crash.step().unwrap();
             }
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -5069,6 +5083,7 @@ fn a_progress_handler_at_a_commits_ending_does_not_stop_it() {
                 crash.step().unwrap();
             }
             Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -5166,6 +5181,7 @@ fn step_until_published(
                 }
                 crash.step().map_err(|e| e.to_string())?;
             }
+            Ok(crate::StepResult::Yield) => crash.step().map_err(|e| e.to_string())?,
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }
@@ -5182,6 +5198,7 @@ fn step_to_end(
             Ok(crate::StepResult::IO) => crash.step().map_err(|e| e.to_string())?,
             Ok(crate::StepResult::Done) => return Ok(()),
             Ok(crate::StepResult::Row) => {}
+            Ok(crate::StepResult::Yield) => crash.step().map_err(|e| e.to_string())?,
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }
@@ -5286,6 +5303,7 @@ fn a_header_write_waiting_when_its_transaction_ends_leaves_none_under_way() {
             while !atoll.header_write_under_way_for_test(atoll.own()) && steps < 100 {
                 match waiting.step() {
                     Ok(crate::StepResult::IO) => crash.step().unwrap(),
+                    Ok(crate::StepResult::Yield) => crash.step().unwrap(),
                     other => panic!("the waiting write ended: {other:?}"),
                 }
                 steps += 1;
@@ -5345,6 +5363,7 @@ fn a_statement_started_while_another_ends_the_transaction_is_refused() {
                 }
                 crash.step().unwrap();
             }
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -5449,6 +5468,7 @@ fn scan_rest(
                 read.push(scan.row().unwrap().get_values().cloned().collect());
             }
             Ok(crate::StepResult::Done) => return Ok(()),
+            Ok(crate::StepResult::Yield) => crash.step().map_err(|e| e.to_string())?,
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }
@@ -5466,6 +5486,7 @@ fn scan_first(
             Ok(crate::StepResult::Row) => {
                 return Ok(scan.row().unwrap().get_values().cloned().collect());
             }
+            Ok(crate::StepResult::Yield) => crash.step().map_err(|e| e.to_string())?,
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }
@@ -5493,6 +5514,7 @@ fn step_to_ending(
                 }
                 crash.step().map_err(|e| e.to_string())?;
             }
+            Ok(crate::StepResult::Yield) => crash.step().map_err(|e| e.to_string())?,
             Ok(other) => return Err(format!("{other:?}")),
             Err(e) => return Err(e.to_string()),
         }
@@ -5579,9 +5601,12 @@ fn a_scan_running_while_its_connection_commit_waits_to_publish_steps_it_and_read
     crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = Some(pause.clone()));
     let mut ender = writer.prepare("COMMIT").unwrap();
     let waited = step_to_ending(&mut ender, &crash, false);
-    let scan_waited = match scan.step() {
-        Ok(crate::StepResult::IO) => Ok(()),
-        other => Err(format!("{other:?}")),
+    let scan_waited = loop {
+        match scan.step() {
+            Ok(crate::StepResult::IO) => break Ok(()),
+            Ok(crate::StepResult::Yield) => {}
+            other => break Err(format!("{other:?}")),
+        }
     };
     pause.complete(0);
     crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
@@ -5655,6 +5680,7 @@ fn a_scan_dropped_while_its_connection_commits_its_attached_part_leaves_it_whole
                 }
                 crash.step().unwrap();
             }
+            Ok(crate::StepResult::Yield) => crash.step().unwrap(),
             Ok(other) => break Err(format!("{other:?}")),
             Err(e) => break Err(e.to_string()),
         }
@@ -5938,9 +5964,12 @@ fn a_sibling_that_fails_beside_its_connections_ending_rolls_nothing_back() {
     let failing = crate::io::Completion::new_wait();
     crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = Some(failing.clone()));
     held.complete(0);
-    let scan_waited = match scan.step() {
-        Ok(crate::StepResult::IO) => Ok(()),
-        other => Err(format!("{other:?}")),
+    let scan_waited = loop {
+        match scan.step() {
+            Ok(crate::StepResult::IO) => break Ok(()),
+            Ok(crate::StepResult::Yield) => {}
+            other => break Err(format!("{other:?}")),
+        }
     };
     failing.error(crate::error::CompletionError::IOError(
         std::io::ErrorKind::Other,
@@ -6007,9 +6036,12 @@ fn a_sibling_reads_on_only_once_the_horizon_covers_its_connections_commit() {
     writer.atoll().unwrap().hold_horizon(true);
     let mut ender = writer.prepare("COMMIT").unwrap();
     let published = step_until_published(&mut ender, &crash);
-    let scan_waited = match scan.step() {
-        Ok(crate::StepResult::IO) => Ok(()),
-        other => Err(format!("{other:?}")),
+    let scan_waited = loop {
+        match scan.step() {
+            Ok(crate::StepResult::IO) => break Ok(()),
+            Ok(crate::StepResult::Yield) => {}
+            other => break Err(format!("{other:?}")),
+        }
     };
     writer.atoll().unwrap().hold_horizon(false);
     let rest = scan_rest(&mut scan, &crash, &mut read);
@@ -6061,6 +6093,11 @@ fn step_to_end_published(
             }
             Ok(crate::StepResult::Done) => return (Ok(()), published),
             Ok(crate::StepResult::Row) => {}
+            Ok(crate::StepResult::Yield) => {
+                if let Err(e) = crash.step() {
+                    return (Err(e.to_string()), published);
+                }
+            }
             Ok(other) => return (Err(format!("{other:?}")), published),
             Err(e) => return (Err(e.to_string()), published),
         }
@@ -7440,6 +7477,11 @@ fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) 
                 }
             }
             Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(crate::StepResult::Yield) => {
+                if let Err(e) = crash.step() {
+                    break Err(e.to_string());
+                }
+            }
             other => break Err(format!("{other:?}")),
         }
     };
@@ -8003,6 +8045,7 @@ mod in_frames {
                         }
                         crate::StepResult::Done => break,
                         crate::StepResult::IO => stmt._io().step().unwrap(),
+                        crate::StepResult::Yield => stmt._io().step().unwrap(),
                         other => panic!("{other:?}"),
                     }
                 }
@@ -8329,6 +8372,7 @@ mod in_frames {
                             chill(db);
                         }
                     }
+                    crate::StepResult::Yield => {}
                     other => panic!("call {}: {other:?}", out.calls),
                 }
                 assert!(
@@ -8458,6 +8502,7 @@ mod in_frames {
                             ),
                             crate::StepResult::Done => break,
                             crate::StepResult::IO => stmt._io().step().unwrap(),
+                            crate::StepResult::Yield => stmt._io().step().unwrap(),
                             other => panic!("{other:?}"),
                         }
                     }
@@ -9084,6 +9129,7 @@ mod in_frames {
                     }
                     crate::StepResult::Done => return out,
                     crate::StepResult::IO => stmt._io().step().unwrap(),
+                    crate::StepResult::Yield => stmt._io().step().unwrap(),
                     other => panic!("{other:?}"),
                 }
             }
@@ -9170,6 +9216,7 @@ mod in_frames {
                                 break a.row().unwrap().get_values().cloned().collect::<Vec<_>>()
                             }
                             crate::StepResult::IO => a._io().step().unwrap(),
+                            crate::StepResult::Yield => a._io().step().unwrap(),
                             other => panic!("{other:?}"),
                         }
                     };
@@ -9201,6 +9248,7 @@ mod in_frames {
                                     chill(&db);
                                 }
                             }
+                            crate::StepResult::Yield => {}
                             other => panic!("call {calls}: {other:?}"),
                         }
                     }
@@ -9719,6 +9767,7 @@ mod in_frames {
                                         chill(&db);
                                     }
                                 }
+                                crate::StepResult::Yield => {}
                                 other => panic!("call {calls}: {other:?}"),
                             }
                         }
@@ -10419,6 +10468,7 @@ mod in_frames {
                                         while_waiting = Some(now);
                                     }
                                 }
+                                Ok(crate::StepResult::Yield) => {}
                                 Ok(other) => panic!("call {calls}: {other:?}"),
                             }
                         }
@@ -11257,6 +11307,7 @@ mod in_frames {
                                 return (owed(conn), steps());
                             }
                         }
+                        Ok(crate::StepResult::Yield) => {}
                         other => panic!("call {calls}: {other:?} before a wait failed"),
                     }
                 }
@@ -11411,6 +11462,7 @@ mod in_frames {
                                         "call {calls}: the IO thread never went idle"
                                     );
                                 }
+                                crate::StepResult::Yield => {}
                                 other => panic!("call {calls}: {other:?}"),
                             }
                         }
@@ -11550,6 +11602,7 @@ mod in_frames {
                             assert!(retired(db), "call {calls}: a request outstanding");
                             assert!(idled(&idle), "call {calls}: the IO thread never went idle");
                         }
+                        crate::StepResult::Yield => {}
                         other => panic!("call {calls}: {other:?}"),
                     }
                 }
@@ -13863,6 +13916,7 @@ mod in_frames {
                                 let c = back.pending_io_for_test().expect("its wait");
                                 assert!(waited(&io, &c), "a wait never finished");
                             }
+                            Ok(crate::StepResult::Yield) => {}
                             other => break Err(format!("{other:?}")),
                         }
                     };
@@ -14220,6 +14274,7 @@ mod in_frames {
                                 let c = reader.pending_io_for_test().expect("its wait");
                                 assert!(waited(&io, &c), "the reader's wait never finished");
                             }
+                            Ok(crate::StepResult::Yield) => {}
                             other => panic!("the reader: {other:?}"),
                         }
                     };
@@ -14839,6 +14894,7 @@ mod in_frames {
                                 let c = back.pending_io_for_test().expect("its wait");
                                 assert!(waited(&io, &c), "a wait never finished");
                             }
+                            Ok(crate::StepResult::Yield) => {}
                             other => panic!("the ROLLBACK TO: {other:?}"),
                         }
                     }
@@ -14861,6 +14917,7 @@ mod in_frames {
                                 }
                                 crate::StepResult::IO => stmt._io().step()?,
                                 crate::StepResult::Done => return Ok(out),
+                                crate::StepResult::Yield => stmt._io().step()?,
                                 _ => {}
                             }
                         }
@@ -15937,6 +15994,9 @@ mod reparse_view_taken_by_an_end {
                 Ok(crate::StepResult::IO) => {
                     let _ = stmt._io().step();
                     std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(crate::StepResult::Yield) => {
+                    let _ = stmt._io().step();
                 }
                 other => return format!("{other:?}"),
             }

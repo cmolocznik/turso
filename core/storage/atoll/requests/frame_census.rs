@@ -254,6 +254,16 @@ const COLD_STEPS_WITH_THE_IO_THREAD_FREE: &[(&str, &str)] = &[];
 /// as a yield, and so does the stop for the budget of a nested program (a trigger's, stepped in
 /// the poll's own dispatch loop). A helper statement, stepped with `step()`, has no stop for the
 /// budget.
+/// Atoll's functions that step a statement with `step()` and have a match arm for its IO stop and
+/// none for its yield, by file and name, each with why no yield reaches it. A step may come back `Yield` to its caller outside
+/// a frame as inside one (`StepResult::Yield`'s contract), and a loop that ends there fails a healthy
+/// run (YIELD-STEP1).
+const STEP_ARMS_WITHOUT_A_YIELD_ARM: &[(&str, &str)] = &[(
+    "sql/mode/tests/poll_budget.rs: a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction",
+    "a statement outside Atoll mode that runs no nested program, so no instruction of it returns \
+     a yield, and its match ends the test at any result it has no arm for",
+)];
+
 const IO_ARMS_WITHOUT_A_YIELD_ARM: &[(&str, &str)] = &[(
     "a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction",
     "a statement outside Atoll mode that runs no nested program, so no instruction of it returns \
@@ -271,9 +281,23 @@ fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for path in crate::source_test::rust_sources(core) {
         let text = std::fs::read_to_string(&path).unwrap();
-        let (stepping, broken) = stops_left_to_chance(&code_of(&text));
+        let code = code_of(&text);
+        let (stepping, broken) = stops_left_to_chance(&code);
         steppers += stepping;
         found.extend(broken);
+        // The rule for a step outside a frame holds Atoll's code, named by file and function.
+        if let Ok(atoll) = path.strip_prefix(core.join("storage/atoll")) {
+            found.extend(
+                step_arms_without_a_yield_arm(&code)
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            LeftToChance::StepArmWithoutAYieldArm,
+                            format!("{}: {name}", atoll.display()),
+                        )
+                    }),
+            );
+        }
     }
     assert!(steppers > 0, "the census found no step in a frame at all");
     for (rule, listed) in [
@@ -284,6 +308,10 @@ fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
         (
             LeftToChance::IoArmWithoutAYieldArm,
             IO_ARMS_WITHOUT_A_YIELD_ARM,
+        ),
+        (
+            LeftToChance::StepArmWithoutAYieldArm,
+            STEP_ARMS_WITHOUT_A_YIELD_ARM,
         ),
     ] {
         let mut found: Vec<&str> = found
@@ -500,6 +528,9 @@ enum LeftToChance {
     ColdStepWithTheIoThreadFree,
     /// It has a match arm for an IO stop and none for a yield.
     IoArmWithoutAYieldArm,
+    /// It steps a statement with `step()` itself, and has a match arm for an IO stop and none for
+    /// a yield.
+    StepArmWithoutAYieldArm,
 }
 
 /// How many functions of one file's `code` step a statement in a frame, themselves or through
@@ -549,6 +580,20 @@ fn stops_left_to_chance(code: &str) -> (usize, Vec<(LeftToChance, String)>) {
         }
     }
     (steps.iter().filter(|s| **s).count(), broken)
+}
+
+/// The functions of one file's `code` that step a statement with `step()` themselves and have a
+/// match arm for its IO stop and none for its yield.
+fn step_arms_without_a_yield_arm(code: &str) -> Vec<String> {
+    functions_of(code)
+        .into_iter()
+        .filter(|(_, body)| {
+            body.contains(".step()")
+                && has_an_arm_for_io(body)
+                && !body.contains("StepResult::Yield")
+        })
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 fn steps_itself(body: &str) -> bool {

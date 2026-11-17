@@ -21,10 +21,11 @@ const CHILD: &str = "TURSO_CHILD_TEST";
 const CHILD_DIR: &str = "TURSO_CHILD_DIR";
 
 /// How long a child may run before it counts as hung and is killed: a hang is the defect some
-/// child tests look for, and the slowest child measured takes under a second, so two minutes
-/// leaves a loaded machine a hundredfold.
+/// child tests look for. The slowest children, the owed rollbacks stepped at each wait, take 46 s
+/// under a gate's whole-library load on the plain build and up to 69 s alone on the io_uring
+/// build, so five minutes leaves four times the slower of the two.
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
-const CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+const CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How often the parent looks whether its child has ended: a hundredth of the fastest child.
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]

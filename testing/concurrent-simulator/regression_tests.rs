@@ -1040,3 +1040,145 @@ fn multiprocess_restart_rebuilds_from_disk_after_restart_checkpoint_changes_gene
 
     whopper.finalize().expect("finalize multiprocess whopper");
 }
+
+/// SIM-KEYLEN1: under Atoll's index key limit, every index the generator can make holds its
+/// longest key. For each seed a generated table (a large one about one time in ten) gets the
+/// widest index the option allows and a row of the longest value each column's type is drawn
+/// with, the rowid the most negative, which an Atoll database must take without refusing the key.
+#[test]
+fn generated_indexes_keep_their_longest_key_within_atolls_limit() {
+    use rand::SeedableRng;
+    use sql_generation::generation::{
+        Arbitrary, ArbitraryFrom, GenerationContext, LONGEST_KEY_TEXT, Opts,
+    };
+    use sql_generation::model::query::{Create, CreateIndex};
+    use sql_generation::model::table::{ColumnType, SimValue, Table};
+    use turso_parser::ast::{self, ColumnConstraint};
+
+    struct Tables {
+        tables: Vec<Table>,
+        opts: Opts,
+    }
+    impl GenerationContext for Tables {
+        fn tables(&self) -> &Vec<Table> {
+            &self.tables
+        }
+        fn opts(&self) -> &Opts {
+            &self.opts
+        }
+    }
+
+    let opts = Opts {
+        index_key_limit: Some(turso_whopper::ATOLL_INDEX_KEY_LIMIT),
+        ..Opts::default()
+    };
+    let io: Arc<dyn IO> = Arc::new(turso_core::MemoryIO::new());
+    let (mut inserted, mut refused, mut failed) = (0, Vec::new(), Vec::new());
+    let (mut drawn, mut longest_drawn) = (0, 0);
+    for seed in 0..200u64 {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let mut tables = Tables {
+            tables: Vec::new(),
+            opts: opts.clone(),
+        };
+        let table = Table::arbitrary(&mut rng, &tables);
+        tables.tables.push(table.clone());
+        let mut index = CreateIndex::arbitrary(&mut rng, &tables);
+        let widest = tables.opts.index_columns(table.columns.len());
+        assert!(
+            index.columns.len() <= widest,
+            "a generated index past the option's width"
+        );
+        let order = index.columns[0].1;
+        index.index.columns = table
+            .columns
+            .iter()
+            .take(widest)
+            .map(|c| (c.name.clone(), order))
+            .collect();
+        // The texts and blobs the generator draws, as column values and as literals, are no longer
+        // than the option allows: the worst row below stands for every row it can make.
+        let mut draws = rand_chacha::ChaCha8Rng::seed_from_u64(seed + 1_000_000);
+        for _ in 0..500 {
+            for column_type in [ColumnType::Text, ColumnType::Blob] {
+                let SimValue(value) = SimValue::arbitrary_from(&mut draws, &tables, &column_type);
+                let len = match &value {
+                    turso_core::Value::Text(text) => text.as_str().len(),
+                    blob => blob.to_blob().map_or(0, |b| b.len()),
+                };
+                longest_drawn = longest_drawn.max(len);
+                drawn += 1;
+            }
+            longest_drawn = longest_drawn.max(match ast::Literal::arbitrary(&mut draws, &tables) {
+                ast::Literal::String(quoted) => quoted.len() - 2,
+                ast::Literal::Blob(hex) => (hex.len() - 3) / 2,
+                _ => 0,
+            });
+        }
+        let generated = |c: &sql_generation::model::table::Column| {
+            c.constraints
+                .iter()
+                .any(|k| matches!(k, ColumnConstraint::Generated { .. }))
+        };
+        let alias = table.columns.iter().any(|c| {
+            c.column_type == ColumnType::Integer
+                && c.constraints
+                    .iter()
+                    .any(|k| matches!(k, ColumnConstraint::PrimaryKey { .. }))
+        });
+        let (mut names, mut values) = (Vec::new(), Vec::new());
+        if !alias {
+            names.push("rowid".to_string());
+            values.push(i64::MIN.to_string());
+        }
+        for column in table.columns.iter().filter(|c| !generated(c)) {
+            names.push(column.name.clone());
+            values.push(match column.column_type {
+                ColumnType::Integer => i64::MIN.to_string(),
+                ColumnType::Float => "-9999999999.123457".to_string(),
+                ColumnType::Text => format!("'{}'", "z".repeat(LONGEST_KEY_TEXT)),
+                ColumnType::Blob => format!("X'{}'", "ff".repeat(LONGEST_KEY_TEXT)),
+            });
+        }
+        let db = Database::open(
+            io.clone(),
+            &format!("/key-limit-{seed}"),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .atoll(turso_core::storage::atoll::db::AtollConfig::small()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let statements = [
+            Create {
+                table: table.clone(),
+            }
+            .to_string(),
+            index.to_string(),
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                table.name,
+                names.join(", "),
+                values.join(", ")
+            ),
+        ];
+        let outcome = statements.iter().try_for_each(|sql| {
+            conn.execute(sql)
+                .map(|_| ())
+                .map_err(|e| (sql.clone(), e.to_string()))
+        });
+        match outcome {
+            Ok(()) => inserted += 1,
+            Err((sql, e)) if e.contains("holds keys of at most") => refused.push((seed, sql, e)),
+            Err((sql, e)) => failed.push((seed, sql, e)),
+        }
+        conn.close().unwrap();
+    }
+    assert!(drawn > 0, "no value drawn");
+    assert!(
+        longest_drawn <= LONGEST_KEY_TEXT,
+        "a text or blob of {longest_drawn} bytes drawn under the limit"
+    );
+    assert_eq!(refused, Vec::new(), "keys past the limit");
+    assert_eq!(failed, Vec::new(), "statements that failed otherwise");
+    assert_eq!(inserted, 200, "seeds whose row went in");
+}

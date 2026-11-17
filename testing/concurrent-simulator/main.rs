@@ -739,6 +739,25 @@ mod tests {
         }
     }
 
+    /// SIM-KEYLEN1: Atoll mode generates statements within Atoll's index key limit; other modes
+    /// have none.
+    #[test]
+    fn atoll_mode_generates_index_keys_within_atolls_limit() {
+        let limit = |arguments: &[&str]| {
+            let args = Args::parse_from(arguments);
+            build_inprocess_opts(&args, 811)
+                .unwrap()
+                .generation_opts()
+                .index_key_limit
+        };
+        assert_eq!(
+            limit(&["whopper", "--atoll"]),
+            Some(turso_whopper::ATOLL_INDEX_KEY_LIMIT),
+            "the limit in Atoll mode"
+        );
+        assert_eq!(limit(&["whopper"]), None, "a limit outside Atoll mode");
+    }
+
     #[test]
     fn fts_modes_reject_unrelated_workloads() {
         let args = Args::parse_from(["whopper", "--mode", "fts-merge", "--elle", "list-append"]);

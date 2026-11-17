@@ -287,6 +287,12 @@ fn open_database(
     )
 }
 
+/// The longest index key Atoll takes in a 4 KiB node, in bytes. A longer one is refused with an
+/// error the simulator does not yet expect (KEY-LEN1), so in Atoll mode its statements stay within
+/// it, until the refusals packet names that error and the simulator meets it as an expected
+/// refusal (SIM-KEYLEN1).
+pub const ATOLL_INDEX_KEY_LIMIT: usize = 933;
+
 /// Configuration options for the Whopper simulator.
 pub struct WhopperOpts {
     /// Random seed for deterministic simulation. If None, a random seed is generated.
@@ -371,6 +377,17 @@ impl Default for SchemaBias {
             num_tables_range: 1..=5,
             num_columns_range: 2..=8,
             initial_rows_per_table: 0,
+        }
+    }
+}
+
+impl WhopperOpts {
+    /// The options the statement generators run with: in Atoll mode, index keys within
+    /// [`ATOLL_INDEX_KEY_LIMIT`].
+    pub fn generation_opts(&self) -> Opts {
+        Opts {
+            index_key_limit: self.atoll.then_some(ATOLL_INDEX_KEY_LIMIT),
+            ..Opts::default()
         }
     }
 }
@@ -878,6 +895,7 @@ impl Whopper {
             enable_mvcc: opts.enable_mvcc,
         };
 
+        let generation = opts.generation_opts();
         let total_weight: u32 = opts.workloads.iter().map(|(w, _)| w).sum();
 
         let mut whopper = Self {
@@ -897,7 +915,7 @@ impl Whopper {
                 .map(std::sync::Mutex::new)
                 .collect(),
             total_weight,
-            opts: Opts::default(),
+            opts: generation,
             current_step: 0,
             max_steps: opts.max_steps,
             max_drain_steps: opts.max_drain_steps,

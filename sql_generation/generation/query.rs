@@ -672,7 +672,8 @@ impl Arbitrary for CreateIndex {
             );
         }
 
-        let num_columns_to_pick = rng.random_range(1..=table.columns.len());
+        let num_columns_to_pick =
+            rng.random_range(1..=env.opts().index_columns(table.columns.len()));
         let picked_column_indices: Vec<usize> = (0..table.columns.len())
             .collect::<Vec<usize>>()
             .choose_multiple(rng, num_columns_to_pick)

@@ -28,6 +28,46 @@ pub struct Opts {
     /// Generate arbitrary INSERT INTO ... SELECT queries. This is disabled by default, as it makes
     /// the simulator very slow and generates huge databases.
     pub arbitrary_insert_into_select: bool,
+    #[garde(skip)]
+    /// The longest index key, in bytes, that the database under test takes, when its statements
+    /// must stay within one: generated texts and blobs are then no longer than a readable name, and
+    /// an index takes no more columns than keep its key within the limit ([`Opts::index_columns`]).
+    /// `None` for no limit.
+    pub index_key_limit: Option<usize>,
+}
+
+/// The longest text or blob generated under an index key limit: a readable name, an adjective of
+/// at most 13 bytes, `_` and a name of at most 42, from the name generator's lists. Longer ones
+/// are cut to it.
+pub const LONGEST_KEY_TEXT: usize = 56;
+
+/// The most bytes one column takes in an Atoll index key under a key limit: a text of
+/// [`LONGEST_KEY_TEXT`] bytes, with no zero byte, is a tag byte, its bytes and the `00 00` that
+/// ends it. A number takes less: a tag and an exact binary value.
+const KEY_COLUMN_BYTES: usize = LONGEST_KEY_TEXT + 3;
+
+/// The bytes kept beside the columns for the key's end: the rowid an index key ends with, a
+/// number, and room to spare.
+const KEY_END_BYTES: usize = 48;
+
+impl Opts {
+    /// The most columns a generated index takes from a table of `columns` columns: all of them,
+    /// or under an index key limit as many as keep the key within it. For Atoll's 933 bytes that
+    /// is (933 - 48) / 59 = 15.
+    pub fn index_columns(&self, columns: usize) -> usize {
+        match self.index_key_limit {
+            Some(limit) => columns
+                .min((limit - KEY_END_BYTES) / KEY_COLUMN_BYTES)
+                .max(1),
+            None => columns,
+        }
+    }
+
+    /// The longest text or blob to generate: [`LONGEST_KEY_TEXT`] under an index key limit, else
+    /// none.
+    pub fn longest_text(&self) -> Option<usize> {
+        self.index_key_limit.map(|_| LONGEST_KEY_TEXT)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]

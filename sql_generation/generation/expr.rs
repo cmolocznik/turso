@@ -4,7 +4,7 @@ use turso_parser::ast::{
 
 use crate::{
     generation::{
-        frequency, gen_random_text, one_of, pick, pick_index, Arbitrary, ArbitraryFrom,
+        frequency, gen_random_text_within, one_of, pick, pick_index, Arbitrary, ArbitraryFrom,
         ArbitrarySized, ArbitrarySizedFrom, GenerationContext,
     },
     model::table::SimValue,
@@ -262,7 +262,8 @@ impl Arbitrary for LikeOperator {
 
 // Current implementation does not take into account the columns affinity nor if table is Strict
 impl Arbitrary for ast::Literal {
-    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, t: &C) -> Self {
+        let longest = t.opts().longest_text();
         loop {
             let choice = rng.random_range(0..5);
             let lit = match choice {
@@ -274,10 +275,10 @@ impl Arbitrary for ast::Literal {
                         rng.random_range(-1e10..1e10).to_string()
                     }
                 }),
-                1 => ast::Literal::String(format!("'{}'", gen_random_text(rng))),
+                1 => ast::Literal::String(format!("'{}'", gen_random_text_within(rng, longest))),
                 2 => ast::Literal::Blob(format!(
                     "X'{}'",
-                    hex::encode(gen_random_text(rng).as_bytes())
+                    hex::encode(gen_random_text_within(rng, longest).as_bytes())
                 )),
                 // TODO: skip Keyword
                 3 => continue,

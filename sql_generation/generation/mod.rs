@@ -169,6 +169,23 @@ pub fn pick_n_unique<R: Rng + ?Sized>(
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
 /// readable names for tables, columns, text values etc.
 pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
+    gen_random_text_within(rng, None)
+}
+
+/// [`gen_random_text`] no longer than `longest` bytes, when given: a readable name, cut at a
+/// character's boundary if it is longer, and never a big text.
+pub fn gen_random_text_within<R: Rng + ?Sized>(rng: &mut R, longest: Option<usize>) -> String {
+    if let Some(longest) = longest {
+        let mut name = readable_name_custom("_", rng).replace("-", "_");
+        if name.len() > longest {
+            let cut = (0..=longest)
+                .rev()
+                .find(|&i| name.is_char_boundary(i))
+                .unwrap_or(0);
+            name.truncate(cut);
+        }
+        return name;
+    }
     let big_text = rng.random_ratio(1, 1000);
     if big_text {
         // let max_size: u64 = 2 * 1024 * 1024 * 1024;

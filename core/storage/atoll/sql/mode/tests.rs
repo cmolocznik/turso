@@ -16447,6 +16447,72 @@ fn values_of_1500_bytes_read_back_after_a_close_and_an_open() {
     assert_eq!(lost, Vec::<i64>::new(), "rows lost");
 }
 
+/// VALUE-LEAK1 through SQL: rounds of values stored out of line, one autocommit insert each, while
+/// the checkpoint thread runs, each round ended by a clean close; every open runs integrity_check,
+/// which must find every page used. Before the fix a page taken by a put the last cut caught before
+/// its first change stayed taken in the checkpoint's map with no copy, and the open's replay put the
+/// row elsewhere: "allocated and never used". On VALUE-LOST1's commit ten runs of it each failed by
+/// the second round (nine at the first). In a child: a failure ends its process, and the parent
+/// shows its words.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_close_and_an_open_leave_no_page_allocated_and_never_used() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_close_and_an_open_leave_no_page_allocated_and_never_used"
+        ),
+        || {
+            let rounds: i64 = std::env::var("VALUE_LEAK_ROUNDS")
+                .ok()
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(LEAK_ROUNDS);
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let path = "/db/value-leak";
+            let config = crate::storage::atoll::sql::mode::config_for(None);
+            let mut first_bad = None;
+            for round in 0..=rounds {
+                let db = open_with(&io, path, config.clone());
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                let check = conn
+                    .prepare("PRAGMA integrity_check")
+                    .unwrap()
+                    .run_collect_rows()
+                    .map_err(|e| e.to_string());
+                if check != Ok(vec![vec![Value::build_text("ok")]]) {
+                    first_bad = Some((round, check));
+                    conn.close().unwrap();
+                    break;
+                }
+                if round < rounds {
+                    if round == 0 {
+                        conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB)")
+                            .unwrap();
+                    }
+                    let mut insert = conn
+                        .prepare("INSERT INTO t VALUES (?1, zeroblob(60000))")
+                        .unwrap();
+                    for k in round * LEAK_ROWS + 1..=(round + 1) * LEAK_ROWS {
+                        insert.reset().unwrap();
+                        insert
+                            .bind_at(1.try_into().unwrap(), Value::from_i64(k))
+                            .unwrap();
+                        insert.run_ignore_rows().unwrap();
+                    }
+                    drop(insert);
+                }
+                conn.close().unwrap();
+            }
+            assert_eq!(first_bad, None, "integrity_check after a close and an open");
+        },
+    );
+}
+
+/// The rows a round of [`a_close_and_an_open_leave_no_page_allocated_and_never_used`] writes.
+const LEAK_ROWS: i64 = 300;
+/// Its rounds.
+const LEAK_ROUNDS: i64 = 10;
+
 /// Writes `rows` rows of `size` bytes, one autocommit insert each, into a database at `path` in
 /// memory with the default configuration, closes it, opens it again, and reads every row: the keys
 /// of the rows that did not read back as written.

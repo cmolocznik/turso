@@ -548,6 +548,208 @@ fn a_value_whose_frame_is_held_at_its_settle_is_settled_once_let_go() {
     );
 }
 
+/// VALUE-LEAK1: a page number taken before a cut whose page is not yet changed is in no image of
+/// that checkpoint and is not left out by it, so its entry in the map the checkpoint writes reads
+/// taken with no copy anywhere. After a crash, a recovery from that checkpoint must find the number
+/// free: nothing names the page and nothing would ever free it.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_number_taken_before_a_cut_and_never_changed_is_free_after_a_recovery() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_number_taken_before_a_cut_and_never_changed_is_free_after_a_recovery"
+        ),
+        || {
+            let crash_io = Arc::new(CrashIO::new(0));
+            let io: Arc<dyn IO> = crash_io.clone();
+            let db = Db::create(io);
+            let root = db.tree.root();
+            db.put("a", &vec![b'a'; 60_000]);
+            let pool = db.db.pool().clone();
+            let store = db.db.store().clone();
+            let class = SizeClass::fitting(60_000).unwrap();
+            let taken = drive(&db.io, || pool.allocate(class)).unwrap();
+            let pid = taken.pid();
+            drop(taken);
+            db.checkpoint();
+            let before = drive(&db.io, || store.entry(pid)).unwrap();
+            drop(pool);
+            drop(store);
+            let image = crash_io.crash(0);
+            drop(db);
+            let recovered = Db::recover(Arc::new(image), root, 1).unwrap();
+            let after = drive(&recovered.io, || recovered.db.store().entry(pid)).unwrap();
+            drop(recovered);
+            assert_eq!(
+                before,
+                crate::storage::atoll::radix::ALLOCATED,
+                "the number as it stands after the checkpoint that left it out"
+            );
+            assert_eq!(
+                after,
+                crate::storage::atoll::radix::FREE,
+                "the number taken before the cut, never changed, after a recovery"
+            );
+        },
+    );
+}
+
+/// VALUE-LEAK1: a number taken at the page store with no frame yet when a checkpoint cuts, as
+/// between a take and the frame's install, is in no image and left out by none. After a crash, a
+/// recovery from that checkpoint must find it free.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_number_taken_with_no_frame_at_a_cut_is_free_after_a_recovery() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_number_taken_with_no_frame_at_a_cut_is_free_after_a_recovery"
+        ),
+        || {
+            let crash_io = Arc::new(CrashIO::new(0));
+            let io: Arc<dyn IO> = crash_io.clone();
+            let db = Db::create(io);
+            let root = db.tree.root();
+            let store = db.db.store().clone();
+            let class = SizeClass::new(0).unwrap();
+            let pid = drive(&db.io, || store.allocate(class)).unwrap();
+            db.checkpoint();
+            drop(store);
+            let image = crash_io.crash(0);
+            drop(db);
+            let recovered = Db::recover(Arc::new(image), root, 1).unwrap();
+            let after = drive(&recovered.io, || recovered.db.store().entry(pid)).unwrap();
+            drop(recovered);
+            assert_eq!(
+                after,
+                crate::storage::atoll::radix::FREE,
+                "the number taken with no frame at the cut, after a recovery"
+            );
+        },
+    );
+}
+
+/// VALUE-LEAK1: a number taken before a cut and freed after it, before the checkpoint looks for
+/// numbers to leave out. The cut's page table still holds it taken, the live one free; the
+/// checkpoint reads the cut's, so it leaves the number out, and a recovery from it finds the
+/// number free.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_number_taken_before_a_cut_and_freed_during_its_checkpoint_is_free_after_a_recovery() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_number_taken_before_a_cut_and_freed_during_its_checkpoint_is_free_after_a_recovery"
+        ),
+        || {
+            let crash_io = Arc::new(CrashIO::new(0));
+            let io: Arc<dyn IO> = crash_io.clone();
+            let db = Db::create(io);
+            let root = db.tree.root();
+            let store = db.db.store().clone();
+            let class = SizeClass::new(0).unwrap();
+            let pid = drive(&db.io, || store.allocate(class)).unwrap();
+            let freed = std::rc::Rc::new(Cell::new(None));
+            {
+                let (io, store, freed) = (db.io.clone(), store.clone(), freed.clone());
+                crate::race::at("checkpoint.untaken_begins", move || {
+                    drive(&io, || store.free(pid)).unwrap();
+                    freed.set(Some(drive(&io, || store.entry(pid)).unwrap()));
+                });
+            }
+            db.checkpoint();
+            drop(store);
+            let image = crash_io.crash(0);
+            drop(db);
+            let recovered = Db::recover(Arc::new(image), root, 1).unwrap();
+            let after = drive(&recovered.io, || recovered.db.store().entry(pid)).unwrap();
+            drop(recovered);
+            assert_eq!(
+                freed.get(),
+                Some(crate::storage::atoll::radix::FREE),
+                "the number as it stands once freed during the checkpoint"
+            );
+            assert_eq!(
+                after,
+                crate::storage::atoll::radix::FREE,
+                "the number freed during the checkpoint, after a recovery"
+            );
+        },
+    );
+}
+
+/// A number left out because it was taken and unchanged at one cut, then written as a node: the
+/// next checkpoint copies it, and after a crash a recovery from that checkpoint reads it as written.
+/// The leave-out edits the cut's map alone; the map as it stands keeps the number taken.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_number_left_out_at_one_cut_and_written_after_is_copied_by_the_next_checkpoint() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_number_left_out_at_one_cut_and_written_after_is_copied_by_the_next_checkpoint"
+        ),
+        || {
+            use super::btree::node;
+            let crash_io = Arc::new(CrashIO::new(0));
+            let io: Arc<dyn IO> = crash_io.clone();
+            let db = Db::create(io);
+            let root = db.tree.root();
+            let pool = db.db.pool().clone();
+            let store = db.db.store().clone();
+            let class = SizeClass::new(0).unwrap();
+            let taken = drive(&db.io, || pool.allocate(class)).unwrap();
+            let pid = taken.pid();
+            drop(taken);
+            db.checkpoint();
+            let live_after_first = drive(&db.io, || store.entry(pid)).unwrap();
+            let mut page = drive(&db.io, || pool.fix_exclusive(pid, None)).unwrap();
+            let layout = node::Layout {
+                root: pid,
+                level: 0,
+                lower: Some(b"left out, then written"),
+                upper: None,
+                next: (PageId::from_raw(0), 0),
+                reserving: false,
+            };
+            node::build(&mut page.page_mut(), &layout, []);
+            let written = node::image(page.page());
+            page.changed();
+            drop(page);
+            db.checkpoint();
+            let live_after_second = drive(&db.io, || store.entry(pid)).unwrap();
+            drop(pool);
+            drop(store);
+            let image = crash_io.crash(0);
+            drop(db);
+            let recovered = Db::recover(Arc::new(image), root, 1).unwrap();
+            let after = drive(&recovered.io, || recovered.db.store().entry(pid)).unwrap();
+            let read = drive(&recovered.io, || {
+                recovered.db.pool().fix_exclusive(pid, None)
+            })
+            .map(|page| {
+                let read = node::image(page.page());
+                drop(page.release_unchanged());
+                read
+            })
+            .map_err(|e| e.to_string());
+            drop(recovered);
+            assert_eq!(
+                live_after_first,
+                crate::storage::atoll::radix::ALLOCATED,
+                "the number as it stands after the cut that left it out"
+            );
+            assert!(
+                live_after_second >= crate::storage::atoll::radix::SLOT_BASE,
+                "the next checkpoint did not copy it: {live_after_second}"
+            );
+            assert_eq!(after, live_after_second, "its entry after a recovery");
+            assert_eq!(read, Ok(written), "the page after a recovery");
+        },
+    );
+}
+
 /// The check behind VALUE-LOST1, in every build: a checkpoint that would leave a value's page out
 /// of its map as unnamed while the page has a checkpoint copy, so freeing a live value, ends the
 /// process with its words instead. A value's page marked changed after its checkpoint, its bytes as
@@ -1360,10 +1562,12 @@ fn a_checkpoint_writes_a_metadata_page_it_found_held(ends: HoldEnds) {
         db.put(&format!("k{i:02}"), &value(i));
     }
     let meta = db.db.store().meta().clone();
-    // A page of the size class no page of the database is in: the checkpoint's own edits, which
-    // would keep it as the cut found it, never touch it.
+    // A free-space page of the size class no page of the database is in: the checkpoint's own
+    // edits, which would keep it as the cut found it, never touch it, and no phase before the
+    // metadata phase reads it (the leave-out of untaken numbers reads every page-table leaf the
+    // checkpoint writes, and waits for one held).
     let id = MetaId {
-        tree: MetaTree::Map,
+        tree: MetaTree::Space,
         class: class(11),
         level: 0,
         index: 0,

@@ -1363,6 +1363,10 @@ fn cut_case() -> CutCase {
     let class = class(0);
     let far = PageId::new(class, radix::MAP_ENTRIES * radix::FANOUT + 7);
     drive(&db.io, || store.allocate_at(far)).unwrap();
+    // Freed again once the page table has grown to reach it: a number taken and never changed is
+    // left out of every checkpoint's map (VALUE-LEAK1), so the pages on its path would never be
+    // written as they stand, nor become clean.
+    drive(&db.io, || store.free(far)).unwrap();
     drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
     let (node, second) = (db.node(), db.node());
     // The nodes' copies named; then every metadata page written, so clean and evictable: the first

@@ -41,8 +41,9 @@ use super::epoch::Notify;
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, LogWait, Lsn};
-use super::meta::{MetaId, MetaRef, TREES};
+use super::meta::{MetaId, MetaRef, Tree, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
+use super::radix;
 use super::stack::Chain;
 use super::store::{CutEdit, Erasing, FreeEdit, MarkEdit, PageStore};
 use super::txn::versioned::AsOf;
@@ -661,9 +662,12 @@ struct Run {
     flying_bytes: usize,
     /// The page table edit of a landed write under way: its page's flight is the next landed.
     landing: CutEdit,
-    /// The edit under way of a page left out: an orphan, a page of a tree set aside, or a value
-    /// no image names, one at a time.
+    /// The edit under way of a page left out: an orphan, a page of a tree set aside, a value no
+    /// image names, or a number taken and never changed, one at a time.
     leaving: CutEdit,
+    /// The page-table leaves the checkpoint writes, read for numbers taken and never changed as of
+    /// the cut, and those numbers still to leave out.
+    untaken: Untaken,
     /// The take of a copy slot under way, for the page being imaged.
     copying: MarkEdit,
     /// The deferred free of a slot under way, the front of its list until it is done.
@@ -725,6 +729,9 @@ enum Phase {
     Orphans,
     Images,
     Values,
+    /// Page numbers taken before the cut whose page the cut did not find owed, so neither imaged
+    /// nor left out: left out now, a page-table leaf read or a number left out a unit.
+    Untaken,
     /// The pool's cut ended, a run of its copies or lend batches a unit.
     EndCut,
     Intent,
@@ -1938,6 +1945,7 @@ impl Run {
             released: false,
             landing: CutEdit::default(),
             leaving: CutEdit::default(),
+            untaken: Untaken::default(),
             copying: MarkEdit::default(),
             freeing: FreeEdit::default(),
         }
@@ -2149,11 +2157,23 @@ impl Run {
                             self.copying.pending().is_none(),
                             "a copy slot's take still under way as the last image is written"
                         );
-                        self.phase = Phase::EndCut;
+                        debug_assert!(
+                            self.flying.is_empty(),
+                            "an image still in flight as the numbers to leave out are looked for"
+                        );
+                        self.phase = Phase::Untaken;
+                        crate::race::point("checkpoint.untaken_begins");
                         return Ok(Unit::Again);
                     }
                     unit => return Ok(unit),
                 },
+                Phase::Untaken => {
+                    if let Some(unit) = self.untaken_unit(cp)? {
+                        return Ok(unit);
+                    }
+                    self.phase = Phase::EndCut;
+                    return Ok(Unit::Again);
+                }
                 Phase::EndCut => {
                     unit::visit();
                     if cp.pool.end_cut_run(self.n, &mut self.end_cut) {
@@ -2778,6 +2798,52 @@ impl Run {
         Ok(Unit::Again)
     }
 
+    /// One unit of the `Untaken` phase: a number left out, or one page-table leaf the checkpoint
+    /// writes read as of the cut for entries still taken and never copied; `None` once every leaf
+    /// is read and every such number left out. After `Images` and `Values` an entry that reads
+    /// taken, with no copy, is a page the cut did not find owed: taken and not yet changed. Its put
+    /// commits after the snapshot, so a recovery from this checkpoint replays it into a page of its
+    /// own, and nothing would ever free this one (VALUE-LEAK1).
+    fn untaken_unit(&mut self, cp: &Checkpointer) -> Result<Option<Unit>> {
+        if let Some(&pid) = self.untaken.numbers.front() {
+            unit::visit();
+            match cp
+                .store
+                .left_out(self.n, &self.heights, pid, &mut self.leaving)?
+            {
+                IOResult::Done(edited) => self.meta.extend(edited.iter().copied()),
+                IOResult::IO(IOCompletions(c)) => return Ok(Some(Unit::Wait(c))),
+            }
+            self.untaken.numbers.pop_front();
+            return Ok(Some(Unit::Again));
+        }
+        let meta = &self.meta;
+        let leaves = self.untaken.leaves.get_or_insert_with(|| {
+            meta.iter()
+                .filter(|id| id.tree == Tree::Map && id.level == 0)
+                .copied()
+                .collect()
+        });
+        let Some(&id) = leaves.get(self.untaken.at) else {
+            return Ok(None);
+        };
+        unit::visit();
+        let leaf = match cp.store.meta().get(id)? {
+            IOResult::Done(leaf) => leaf,
+            IOResult::IO(IOCompletions(c)) => return Ok(Some(Unit::Wait(c))),
+        };
+        let Some(units) = leaf.read_cut(self.n, |live| taken_units(live), |cut| taken_units(cut))
+        else {
+            return Ok(Some(Unit::Wait(leaf.wait_while_held())));
+        };
+        let first = id.index * radix::MAP_ENTRIES;
+        self.untaken
+            .numbers
+            .extend(units.into_iter().map(|u| PageId::new(id.class, first + u)));
+        self.untaken.at += 1;
+        Ok(Some(Unit::Again))
+    }
+
     /// Names in the page table one image write that has landed, its place in the flight set
     /// freed: whether there was one. Fails on one that failed. A landing whose edit waited is the
     /// next one made, whatever lands meanwhile, so no other replaces the pages its edit keeps.
@@ -2834,6 +2900,24 @@ impl Run {
         self.flying.swap_remove(i);
         Ok(IOResult::Done(true))
     }
+}
+
+/// The units of a page-table leaf that read taken with no copy.
+fn taken_units<P: super::shared::Bytes + ?Sized>(leaf: &P) -> Vec<u64> {
+    (0..radix::MAP_ENTRIES)
+        .filter(|&i| radix::map_entry(leaf, i) == radix::ALLOCATED)
+        .collect()
+}
+
+/// Where a checkpoint stands in leaving out the numbers taken before its cut and never changed.
+#[derive(Default)]
+struct Untaken {
+    /// The page-table leaves it writes, listed once its images are done.
+    leaves: Option<Vec<MetaId>>,
+    /// The next of them to read.
+    at: usize,
+    /// Numbers read taken and never copied, still to leave out.
+    numbers: VecDeque<PageId>,
 }
 
 /// The intent record's payload: the checkpoint's number, then each metadata page's id.
@@ -3417,6 +3501,7 @@ mod tests {
             "mapped_roots",
             "scan",
             "superblock",
+            "untaken",
         ];
         const WHOLE: &[&str] = &[
             "n",
@@ -3485,10 +3570,12 @@ mod tests {
             // The cut's scan holds pages owed an image, seen and swapped, all page ids.
             vec(&run.scan.owed) && !needs_drop::<PageId>(),
             !needs_drop::<(Lsn, Lsn)>(),
+            // The map leaves to read and one leaf's numbers: two frees.
+            !needs_drop::<MetaId>() && deque(&run.untaken.numbers),
         ];
         drop(run);
         assert_eq!(
-            one_free, [true; 10],
+            one_free, [true; 11],
             "fields one free, by their place in ONE_FREE"
         );
     }

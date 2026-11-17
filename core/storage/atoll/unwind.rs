@@ -423,6 +423,31 @@ mod tests {
     const PANICKING: &[(&str, &str, &str)] = &[
         (
             "tests.rs",
+            "a_number_taken_with_no_frame_at_a_cut_is_free_after_a_recovery",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_close_and_an_open_leave_no_page_allocated_and_never_used",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_number_taken_before_a_cut_and_freed_during_its_checkpoint_is_free_after_a_recovery",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_number_left_out_at_one_cut_and_written_after_is_copied_by_the_next_checkpoint",
+            "child",
+        ),
+        (
+            "tests.rs",
+            "a_number_taken_before_a_cut_and_never_changed_is_free_after_a_recovery",
+            "child",
+        ),
+        (
+            "tests.rs",
             "a_load_after_the_settle_gave_the_swap_copy_up_reads_the_checkpoint_copy_and_is_owed_nothing",
             "child",
         ),

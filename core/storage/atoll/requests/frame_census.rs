@@ -249,35 +249,52 @@ fn every_site_that_queues_a_request_for_the_io_threads_is_listed() {
 /// alone the IO thread is the slower, under load the statement's thread is.
 const COLD_STEPS_WITH_THE_IO_THREAD_FREE: &[(&str, &str)] = &[];
 
+const NO_NESTED_PROGRAM_OUTSIDE_ATOLL: &str =
+    "a statement outside Atoll mode that runs no nested program, so no instruction of it returns \
+     a yield, and its match ends the test at any result it has no arm for";
+
 /// Functions with a match arm for a framed step's IO stop and none for its yield, each with why
 /// no yield reaches it. A look-again yield an instruction returns reaches the statement's caller
 /// as a yield, and so does the stop for the budget of a nested program (a trigger's, stepped in
 /// the poll's own dispatch loop). A helper statement, stepped with `step()`, has no stop for the
 /// budget.
-/// Atoll's functions that step a statement with `step()` and have a match arm for its IO stop and
-/// none for its yield, by file and name, each with why no yield reaches it. A step may come back `Yield` to its caller outside
-/// a frame as inside one (`StepResult::Yield`'s contract), and a loop that ends there fails a healthy
-/// run (YIELD-STEP1).
-const STEP_ARMS_WITHOUT_A_YIELD_ARM: &[(&str, &str)] = &[(
-    "sql/mode/tests/poll_budget.rs: a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction",
-    "a statement outside Atoll mode that runs no nested program, so no instruction of it returns \
-     a yield, and its match ends the test at any result it has no arm for",
-)];
-
 const IO_ARMS_WITHOUT_A_YIELD_ARM: &[(&str, &str)] = &[(
     "a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction",
-    "a statement outside Atoll mode that runs no nested program, so no instruction of it returns \
-     a yield, and its match ends the test at any result it has no arm for",
+    NO_NESTED_PROGRAM_OUTSIDE_ATOLL,
 )];
+
+/// The matches in Atoll's files with an arm for a step's IO stop and none for its yield, each
+/// with why no yield reaches it. Each is named "file: function match k": the file under
+/// `storage/atoll`, and k counting from 1, in source order, the function's matches with an arm
+/// for an IO stop. A step may come back `Yield` to its caller outside a frame as inside one
+/// (`StepResult::Yield`'s contract), and a match that ends at a result it has no arm for fails a
+/// healthy run there (YIELD-STEP1).
+const MATCH_ARMS_FOR_IO_WITHOUT_ONE_FOR_YIELD: &[(&str, &str)] = &[
+    (
+        "sql/integrity/tests.rs: called match 1",
+        "a framed step whose loop steps again on a yield before the match",
+    ),
+    (
+        "sql/mode/tests/poll_budget.rs: \
+         a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction match 1",
+        NO_NESTED_PROGRAM_OUTSIDE_ATOLL,
+    ),
+    (
+        "sql/mode/tests/poll_budget.rs: \
+         a_call_after_a_stop_for_the_budget_checks_before_its_first_instruction match 2",
+        NO_NESTED_PROGRAM_OUTSIDE_ATOLL,
+    ),
+];
 
 /// A test that steps a statement in a cooperative frame (`Statement::step_in_frame`) makes the
 /// stops it asserts on (the auditor's #5966, after 4.1's first gate): one that makes pages cold
 /// holds the IO thread through the call, and one with an arm for an IO stop has one for a yield.
-/// Every function that breaks either rule is listed with its reason, and every one listed still
-/// breaks it.
+/// In Atoll's files, in a frame or not, every match with an arm for a step's IO stop has one for
+/// its yield too. Every function or match that breaks a rule is listed with its reason, and every
+/// one listed still breaks it.
 #[test]
 fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
-    let (mut steppers, mut found) = (0, Vec::new());
+    let (mut steppers, mut io_matches, mut found) = (0, 0, Vec::new());
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for path in crate::source_test::rust_sources(core) {
         let text = std::fs::read_to_string(&path).unwrap();
@@ -285,21 +302,22 @@ fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
         let (stepping, broken) = stops_left_to_chance(&code);
         steppers += stepping;
         found.extend(broken);
-        // The rule for a step outside a frame holds Atoll's code, named by file and function.
         if let Ok(atoll) = path.strip_prefix(core.join("storage/atoll")) {
-            found.extend(
-                step_arms_without_a_yield_arm(&code)
-                    .into_iter()
-                    .map(|name| {
-                        (
-                            LeftToChance::StepArmWithoutAYieldArm,
-                            format!("{}: {name}", atoll.display()),
-                        )
-                    }),
-            );
+            let (with_io, broken) = match_arms_for_io_without_one_for_yield(&code);
+            io_matches += with_io;
+            found.extend(broken.into_iter().map(|name| {
+                (
+                    LeftToChance::MatchArmForIoWithoutOneForYield,
+                    format!("{}: {name}", atoll.display()),
+                )
+            }));
         }
     }
     assert!(steppers > 0, "the census found no step in a frame at all");
+    assert!(
+        io_matches > 0,
+        "the census found no match in Atoll's files with an arm for an IO stop"
+    );
     for (rule, listed) in [
         (
             LeftToChance::ColdStepWithTheIoThreadFree,
@@ -310,8 +328,8 @@ fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
             IO_ARMS_WITHOUT_A_YIELD_ARM,
         ),
         (
-            LeftToChance::StepArmWithoutAYieldArm,
-            STEP_ARMS_WITHOUT_A_YIELD_ARM,
+            LeftToChance::MatchArmForIoWithoutOneForYield,
+            MATCH_ARMS_FOR_IO_WITHOUT_ONE_FOR_YIELD,
         ),
     ] {
         let mut found: Vec<&str> = found
@@ -324,7 +342,7 @@ fn every_test_that_steps_in_a_frame_makes_its_stops_certain() {
         listed.sort();
         assert_eq!(
             found, listed,
-            "{rule:?}: a function that steps in a frame and is not listed, or one listed that no longer does"
+            "{rule:?}: a function or match that breaks the rule and is not listed, or one listed that no longer does"
         );
     }
 }
@@ -521,16 +539,16 @@ fn waits_for_the_thread(body: &str) -> bool {
     })
 }
 
-/// How a function that steps a statement in a frame leaves a stop it reads to chance.
+/// How a function, or a match in Atoll's files, leaves a stop it reads to chance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LeftToChance {
-    /// It makes pages cold and steps with the IO thread free to finish the read first.
+    /// A function stepping in a frame makes pages cold and steps with the IO thread free to
+    /// finish the read first.
     ColdStepWithTheIoThreadFree,
-    /// It has a match arm for an IO stop and none for a yield.
+    /// A function stepping in a frame has a match arm for an IO stop and none for a yield.
     IoArmWithoutAYieldArm,
-    /// It steps a statement with `step()` itself, and has a match arm for an IO stop and none for
-    /// a yield.
-    StepArmWithoutAYieldArm,
+    /// A match in Atoll's files has an arm of its own for an IO stop and none for a yield.
+    MatchArmForIoWithoutOneForYield,
 }
 
 /// How many functions of one file's `code` step a statement in a frame, themselves or through
@@ -575,25 +593,103 @@ fn stops_left_to_chance(code: &str) -> (usize, Vec<(LeftToChance, String)>) {
         if cold[i] && steps_unheld[i] {
             broken.push((LeftToChance::ColdStepWithTheIoThreadFree, name.to_string()));
         }
-        if steps[i] && has_an_arm_for_io(body) && !body.contains("StepResult::Yield") {
+        if steps[i] && has_an_arm_for(body, "StepResult::IO") && !body.contains("StepResult::Yield")
+        {
             broken.push((LeftToChance::IoArmWithoutAYieldArm, name.to_string()));
         }
     }
     (steps.iter().filter(|s| **s).count(), broken)
 }
 
-/// The functions of one file's `code` that step a statement with `step()` themselves and have a
-/// match arm for its IO stop and none for its yield.
-fn step_arms_without_a_yield_arm(code: &str) -> Vec<String> {
-    functions_of(code)
+/// How many matches of one file's `code` have an arm of their own for an IO stop, and each of
+/// those with none for a yield, named "function match k": the match is the k-th, counting from 1
+/// in source order, of the innermost function holding it to have an arm of its own for an IO
+/// stop. A match's own arms are its block without the blocks of the matches inside it, so a match
+/// whose arm holds a loop over a step's match is not read as having that match's arms.
+fn match_arms_for_io_without_one_for_yield(code: &str) -> (usize, Vec<String>) {
+    // Each body is a slice of `code`: the span it takes there.
+    let functions: Vec<(&str, std::ops::Range<usize>)> = functions_of(code)
         .into_iter()
-        .filter(|(_, body)| {
-            body.contains(".step()")
-                && has_an_arm_for_io(body)
-                && !body.contains("StepResult::Yield")
+        .map(|(name, body)| {
+            let start = body.as_ptr() as usize - code.as_ptr() as usize;
+            (name, start..start + body.len())
         })
-        .map(|(name, _)| name.to_string())
-        .collect()
+        .collect();
+    let blocks = match_blocks(code);
+    let mut counted = vec![0usize; functions.len()];
+    let (mut with_io, mut broken) = (0, Vec::new());
+    for (i, (keyword, _)) in blocks.iter().enumerate() {
+        let own = own_arms(code, &blocks, i);
+        if !has_an_arm_for(&own, "StepResult::IO") {
+            continue;
+        }
+        with_io += 1;
+        let function = (0..functions.len())
+            .filter(|&f| functions[f].1.contains(keyword))
+            .max_by_key(|&f| functions[f].1.start)
+            .expect("a match with an arm for an IO stop outside any function");
+        counted[function] += 1;
+        if !has_an_arm_for(&own, "StepResult::Yield") {
+            broken.push(format!(
+                "{} match {}",
+                functions[function].0, counted[function]
+            ));
+        }
+    }
+    (with_io, broken)
+}
+
+/// Every `match` of `code`, in source order, by where its keyword starts, with the span of its
+/// arms' block, braces included: the first brace after the keyword outside parentheses and
+/// brackets opens it.
+fn match_blocks(code: &str) -> Vec<(usize, std::ops::Range<usize>)> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut blocks = Vec::new();
+    for (at, keyword) in code.match_indices("match") {
+        let after = at + keyword.len();
+        if code[..at].chars().next_back().is_some_and(ident)
+            || code[after..].chars().next().is_some_and(ident)
+        {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (i, c) in code[after..].char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' if depth == 0 => break,
+                ')' | ']' => depth -= 1,
+                // The word, not an expression that opens a block: in a macro's input, say.
+                ';' | '}' if depth == 0 => break,
+                '{' if depth == 0 => {
+                    let open = after + i;
+                    blocks.push((at, open..open + braced(&code[open..])));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    blocks
+}
+
+/// The text of the arms of match `i` of `blocks`, without the blocks of the matches inside them.
+fn own_arms(code: &str, blocks: &[(usize, std::ops::Range<usize>)], i: usize) -> String {
+    let arms = &blocks[i].1;
+    let (mut own, mut from) = (String::new(), arms.start);
+    for (keyword, inner) in blocks[i + 1..]
+        .iter()
+        .take_while(|(keyword, _)| *keyword < arms.end)
+    {
+        // A match inside one already left out goes with it, and one in the scrutinee is not in
+        // the arms.
+        if *keyword < from {
+            continue;
+        }
+        own.push_str(&code[from..inner.start]);
+        from = inner.end;
+    }
+    own.push_str(&code[from..arms.end]);
+    own
 }
 
 fn steps_itself(body: &str) -> bool {
@@ -615,10 +711,10 @@ fn calls_function(body: &str, name: &str) -> bool {
     })
 }
 
-/// Whether `body` has a match arm whose pattern names an IO stop: `StepResult::IO`, then the
-/// pattern's closing parentheses, then `=>` or another alternative.
-fn has_an_arm_for_io(body: &str) -> bool {
-    body.match_indices("StepResult::IO").any(|(at, found)| {
+/// Whether `body` has a match arm whose pattern names the step result `stop` (`StepResult::IO`,
+/// say): `stop`, then the pattern's closing parentheses, then `=>` or another alternative.
+fn has_an_arm_for(body: &str, stop: &str) -> bool {
+    body.match_indices(stop).any(|(at, found)| {
         let after =
             body[at + found.len()..].trim_start_matches(|c: char| c == ')' || c.is_whitespace());
         after.starts_with("=>") || after.starts_with('|')

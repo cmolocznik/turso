@@ -827,6 +827,11 @@ fn a_writer_reset_between_its_begin_and_its_write_leaves_a_reader_its_transactio
                                             break format!("io error: {e}");
                                         }
                                     }
+                                    Ok(crate::StepResult::Yield) => {
+                                        if let Err(e) = y.wait_io() {
+                                            break format!("io error: {e}");
+                                        }
+                                    }
                                     Ok(other) => break format!("{other:?}"),
                                     Err(e) => break format!("error: {e}"),
                                 }

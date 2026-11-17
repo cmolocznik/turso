@@ -4944,6 +4944,7 @@ fn a_published_commit_whose_log_fails(seed: u64, dropped: bool) {
             match statement.step() {
                 Ok(crate::StepResult::IO) => crash.step().unwrap(),
                 Ok(crate::StepResult::Done) => break Ok(()),
+                Ok(crate::StepResult::Yield) => crash.step().unwrap(),
                 Ok(other) => break Err(format!("{other:?}")),
                 Err(e) => break Err(e.to_string()),
             }
@@ -4965,9 +4966,11 @@ fn a_published_commit_whose_log_fails(seed: u64, dropped: bool) {
         "the COMMIT was never published with its ending waiting"
     );
     if let Some(ended) = ended {
-        assert!(
-            ended.is_err(),
-            "the COMMIT did not return its log's failure: {ended:?}"
+        // The write the fault made fail on the log's file, as `CrashIO` reports it.
+        assert_eq!(
+            ended,
+            Err("I/O error (write): other error".to_string()),
+            "the COMMIT did not return its log's failure"
         );
     }
     assert!(

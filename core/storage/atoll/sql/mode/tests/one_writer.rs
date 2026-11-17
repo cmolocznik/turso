@@ -70,7 +70,10 @@ fn holding(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connection>, Stri
 
 /// What a connection shows of its transaction: whether Atoll has one open, and autocommit.
 fn shows(conn: &Arc<Connection>) -> (bool, bool) {
-    (conn.atoll().unwrap().is_open(), conn.get_auto_commit())
+    (
+        conn.atoll().unwrap().is_open(TxnOf::Connection),
+        conn.get_auto_commit(),
+    )
 }
 
 const CREATE_C: &str = "CREATE TABLE c(k INTEGER PRIMARY KEY, w TEXT)";

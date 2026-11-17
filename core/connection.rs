@@ -6,6 +6,7 @@ use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
 use crate::sync::{
     atomic::{
@@ -304,7 +305,8 @@ impl ReparsePin {
         if self.hold.armed() {
             reparse_event("pin");
         }
-        self.conn.finish_release(atoll.release_pin(&mut self.hold))
+        self.conn
+            .finish_release(atoll.release_pin(TxnOf::Connection, &mut self.hold))
     }
 }
 
@@ -879,7 +881,7 @@ impl Drop for Connection {
             self.rollback_attached_mvcc_txs(false);
             // An Atoll transaction's ending drives itself to its end where it drops (R19).
             if let Some(atoll) = self.atoll.as_ref() {
-                drop(atoll.end(false));
+                atoll.end_every();
             }
 
             // Release any WAL locks the connection might be holding.
@@ -1534,7 +1536,7 @@ impl Connection {
             // Atoll mode (DESIGN.md §17): the committed cookie, and a reparse through SQL whose
             // statements begin and end their own Atoll transactions. A newer schema it labels
             // with the older cookie costs one more reparse, never a stale schema (R31).
-            if self.db.schema.lock().schema_version == atoll.schema_cookie()? {
+            if self.db.schema.lock().schema_version == atoll.schema_cookie(TxnOf::Connection)? {
                 return Ok(());
             }
             self.reparse_schema()?;
@@ -1708,9 +1710,8 @@ impl Connection {
             self.set_tx_state(TransactionState::None);
         }
         if let Some(clear) = clear {
-            self.atoll()
-                .expect("a pin's release in Atoll mode")
-                .clear_pin(clear);
+            let atoll = self.atoll().expect("a pin's release in Atoll mode");
+            atoll.clear_pin(TxnOf::Connection, clear);
         }
         match error {
             Some(e) => Err(e),
@@ -1807,9 +1808,11 @@ impl Connection {
                 ReparseSchemaState::Pinning(pending) => {
                     let stepped = match pending.at {
                         PendingAt::Pin => atoll
-                            .pin_in(&mut pending.pin.hold)
+                            .pin_in(TxnOf::Connection, &mut pending.pin.hold)
                             .map(|io| io.map(|()| None)),
-                        PendingAt::Cookie if !atoll.pin_view_is(&pending.pin.hold) => {
+                        PendingAt::Cookie
+                            if !atoll.pin_view_is(TxnOf::Connection, &pending.pin.hold) =>
+                        {
                             Err(view_changed())
                         }
                         #[cfg(test)]
@@ -1817,7 +1820,7 @@ impl Connection {
                             LimboError::InternalError("an injected failure at the cookie".into()),
                         ),
                         PendingAt::Cookie => atoll
-                            .schema_cookie_in(&mut pending.cookie)
+                            .schema_cookie_in(TxnOf::Connection, &mut pending.cookie)
                             .map(|io| io.map(Some)),
                     };
                     let cookie = match stepped {
@@ -1856,7 +1859,7 @@ impl Connection {
                     let view = inner
                         .pin
                         .as_ref()
-                        .is_none_or(|pin| atoll.pin_view_is(&pin.hold));
+                        .is_none_or(|pin| atoll.pin_view_is(TxnOf::Connection, &pin.hold));
                     crate::race::point("reparse.building_checked");
                     let out = if !view {
                         Err(view_changed().into())
@@ -2215,7 +2218,7 @@ impl Connection {
                     // begin, so the same view means every read was in it.
                     let kept = pin.as_ref().is_none_or(|pin| {
                         self.atoll()
-                            .is_some_and(|atoll| atoll.pin_view_is(&pin.hold))
+                            .is_some_and(|atoll| atoll.pin_view_is(TxnOf::Connection, &pin.hold))
                     });
                     if !kept {
                         self.put_back_schema(previous);
@@ -2246,7 +2249,7 @@ impl Connection {
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
         if let Some(atoll) = self.atoll() {
-            atoll.schema_cookie()
+            atoll.schema_cookie(TxnOf::Connection)
         } else if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
             mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
@@ -2265,7 +2268,7 @@ impl Connection {
     pub(crate) fn read_current_schema_cookie_nonblock(&self) -> crate::types::IOResultOr<u32> {
         use crate::types::IOResult;
         if let Some(atoll) = self.atoll() {
-            Ok(IOResult::Done(atoll.schema_cookie()?))
+            Ok(IOResult::Done(atoll.schema_cookie(TxnOf::Connection)?))
         } else if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
             let cookie =
@@ -3030,7 +3033,7 @@ impl Connection {
                     }
                     pager.end_read_tx();
                 } else if self.atoll().is_some() {
-                    self.rollback_atoll();
+                    self.rollback_atoll(TxnOf::Connection);
                 } else {
                     pager.rollback_tx(self);
                 }
@@ -3044,7 +3047,7 @@ impl Connection {
         }
         // An Atoll transaction the state did not show, ended all the same: none outlives a close.
         if let Some(atoll) = self.atoll.as_ref() {
-            drop(atoll.end(false));
+            atoll.end_every();
         }
         self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
@@ -3699,7 +3702,7 @@ impl Connection {
 
     /// Ends the Atoll transaction, rolling it back, at a synchronous site (R19); restores the
     /// schema a rolled-back schema change left, as `Pager::rollback` does (R28).
-    pub(crate) fn rollback_atoll(&self) {
+    pub(crate) fn rollback_atoll(&self, which: TxnOf<'_>) {
         let Some(atoll) = self.atoll.as_ref() else {
             return;
         };
@@ -3709,7 +3712,7 @@ impl Connection {
                 schema_did_change: true
             }
         );
-        if let Some(mut ending) = atoll.end(false) {
+        if let Some(mut ending) = atoll.end(which, false) {
             if let Err(e) = ending.finish() {
                 tracing::error!("rolling back an Atoll transaction failed: {e}");
             }
@@ -5219,7 +5222,7 @@ impl Connection {
         };
         let ender_only =
             remaining == 1 && self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING;
-        if !(remaining == 0 || ender_only) || !atoll.end_served() {
+        if !(remaining == 0 || ender_only) || !atoll.end_served(TxnOf::Connection) {
             return;
         }
         if remaining == 0 {
@@ -5775,6 +5778,7 @@ impl Connection {
         &self,
         pager: &Arc<Pager>,
         clear_attached_schemas: bool,
+        which: TxnOf<'_>,
     ) {
         if let Some(mv_store) = self.mv_store().as_ref() {
             if let Some(tx_id) = self.get_mv_tx_id() {
@@ -5788,7 +5792,7 @@ impl Connection {
             pager.end_read_tx();
             self.rollback_attached_mvcc_txs(clear_attached_schemas);
         } else if self.atoll().is_some() {
-            self.rollback_atoll();
+            self.rollback_atoll(which);
             self.auto_commit.store(true, Ordering::SeqCst);
         } else {
             pager.rollback_tx(self);
@@ -5822,7 +5826,7 @@ impl Connection {
             || pager.holds_write_lock();
 
         if main_has_implicit_state {
-            self.rollback_current_txn_state(pager, clear_attached_schemas);
+            self.rollback_current_txn_state(pager, clear_attached_schemas, TxnOf::Connection);
         } else {
             if self.next_attached_mv_tx().is_some() {
                 self.rollback_attached_mvcc_txs(clear_attached_schemas);

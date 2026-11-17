@@ -5,6 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -3085,7 +3086,7 @@ impl Database {
             mv_tx: RwLock::new(None),
             atoll_owed: atoll
                 .as_ref()
-                .map(crate::storage::atoll::sql::mode::ConnTxn::owed_flag),
+                .map(|atoll| atoll.owed_flag(TxnOf::Connection)),
             atoll,
             atoll_end: AtomicU8::new(Connection::END_FREE),
             attached_mv_txs: RwLock::new(HashMap::default()),

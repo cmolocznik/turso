@@ -4,6 +4,7 @@
 use crate::io::{MemoryIO, OpenFlags, IO};
 use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS};
 use crate::storage::atoll::sql::catalog::tests::config;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::storage::atoll::txn::arena::PAGES_TAKEN;
 use crate::sync::Arc;
 use crate::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, SqliteDialect, Value};
@@ -1072,16 +1073,23 @@ fn a_cursor_stays_on_the_tree_it_opened_through_a_destroy_in_its_statement() {
         other => panic!("{other:?}"),
     };
     let ct = conn.atoll().expect("Atoll mode");
-    drive(&io, || ct.begin(Begin::Write { schema: true })).unwrap();
-    ct.start_statement().unwrap();
-    let mut cursor = SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+    drive(&io, || {
+        ct.begin(TxnOf::Connection, Begin::Write { schema: true })
+    })
+    .unwrap();
+    ct.start_statement(TxnOf::Connection).unwrap();
+    let mut cursor =
+        SqlCursor::new(ct, TxnOf::Connection, conn.pager.load().clone(), id, None).opening_fresh();
     drive(&io, || cursor.finish_open().map_err(|e| *e)).unwrap();
     let mut op = None;
-    drive(&io, || ct.retire_tree(&mut op, id, false)).unwrap();
+    drive(&io, || {
+        ct.retire_tree(TxnOf::Connection, &mut op, id, false)
+    })
+    .unwrap();
     assert!(!catalogued_in(ct, id), "the Destroy took the catalog row");
     assert_eq!(drive(&io, || cursor.count().map_err(|e| *e)).unwrap(), 3);
     drop(cursor);
-    ct.end(false)
+    ct.end(TxnOf::Connection, false)
         .expect("a transaction to end")
         .finish()
         .unwrap();
@@ -1094,7 +1102,7 @@ fn catalogued_in(ct: &crate::storage::atoll::sql::mode::ConnTxn, id: u64) -> boo
     use crate::storage::atoll::sql::catalog::key;
     use crate::storage::atoll::txn::versioned::Get;
     let db = ct.db();
-    let mut guard = ct.cell.lock_for_test();
+    let mut guard = ct.own().cell.lock_for_test();
     let txn = guard.as_mut().expect("an open transaction");
     let mut get = Get::new(&key(id));
     drive(db.io(), || {
@@ -2165,7 +2173,7 @@ fn a_write_reprepared_after_waiting_behind_ddl_commits_at_its_halt() {
     assert_eq!(drawn, vec![vec![Value::from_i64(1)]]);
     drop(draw);
     assert!(
-        !a.atoll().unwrap().is_open(),
+        !a.atoll().unwrap().is_open(TxnOf::Connection),
         "the reprepared statement's transaction ended at its halt"
     );
     assert_eq!(
@@ -2185,11 +2193,11 @@ fn an_autocommit_write_that_begins_the_transaction_commits_it_at_its_halt() {
         db.connect(ConnectOpts::new()).unwrap(),
     );
     a.execute("CREATE TABLE t (x)").unwrap();
-    assert!(!a.atoll().unwrap().is_open());
+    assert!(!a.atoll().unwrap().is_open(TxnOf::Connection));
     a.set_tx_state(crate::connection::TransactionState::Read);
     a.execute("INSERT INTO t VALUES (1)").unwrap();
     assert!(
-        !a.atoll().unwrap().is_open(),
+        !a.atoll().unwrap().is_open(TxnOf::Connection),
         "the insert's transaction ended at its halt"
     );
     assert_eq!(rows(&b, "SELECT x FROM t"), vec![vec![Value::from_i64(1)]]);
@@ -3765,7 +3773,7 @@ fn end_cancels() -> std::result::Result<(), String> {
     }
     // The transaction ends under the suspended statement.
     let ct = conn.atoll().expect("Atoll mode");
-    let ending = ct.end(false);
+    let ending = ct.end(TxnOf::Connection, false);
     let queued = pool.shortage_len();
     if let Some(mut ending) = ending {
         ending.finish().map_err(|e| e.to_string())?;
@@ -4991,7 +4999,7 @@ fn a_published_endings_failure_is_what_its_next_step_returns() {
         .iter()
         .map(|sql| ran_on(&conn, &crash, sql))
         .collect::<std::result::Result<Vec<_>, _>>();
-    let mut ending = conn.atoll().unwrap().end(true).unwrap();
+    let mut ending = conn.atoll().unwrap().end(TxnOf::Connection, true).unwrap();
     let published = loop {
         match ending.step() {
             Ok(crate::IOResult::IO(_)) if ending.published() => break Ok(()),
@@ -5208,7 +5216,7 @@ fn an_ending_not_over_is_driven_to_its_end_outside_its_connections_place() {
             }
             let atoll = writer.atoll().expect("an Atoll connection");
             // Placed, never stepped: not over.
-            let placed = atoll.end_into_place(true, None);
+            let placed = atoll.end_into_place(TxnOf::Connection, true, None);
             let pause = crate::io::Completion::new_wait();
             crate::storage::atoll::testing::ENDING_PAUSE
                 .with(|p| *p.borrow_mut() = Some(pause.clone()));
@@ -5220,7 +5228,7 @@ fn an_ending_not_over_is_driven_to_its_end_outside_its_connections_place() {
                 let atoll = conn.atoll().expect("an Atoll connection");
                 let start = std::time::Instant::now();
                 let found = loop {
-                    if atoll.place_free_and_empty_for_test() {
+                    if atoll.place_free_and_empty_for_test(atoll.own()) {
                         break true;
                     }
                     if start.elapsed() > std::time::Duration::from_secs(20) {
@@ -5231,7 +5239,7 @@ fn an_ending_not_over_is_driven_to_its_end_outside_its_connections_place() {
                 paused.complete(0);
                 found
             });
-            atoll.drop_placed();
+            atoll.drop_placed(TxnOf::Connection);
             let found = helper.join().expect("the helper");
             crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
             let committed = reader
@@ -5275,17 +5283,17 @@ fn a_header_write_waiting_when_its_transaction_ends_leaves_none_under_way() {
             let mut waiting = writer.prepare("PRAGMA user_version = 7").unwrap();
             let atoll = writer.atoll().expect("an Atoll connection");
             let mut steps = 0;
-            while !atoll.header_write_under_way_for_test() && steps < 100 {
+            while !atoll.header_write_under_way_for_test(atoll.own()) && steps < 100 {
                 match waiting.step() {
                     Ok(crate::StepResult::IO) => crash.step().unwrap(),
                     other => panic!("the waiting write ended: {other:?}"),
                 }
                 steps += 1;
             }
-            let under_way = atoll.header_write_under_way_for_test();
+            let under_way = atoll.header_write_under_way_for_test(atoll.own());
             // Its statement dropped: its autocommit transaction ends.
             drop(waiting);
-            let left = atoll.header_write_under_way_for_test();
+            let left = atoll.header_write_under_way_for_test(atoll.own());
             ran_on(&holder, &crash, "ROLLBACK").unwrap();
             let next = ran_on(&writer, &crash, "PRAGMA application_id = 9");
             let read = |sql: &str| {
@@ -5718,7 +5726,7 @@ fn a_scan_begun_in_a_transaction_and_finished_after_its_commit_leaves_no_read_be
     let committed = ran_on(&writer, &crash, "COMMIT");
     let rest = scan_rest(&mut scan, &crash, &mut read);
     drop(scan);
-    let left_open = writer.atoll().unwrap().is_open();
+    let left_open = writer.atoll().unwrap().is_open(TxnOf::Connection);
     let later = ran_on(&other, &crash, "INSERT INTO kept VALUES (2)");
     let seen = writer
         .prepare("SELECT a FROM kept")
@@ -5771,11 +5779,11 @@ fn a_sibling_gone_while_its_connections_commit_waits_releases_its_read_at_once()
     let mut ender = writer.prepare("CREATE TABLE made(a INTEGER)").unwrap();
     let waited = step_to_ending(&mut ender, &crash, true);
     let second = scan_first(&mut scan, &crash);
-    let served = writer.atoll().unwrap().is_open();
+    let served = writer.atoll().unwrap().is_open(TxnOf::Connection);
     let made = crate::storage::atoll::testing::endings_made();
     drop(scan);
     let after_the_sibling = (
-        writer.atoll().unwrap().is_open(),
+        writer.atoll().unwrap().is_open(TxnOf::Connection),
         ender.atoll_ending_phase(),
         crate::storage::atoll::testing::endings_made() - made,
     );
@@ -5785,7 +5793,7 @@ fn a_sibling_gone_while_its_connections_commit_waits_releases_its_read_at_once()
     let state = (
         writer.get_auto_commit(),
         writer.get_tx_state(),
-        writer.atoll().unwrap().is_open(),
+        writer.atoll().unwrap().is_open(TxnOf::Connection),
     );
     drop((writer, reader, db));
     assert_eq!(setup.map(drop), Ok(()));
@@ -6412,9 +6420,10 @@ fn a_close_and_an_endings_start_exclude_each_other() {
     let db = open(&io, "/db/end-word");
     let ending_first = db.connect(ConnectOpts::new()).unwrap();
     let closed_first = db.connect(ConnectOpts::new()).unwrap();
-    let ending = crate::vdbe::EndingBegun::new(&ending_first).map_err(|e| e.to_string());
+    let ending = crate::vdbe::EndingBegun::new(&ending_first, &Default::default())
+        .map_err(|e| e.to_string());
     let second_refused = matches!(
-        crate::vdbe::EndingBegun::new(&ending_first),
+        crate::vdbe::EndingBegun::new(&ending_first, &Default::default()),
         Err(crate::LimboError::StatementsInProgress(_))
     );
     let refused = matches!(
@@ -6425,7 +6434,7 @@ fn a_close_and_an_endings_start_exclude_each_other() {
     drop(ending);
     let closed = ending_first.close().map_err(|e| e.to_string());
     let closing = closed_first.close().map_err(|e| e.to_string());
-    let begun = crate::vdbe::EndingBegun::new(&closed_first)
+    let begun = crate::vdbe::EndingBegun::new(&closed_first, &Default::default())
         .map(drop)
         .map_err(|e| e.to_string());
     drop((ending_first, closed_first, db));
@@ -7653,7 +7662,7 @@ mod in_frames {
             let idle = atoll.io_idle_for_test();
             drop(held);
             assert!(
-                ct.cell.try_lock_for_test().is_some(),
+                ct.own().cell.try_lock_for_test().is_some(),
                 "call {calls}: a guard of the transaction held across the return"
             );
             match out {
@@ -7732,7 +7741,10 @@ mod in_frames {
     ) -> &'c crate::storage::atoll::sql::mode::ConnTxn {
         let ct = conn.atoll().expect("Atoll mode");
         crate::storage::atoll::drive(io, || {
-            ct.begin(crate::storage::atoll::sql::mode::Begin::Read)
+            ct.begin(
+                TxnOf::Connection,
+                crate::storage::atoll::sql::mode::Begin::Read,
+            )
         })
         .unwrap();
         ct
@@ -7758,14 +7770,19 @@ mod in_frames {
                 let (cookie, header) = {
                     // Read once synchronously, which opens every file the reads reach.
                     let ct = reading(&io, &other);
-                    (ct.schema_cookie().unwrap(), ct.header().unwrap())
+                    (
+                        ct.schema_cookie(TxnOf::Connection).unwrap(),
+                        ct.header(TxnOf::Connection).unwrap(),
+                    )
                 };
                 let ct = reading(&io, &conn);
                 // The pages the begins changed, written, so the eviction below takes them too.
                 let ck = db.connect(ConnectOpts::new()).unwrap();
                 checkpointed(&ck);
                 chill(&db);
-                let framed = in_frames_chilled(&io, &db, ct, |read| ct.schema_cookie_in(read));
+                let framed = in_frames_chilled(&io, &db, ct, |read| {
+                    ct.schema_cookie_in(TxnOf::Connection, read)
+                });
                 assert_eq!(framed.value, cookie, "the schema cookie read in frames");
                 loaded_once("the schema cookie", &framed);
                 assert!(
@@ -7781,7 +7798,8 @@ mod in_frames {
                 let ct = reading(&io, &third);
                 checkpointed(&ck);
                 chill(&db);
-                let framed = in_frames_chilled(&io, &db, ct, |read| ct.header_in(read));
+                let framed =
+                    in_frames_chilled(&io, &db, ct, |read| ct.header_in(TxnOf::Connection, read));
                 assert_eq!(
                     (
                         framed.value.schema_cookie.get(),
@@ -7819,9 +7837,10 @@ mod in_frames {
                     .unwrap();
                 checkpointed(&conn);
                 let ct = reading(&io, &conn);
-                let pages = ct.pages().unwrap();
+                let pages = ct.pages(TxnOf::Connection).unwrap();
                 chill(&db);
-                let framed = in_frames_chilled(&io, &db, ct, |read| ct.pages_in(read));
+                let framed =
+                    in_frames_chilled(&io, &db, ct, |read| ct.pages_in(TxnOf::Connection, read));
                 assert_eq!(framed.value, pages, "the pages in use read in frames");
                 loaded_once("the pages in use", &framed);
                 assert!(
@@ -7870,12 +7889,24 @@ mod in_frames {
                 // after its take is its one read of the set.
                 let ct = reading(&io, &conn);
                 crate::storage::atoll::drive(&io, || {
-                    ct.begin_reading(Begin::Write { schema: true }, &[], &mut None, None)
+                    ct.begin_reading(
+                        TxnOf::Connection,
+                        Begin::Write { schema: true },
+                        &[],
+                        &mut None,
+                        None,
+                    )
                 })
                 .unwrap();
                 chill(&db);
                 let framed = in_frames_chilled(&io, &db, ct, |read| {
-                    ct.begin_reading(Begin::Write { schema: true }, &reads, read, None)
+                    ct.begin_reading(
+                        TxnOf::Connection,
+                        Begin::Write { schema: true },
+                        &reads,
+                        read,
+                        None,
+                    )
                 });
                 assert!(
                     !framed.value,
@@ -8040,7 +8071,9 @@ mod in_frames {
                 conn.execute("CREATE TABLE t (a)").unwrap();
                 checkpointed(&conn);
                 let other = db.connect(ConnectOpts::new()).unwrap();
-                let cookie = reading(&io, &other).schema_cookie().unwrap();
+                let cookie = reading(&io, &other)
+                    .schema_cookie(TxnOf::Connection)
+                    .unwrap();
                 let ct = reading(&io, &conn);
                 let pool = db.atoll.as_ref().unwrap().atoll().pool().clone();
                 chill(&db);
@@ -8051,7 +8084,7 @@ mod in_frames {
                                    kept: &mut Kept| {
                     crate::storage::atoll::buffer::scarce(|| {
                         let _frame = crate::storage::atoll::cooperative::Frame::enter();
-                        ct.schema_cookie_in(kept).unwrap()
+                        ct.schema_cookie_in(TxnOf::Connection, kept).unwrap()
                     })
                 };
                 let mut kept: Kept = None;
@@ -8080,7 +8113,7 @@ mod in_frames {
                     }
                     out = {
                         let _frame = crate::storage::atoll::cooperative::Frame::enter();
-                        ct.schema_cookie_in(&mut kept).unwrap()
+                        ct.schema_cookie_in(TxnOf::Connection, &mut kept).unwrap()
                     };
                 };
                 // A second read short of memory, dropped unfinished: its place goes back.
@@ -8562,9 +8595,13 @@ mod in_frames {
             id: u64,
         ) -> (&'c crate::storage::atoll::sql::mode::ConnTxn, SqlCursor) {
             let ct = conn.atoll().expect("Atoll mode");
-            crate::storage::atoll::drive(io, || ct.begin(Begin::Write { schema: true })).unwrap();
-            ct.start_statement().unwrap();
-            let cursor = SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+            crate::storage::atoll::drive(io, || {
+                ct.begin(TxnOf::Connection, Begin::Write { schema: true })
+            })
+            .unwrap();
+            ct.start_statement(TxnOf::Connection).unwrap();
+            let cursor = SqlCursor::new(ct, TxnOf::Connection, conn.pager.load().clone(), id, None)
+                .opening_fresh();
             (ct, cursor)
         }
 
@@ -8593,22 +8630,25 @@ mod in_frames {
                     crate::storage::atoll::drive(&io, || a.finish_open().map_err(|e| *e)).unwrap();
                     crate::storage::atoll::drive(&io, || a.rewind().map_err(|e| *e)).unwrap();
                     let mut op = None;
-                    crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, true))
-                        .unwrap();
+                    crate::storage::atoll::drive(&io, || {
+                        ct.retire_tree(TxnOf::Connection, &mut op, id, true)
+                    })
+                    .unwrap();
                     drop(op);
                     chill(&db);
                     let first = in_frame(&io, &db, || a.next().map_err(|e| *e)).unwrap();
                     let keeps = a.resolving_for_test();
                     let before = kept_now(&db, keeps.unwrap_or_default());
                     let mut b =
-                        SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                        SqlCursor::new(ct, TxnOf::Connection, conn.pager.load().clone(), id, None)
+                            .opening_fresh();
                     crate::storage::atoll::drive(&io, || b.finish_open().map_err(|e| *e)).unwrap();
                     drop(b);
                     let second = in_frame(&io, &db, || a.next().map_err(|e| *e)).unwrap();
                     let kept_after = a.resolving_for_test();
                     let after = kept_now(&db, keeps.unwrap_or_default());
                     drop(a);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8652,14 +8692,15 @@ mod in_frames {
                     let keeps = a.resolving_for_test();
                     let before = kept_now(&db, keeps.unwrap_or_default());
                     let mut b =
-                        SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                        SqlCursor::new(ct, TxnOf::Connection, conn.pager.load().clone(), id, None)
+                            .opening_fresh();
                     crate::storage::atoll::drive(&io, || b.finish_open().map_err(|e| *e)).unwrap();
                     drop(b);
                     let second = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
                     let (kept_after, opening) = (a.resolving_for_test(), a.opening());
                     let after = kept_now(&db, keeps.unwrap_or_default());
                     drop(a);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8697,8 +8738,10 @@ mod in_frames {
                     let keeps = a.resolving_for_test();
                     let before = kept_now(&db, keeps.unwrap_or_default());
                     let mut op = None;
-                    crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, false))
-                        .unwrap();
+                    crate::storage::atoll::drive(&io, || {
+                        ct.retire_tree(TxnOf::Connection, &mut op, id, false)
+                    })
+                    .unwrap();
                     drop(op);
                     let second = in_frame(&io, &db, || a.finish_open().map_err(|e| *e));
                     let (kept_after, opening) = (a.resolving_for_test(), a.opening());
@@ -8722,7 +8765,7 @@ mod in_frames {
                     let counted =
                         crate::storage::atoll::drive(&io, || a.count().map_err(|e| *e)).unwrap();
                     drop(a);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8753,7 +8796,7 @@ mod in_frames {
                     let first = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
                     let keeps = a.resolving_for_test();
                     let before = kept_now(&db, keeps.unwrap_or_default());
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8801,7 +8844,7 @@ mod in_frames {
                             // A Clear of another tree: the catalog counts a change.
                             let mut op = None;
                             crate::storage::atoll::drive(&io, || {
-                                ct.retire_tree(&mut op, other, true)
+                                ct.retire_tree(TxnOf::Connection, &mut op, other, true)
                             })
                             .unwrap();
                         }
@@ -8817,7 +8860,7 @@ mod in_frames {
                             made,
                         ));
                         drop(a);
-                        ct.end(false)
+                        ct.end(TxnOf::Connection, false)
                             .expect("a transaction to end")
                             .finish()
                             .unwrap();
@@ -8861,13 +8904,15 @@ mod in_frames {
                         chill(&db);
                     }
                     let mut op = None;
-                    crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, false))
-                        .unwrap();
+                    crate::storage::atoll::drive(&io, || {
+                        ct.retire_tree(TxnOf::Connection, &mut op, id, false)
+                    })
+                    .unwrap();
                     drop(op);
                     let counted =
                         crate::storage::atoll::drive(&io, || a.count().map_err(|e| *e)).unwrap();
                     drop(a);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8918,7 +8963,8 @@ mod in_frames {
                     ));
                     // The row known to the connection now: no read.
                     let mut b =
-                        SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                        SqlCursor::new(ct, TxnOf::Connection, conn.pager.load().clone(), id, None)
+                            .opening_fresh();
                     let start = counts();
                     let out = in_frame(&io, &db, || b.finish_open().map_err(|e| *e)).unwrap();
                     let end = counts();
@@ -8929,7 +8975,7 @@ mod in_frames {
                         end.1 - start.1,
                     ));
                     drop((a, b));
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8941,7 +8987,7 @@ mod in_frames {
                     {
                     }
                     drop(warm);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8956,7 +9002,7 @@ mod in_frames {
                         end.1 - start.1,
                     ));
                     drop(c);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -8973,7 +9019,7 @@ mod in_frames {
                         end.1 - start.1,
                     ));
                     drop(d);
-                    ct.end(false)
+                    ct.end(TxnOf::Connection, false)
                         .expect("a transaction to end")
                         .finish()
                         .unwrap();
@@ -9348,17 +9394,17 @@ mod in_frames {
                 || {
                     let (io, _db, conn) = seven_hundred("/db/no-wait-maker");
                     let ct = conn.atoll().expect("Atoll mode");
-                    crate::storage::atoll::drive(&io, || ct.begin(Begin::Read)).unwrap();
-                    let outside = crate::index_method::open_table_cursor(&conn, 0, "t699")
+                    crate::storage::atoll::drive(&io, || ct.begin(TxnOf::Connection, Begin::Read)).unwrap();
+                    let outside = crate::index_method::open_table_cursor(&conn, 0, "t699", TxnOf::Connection)
                         .unwrap()
                         .opening();
                     let inside = {
                         let _frame = crate::storage::atoll::cooperative::Frame::enter();
-                        crate::index_method::open_table_cursor(&conn, 0, "t699")
+                        crate::index_method::open_table_cursor(&conn, 0, "t699", TxnOf::Connection)
                             .unwrap()
                             .opening()
                     };
-                    ct.end(false).map(|mut e| e.finish().unwrap());
+                    ct.end(TxnOf::Connection, false).map(|mut e| e.finish().unwrap());
                     assert_eq!(
                         (outside, inside),
                         (false, true),
@@ -9589,7 +9635,8 @@ mod in_frames {
                 let start = made();
                 let mut phases = Vec::new();
                 for calls in 1..100_000 {
-                    let out = in_frame(io, db, || ct.retire_tree(op, id, true)).unwrap();
+                    let out = in_frame(io, db, || ct.retire_tree(TxnOf::Connection, op, id, true))
+                        .unwrap();
                     witnessed(calls, start);
                     match out {
                         IOResult::Done(n) => return (n, phases),
@@ -9719,7 +9766,7 @@ mod in_frames {
                         let mut op = None;
                         let (n, phases) = cleared_in_frames(&io, &db, ct, &mut op, id);
                         drop(op);
-                        ct.end(false)
+                        ct.end(TxnOf::Connection, false)
                             .expect("a transaction to end")
                             .finish()
                             .unwrap();
@@ -9755,8 +9802,10 @@ mod in_frames {
                             // Stepped to a return for IO in the phase, every page not kept evicted.
                             let mut keeps = None;
                             for calls in 1..100_000 {
-                                let out = in_frame(&io, &db, || ct.retire_tree(&mut op, id, true))
-                                    .unwrap();
+                                let out = in_frame(&io, &db, || {
+                                    ct.retire_tree(TxnOf::Connection, &mut op, id, true)
+                                })
+                                .unwrap();
                                 assert!(
                                     matches!(out, IOResult::IO(_)),
                                     "{phase}: the count finished at call {calls} without a return in it"
@@ -9773,11 +9822,13 @@ mod in_frames {
                             }
                             let keeps = keeps.expect("the count's keeps at its return");
                             let before = kept_now(&db, keeps);
-                            ct.end(false)
+                            ct.end(TxnOf::Connection, false)
                                 .expect("a transaction to end")
                                 .finish()
                                 .unwrap();
-                            let failed = in_frame(&io, &db, || ct.retire_tree(&mut op, id, true));
+                            let failed = in_frame(&io, &db, || {
+                                ct.retire_tree(TxnOf::Connection, &mut op, id, true)
+                            });
                             let o = op.as_ref().expect("the Clear's state, alive");
                             let (counted, at) = (o.counted_for_test(), o.count_at_for_test());
                             let after = kept_now(&db, keeps);
@@ -9871,18 +9922,21 @@ mod in_frames {
                         chill(&db);
                         let start = made();
                         let mut op = None;
-                        let first =
-                            in_frame(&io, &db, || ct.retire_tree(&mut op, id, true)).unwrap();
+                        let first = in_frame(&io, &db, || {
+                            ct.retire_tree(TxnOf::Connection, &mut op, id, true)
+                        })
+                        .unwrap();
                         let kept = op.as_ref().and_then(|o| o.count_at_for_test());
-                        let n =
-                            crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, true))
-                                .unwrap();
+                        let n = crate::storage::atoll::drive(&io, || {
+                            ct.retire_tree(TxnOf::Connection, &mut op, id, true)
+                        })
+                        .unwrap();
                         let (built, after) = (
                             made().0 - start.0,
                             op.as_ref().and_then(|o| o.count_at_for_test()),
                         );
                         drop(op);
-                        ct.end(false)
+                        ct.end(TxnOf::Connection, false)
                             .expect("a transaction to end")
                             .finish()
                             .unwrap();
@@ -9937,7 +9991,7 @@ mod in_frames {
             /// The rollback the connection's transaction owes: its serial, and whether it failed.
             fn owed(conn: &Arc<Connection>) -> Option<(u64, bool)> {
                 let ct = conn.atoll().expect("Atoll mode");
-                let slot = ct.cell.lock_for_test();
+                let slot = ct.own().cell.lock_for_test();
                 slot.owed_for_test()
                     .map(|o| (o.serial_for_test(), o.failed()))
             }
@@ -9955,7 +10009,7 @@ mod in_frames {
             /// The open transaction's current statement number.
             fn command(conn: &Arc<Connection>) -> u32 {
                 let ct = conn.atoll().expect("Atoll mode");
-                let slot = ct.cell.lock_for_test();
+                let slot = ct.own().cell.lock_for_test();
                 slot.as_ref().expect("an open transaction").command()
             }
 
@@ -10218,26 +10272,26 @@ mod in_frames {
                             } else {
                                 (after_a, after_b)
                             };
-                            let _ = in_frame(&io, &db, || ct.rollback_statement(first).map(IOResult::Done))
+                            let _ = in_frame(&io, &db, || ct.rollback_statement(TxnOf::Connection, first).map(IOResult::Done))
                                 .unwrap();
                             let serial = owed(&conn).map(|(s, _)| s);
                             // Settled in frames until it has put a key back and still waits: part-way.
                             let put_back = || {
-                                let slot = ct.cell.lock_for_test();
+                                let slot = ct.own().cell.lock_for_test();
                                 slot.owed_for_test().map(|o| o.put_back_for_test())
                             };
                             let mut stepped = false;
                             for _ in 0..64 {
-                                stepped = in_frame(&io, &db, || ct.settle()).unwrap().is_io();
+                                stepped = in_frame(&io, &db, || ct.settle(TxnOf::Connection)).unwrap().is_io();
                                 if !stepped || put_back().is_some_and(|n| n > 0) {
                                     break;
                                 }
                             }
                             let begun = put_back();
-                            let _ = in_frame(&io, &db, || ct.rollback_statement(second).map(IOResult::Done))
+                            let _ = in_frame(&io, &db, || ct.rollback_statement(TxnOf::Connection, second).map(IOResult::Done))
                                 .unwrap();
                             let merged = owed(&conn).map(|(s, _)| s);
-                            assert!(!ct.settle().unwrap().is_io(), "a settle outside a frame returned IO");
+                            assert!(!ct.settle(TxnOf::Connection).unwrap().is_io(), "a settle outside a frame returned IO");
                             let left = owed(&conn);
                             let counted = rows(&conn, "SELECT count(*) FROM t");
                             conn.execute("ROLLBACK").unwrap();
@@ -10309,8 +10363,14 @@ mod in_frames {
                             .prepare("UPDATE t SET b = x'0b0b' WHERE a IN (1, 900)")
                             .unwrap();
                         let ct = conn.atoll().expect("Atoll mode");
-                        let mut cursor =
-                            SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                        let mut cursor = SqlCursor::new(
+                            ct,
+                            TxnOf::Connection,
+                            conn.pager.load().clone(),
+                            id,
+                            None,
+                        )
+                        .opening_fresh();
                         crate::storage::atoll::drive(&io, || cursor.finish_open().map_err(|e| *e))
                             .unwrap();
                         crate::storage::atoll::drive(&io, || {
@@ -10368,7 +10428,7 @@ mod in_frames {
                             crate::storage::atoll::drive(&io, || cursor.next().map_err(|e| *e))
                                 .map_err(|e| e.to_string());
                         assert!(
-                            !ct.settle().unwrap().is_io(),
+                            !ct.settle(TxnOf::Connection).unwrap().is_io(),
                             "a settle outside a frame returned IO"
                         );
                         crate::storage::atoll::drive(&io, || {
@@ -10439,11 +10499,11 @@ mod in_frames {
                             .unwrap();
                         let after_a = command(&conn);
                         big(&conn, 100, 100);
-                        let _ = in_frame(&io, &db, || ct.rollback_statement(after_a).map(IOResult::Done))
+                        let _ = in_frame(&io, &db, || ct.rollback_statement(TxnOf::Connection, after_a).map(IOResult::Done))
                             .unwrap();
                         let recorded = owed(&conn);
                         let mut cursor =
-                            SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                            SqlCursor::new(ct, TxnOf::Connection, conn.pager.load().clone(), id, None).opening_fresh();
                         let opened = crate::storage::atoll::drive(&io, || cursor.finish_open().map_err(|e| *e))
                             .map(|_| ())
                             .map_err(|e| e.to_string());
@@ -10452,10 +10512,10 @@ mod in_frames {
                         drop(cursor);
                         let mut top = crate::storage::atoll::buffer::Owner::new();
                         let nested = top
-                            .call(|| Ok(IOResult::Done(ct.cell.settle().map(|r| r.is_io()))))
+                            .call(|| Ok(IOResult::Done(ct.own().cell.settle().map(|r| r.is_io()))))
                             .unwrap();
                         drop(top);
-                        assert!(!ct.settle().unwrap().is_io(), "a settle outside a frame returned IO");
+                        assert!(!ct.settle(TxnOf::Connection).unwrap().is_io(), "a settle outside a frame returned IO");
                         let after = rows(&conn, "SELECT count(*) FROM t");
                         conn.execute("ROLLBACK").unwrap();
                         assert!(recorded.is_some(), "nothing owed after the record");
@@ -10498,11 +10558,14 @@ mod in_frames {
                         let after_a = command(&conn);
                         big(&conn, 100, 100);
                         let _ = in_frame(&io, &db, || {
-                            ct.rollback_statement(after_a).map(IOResult::Done)
+                            ct.rollback_statement(TxnOf::Connection, after_a)
+                                .map(IOResult::Done)
                         })
                         .unwrap();
                         let recorded = owed(&conn);
-                        let mut ending = ct.end(true).expect("a transaction to end");
+                        let mut ending = ct
+                            .end(TxnOf::Connection, true)
+                            .expect("a transaction to end");
                         // The commit paused before its first step, so its log work, which a frame
                         // of this test database refuses without a worker, runs outside the frames.
                         let pause = crate::io::Completion::new_wait();
@@ -10605,11 +10668,14 @@ mod in_frames {
                 let after_a = command(&conn);
                 big(&conn, 100, 100);
                 let _ = in_frame(&io, &db, || {
-                    ct.rollback_statement(after_a).map(IOResult::Done)
+                    ct.rollback_statement(TxnOf::Connection, after_a)
+                        .map(IOResult::Done)
                 })
                 .unwrap();
                 let recorded = owed(&conn);
-                let mut ending = ct.end(true).expect("a transaction to end");
+                let mut ending = ct
+                    .end(TxnOf::Connection, true)
+                    .expect("a transaction to end");
                 // The commit pauses before its first commit step: none of it runs in the frames.
                 let pause = crate::io::Completion::new_wait();
                 crate::storage::atoll::testing::ENDING_PAUSE
@@ -10881,16 +10947,17 @@ mod in_frames {
                         let after_a = command(&conn);
                         big(&conn, 100, 100);
                         let _ = in_frame(&io, &db, || {
-                            ct.rollback_statement(after_a).map(IOResult::Done)
+                            ct.rollback_statement(TxnOf::Connection, after_a)
+                                .map(IOResult::Done)
                         })
                         .unwrap();
-                        let stepped = in_frame(&io, &db, || ct.settle()).unwrap();
+                        let stepped = in_frame(&io, &db, || ct.settle(TxnOf::Connection)).unwrap();
                         let keeps = {
-                            let slot = ct.cell.lock_for_test();
+                            let slot = ct.own().cell.lock_for_test();
                             slot.owed_for_test().and_then(|o| o.keeps_for_test())
                         };
                         let before = keeps.map(|k| kept_now(&db, k));
-                        ct.end(false)
+                        ct.end(TxnOf::Connection, false)
                             .expect("a transaction to end")
                             .finish()
                             .unwrap();
@@ -10956,8 +11023,9 @@ mod in_frames {
             }
 
             /// The census of the ways into a connection's transaction (ASYNC1 D2e (iii-b)): the slot
-            /// has no `Deref` to its lock, and the callers of `observe`, `enter_now`, `settle` and
-            /// `settle_now` are exactly the reviewed lists, each with its reason in the design.
+            /// has no `Deref` to its lock, and the callers of `observe`, `enter_now`, `settle`,
+            /// `settle_of` and `settle_now` are exactly the reviewed lists, each with its reason in
+            /// the design.
             #[test]
             fn every_way_into_the_transaction_is_reviewed() {
                 use crate::storage::atoll::testing::atoll_dir;
@@ -10967,7 +11035,7 @@ mod in_frames {
                     &str,
                     std::collections::BTreeSet<String>,
                 > = Default::default();
-                for method in ["observe", "enter_now", "settle", "settle_now"] {
+                for method in ["observe", "enter_now", "settle", "settle_of", "settle_now"] {
                     let set = found.entry(method).or_default();
                     for file in ["cursor.rs", "mode.rs"] {
                         for within in method_sites(&sql.join(file), method) {
@@ -11016,18 +11084,23 @@ mod in_frames {
                     "the callers of enter_now"
                 );
                 // Where no operation's owner runs: a statement step's entry, the record outside a
-                // frame, the facade's settle (a pin's release first, ASYNC1 D2e (iii-c)), the
-                // synchronous forms, and a reparse's pin before its begin.
+                // frame, the settle of a named transaction (a pin's release first, ASYNC1 D2e
+                // (iii-c)), and a reparse's pin before its begin.
                 assert_eq!(
                     found["settle"],
                     want(&[
                         "mode.rs:pin_in",
                         "mode.rs:rollback_statement",
-                        "mode.rs:settle",
-                        "mode.rs:settle_now",
+                        "mode.rs:settle_of",
                         "vdbe/mod.rs:settle_atoll",
                     ]),
                     "the callers of settle"
+                );
+                // The facade's settle, which names the transaction, and the synchronous forms.
+                assert_eq!(
+                    found["settle_of"],
+                    want(&["mode.rs:settle", "mode.rs:settle_now"]),
+                    "the callers of settle_of"
                 );
                 assert_eq!(
                     found["settle_now"],
@@ -11500,7 +11573,7 @@ mod in_frames {
                 let ct = conn.atoll().expect("Atoll mode");
                 conn.atoll_owed
                     .as_ref()
-                    .is_some_and(|flag| ct.owed_flag_is_its_for_test(flag))
+                    .is_some_and(|flag| ct.owed_flag_is_its_for_test(ct.own(), flag))
             }
 
             /// 6a: a settle's IO that fails. The statement's parked copy only woke it: the owed
@@ -11605,22 +11678,26 @@ mod in_frames {
                         let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
                         let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
                         let identity = {
-                            let slot = ct.cell.lock_for_test();
+                            let slot = ct.own().cell.lock_for_test();
                             let txn = slot.as_ref().expect("an open transaction");
                             (txn.slot(), txn.start())
                         };
                         reads_fail(&crash, Some(path));
-                        let first = ct.schema_cookie().map_err(|e| e.to_string());
+                        let first = ct
+                            .schema_cookie(TxnOf::Connection)
+                            .map_err(|e| e.to_string());
                         clear_faults(&crash);
                         let kept = |ct: &crate::storage::atoll::sql::mode::ConnTxn| {
-                            let slot = ct.cell.lock_for_test();
+                            let slot = ct.own().cell.lock_for_test();
                             (
                                 slot.as_ref().map(|t| (t.slot(), t.start())),
                                 slot.owed_for_test().map(|o| o.failed()),
                             )
                         };
                         let after_first = (kept(ct), failure_of(&db));
-                        let second = ct.schema_cookie().map_err(|e| e.to_string());
+                        let second = ct
+                            .schema_cookie(TxnOf::Connection)
+                            .map_err(|e| e.to_string());
                         let after_second = (kept(ct), failure_of(&db));
                         unrelated.reset().unwrap();
                         let after_reset = kept(ct);
@@ -11695,7 +11772,9 @@ mod in_frames {
                             let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
                             let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
                             reads_fail(&crash, Some(path));
-                            let facade = ct.schema_cookie().map_err(|e| e.to_string());
+                            let facade = ct
+                                .schema_cookie(TxnOf::Connection)
+                                .map_err(|e| e.to_string());
                             clear_faults(&crash);
                             let ended = stepped_outside(&mut end);
                             let after = (owed(&conn), conn.get_auto_commit(), failure_of(&db));
@@ -11806,7 +11885,7 @@ mod in_frames {
                         let hold = held_io(&db);
                         big(&conn, 100, 12);
                         let last_part = {
-                            let slot = ct.cell.lock_for_test();
+                            let slot = ct.own().cell.lock_for_test();
                             let txn = slot.as_ref().expect("an open transaction");
                             txn.changes().parts().last().map(|p| p.lsn)
                         };
@@ -11828,7 +11907,7 @@ mod in_frames {
                         let mut first_io = None;
                         let mut settled = None;
                         for calls in 1..=64 {
-                            match in_frame(&io, &db, || ct.settle()) {
+                            match in_frame(&io, &db, || ct.settle(TxnOf::Connection)) {
                                 Ok(IOResult::IO(_)) => first_io = first_io.or(Some(calls)),
                                 Ok(IOResult::Done(())) => {
                                     settled = Some(Ok(calls));
@@ -11970,7 +12049,7 @@ mod in_frames {
                         clear_faults(&crash);
                         let after_reset = {
                             let ct = conn.atoll().unwrap();
-                            let slot = ct.cell.lock_for_test();
+                            let slot = ct.own().cell.lock_for_test();
                             slot.owed_for_test()
                                 .map(|o| (o.failed(), o.waiting_for_test().map(|w| w.1)))
                         };
@@ -12356,7 +12435,7 @@ mod in_frames {
                             });
                             let owed_queued = {
                                 let ct = conn.atoll().unwrap();
-                                let slot = ct.cell.lock_for_test();
+                                let slot = ct.own().cell.lock_for_test();
                                 slot.owed_for_test()
                                     .and_then(|o| o.waiting_for_test())
                                     .is_some_and(|w| w.2)
@@ -12567,7 +12646,8 @@ mod in_frames {
                 conn.execute("INSERT INTO go VALUES (1)").unwrap();
                 if driver != Driver::RollbackEnding {
                     let _ = in_frame(&io, &db, || {
-                        ct.rollback_statement(after_a).map(IOResult::Done)
+                        ct.rollback_statement(TxnOf::Connection, after_a)
+                            .map(IOResult::Done)
                     })
                     .unwrap();
                 }
@@ -12604,8 +12684,14 @@ mod in_frames {
                 let begun = WRITES_BEGUN.with(|w| w.borrow().len());
                 let mut ending = match driver {
                     Driver::Settle => None,
-                    Driver::CommitEnding => Some(ct.end(true).expect("a transaction to end")),
-                    Driver::RollbackEnding => Some(ct.end(false).expect("a transaction to end")),
+                    Driver::CommitEnding => Some(
+                        ct.end(TxnOf::Connection, true)
+                            .expect("a transaction to end"),
+                    ),
+                    Driver::RollbackEnding => Some(
+                        ct.end(TxnOf::Connection, false)
+                            .expect("a transaction to end"),
+                    ),
                 };
                 // A commit pauses before its first commit step, so none of it runs in a frame.
                 let pause = crate::io::Completion::new_wait();
@@ -12623,7 +12709,7 @@ mod in_frames {
                     let out = {
                         let _frame = crate::storage::atoll::cooperative::Frame::enter();
                         match ending.as_mut() {
-                            None => ct.settle(),
+                            None => ct.settle(TxnOf::Connection),
                             Some(e) => e.step(),
                         }
                     };
@@ -12655,7 +12741,7 @@ mod in_frames {
                     if hold.as_ref().is_some_and(|h| h.versions().is_some()) {
                         let working = match ending.as_ref() {
                             None => {
-                                let slot = ct.cell.lock_for_test();
+                                let slot = ct.own().cell.lock_for_test();
                                 slot.owed_for_test().map(|o| o.working_for_test())
                             }
                             Some(e) => e.working_for_test(),
@@ -12705,7 +12791,7 @@ mod in_frames {
                 pause.complete(0);
                 crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
                 let finished = match ending.as_mut() {
-                    None if failed.is_none() => ct.settle().map(|_| ()),
+                    None if failed.is_none() => ct.settle(TxnOf::Connection).map(|_| ()),
                     None => Ok(()),
                     Some(e) => e.finish(),
                 };
@@ -13085,12 +13171,12 @@ mod in_frames {
         }
 
         fn pin_of(conn: &Arc<Connection>) -> Option<Pin> {
-            ct(conn).cell.pin_for_test()
+            ct(conn).own().cell.pin_for_test()
         }
 
         /// The open transaction's view, if one is open.
         fn view_of(conn: &Arc<Connection>) -> Option<ViewId> {
-            let slot = ct(conn).cell.lock_for_test();
+            let slot = ct(conn).own().cell.lock_for_test();
             slot.as_ref().map(|t| (t.slot(), t.start()))
         }
 
@@ -13200,17 +13286,17 @@ mod in_frames {
                         .any(|p| p.1 == PinPhase::Held && p.3);
                     let left = pin_of(&conn);
                     let open_view = view_of(&conn);
-                    let owed_flag = ct(&conn).cell.owes();
+                    let owed_flag = ct(&conn).own().cell.owes();
                     let endings = PIN_ENDINGS.with(|n| n.get());
                     // A host's step entry, as a statement's outside any frame calls it; then what it
                     // left, before any statement could end a view itself.
-                    let settled = ct(&conn).settle();
+                    let settled = ct(&conn).settle(TxnOf::Connection);
                     let ended = PIN_ENDINGS.with(|n| n.get()) - endings;
                     let after = (
                         pin_of(&conn),
-                        ct(&conn).is_pinned(),
-                        ct(&conn).cell.owes(),
-                        ct(&conn).is_open(),
+                        ct(&conn).is_pinned(TxnOf::Connection),
+                        ct(&conn).own().cell.owes(),
+                        ct(&conn).is_open(TxnOf::Connection),
                         conn.get_tx_state(),
                     );
                     let read = rows(&conn, "SELECT count(*) FROM t");
@@ -13376,13 +13462,20 @@ mod in_frames {
                     let (_io, _db, conn) = slotted("/db/pin-stale", 4);
                     let atoll = ct(&conn);
                     let mut a = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut a), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut a),
+                        Ok(IOResult::Done(()))
+                    ));
                     let id_a = a.id_for_test().expect("A's id");
-                    conn.finish_release(atoll.release_pin(&mut a)).unwrap();
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut a))
+                        .unwrap();
                     let mut b = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut b), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut b),
+                        Ok(IOResult::Done(()))
+                    ));
                     let mut forged = PinHold::forged_for_test(id_a);
-                    let _ = conn.finish_release(atoll.release_pin(&mut forged));
+                    let _ = conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut forged));
                     eprintln!("the forged release returned");
                 },
             );
@@ -13416,7 +13509,7 @@ mod in_frames {
                     PIN_FAILS_AFTER_INSTALL.with(|f| f.set(true));
                     let err = {
                         let _frame = Frame::enter();
-                        atoll.pin_in(&mut hold)
+                        atoll.pin_in(TxnOf::Connection, &mut hold)
                     }
                     .expect_err("the injected failure");
                     assert!(err.to_string().contains("injected failure after a pin's install"), "{err}");
@@ -13426,12 +13519,12 @@ mod in_frames {
                         owned && view.is_some() && view == view_of(&conn),
                         "a view the pin's begin installed was left unowned: {view:?} {owned}"
                     );
-                    let released = conn.finish_release(atoll.release_pin(&mut hold));
+                    let released = conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold));
                     assert!(
                         released.as_ref().is_err_and(|e| e.to_string().contains("injected failure")),
                         "the release did not carry the pin's own error: {released:?}"
                     );
-                    assert!(!atoll.is_open(), "a view the pin's begin installed was left open");
+                    assert!(!atoll.is_open(TxnOf::Connection), "a view the pin's begin installed was left open");
                     assert!(pin_of(&conn).is_none(), "the pin still registered");
                     assert_eq!(conn.get_tx_state(), TransactionState::None);
                 },
@@ -13492,7 +13585,10 @@ mod in_frames {
                             pin_of(&conn).is_none(),
                             "{fails:?}: the pin still registered"
                         );
-                        assert!(!ct(&conn).is_open(), "{fails:?}: the pin's view left open");
+                        assert!(
+                            !ct(&conn).is_open(TxnOf::Connection),
+                            "{fails:?}: the pin's view left open"
+                        );
                         assert_eq!(conn.get_tx_state(), TransactionState::None, "{fails:?}");
                     }
                 },
@@ -13528,7 +13624,10 @@ mod in_frames {
                         "the completing host met the reparse's error: {cookie:?}"
                     );
                     assert!(pin_of(&conn).is_none(), "the pin still registered");
-                    assert!(!ct(&conn).is_open(), "the pin's view left open");
+                    assert!(
+                        !ct(&conn).is_open(TxnOf::Connection),
+                        "the pin's view left open"
+                    );
                     assert_eq!(conn.get_tx_state(), TransactionState::None);
                 },
             );
@@ -13551,7 +13650,10 @@ mod in_frames {
                     let (_io, _db, conn) = slotted("/db/pin-nested", 4);
                     let atoll = ct(&conn);
                     let mut hold = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut hold),
+                        Ok(IOResult::Done(()))
+                    ));
                     let (_, phase, _, owned) = pin_of(&conn).expect("the pin registered");
                     assert_eq!(
                         (phase, owned),
@@ -13569,7 +13671,7 @@ mod in_frames {
                         unrelated.step()
                     };
                     let waited_on = unrelated.pending_io_for_test();
-                    let signal = ct(&conn).cell.pin_signal_for_test();
+                    let signal = ct(&conn).own().cell.pin_signal_for_test();
                     let on_signal = match (&waited_on, &signal) {
                         (Some(w), Some(s)) => Some((w.ptr_eq(s), w.finished())),
                         _ => None,
@@ -13583,7 +13685,8 @@ mod in_frames {
                         permitted.step()
                     };
                     drop((unrelated, permitted, helper));
-                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold))
+                        .unwrap();
                     assert!(
                         matches!(stepped, Ok(crate::StepResult::IO)),
                         "a statement beside a live helper read in a view the pin owns: {stepped:?}"
@@ -13617,7 +13720,10 @@ mod in_frames {
                     let (_io, _db, conn) = slotted("/db/pin-helper-stepped", 4);
                     let atoll = ct(&conn);
                     let mut hold = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut hold),
+                        Ok(IOResult::Done(()))
+                    ));
                     let mut helper = conn.prepare_internal("SELECT count(*) FROM t").unwrap();
                     let stepped = {
                         let _frame = Frame::enter();
@@ -13625,13 +13731,14 @@ mod in_frames {
                     };
                     let nested_after = conn.is_nested_stmt();
                     let waited_on = helper.pending_io_for_test();
-                    let signal = ct(&conn).cell.pin_signal_for_test();
+                    let signal = ct(&conn).own().cell.pin_signal_for_test();
                     let on_signal = match (&waited_on, &signal) {
                         (Some(w), Some(s)) => Some((w.ptr_eq(s), w.finished())),
                         _ => None,
                     };
                     drop(helper);
-                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold))
+                        .unwrap();
                     assert!(
                         matches!(stepped, Ok(crate::StepResult::IO)),
                         "a helper stepped beside a pin read in a view the pin owns: {stepped:?}"
@@ -13685,7 +13792,7 @@ mod in_frames {
                     let events = REPARSE_EVENTS.with(|e| e.borrow().clone());
                     crate::connection::REPARSE_FAILS_AT.with(|f| f.set(None));
                     // Its owned view's release was owed in the frame: a host's step entry ends it.
-                    let settled = ct(&conn).settle();
+                    let settled = ct(&conn).settle(TxnOf::Connection);
                     assert!(settled.is_ok(), "the host's settle: {settled:?}");
                     assert!(kept, "the cold cookie never returned with its read kept");
                     assert!(
@@ -13700,7 +13807,10 @@ mod in_frames {
                         "what the reparse let go of, in order"
                     );
                     assert!(pin_of(&conn).is_none(), "the pin still registered");
-                    assert!(!ct(&conn).is_open(), "the pin's view left open");
+                    assert!(
+                        !ct(&conn).is_open(TxnOf::Connection),
+                        "the pin's view left open"
+                    );
                     assert_eq!(conn.get_tx_state(), TransactionState::None);
                 },
             );
@@ -13758,7 +13868,7 @@ mod in_frames {
                     };
                     drop(back);
                     let owed = || {
-                        let slot = ct(&conn).cell.lock_for_test();
+                        let slot = ct(&conn).own().cell.lock_for_test();
                         slot.owed_for_test().map(|o| o.serial_for_test())
                     };
                     let (before, view) = (owed(), view_of(&conn));
@@ -13766,7 +13876,12 @@ mod in_frames {
                     let first = once_held(&db, &conn, &mut state);
                     let at = (state.stage_for_test(), pin_of(&conn).map(|p| p.1));
                     drop(state);
-                    let after = (owed(), view_of(&conn), pin_of(&conn), ct(&conn).is_pinned());
+                    let after = (
+                        owed(),
+                        view_of(&conn),
+                        pin_of(&conn),
+                        ct(&conn).is_pinned(TxnOf::Connection),
+                    );
                     conn.execute("ROLLBACK").unwrap();
                     assert_eq!(back_out, Ok(()), "the ROLLBACK TO in a frame");
                     assert!(
@@ -13871,9 +13986,13 @@ mod in_frames {
                             drop(state);
                         }
                         let owed = pin_of(&conn).map(|p| (p.1, p.3));
-                        let settled = ct(&conn).settle();
+                        let settled = ct(&conn).settle(TxnOf::Connection);
                         assert!(settled.is_ok(), "{stop}: the host's settle: {settled:?}");
-                        let after = (pin_of(&conn), ct(&conn).is_open(), conn.get_tx_state());
+                        let after = (
+                            pin_of(&conn),
+                            ct(&conn).is_open(TxnOf::Connection),
+                            conn.get_tx_state(),
+                        );
                         let mut later = ReparseSchemaState::default();
                         let finished = conn.reparse_schema_nonblock(&mut later);
                         assert!(reached, "{stop}: the reparse never returned there");
@@ -13923,7 +14042,7 @@ mod in_frames {
                         let mut hold = PinHold::new();
                         let out = {
                             let _frame = Frame::enter();
-                            ct(&pin_conn).pin_in(&mut hold)
+                            ct(&pin_conn).pin_in(TxnOf::Connection, &mut hold)
                         };
                         (out.map(|io| matches!(io, IOResult::Done(()))), hold)
                     });
@@ -13934,9 +14053,15 @@ mod in_frames {
                     let look = || {
                         let out = {
                             let _frame = Frame::enter();
-                            ct(&conn).begin_reading(Begin::Read, &[], &mut None, None)
+                            ct(&conn).begin_reading(
+                                TxnOf::Connection,
+                                Begin::Read,
+                                &[],
+                                &mut None,
+                                None,
+                            )
                         };
-                        let signal = ct(&conn).cell.pin_signal_for_test();
+                        let signal = ct(&conn).own().cell.pin_signal_for_test();
                         match out {
                             Ok(IOResult::IO(IOCompletions(c))) => Some((
                                 c.finished(),
@@ -13952,7 +14077,8 @@ mod in_frames {
                     let (pinned, mut hold) = pin.join().expect("the pin's thread");
                     let finished_by_held = installed.as_ref().map(|l| l.3.finished());
                     let held = look();
-                    let released = conn.finish_release(ct(&conn).release_pin(&mut hold));
+                    let released =
+                        conn.finish_release(ct(&conn).release_pin(TxnOf::Connection, &mut hold));
                     assert!(
                         in_span,
                         "the pin's thread never reached the span before Held"
@@ -13987,7 +14113,7 @@ mod in_frames {
                     );
                     assert!(released.is_ok(), "the release: {released:?}");
                     assert!(
-                        pin_of(&conn).is_none() && !ct(&conn).is_open(),
+                        pin_of(&conn).is_none() && !ct(&conn).is_open(TxnOf::Connection),
                         "the pin or its view left"
                     );
                 },
@@ -14023,9 +14149,15 @@ mod in_frames {
                     let look = || {
                         let out = {
                             let _frame = Frame::enter();
-                            ct(&conn).begin_reading(Begin::Read, &[], &mut None, None)
+                            ct(&conn).begin_reading(
+                                TxnOf::Connection,
+                                Begin::Read,
+                                &[],
+                                &mut None,
+                                None,
+                            )
                         };
-                        let signal = ct(&conn).cell.pin_signal_for_test();
+                        let signal = ct(&conn).own().cell.pin_signal_for_test();
                         match out {
                             Ok(IOResult::IO(IOCompletions(c))) => {
                                 let finished = c.finished();
@@ -14069,7 +14201,7 @@ mod in_frames {
                         .then(|| step(&mut reader));
                     looks.push(("release owed", owed));
                     // A host completes the release; the statement then reads.
-                    let settled = ct(&conn).settle();
+                    let settled = ct(&conn).settle(TxnOf::Connection);
                     let read = loop {
                         let stepped = {
                             let _frame = Frame::enter();
@@ -14145,7 +14277,7 @@ mod in_frames {
                     let mut hold = PinHold::new();
                     PIN_FAILS_AFTER_INSTALL.with(|f| f.set(true));
                     let original = atoll
-                        .pin_in(&mut hold)
+                        .pin_in(TxnOf::Connection, &mut hold)
                         .expect_err("the injected begin failure");
                     conn.set_tx_state(TransactionState::Read);
                     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -14156,8 +14288,10 @@ mod in_frames {
                     });
                     let clears = PIN_CLEARS.with(|n| n.get());
                     PIN_ENDINGS_FAIL_NEXT.with(|f| f.set(true));
-                    let released = conn.finish_release(atoll.release_pin(&mut hold));
-                    let again = conn.finish_release(atoll.release_pin(&mut hold));
+                    let released =
+                        conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold));
+                    let again =
+                        conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold));
                     let cleared = PIN_CLEARS.with(|n| n.get()) - clears;
                     let message = released
                         .as_ref()
@@ -14183,7 +14317,7 @@ mod in_frames {
                     assert_eq!(cleared, 1, "the registration was not cleared exactly once");
                     assert!(again.is_ok(), "a second release did something: {again:?}");
                     assert!(
-                        pin_of(&conn).is_none() && !atoll.is_open(),
+                        pin_of(&conn).is_none() && !atoll.is_open(TxnOf::Connection),
                         "the view or pin left"
                     );
                 },
@@ -14214,13 +14348,13 @@ mod in_frames {
                         crate::race::at("pin.after_take", move || {
                             let _ = entered.send(());
                         });
-                        ct(&owner_conn).settle().map(|_| ())
+                        ct(&owner_conn).settle(TxnOf::Connection).map(|_| ())
                     });
                     let reached = enter
                         .recv_timeout(std::time::Duration::from_secs(20))
                         .is_ok();
-                    let loser = ct(&conn).settle();
-                    let signal = ct(&conn).cell.pin_signal_for_test();
+                    let loser = ct(&conn).settle(TxnOf::Connection);
+                    let signal = ct(&conn).own().cell.pin_signal_for_test();
                     let looked = match &loser {
                         Ok(IOResult::IO(IOCompletions(c))) => Some((
                             c.finished(),
@@ -14232,7 +14366,7 @@ mod in_frames {
                     crate::storage::atoll::notify::finish(&pause, Ok(0));
                     let owned = owner.join().expect("the owner's thread");
                     let finished = looked.as_ref().is_some_and(|l| waited(&io, &l.2));
-                    let next = ct(&conn).settle();
+                    let next = ct(&conn).settle(TxnOf::Connection);
                     assert!(reached, "the owner never reached its ending");
                     assert!(owned.is_ok(), "the owner's ending: {owned:?}");
                     let (was_finished, same, _) = looked
@@ -14265,20 +14399,24 @@ mod in_frames {
                     let (_io, _db, conn) = slotted("/db/pin-flag-take", 4);
                     let atoll = ct(&conn);
                     let mut hold = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut hold),
+                        Ok(IOResult::Done(()))
+                    ));
                     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
                     let (at_take, take_conn) = (seen.clone(), conn.clone());
                     crate::race::at("pin.after_take", move || {
-                        at_take.set(Some(ct(&take_conn).cell.owes()));
+                        at_take.set(Some(ct(&take_conn).own().cell.owes()));
                     });
-                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold))
+                        .unwrap();
                     assert_eq!(
                         seen.get(),
                         Some(true),
                         "the owed flag cleared while the pin's release was ending"
                     );
                     assert!(
-                        !atoll.cell.owes(),
+                        !atoll.own().cell.owes(),
                         "the owed flag still set after the clear"
                     );
                 },
@@ -14303,7 +14441,7 @@ mod in_frames {
                     let atoll = ct(&conn);
                     let hold = std::rc::Rc::new(std::cell::RefCell::new(PinHold::new()));
                     assert!(matches!(
-                        atoll.pin_in(&mut hold.borrow_mut()),
+                        atoll.pin_in(TxnOf::Connection, &mut hold.borrow_mut()),
                         Ok(IOResult::Done(()))
                     ));
                     let mut reader = conn.prepare("SELECT count(*) FROM t").unwrap();
@@ -14311,7 +14449,8 @@ mod in_frames {
                     let released = std::rc::Rc::new(std::cell::Cell::new(false));
                     let did = released.clone();
                     crate::race::at("vdbe.owed_flag_read", move || {
-                        let step = ct(&release_conn).release_pin(&mut release_hold.borrow_mut());
+                        let step = ct(&release_conn)
+                            .release_pin(TxnOf::Connection, &mut release_hold.borrow_mut());
                         let _ = release_conn.finish_release(step);
                         did.set(true);
                     });
@@ -14452,7 +14591,7 @@ mod in_frames {
                             .is_ok();
                         if parked_with_no_actor {
                             // Bounded cleanup: the test, a host, completes the release itself.
-                            let _ = ct(&conn).complete_owed_release_for_test();
+                            let _ = ct(&conn).complete_owed_release_for_test(TxnOf::Connection);
                         }
                         let (cookie, endings, clears, at_wake) = y.join().expect("thread Y");
                         assert!(
@@ -14482,7 +14621,7 @@ mod in_frames {
                             assert!(cookie.is_ok(), "Y's cookie: {cookie:?}");
                         }
                         assert!(
-                            pin_of(&conn).is_none() && !ct(&conn).is_open(),
+                            pin_of(&conn).is_none() && !ct(&conn).is_open(TxnOf::Connection),
                             "the pin or its view left"
                         );
                     }
@@ -14514,7 +14653,7 @@ mod in_frames {
                         crate::race::at("pin.after_take", move || {
                             let _ = entered.send(());
                         });
-                        ct(&owner_conn).settle().map(|_| ())
+                        ct(&owner_conn).settle(TxnOf::Connection).map(|_| ())
                     });
                     let reached = enter
                         .recv_timeout(std::time::Duration::from_secs(20))
@@ -14556,7 +14695,7 @@ mod in_frames {
                         "the host ended or cleared the pin itself"
                     );
                     assert!(
-                        pin_of(&conn).is_none() && !ct(&conn).is_open(),
+                        pin_of(&conn).is_none() && !ct(&conn).is_open(TxnOf::Connection),
                         "the pin or its view left"
                     );
                 },
@@ -14577,18 +14716,25 @@ mod in_frames {
                     let atoll = ct(&conn);
                     // The control: an owned pin released outside any frame, its view ended there.
                     let mut first = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut first), Ok(IOResult::Done(()))));
-                    conn.finish_release(atoll.release_pin(&mut first)).unwrap();
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut first),
+                        Ok(IOResult::Done(()))
+                    ));
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut first))
+                        .unwrap();
                     assert!(
-                        !atoll.is_open() && pin_of(&conn).is_none(),
+                        !atoll.is_open(TxnOf::Connection) && pin_of(&conn).is_none(),
                         "the control's view left"
                     );
                     // A second owned pin, its ending asked for in a frame.
                     let mut second = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut second), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut second),
+                        Ok(IOResult::Done(()))
+                    ));
                     let id = second.id_for_test().expect("its id");
                     let _frame = Frame::enter();
-                    let _ = atoll.end_for_pin_for_test(id, &conn);
+                    let _ = atoll.end_for_pin_for_test(TxnOf::Connection, id, &conn);
                     eprintln!("the ending returned in a frame");
                 },
             );
@@ -14616,11 +14762,13 @@ mod in_frames {
                 || {
                     let (_io, _db, conn) = slotted("/db/pin-completer-frame", 4);
                     assert!(
-                        ct(&conn).complete_owed_release_for_test().is_ok(),
+                        ct(&conn)
+                            .complete_owed_release_for_test(TxnOf::Connection)
+                            .is_ok(),
                         "the control outside a frame"
                     );
                     let _frame = Frame::enter();
-                    let _ = ct(&conn).complete_owed_release_for_test();
+                    let _ = ct(&conn).complete_owed_release_for_test(TxnOf::Connection);
                     eprintln!("the completer returned in a frame");
                 },
             );
@@ -14674,7 +14822,10 @@ mod in_frames {
                         .unwrap();
                     let atoll = ct(&conn);
                     let mut hold = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut hold), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut hold),
+                        Ok(IOResult::Done(()))
+                    ));
                     let owned = pin_of(&conn).map(|p| p.3);
                     let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
                     loop {
@@ -14693,11 +14844,12 @@ mod in_frames {
                     }
                     drop(back);
                     let owed_before = {
-                        let slot = atoll.cell.lock_for_test();
+                        let slot = atoll.own().cell.lock_for_test();
                         slot.owed_for_test().is_some()
                     };
-                    conn.finish_release(atoll.release_pin(&mut hold)).unwrap();
-                    let flag_after_release = atoll.cell.owes();
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold))
+                        .unwrap();
+                    let flag_after_release = atoll.own().cell.owes();
                     let settles = SETTLES_AT_STEP.with(|n| n.get());
                     let counted = (|| -> crate::Result<Vec<Vec<Value>>> {
                         let mut stmt = conn.prepare("SELECT count(*) FROM t")?;
@@ -14715,7 +14867,7 @@ mod in_frames {
                     })();
                     let settled = SETTLES_AT_STEP.with(|n| n.get()) - settles;
                     let owed_after = {
-                        let slot = atoll.cell.lock_for_test();
+                        let slot = atoll.own().cell.lock_for_test();
                         slot.owed_for_test().is_some()
                     };
                     let committed = conn.execute("COMMIT");
@@ -15181,7 +15333,7 @@ mod in_frames {
                     use std::sync::mpsc::channel;
                     use std::time::Duration;
                     let (io, db, conn) = slotted("/db/pin-close-end", 4);
-                    let open_before = ct(&conn).is_open();
+                    let open_before = ct(&conn).is_open(TxnOf::Connection);
                     let (at_look, looked) = channel::<bool>();
                     let (go, gone) = channel::<()>();
                     let (closed, close_done) = channel::<()>();
@@ -15189,7 +15341,7 @@ mod in_frames {
                     let close = std::thread::spawn(move || {
                         let c = close_conn.clone();
                         crate::race::at("end.after_pinned_read", move || {
-                            let _ = at_look.send(ct(&c).is_open());
+                            let _ = at_look.send(ct(&c).is_open(TxnOf::Connection));
                             let _ = gone.recv_timeout(Duration::from_secs(20));
                         });
                         let out = close_conn.close().map_err(|e| e.to_string());
@@ -15214,8 +15366,12 @@ mod in_frames {
                         .is_err_and(|e| e.contains("the schema reparse's view changed"));
                     // The host finishes the release the failed reparse left owed; a view taken from
                     // under the pin leaves nothing for it to end.
-                    let settled = view_kept.then(|| ct(&conn).settle().map(|_| ()));
-                    let left = (pin_of(&conn).map(|p| (p.1, p.3)), ct(&conn).is_open());
+                    let settled =
+                        view_kept.then(|| ct(&conn).settle(TxnOf::Connection).map(|_| ()));
+                    let left = (
+                        pin_of(&conn).map(|p| (p.1, p.3)),
+                        ct(&conn).is_open(TxnOf::Connection),
+                    );
                     assert!(!open_before, "a transaction open before the close");
                     assert_eq!(
                         open_at_look,
@@ -15254,11 +15410,17 @@ mod in_frames {
                     let atoll = ct(&conn);
                     atoll.set_last_pin_for_test(u64::MAX - 1);
                     let mut last = PinHold::new();
-                    assert!(matches!(atoll.pin_in(&mut last), Ok(IOResult::Done(()))));
+                    assert!(matches!(
+                        atoll.pin_in(TxnOf::Connection, &mut last),
+                        Ok(IOResult::Done(()))
+                    ));
                     assert_eq!(last.id_for_test(), Some(u64::MAX), "the last id");
-                    conn.finish_release(atoll.release_pin(&mut last)).unwrap();
+                    conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut last))
+                        .unwrap();
                     let mut past = PinHold::new();
-                    let err = atoll.pin_in(&mut past).expect_err("an id past the last");
+                    let err = atoll
+                        .pin_in(TxnOf::Connection, &mut past)
+                        .expect_err("an id past the last");
                     assert!(err.to_string().contains("ids are used up"), "{err}");
                     assert!(!past.armed(), "a refused registration armed its hold");
                     assert!(
@@ -15712,11 +15874,11 @@ mod reparse_view_taken_by_an_end {
     type Pin = (u64, PinPhase, Option<ViewId>, bool);
 
     fn pin_of(conn: &Arc<Connection>) -> Option<Pin> {
-        conn.atoll().unwrap().cell.pin_for_test()
+        conn.atoll().unwrap().own().cell.pin_for_test()
     }
 
     fn view_of(conn: &Arc<Connection>) -> Option<ViewId> {
-        let slot = conn.atoll().unwrap().cell.lock_for_test();
+        let slot = conn.atoll().unwrap().own().cell.lock_for_test();
         slot.as_ref().map(|t| (t.slot(), t.start()))
     }
 
@@ -15916,15 +16078,15 @@ mod reparse_view_taken_by_an_end {
             o.installed_has_v = schema.has_table(crate::namespace::NamespaceId::ROOT, "v");
         }
         // Whatever the scenario left open is ended before anything is asserted.
-        conn.rollback_atoll();
+        conn.rollback_atoll(TxnOf::Connection);
         conn.set_tx_state(crate::TransactionState::None);
-        o.committed_cookie = match conn.atoll().unwrap().schema_cookie() {
+        o.committed_cookie = match conn.atoll().unwrap().schema_cookie(TxnOf::Connection) {
             Ok(c) => c.to_string(),
             Err(e) => format!("Err({e})"),
         };
         o.cleanup = pin_of(&conn).is_none()
-            && !conn.atoll().unwrap().is_open()
-            && !conn.atoll().unwrap().cell.owes();
+            && !conn.atoll().unwrap().is_open(TxnOf::Connection)
+            && !conn.atoll().unwrap().own().cell.owes();
         drop(other);
         drop((conn, db, io));
         o
@@ -16100,8 +16262,8 @@ mod reparse_failed_in_its_build {
             "after the failed reparse: schema {:?}; state {:?}; pin {:?}; open {}",
             tables(&conn),
             conn.get_tx_state(),
-            conn.atoll().unwrap().cell.pin_for_test(),
-            conn.atoll().unwrap().is_open()
+            conn.atoll().unwrap().own().cell.pin_for_test(),
+            conn.atoll().unwrap().is_open(TxnOf::Connection)
         ));
         seen.push(format!(
             "SELECT a FROM t: {}",
@@ -16132,6 +16294,129 @@ mod reparse_failed_in_its_build {
             "a connection whose reparse failed in its build lost its tables: {seen:?}"
         );
     }
+}
+
+/// A connection has one transaction of its own, made once with the connection: statements in
+/// autocommit, an explicit transaction, a savepoint, a pragma's scan, a schema change and a
+/// reset make no other.
+#[test]
+fn a_connection_makes_one_transaction_whatever_its_statements_do() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/one-sql-txn");
+    let made = || super::SQL_TXNS_MADE.with(|n| n.get());
+    let before = made();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let with_the_connections = made() - before;
+    for sql in [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+        "INSERT INTO t VALUES (1, 'one'), (2, 'two')",
+        "BEGIN",
+        "INSERT INTO t VALUES (3, 'three')",
+        "SAVEPOINT s",
+        "DELETE FROM t WHERE a = 1",
+        "ROLLBACK TO s",
+        "COMMIT",
+        "CREATE INDEX t_b ON t(b)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let scanned = rows(&conn, "SELECT name FROM pragma_table_info('t')").len();
+    let mut reset = conn.prepare("INSERT INTO t VALUES (4, 'four')").unwrap();
+    reset.reset().unwrap();
+    drop(reset);
+    let seen = rows(&other, "SELECT count(*) FROM t");
+    let with_their_statements = made() - before;
+    drop((conn, other, db));
+    assert_eq!(
+        with_the_connections, 2,
+        "transactions made for two connections"
+    );
+    assert_eq!(scanned, 2);
+    assert_eq!(seen, vec![vec![Value::from_i64(3)]]);
+    assert_eq!(
+        with_their_statements, 2,
+        "a statement made its connection another transaction"
+    );
+}
+
+/// A transaction's wait group is begun once, its word kept in the transaction's slot while the
+/// transaction runs and taken at its end: a second statement waits in the same group, and the
+/// next transaction begins another.
+#[test]
+fn a_transactions_group_is_begun_once_and_its_word_taken_at_its_end() {
+    use crate::storage::atoll::sql::wait::graph;
+    use std::sync::atomic::Ordering;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/group-word");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    let word = || {
+        let atoll = conn.atoll().expect("Atoll mode");
+        atoll.own().cell.group().load(Ordering::Acquire)
+    };
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let first = word();
+    let first_ran = graph().running(first);
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    let at_the_second_statement = word();
+    conn.execute("COMMIT").unwrap();
+    let after_the_commit = word();
+    let first_runs_on = graph().running(first);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    let next = word();
+    let next_ran = graph().running(next);
+    conn.execute("ROLLBACK").unwrap();
+    let after_the_rollback = word();
+    let next_runs_on = graph().running(next);
+    drop((conn, db));
+    assert_ne!(
+        first, 0,
+        "a transaction at its second statement has no group"
+    );
+    assert!(first_ran, "the transaction's group does not run");
+    assert_eq!(
+        at_the_second_statement, first,
+        "a second statement of the transaction began another group"
+    );
+    assert_eq!(
+        after_the_commit, 0,
+        "a committed transaction kept its group's word"
+    );
+    assert!(!first_runs_on, "a committed transaction's group runs on");
+    assert_ne!(next, 0, "the next transaction has no group");
+    assert_ne!(next, first, "the next transaction runs in the ended group");
+    assert!(next_ran, "the next transaction's group does not run");
+    assert_eq!(
+        after_the_rollback, 0,
+        "a rolled back transaction kept its group's word"
+    );
+    assert!(!next_runs_on, "a rolled back transaction's group runs on");
+}
+
+/// A dropped connection ends the wait group its transaction still has, before its seat is given
+/// up: none runs on. A close ends every open transaction and its group with it, so the group is
+/// begun here the way a writer's begin begins it, with no transaction for the close to end.
+#[test]
+fn a_dropped_connection_ends_the_group_its_transaction_still_has() {
+    use crate::storage::atoll::sql::wait::graph;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/group-drop");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let left = {
+        let atoll = conn.atoll().expect("Atoll mode");
+        atoll.waits.group(&atoll.own().cell)
+    };
+    let ran = graph().running(left);
+    drop(conn);
+    let runs_on = graph().running(left);
+    drop(db);
+    assert_ne!(left, 0, "no group was begun");
+    assert!(ran, "the group begun does not run");
+    assert!(!runs_on, "a dropped connection's group runs on");
 }
 
 #[cfg(all(unix, not(miri)))]

@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -422,19 +423,26 @@ enum CommitState {
 /// A statement's hold on the end of its connection's transaction in Atoll mode
 /// (`Connection::atoll_end`): taken as the ending begins, let go as it is dropped, with the
 /// statement's commit state or once the commit has been finished whole.
-pub(crate) struct EndingBegun(Arc<Connection>);
+pub(crate) struct EndingBegun(
+    Arc<Connection>,
+    crate::storage::atoll::sql::mode::StatementTxn,
+);
 
 impl EndingBegun {
-    /// Takes the end of `connection`'s transaction for the statement about to end it. A close that
-    /// holds it has the transaction: the statement's ending does not begin.
-    pub(crate) fn new(connection: &Arc<Connection>) -> Result<Self> {
+    /// Takes the end of `connection`'s transaction for the statement about to end it, which
+    /// reaches the transaction through `statement`. A close that holds it has the transaction:
+    /// the statement's ending does not begin.
+    pub(crate) fn new(
+        connection: &Arc<Connection>,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
+    ) -> Result<Self> {
         match connection.atoll_end.compare_exchange(
             Connection::END_FREE,
             Connection::END_ENDING,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(Self(connection.clone())),
+            Ok(_) => Ok(Self(connection.clone(), statement.clone())),
             Err(Connection::END_CLOSING) => {
                 Err(LimboError::InternalError("Connection closed".to_string()))
             }
@@ -453,7 +461,7 @@ impl Drop for EndingBegun {
         // An ending still in the place drives itself to its end as it drops, before the end is
         // let go.
         if let Some(atoll) = self.0.atoll() {
-            atoll.drop_placed();
+            atoll.drop_placed(TxnOf::Statement(&self.1));
         }
         self.0
             .atoll_end
@@ -1385,6 +1393,9 @@ pub struct ProgramState {
     /// Whether this statement's Transaction opcode left a take of Atoll's write gate waiting,
     /// which it gives up if it stops waiting (R15).
     pub(crate) atoll_taking: bool,
+    /// What this statement holds of the Atoll transaction it runs in, which `TxnOf::Statement`
+    /// names by it.
+    pub(crate) atoll_txn: crate::storage::atoll::sql::mode::StatementTxn,
     /// The Atoll transaction (its slot and start) whose owed statement rollback this statement
     /// found failed: its abort rolls that transaction back whole (R19, ASYNC1 D2e (iii-b)).
     pub(crate) atoll_met_failure: Option<(u16, u64)>,
@@ -1537,6 +1548,7 @@ impl ProgramState {
             uses_subjournal: false,
             atoll_statement: None,
             atoll_taking: false,
+            atoll_txn: Default::default(),
             atoll_met_failure: None,
             atoll_pin_permit: None,
             atoll_ending_begun: None,
@@ -2122,7 +2134,7 @@ impl ProgramState {
         matches!(self.commit_state, CommitState::Atoll { .. })
             && connection
                 .atoll()
-                .is_some_and(|atoll| atoll.placed_published())
+                .is_some_and(|atoll| atoll.placed_published(TxnOf::Statement(&self.atoll_txn)))
     }
 
     /// The failure the statement's published Atoll commit met, once the commit has finished
@@ -2412,9 +2424,10 @@ impl ProgramState {
                     // rolls the transaction back whole.
                     match self.atoll_statement {
                         Some(n) => {
-                            let failed = atoll.rollback_statement(n).err();
+                            let which = TxnOf::Statement(&self.atoll_txn);
+                            let failed = atoll.rollback_statement(which, n).err();
                             if failed.is_some() {
-                                self.atoll_met_failure = atoll.owed_failure();
+                                self.atoll_met_failure = atoll.owed_failure(which);
                             }
                             failed
                         }
@@ -3498,8 +3511,9 @@ impl Program {
             if let (CommitState::Atoll { .. }, Some(atoll)) =
                 (&state.commit_state, self.connection.atoll())
             {
-                if atoll.placed_published() {
-                    atoll.fail_placed(err.into());
+                let which = TxnOf::Statement(&state.atoll_txn);
+                if atoll.placed_published(which) {
+                    atoll.fail_placed(which, err.into());
                     state.io_completions = None;
                     return None;
                 }
@@ -3523,7 +3537,7 @@ impl Program {
         let atoll = self.connection.atoll()?;
         #[cfg(test)]
         crate::storage::atoll::sql::mode::SETTLES_AT_STEP.with(|n| n.set(n.get() + 1));
-        match atoll.settle() {
+        match atoll.settle(TxnOf::Statement(&state.atoll_txn)) {
             Ok(IOResult::Done(())) => None,
             // A yield stores no wait.
             Ok(IOResult::IO(io)) if io.is_explicit_yield() => self.park_on_io(state, io),
@@ -3535,7 +3549,7 @@ impl Program {
                 None
             }
             Err(err) => {
-                state.atoll_met_failure = atoll.owed_failure();
+                state.atoll_met_failure = atoll.owed_failure(TxnOf::Statement(&state.atoll_txn));
                 self.fail_step(state, pager, err)
             }
         }
@@ -3554,7 +3568,7 @@ impl Program {
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
         let atoll = self.connection.atoll()?;
-        match atoll.serve_sibling() {
+        match atoll.serve_sibling(TxnOf::Statement(&state.atoll_txn)) {
             Ok(IOResult::Done(())) => None,
             Ok(IOResult::IO(io)) => self.park_on_io(state, io),
             Err(err) => self.fail_step(state, pager, err),
@@ -3974,7 +3988,8 @@ impl Program {
                 }
             );
             let atoll = connection.atoll().expect("Atoll mode");
-            program_state.atoll_ending_begun = Some(EndingBegun::new(connection)?);
+            program_state.atoll_ending_begun =
+                Some(EndingBegun::new(connection, &program_state.atoll_txn)?);
             // The statement's outcome is decided: no interrupt, deadline or progress handler stops
             // what is left of it (`Program::maybe_request_interrupt`).
             program_state.halt_in_progress = true;
@@ -3985,7 +4000,11 @@ impl Program {
                 let (db, schema) = (connection.db.clone(), connection.schema.read().clone());
                 Box::new(move || db.update_schema_if_newer(schema)) as Box<dyn FnOnce() + Send>
             });
-            program_state.commit_state = if atoll.end_into_place(!rollback, publish) {
+            program_state.commit_state = if atoll.end_into_place(
+                TxnOf::Statement(&program_state.atoll_txn),
+                !rollback,
+                publish,
+            ) {
                 CommitState::Atoll {
                     schema_did_change,
                     rollback,
@@ -4000,19 +4019,20 @@ impl Program {
         } = program_state.commit_state
         {
             let atoll = connection.atoll().expect("Atoll mode");
-            match atoll.step_placed() {
+            let which = TxnOf::Statement(&program_state.atoll_txn);
+            match atoll.step_placed(which) {
                 Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                 Ok(IOResult::Done(())) => {}
                 // A commit published before its ending failed is decided: it is finished whole, the
                 // attached databases' transactions committed, and the failure is then the
                 // statement's outcome (DESIGN.md §17).
-                Err(failure) if atoll.placed_published() => {
+                Err(failure) if atoll.placed_published(which) => {
                     program_state.atoll_commit_failure = Some(failure)
                 }
                 Err(e) => return Err(e.into()),
             }
             // Over: done, or failed once published.
-            atoll.drop_placed();
+            atoll.drop_placed(which);
             // A commit's schema was published with it; a rollback's is put back.
             if schema_did_change && rollback {
                 *connection.schema.write() = connection.db.clone_schema();
@@ -4032,8 +4052,11 @@ impl Program {
         // A halt that ended nothing, the transaction held by a schema reparse, leaves it open for
         // the statements reading in it, and so does one whose sibling began its read meanwhile
         // (`ConnTxn::serve_sibling`) while a sibling still reads: the connection's state says so.
-        if atoll.is_open() {
-            if atoll.is_pinned() || connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+        let which = TxnOf::Statement(&program_state.atoll_txn);
+        if atoll.is_open(which) {
+            if atoll.is_pinned(which)
+                || connection.n_active_root_statements.load(Ordering::SeqCst) > 1
+            {
                 connection.set_tx_state(TransactionState::Read);
                 return Ok(IOResult::Done(()));
             }
@@ -4041,7 +4064,7 @@ impl Program {
             // last reader lets go of it (`Connection::end_served_atoll_read`): its slot and snapshot,
             // with no ending of its own beside this one (the auditor's #4459). One that is not such
             // a read stays open, and the connection's state says so.
-            if !atoll.end_served() {
+            if !atoll.end_served(which) {
                 connection.set_tx_state(TransactionState::Read);
                 return Ok(IOResult::Done(()));
             }
@@ -4053,7 +4076,7 @@ impl Program {
         if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
             let io = connection.db.io.clone();
             crate::storage::atoll::drive(&io, || {
-                atoll.begin(crate::storage::atoll::sql::mode::Begin::Read)
+                atoll.begin(which, crate::storage::atoll::sql::mode::Begin::Read)
             })?;
             atoll.mark_served();
             connection.set_tx_state(TransactionState::Read);
@@ -4707,7 +4730,7 @@ impl Program {
         // (R15), so its connection's next statement never runs behind it.
         if std::mem::take(&mut state.atoll_taking) {
             if let Some(atoll) = self.connection.atoll() {
-                atoll.give_up();
+                atoll.give_up(TxnOf::Statement(&state.atoll_txn));
             }
         }
         // Errors from nested statements are handled by the parent statement. A statement reading
@@ -4814,7 +4837,7 @@ impl Program {
                             "Failed to rollback saved outer transaction after sequence conflict",
                         );
                     }
-                    self.rollback_current_txn_for(continues, pager);
+                    self.rollback_current_txn_for(&state.atoll_txn, continues, pager);
                     self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
@@ -4822,7 +4845,7 @@ impl Program {
                 // rollback transaction in autocommit mode.
                 Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
-                        self.rollback_current_txn_for(continues, pager);
+                        self.rollback_current_txn_for(&state.atoll_txn, continues, pager);
                     }
                     self.connection.set_changes(0);
                 }
@@ -4844,7 +4867,7 @@ impl Program {
                             // ROLLBACK ends the whole transaction, and a statement still
                             // reading it fails at its next step, as SQLite's reads do with
                             // SQLITE_ABORT_ROLLBACK. Writers that already halted committed.
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(&state.atoll_txn, pager);
                             // All deferred FK violations are undone by the full rollback.
                             self.connection.clear_deferred_foreign_key_violations();
                         }
@@ -4935,7 +4958,7 @@ impl Program {
                         }
                         _ => {
                             if must_rollback_tx_if_needed {
-                                self.rollback_current_txn_for(continues, pager);
+                                self.rollback_current_txn_for(&state.atoll_txn, continues, pager);
                             }
                         }
                     }
@@ -4957,7 +4980,7 @@ impl Program {
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
                         if must_rollback_tx_if_needed {
-                            self.rollback_current_txn_for(continues, pager);
+                            self.rollback_current_txn_for(&state.atoll_txn, continues, pager);
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
@@ -4968,7 +4991,7 @@ impl Program {
                         // SQLite on SQLITE_IOERR.
                         let io_error = matches!(err, Some(LimboError::CompletionError(_)));
                         if can_autocommit_now || io_error {
-                            self.rollback_current_txn_for(continues, pager);
+                            self.rollback_current_txn_for(&state.atoll_txn, continues, pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
                                 &self.connection,
@@ -5028,7 +5051,7 @@ impl Program {
                             );
                         }
                         if can_autocommit_now || forces_rollback || wrote_without_savepoint {
-                            self.rollback_current_txn_for(continues, pager);
+                            self.rollback_current_txn_for(&state.atoll_txn, continues, pager);
                         }
                     }
                 },
@@ -5053,8 +5076,13 @@ impl Program {
         // failure: an abort whose statement did not meet it, a reset's or a drop's, decides
         // nothing about it, and a mark never reaches a later transaction.
         if let Some(met) = state.atoll_met_failure.take() {
-            if self.connection.atoll().and_then(|a| a.owed_failure()) == Some(met) {
-                self.rollback_current_txn(pager);
+            if self
+                .connection
+                .atoll()
+                .and_then(|a| a.owed_failure(TxnOf::Statement(&state.atoll_txn)))
+                == Some(met)
+            {
+                self.rollback_current_txn(&state.atoll_txn, pager);
                 self.connection.clear_deferred_foreign_key_violations();
             }
         }
@@ -5069,19 +5097,29 @@ impl Program {
         Ok(())
     }
 
-    fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        self.connection.rollback_current_txn_state(pager, true);
+    fn rollback_current_txn(
+        &self,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
+        pager: &Arc<Pager>,
+    ) {
+        self.connection
+            .rollback_current_txn_state(pager, true, TxnOf::Statement(statement));
         self.connection.set_cdc_transaction_id(-1);
     }
 
     /// `continues`: other statements still read the MVCC autocommit transaction, which goes on
     /// for them without this statement's writes (`Connection::rollback_writes_continued`).
-    fn rollback_current_txn_for(&self, continues: bool, pager: &Arc<Pager>) {
+    fn rollback_current_txn_for(
+        &self,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
+        continues: bool,
+        pager: &Arc<Pager>,
+    ) {
         if continues {
             self.connection.rollback_writes_continued();
             self.connection.set_cdc_transaction_id(-1);
         } else {
-            self.rollback_current_txn(pager);
+            self.rollback_current_txn(statement, pager);
         }
     }
 

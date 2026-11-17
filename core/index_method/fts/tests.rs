@@ -1325,12 +1325,16 @@ pub(super) fn backing_bytes(
         .unwrap()
         .run_collect_rows()
         .unwrap();
-    let mut cursor =
-        BackingStore::lookup(conn, crate::MAIN_DB_ID, FtsStore::new("docs_fts").index())
-            .unwrap()
-            .unwrap()
-            .open_cursor()
-            .unwrap();
+    let mut cursor = BackingStore::lookup(
+        conn,
+        crate::MAIN_DB_ID,
+        FtsStore::new("docs_fts").index(),
+        &Default::default(),
+    )
+    .unwrap()
+    .unwrap()
+    .open_cursor()
+    .unwrap();
     let mut rows = std::collections::HashSet::new();
     drive(io, || cursor.rewind());
     while cursor.has_record() {

@@ -1,4 +1,5 @@
 use crate::namespace::NamespaceId;
+use crate::storage::atoll::sql::mode::TxnOf;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -18,7 +19,12 @@ impl IndexMethodContext {
     /// Find the backing store that is `index`. Returns `None` if the index
     /// is not in the schema yet.
     pub fn backing_store(&self, index: &BackingIndex) -> Result<Option<BackingStore>> {
-        BackingStore::lookup(&self.connection()?, self.database().id, index)
+        BackingStore::lookup(
+            &self.connection()?,
+            self.database().id,
+            index,
+            self.statement(),
+        )
     }
 
     /// Create the tables of `schema`, then its indexes, in order. An object
@@ -243,6 +249,9 @@ pub struct BackingStore {
     root_page: i64,
     index_info: Arc<IndexInfo>,
     mvcc: Option<BackingStoreMvccBinding>,
+    /// What the statement that opened the method's cursor holds of its Atoll transaction: the
+    /// store's cursor reads and writes in it.
+    statement: crate::storage::atoll::sql::mode::StatementTxn,
 }
 
 struct BackingStoreMvccBinding {
@@ -268,6 +277,7 @@ impl BackingStore {
         connection: &Arc<Connection>,
         database_id: usize,
         index: &BackingIndex,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
     ) -> Result<Option<Self>> {
         let table_name = index.table.clone();
         let index_name = index.name.clone();
@@ -315,6 +325,7 @@ impl BackingStore {
             root_page: index.root_page,
             index_info,
             mvcc,
+            statement: statement.clone(),
         }))
     }
 
@@ -328,6 +339,7 @@ impl BackingStore {
             // Its writes meet another writer as MVCC's do, which index methods are written
             // against: they fail at once and change nothing.
             return Ok(Box::new(atoll.open_cursor_no_wait(
+                TxnOf::Statement(&self.statement),
                 pager,
                 self.root_page,
                 Some(Arc::clone(&self.index_info)),

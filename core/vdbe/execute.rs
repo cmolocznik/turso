@@ -19,6 +19,7 @@ use crate::schema::{
     SCHEMA_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
     PageCategory,
@@ -1298,6 +1299,7 @@ fn ensure_index_method_context(
         &program.connection,
         database_id,
         &attachment.definition(),
+        &state.atoll_txn,
     )?);
     state.index_method_contexts[cursor_id] = Some(Arc::clone(&context));
     Ok(context)
@@ -4875,6 +4877,7 @@ pub fn op_transaction_inner(
                         // of the write gate left waiting, parked or Busy, is this statement's
                         // until it is taken or given up (R15).
                         let begins = match atoll.begin_reading(
+                            TxnOf::Statement(&state.atoll_txn),
                             wants,
                             &program.schema_reads,
                             &mut state.atoll_read,
@@ -4900,9 +4903,12 @@ pub fn op_transaction_inner(
                             state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                         }
                         if statement_writes_db && state.atoll_statement.is_none() {
-                            state.atoll_statement = Some(atoll.start_statement()?);
+                            state.atoll_statement =
+                                Some(atoll.start_statement(TxnOf::Statement(&state.atoll_txn))?);
                         }
-                    } else if let Some(io) = atoll.admits_nested(state.atoll_pin_permit) {
+                    } else if let Some(io) = atoll
+                        .admits_nested(TxnOf::Statement(&state.atoll_txn), state.atoll_pin_permit)
+                    {
                         // Nested, it begins nothing, but a schema reparse's pin that owns its view
                         // admits only the reparse's own statements (ASYNC1 D2e (iii-c), #5665).
                         return Ok(state.suspend_on_io(io));
@@ -5264,6 +5270,7 @@ pub fn op_transaction_inner(
                     mv_store.as_ref(),
                     program,
                     &mut state.atoll_read,
+                    &state.atoll_txn,
                     *db,
                 );
                 match res {
@@ -5790,6 +5797,7 @@ pub fn op_savepoint(
                     if let Some(atoll) = conn.atoll() {
                         // Atoll mode: the statement it rolls back to (DESIGN.md §17, §3).
                         atoll.open_savepoint(
+                            TxnOf::Connection,
                             name.clone(),
                             starts_transaction,
                             deferred_fk_violations,
@@ -5954,7 +5962,7 @@ pub fn op_savepoint(
             let deferred_fk_snapshot = if let Some(atoll) = conn.atoll() {
                 // Owed by the transaction in a cooperative frame, finished at the top of the
                 // connection's next call; finished here outside one (R19, ASYNC1 D2e (iii-b)).
-                atoll.rollback_to_savepoint(name)?
+                atoll.rollback_to_savepoint(TxnOf::Connection, name)?
             } else if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
@@ -14797,14 +14805,19 @@ fn atoll_cursor_shell(
             if let Some(sql) = (parked.as_mut() as &mut dyn Any)
                 .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
             {
-                if sql.reopened(atoll, pager, index) {
+                if sql.reopened(atoll, TxnOf::Statement(&state.atoll_txn), pager, index) {
                     return Ok(parked);
                 }
             }
         }
     }
     let index = atoll_index_info(cursor_type)?;
-    Ok(atoll.open_cursor_boxed(pager.clone(), root, index)?)
+    Ok(atoll.open_cursor_boxed(
+        TxnOf::Statement(&state.atoll_txn),
+        pager.clone(),
+        root,
+        index,
+    )?)
 }
 
 pub fn op_open_write(
@@ -15111,7 +15124,11 @@ pub fn op_create_btree(
         // (DESIGN.md §17, §5). An index's flags also mark a WITHOUT ROWID table (R29).
         let id = return_if_io!(
             state,
-            atoll.create_btree(&mut state.atoll_create, !flags.is_table())
+            atoll.create_btree(
+                TxnOf::Statement(&state.atoll_txn),
+                &mut state.atoll_create,
+                !flags.is_table()
+            )
         );
         state.atoll_create = None;
         state.registers[*root].set_int(id as i64);
@@ -15382,7 +15399,15 @@ pub fn op_destroy(
         // Atoll mode: the catalog row deleted and the root listed as dropped, in the current
         // statement (DESIGN.md §17, §5). Atoll has no auto-vacuum, so no root page moves.
         let id = crate::storage::atoll::sql::mode::tree_id(*root)?;
-        return_if_io!(state, atoll.retire_tree(&mut state.atoll_retire, id, false));
+        return_if_io!(
+            state,
+            atoll.retire_tree(
+                TxnOf::Statement(&state.atoll_txn),
+                &mut state.atoll_retire,
+                id,
+                false
+            )
+        );
         state.atoll_retire = None;
         state.registers[*former_root_reg].set_int(0);
         state.pc += 1;
@@ -15460,7 +15485,15 @@ fn op_clear_btree_inner(
         // dropped (DESIGN.md §17, §5); the cursors over the tree read the new one from their next
         // step.
         let id = crate::storage::atoll::sql::mode::tree_id(*root)?;
-        let removed = return_if_io!(state, atoll.retire_tree(&mut state.atoll_retire, id, true));
+        let removed = return_if_io!(
+            state,
+            atoll.retire_tree(
+                TxnOf::Statement(&state.atoll_txn),
+                &mut state.atoll_retire,
+                id,
+                true
+            )
+        );
         state.atoll_retire = None;
         for cursor in state.cursors.iter_mut().flatten() {
             if let Cursor::Dyn(..) = cursor {
@@ -16462,10 +16495,11 @@ pub fn op_page_count(
     load_insn!(PageCount { db, dest }, insn);
     if let Some(atoll) = program.connection.atoll_for_db(*db) {
         // Atoll mode: the page store's pages in use (DESIGN.md §17, §12).
-        let pages = match atoll.pages_in(&mut state.atoll_read)? {
-            IOResult::Done(pages) => pages,
-            IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
-        };
+        let pages =
+            match atoll.pages_in(TxnOf::Statement(&state.atoll_txn), &mut state.atoll_read)? {
+                IOResult::Done(pages) => pages,
+                IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+            };
         state.registers[*dest].set_int(pages.into());
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -16477,6 +16511,7 @@ pub fn op_page_count(
         mv_store.as_ref(),
         program,
         &mut state.atoll_read,
+        &state.atoll_txn,
         *db,
         |header| header.database_size.get(),
     ) {
@@ -17099,6 +17134,7 @@ pub fn op_read_cookie(
         mv_store.as_ref(),
         program,
         &mut state.atoll_read,
+        &state.atoll_txn,
         *db,
         |header| match cookie {
             Cookie::ApplicationId => header.application_id.get().into(),
@@ -17159,8 +17195,14 @@ pub fn op_set_cookie(
         upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
     }
 
-    match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
-        match cookie {
+    match with_header_mut(
+        &pager,
+        mv_store.as_ref(),
+        program,
+        &state.atoll_txn,
+        *db,
+        |header| {
+            match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
             Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
             Cookie::DatabaseTextEncoding => {
@@ -17223,8 +17265,9 @@ pub fn op_set_cookie(
             ),
             Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
         };
-        Ok(())
-    })? {
+            Ok(())
+        },
+    )? {
         IOResult::Done(result) => result?,
         IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     }
@@ -17527,6 +17570,7 @@ pub fn op_open_ephemeral(
                     mv_store.as_ref(),
                     program,
                     &mut state.atoll_read,
+                    &state.atoll_txn,
                     0,
                     |header| { header.page_size }
                 )
@@ -18033,7 +18077,11 @@ pub fn op_integrity_check(
             OpIntegrityCheckState::Atoll(walk) => Some(walk),
             _ => None,
         };
-        let found = match atoll.check_pages_in(&mut walk, *max_errors) {
+        let found = match atoll.check_pages_in(
+            TxnOf::Statement(&state.atoll_txn),
+            &mut walk,
+            *max_errors,
+        ) {
             Ok(IOResult::IO(io)) => {
                 *state.active_op_state.integrity_check() =
                     OpIntegrityCheckState::Atoll(walk.expect("a walk kept across its IO"));
@@ -18082,6 +18130,7 @@ pub fn op_integrity_check(
                     physical_header_store,
                     program,
                     &mut state.atoll_read,
+                    &state.atoll_txn,
                     *db,
                     |header| (header.freelist_trunk_page.get(), header.database_size.get())
                 )
@@ -18098,6 +18147,7 @@ pub fn op_integrity_check(
                         physical_header_store,
                         program,
                         &mut state.atoll_read,
+                        &state.atoll_txn,
                         *db,
                         |header| { header.freelist_pages.get() }
                     )
@@ -20532,6 +20582,7 @@ fn op_journal_mode_inner(
                     mv_store.as_ref(),
                     program,
                     &mut state.atoll_read,
+                    &state.atoll_txn,
                     *db,
                     |header| header.read_version,
                 );
@@ -21390,6 +21441,7 @@ fn with_header<T, F>(
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     atoll_read: &mut Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
+    atoll_txn: &crate::storage::atoll::sql::mode::StatementTxn,
     db: usize,
     f: F,
 ) -> IOResultOr<T>
@@ -21397,7 +21449,9 @@ where
     F: Fn(&DatabaseHeader) -> T,
 {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
-        return Ok(atoll.header_in(atoll_read)?.map(|header| f(&header)));
+        return Ok(atoll
+            .header_in(TxnOf::Statement(atoll_txn), atoll_read)?
+            .map(|header| f(&header)));
     }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
@@ -21414,6 +21468,7 @@ pub fn with_header_mut<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
+    atoll_txn: &crate::storage::atoll::sql::mode::StatementTxn,
     db: usize,
     f: F,
 ) -> IOResultOr<T>
@@ -21421,7 +21476,7 @@ where
     F: Fn(&mut DatabaseHeader) -> T,
 {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
-        return Ok(atoll.set_header(&f)?);
+        return Ok(atoll.set_header(TxnOf::Statement(atoll_txn), &f)?);
     }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
@@ -21439,10 +21494,11 @@ fn get_schema_cookie(
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     atoll_read: &mut Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
+    atoll_txn: &crate::storage::atoll::sql::mode::StatementTxn,
     db: usize,
 ) -> IOResultOr<u32> {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
-        return Ok(atoll.schema_cookie_in(atoll_read)?);
+        return Ok(atoll.schema_cookie_in(TxnOf::Statement(atoll_txn), atoll_read)?);
     }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);

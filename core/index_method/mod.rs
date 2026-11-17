@@ -1,6 +1,7 @@
 use std::sync::{Arc, Weak};
 
 use crate::namespace::NamespaceId;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
@@ -304,6 +305,9 @@ pub struct IndexMethodContext {
     snapshot: IndexMethodSnapshotIdentity,
     schema_generation: u64,
     index: IndexMethodIdentity,
+    /// What the statement that opened the cursor holds of its Atoll transaction: the method's
+    /// cursors read and write in it.
+    statement: crate::storage::atoll::sql::mode::StatementTxn,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
 }
@@ -327,6 +331,7 @@ impl IndexMethodContext {
         connection: &Arc<Connection>,
         database_id: usize,
         definition: &IndexMethodDefinition<'_>,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
     ) -> Result<Self> {
         let pager = connection.get_pager_from_database_index(&database_id)?;
         let schema_root = connection.with_schema(database_id, |schema| {
@@ -379,7 +384,9 @@ impl IndexMethodContext {
                     IndexMethodTransactionMode::Read
                 },
                 IndexMethodSnapshotIdentity::Atoll {
-                    snapshot_timestamp: atoll.snapshot().unwrap_or(u64::MAX),
+                    snapshot_timestamp: atoll
+                        .snapshot(TxnOf::Statement(statement))
+                        .unwrap_or(u64::MAX),
                 },
                 connection.with_schema(database_id, |schema| u64::from(schema.schema_version)),
             )
@@ -418,6 +425,7 @@ impl IndexMethodContext {
             transaction_mode,
             snapshot,
             schema_generation,
+            statement: statement.clone(),
             index: IndexMethodIdentity {
                 method_name: definition.method_name.to_string(),
                 table_name: definition.table_name.to_string(),
@@ -439,7 +447,13 @@ impl IndexMethodContext {
         database_id: usize,
         attachment: &dyn IndexMethodAttachment,
     ) -> Result<Self> {
-        Self::new(connection, database_id, &attachment.definition())
+        // A raw test's cursor has no statement: it runs in the connection's own transaction.
+        Self::new(
+            connection,
+            database_id,
+            &attachment.definition(),
+            &Default::default(),
+        )
     }
 
     /// The connection this context was built for. Errors once the connection
@@ -486,7 +500,17 @@ impl IndexMethodContext {
     }
 
     pub fn open_table_cursor(&self, table: &str) -> Result<Box<dyn CursorTrait>> {
-        open_table_cursor(&self.connection()?, self.database.id, table)
+        open_table_cursor(
+            &self.connection()?,
+            self.database.id,
+            table,
+            TxnOf::Statement(&self.statement),
+        )
+    }
+
+    /// What the statement that opened the cursor holds of its Atoll transaction.
+    pub(crate) fn statement(&self) -> &crate::storage::atoll::sql::mode::StatementTxn {
+        &self.statement
     }
 }
 
@@ -830,6 +854,7 @@ pub(crate) fn open_table_cursor(
     connection: &Arc<Connection>,
     database_id: usize,
     table: &str,
+    which: TxnOf<'_>,
 ) -> Result<Box<dyn CursorTrait>> {
     let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(table) = connection.with_schema(database_id, |schema| {
@@ -842,7 +867,9 @@ pub(crate) fn open_table_cursor(
     let root_page = table.get_root_page()?;
     if let Some(atoll) = connection.atoll_for_db(database_id) {
         // Its writes meet another writer as MVCC's do: they fail at once and change nothing.
-        return Ok(Box::new(atoll.open_cursor_no_wait(pager, root_page, None)?));
+        return Ok(Box::new(
+            atoll.open_cursor_no_wait(which, pager, root_page, None)?,
+        ));
     }
     let cursor = Box::new(BTreeCursor::new_table(
         pager,

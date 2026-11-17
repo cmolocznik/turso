@@ -33,7 +33,7 @@ use crate::storage::atoll::txn::versioned::{
 };
 use crate::storage::atoll::txn::Txn;
 use crate::storage::btree::BTreeKey;
-use crate::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use crate::sync::Arc;
 use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult,
@@ -94,6 +94,9 @@ pub struct TxnSlot {
     /// Whether a schema reparse's pin is registered (`slot.pin`): written under the lock with it,
     /// read without it by the transaction's endings, which a pin refuses.
     pinned: AtomicBool,
+    /// The group in the wait graph of the transaction that lies here; 0 for none. Begun and ended
+    /// by its connection's `Waits`, read by the cursors that hold this slot.
+    group: AtomicU64,
     conn: Arc<crate::storage::atoll::buffer::Conn>,
 }
 
@@ -249,8 +252,14 @@ impl TxnSlot {
             }),
             owing: Arc::new(AtomicBool::new(false)),
             pinned: AtomicBool::new(false),
+            group: AtomicU64::new(0),
             conn: crate::storage::atoll::buffer::Conn::new(),
         })
+    }
+
+    /// The word holding the group in the wait graph of the transaction that lies here.
+    pub(in crate::storage::atoll) fn group(&self) -> &AtomicU64 {
+        &self.group
     }
 
     /// The connection's identity.

@@ -11,6 +11,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -484,7 +485,7 @@ impl Statement {
             return;
         }
         if let Some(atoll) = self.program.connection.atoll() {
-            atoll.give_up();
+            atoll.give_up(TxnOf::Statement(&self.state.atoll_txn));
         }
         self.release_active_root_if_counted(false);
         self.state.reset(None, None);
@@ -1227,7 +1228,7 @@ impl Statement {
             || attached_leaked
             || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
         if conn.get_auto_commit() && has_implicit_txn_state {
-            conn.rollback_current_txn_state(&main_pager, true);
+            self.rollback_txn_state_for_retry(&conn, &main_pager);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
         }
 
@@ -1260,6 +1261,14 @@ impl Statement {
             }
         }
         Ok(())
+    }
+
+    /// Rolls back the transaction state a schema retry found left. Out of line: only a retry
+    /// runs it, and in line `finish_step` makes the statement's Atoll token for it at every step.
+    #[cold]
+    #[inline(never)]
+    fn rollback_txn_state_for_retry(&self, conn: &Arc<Connection>, main_pager: &Arc<Pager>) {
+        conn.rollback_current_txn_state(main_pager, true, TxnOf::Statement(&self.state.atoll_txn));
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

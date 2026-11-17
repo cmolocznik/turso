@@ -295,6 +295,12 @@ impl WaitGraph {
         }
     }
 
+    /// Whether group `id` is the one running on its node: begun and not ended.
+    #[cfg(test)]
+    pub fn running(&self, id: GroupId) -> bool {
+        self.live(id).is_some()
+    }
+
     /// Whether group `id` was chosen as a victim: it rolls back at its next step.
     #[cfg(test)]
     pub fn doomed(&self, id: GroupId) -> bool {

@@ -6,6 +6,7 @@ use crate::storage::atoll::btree::Check;
 use crate::storage::atoll::drive;
 use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::sql::catalog::tests::config;
+use crate::storage::atoll::sql::mode::TxnOf;
 use crate::storage::atoll::sql::AtollDb;
 use crate::sync::Arc;
 use crate::{ConnectOpts, Connection, Database, OpenOptions, SqliteDialect, Value};
@@ -1189,7 +1190,9 @@ fn entered_in_frame(conn: &Arc<Connection>) -> Called {
     let mut walk = None;
     let out = {
         let _frame = crate::storage::atoll::cooperative::Frame::enter();
-        conn.atoll().unwrap().check_pages_in(&mut walk, 100)
+        conn.atoll()
+            .unwrap()
+            .check_pages_in(TxnOf::Connection, &mut walk, 100)
     };
     {
         let _frame = crate::storage::atoll::cooperative::Frame::enter();
@@ -1383,7 +1386,7 @@ fn host_check_as(conn: &Arc<Connection>, direct: bool) -> HostCheck {
         let rows = if direct {
             conn.atoll()
                 .unwrap()
-                .check_pages(100)
+                .check_pages(TxnOf::Connection, 100)
                 .map(|found| {
                     vec![vec![Value::build_text(if found.is_empty() {
                         "ok".to_string()
@@ -1464,7 +1467,13 @@ fn a_host_check_beside_a_cooperative_walk_is_refused() {
                 "a host integrity check went on while a cooperative walk held the lease"
             );
             let after = (cp.lease_and_fulls_for_test(), cp.contenders_for_test());
-            let slot_free = conn.atoll().unwrap().cell.try_lock_for_test().is_some();
+            let slot_free = conn
+                .atoll()
+                .unwrap()
+                .own()
+                .cell
+                .try_lock_for_test()
+                .is_some();
             // A host check that went on holds the slot while its full checkpoint waits on the
             // walk's lease: the walk is dropped, not called, so its lease goes and the check ends.
             let first = match went_on {
@@ -1581,7 +1590,9 @@ fn a_cooperative_walk_beside_a_host_check_is_refused() {
                     let mut walk = None;
                     let out = {
                         let _frame = crate::storage::atoll::cooperative::Frame::enter();
-                        conn.atoll().unwrap().check_pages_in(&mut walk, 100)
+                        conn.atoll()
+                            .unwrap()
+                            .check_pages_in(TxnOf::Connection, &mut walk, 100)
                     };
                     let out = match out {
                         Ok(crate::types::IOResult::IO(_)) => Called::Failed("IO".to_string()),
@@ -1961,11 +1972,12 @@ fn a_reset_walk_lets_go_and_a_walk_in_another_transaction_is_refused() {
             let ended = conn
                 .atoll()
                 .unwrap()
-                .end(false)
+                .end(TxnOf::Connection, false)
                 .map(|mut ending| ending.finish().map_err(|e| e.to_string()));
             // Begun directly: no statement starts while the walk lives.
             let other_began = matches!(
                 conn.atoll().unwrap().begin_reading(
+                    TxnOf::Connection,
                     crate::storage::atoll::sql::mode::Begin::Read,
                     &[],
                     &mut None,
@@ -1978,7 +1990,7 @@ fn a_reset_walk_lets_go_and_a_walk_in_another_transaction_is_refused() {
             let other_ended = conn
                 .atoll()
                 .unwrap()
-                .end(false)
+                .end(TxnOf::Connection, false)
                 .map(|mut ending| ending.finish().map_err(|e| e.to_string()));
             assert!(
                 held && let_go && at_checkpoint,
@@ -2052,7 +2064,9 @@ fn the_admission_word_refuses_a_host_check_past_its_count() {
             let mut walk = None;
             let coop = {
                 let _frame = crate::storage::atoll::cooperative::Frame::enter();
-                atoll.check_pages_in(&mut walk, 100).map(|_| ())
+                atoll
+                    .check_pages_in(TxnOf::Connection, &mut walk, 100)
+                    .map(|_| ())
             }
             .map_err(|e| e.to_string());
             let kept = walk.is_some();

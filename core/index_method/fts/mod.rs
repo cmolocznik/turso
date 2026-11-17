@@ -1786,6 +1786,9 @@ pub struct FtsCursor {
     /// connection alive (see `IndexMethodContext::connection`).
     connection: Option<Weak<Connection>>,
     database_id: Option<usize>,
+    /// What the statement that opened this cursor holds of its Atoll transaction, kept from the
+    /// context for the opens this cursor drives later.
+    statement: crate::storage::atoll::sql::mode::StatementTxn,
     fts_dir_cursor: Option<Box<dyn CursorTrait>>,
     /// A create or a drop of the backing store that is in progress. It is
     /// `Some` only while the operation waits at an I/O yield.
@@ -1883,6 +1886,7 @@ impl FtsCursor {
             cursor_instance_id: NEXT_FTS_CURSOR_INSTANCE.fetch_add(1, Ordering::Relaxed),
             connection: None,
             database_id: None,
+            statement: Default::default(),
             fts_dir_cursor: None,
             pending_store_op: None,
             backing: None,
@@ -1997,8 +2001,8 @@ impl FtsCursor {
         if self.fts_dir_cursor.is_some() {
             return Ok(());
         }
-        let backing =
-            BackingStore::lookup(conn, database_id, self.store.index())?.ok_or_else(|| {
+        let backing = BackingStore::lookup(conn, database_id, self.store.index(), &self.statement)?
+            .ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "FTS backing store {} not found",
                     self.store.table_name()
@@ -4144,11 +4148,17 @@ pub struct FtsBackingRowWiper {
 #[cfg(feature = "test_helper")]
 impl FtsBackingRowWiper {
     pub fn new(conn: &Arc<Connection>, database_id: usize, index_name: &str) -> Result<Self> {
-        let cursor = BackingStore::lookup(conn, database_id, FtsStore::new(index_name).index())?
-            .ok_or_else(|| {
-                LimboError::InternalError(format!("FTS backing store for {index_name} not found"))
-            })?
-            .open_cursor()?;
+        // A test helper's cursor has no statement: it runs in the connection's own transaction.
+        let cursor = BackingStore::lookup(
+            conn,
+            database_id,
+            FtsStore::new(index_name).index(),
+            &Default::default(),
+        )?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("FTS backing store for {index_name} not found"))
+        })?
+        .open_cursor()?;
         Ok(Self {
             cursor,
             // Every path is a prefix match for the empty string.
@@ -4176,11 +4186,17 @@ pub struct FtsBackingRowDumper {
 #[cfg(feature = "test_helper")]
 impl FtsBackingRowDumper {
     pub fn new(conn: &Arc<Connection>, database_id: usize, index_name: &str) -> Result<Self> {
-        let cursor = BackingStore::lookup(conn, database_id, FtsStore::new(index_name).index())?
-            .ok_or_else(|| {
-                LimboError::InternalError(format!("FTS backing store for {index_name} not found"))
-            })?
-            .open_cursor()?;
+        // A test helper's cursor has no statement: it runs in the connection's own transaction.
+        let cursor = BackingStore::lookup(
+            conn,
+            database_id,
+            FtsStore::new(index_name).index(),
+            &Default::default(),
+        )?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("FTS backing store for {index_name} not found"))
+        })?
+        .open_cursor()?;
         Ok(Self {
             cursor,
             started: false,
@@ -4244,6 +4260,7 @@ impl IndexMethodCursor for FtsCursor {
         self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        self.statement = context.statement().clone();
         if self.is_publishing() {
             return_if_io!(self.drive_publish());
             return Ok(IOResult::Done(()));
@@ -4279,6 +4296,7 @@ impl IndexMethodCursor for FtsCursor {
         self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        self.statement = context.statement().clone();
         if let Some(op) = self.pending_store_op.as_mut() {
             return_if_io!(op.step());
             self.pending_store_op = None;
@@ -4325,6 +4343,7 @@ impl IndexMethodCursor for FtsCursor {
         self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        self.statement = context.statement().clone();
         if matches!(self.state, FtsState::Ready) {
             return self.ensure_snapshot_loaded();
         }
@@ -4341,6 +4360,7 @@ impl IndexMethodCursor for FtsCursor {
         self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        self.statement = context.statement().clone();
         self.opening_for_write = true;
         if matches!(self.state, FtsState::Ready) {
             return Ok(IOResult::Done(()));
@@ -5090,6 +5110,7 @@ impl IndexMethodCursor for FtsCursor {
         self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
+        self.statement = context.statement().clone();
 
         loop {
             match self.optimize_state {

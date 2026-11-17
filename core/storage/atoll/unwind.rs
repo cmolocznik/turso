@@ -1721,7 +1721,9 @@ mod tests {
     /// out `ReleaseStep`, an error, a flag and `PinClear`, an id whose drop unconsumed is a broken
     /// invariant: the registration they name lives in the transaction's slot (ASYNC1 D2e (iii-c)).
     /// `PollBudget` reads and charges the thread's frame mark and budget, two thread-local
-    /// counters, and nothing of the engine (ASYNC1 D2e (iv)).
+    /// counters, and nothing of the engine (ASYNC1 D2e (iv)). `StatementTxn` is what a statement
+    /// keeps of the transaction it runs in, nothing while a connection has one, and `TxnOf` names
+    /// a statement's transaction by it or the connection's own: neither reaches a transaction.
     const PLAIN: &[&str] = &[
         "AtollConfig",
         "Begin",
@@ -1742,8 +1744,10 @@ mod tests {
         "Probed",
         "SCHEMA_ID",
         "Statement",
+        "StatementTxn",
         "StoreConfig",
         "TxnConfig",
+        "TxnOf",
     ];
 
     /// An item of a module or of an impl, at its own level.

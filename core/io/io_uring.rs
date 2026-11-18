@@ -1404,7 +1404,9 @@ impl File for UringFile {
             let ptr = buffer.as_ptr();
             let len = buffer.len();
             let fd = io_uring::types::Fd(self.file.as_raw_fd());
-            let dsync = libc::RWF_DSYNC as io_uring::types::RwFlags;
+            // io-uring changed this parameter's type between 0.7.6 and 0.7.13: the cast below
+            // gives each version the type it takes.
+            let dsync = libc::RWF_DSYNC;
             trace!("pwrite_durable(pos = {}, length = {})", pos, len);
             if let Some(idx) = buffer.fixed_id() {
                 #[cfg(debug_assertions)]
@@ -1413,13 +1415,13 @@ impl File for UringFile {
                 }
                 io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
                     .offset(pos)
-                    .rw_flags(dsync)
+                    .rw_flags(dsync as _)
                     .build()
                     .user_data(get_key(c.clone()))
             } else {
                 io_uring::opcode::Write::new(fd, ptr, len as u32)
                     .offset(pos)
-                    .rw_flags(dsync)
+                    .rw_flags(dsync as _)
                     .build()
                     .user_data(get_key(c.clone()))
             }

@@ -495,6 +495,15 @@ Test: `storage::atoll::store::tests::copies_are_read_back_from_their_newest_slot
 deadlocked on io_uring (Atoll's log chains a segment's zero-fill writes from completions) and
 passes with the change; `io::io_uring` tests pass.
 
+### `pwrite_durable` did not compile against io-uring 0.7.13
+2026-11-19, on branch `path-trie` (not yet on `atoll`), in the commit that adds this entry.
+`core/io/io_uring.rs`. The fork locks io-uring 0.7.6, where `rw_flags` takes `types::RwFlags`. In
+0.7.13 it takes `i32`, and a workspace that depends on this fork from git resolves 0.7.13, since a
+dependency's lock file is not used: `turso_core` then failed to compile. The flag is now cast to
+whichever type the parameter has.
+Test: none of its own. It compiles against 0.7.6 here and against 0.7.13 in the atoll-forge
+workspace, whose forge tests pass on it.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)

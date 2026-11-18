@@ -1587,6 +1587,50 @@ as given, then the `should` terms as given, repeats dropped), and cuts by that s
 key. Proof: `many_term_queries_sum_in_clause_order_bit_for_bit`, 3 to 12 terms against an f32
 oracle built on Tantivy's `Bm25Weight`.
 
+### The `path_trie` index method and `path_sync`
+2026-11-19, on branch `path-trie` (not yet on `atoll`), in the commit that adds this entry.
+`core/index_method/path_trie.rs`, registered in `core/index_method/mod.rs` and `core/ext/mod.rs`;
+the scalar function `path_sync` in `core/function.rs`, the SQLite dialect, the expression
+translator and `core/vdbe/execute.rs`; `globset` joins `turso_core`'s dependencies. Both need the
+`json` feature. User docs: `docs/sql-reference/functions/path.mdx`.
+Why: atoll-forge keeps one row per file of its main branch, with the number of the landing that
+last changed it, and syncs a workspace's part of the tree by glob patterns: everything once, then
+only what changed since the landing on disk (atoll-forge's `FORGE-PATH-INDEX.md`). A B-tree keyed
+by path narrows a query only by its pattern's literal start, and reads every row under it to find
+the few that changed.
+What: `path_sync(path, seq, patterns, since)` is true for a row whose path matches any glob of a
+JSON array (globset's rules, `*` not crossing `/`) and, unless `since` is NULL, whose `seq` is above
+it. `CREATE INDEX .. USING path_trie (path, seq)` serves it from a prefix tree keyed by path
+component, kept in two key-only B-trees on a table of the method's own: a directory's entries by
+name, and by sequence number newest first. A directory's entry holds the highest sequence number
+beneath it, which each insert raises on the directories above the row. A query follows the
+patterns down the tree, skips a directory no pattern can match, and with `since` reads a directory's
+entries newest first and stops at the first that is not newer. Every returned path is confirmed
+with the whole patterns, so the split patterns may only read too much.
+A name written with escapes (`[*]`, as `globset::escape` writes it, or `\*`) is one exact name to
+the walk: a seek, not a scan of its directory.
+One writer at a time: every insert and delete replaces one counter entry, so a second transaction
+writing the index at once meets a write conflict instead of leaving a directory removed with a
+file in it.
+Not done: it has had none of `ivf_crash`'s kill rounds, no run in Atoll mode, and no cost run.
+Tests: `index_method::path_trie` in `tests/integration` (ten, two of them under
+`io_memory_yield`) and `index_method::path_trie::tests` in `turso_core` (four); `turso_core`'s
+unit suite, 4,218 tests, and the 163 of `index_method::` in `tests/integration` pass with it.
+- The same rows as a plain scan: a table with the index and one without take the same 600 random
+  inserts, updates, moves and deletes, some of names with glob characters (`[id]`, `a*b`, `q?`),
+  and every `path_sync` query gives the same rows from both,
+  under WAL, under MVCC, and (`io_memory_yield`) over an IO that finishes nothing until stepped,
+  with a 12-page cache. That last run found a delete whose seek stopped at the end of a leaf, its
+  key being the divider in the page above: the delete now advances as `seek_internal` does.
+- What a query reads (`io_memory_yield`): in a table of 400 directories of 20 files, against one of
+  50, a query for every file waited for IO 814 times against 90, one for a single changed file 7
+  against 6, and one for a single directory 9 against 8.
+- A second writer at once is refused under MVCC; removing the counter's replacement from deletes
+  makes that test fail with both writers committed.
+- An index made on a table that has rows holds them. The first version kept its B-trees on the
+  indexed table, as `toy_vector_sparse_ivf` does, and `CREATE INDEX` filled them from the table's
+  rows.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

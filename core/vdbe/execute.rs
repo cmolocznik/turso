@@ -10829,6 +10829,23 @@ pub fn op_function(
             }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
+            ScalarFunc::PathSync => {
+                #[cfg(feature = "json")]
+                {
+                    let result = crate::index_method::path_trie::path_sync(
+                        state.registers[*start_reg].get_value(),
+                        state.registers[*start_reg + 1].get_value(),
+                        state.registers[*start_reg + 2].get_value(),
+                        state.registers[*start_reg + 3].get_value(),
+                    )?;
+                    state.registers[*dest].set_value(result);
+                }
+                #[cfg(not(feature = "json"))]
+                return Err(LimboError::InvalidArgument(
+                    "path_sync needs the json feature".to_string(),
+                )
+                .into());
+            }
             ScalarFunc::Instr => {
                 let reg_value = &state.registers[*start_reg];
                 let pattern_value = &state.registers[*start_reg + 1];

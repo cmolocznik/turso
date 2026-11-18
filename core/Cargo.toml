@@ -109,6 +109,7 @@ icu_collator = "2.2.0"
 icu_locale = "2.2.0"
 thiserror = { workspace = true }
 regex = { workspace = true }
+globset = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [
     "unicode",
 ] }

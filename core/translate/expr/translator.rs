@@ -1689,6 +1689,25 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
+                ScalarFunc::PathSync => {
+                    if args.len() != 4 {
+                        crate::bail_parse_error!(
+                            "{} function must have four arguments",
+                            srf.to_string()
+                        );
+                    }
+                    let start_reg = program.alloc_registers(4);
+                    for (i, arg) in args.iter().enumerate() {
+                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+                    }
+                    program.emit_insn(Insn::Function {
+                        constant_mask: 0,
+                        start_reg,
+                        dest: target_register,
+                        func: func_ctx,
+                    });
+                    Ok(target_register)
+                }
                 ScalarFunc::Nullif | ScalarFunc::Instr => {
                     if args.len() != 2 {
                         crate::bail_parse_error!(

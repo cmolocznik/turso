@@ -27,6 +27,8 @@ pub mod backing_store;
 pub mod fts;
 pub mod ivf_rq;
 pub(crate) mod optimize_steps;
+#[cfg(feature = "json")]
+pub mod path_trie;
 pub mod toy_vector_sparse_ivf;
 
 pub use backing_store::{
@@ -35,6 +37,7 @@ pub use backing_store::{
 
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
 pub const TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME: &str = "toy_vector_sparse_ivf";
+pub const PATH_TRIE_INDEX_METHOD_NAME: &str = "path_trie";
 
 /// Default for `PRAGMA fts_merge_threshold`: the number of visible FTS
 /// segments a statement flush may leave behind before the write path merges

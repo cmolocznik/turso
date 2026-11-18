@@ -270,6 +270,11 @@ impl Database {
                 BACKING_BTREE_INDEX_METHOD_NAME.to_string(),
                 Arc::new(BackingBtreeIndexMethod),
             );
+            #[cfg(feature = "json")]
+            syms.index_methods.insert(
+                crate::index_method::PATH_TRIE_INDEX_METHOD_NAME.to_string(),
+                Arc::new(crate::index_method::path_trie::PathTrieIndexMethod),
+            );
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));

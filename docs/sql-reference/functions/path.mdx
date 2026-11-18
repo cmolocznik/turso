@@ -1,0 +1,94 @@
+---
+title: Path Sync
+description: Find rows by glob patterns over slash-separated paths, and by what changed since a sequence number
+sidebarTitle: Path Sync
+---
+
+# Path Sync
+
+<Info>
+**Turso Extension**: `path_sync` and the `path_trie` index method are not part of SQLite.
+</Info>
+
+`path_sync` answers one question: which rows have a path that matches any of a set of glob patterns and, optionally, a sequence number above a given one. With a `path_trie` index, the cost of the answer follows the rows it returns, not the size of the table.
+
+It is built for keeping a copy of part of a tree of files up to date: ask once for everything under some patterns, then ask again for only what changed since the last answer.
+
+---
+
+## path_sync(path, seq, patterns, since)
+
+Returns 1 if `path` matches any glob in `patterns` and, unless `since` is NULL, `seq` is an integer above `since`. Otherwise it returns 0.
+
+| Argument | Meaning |
+|----------|---------|
+| `path` | A slash-separated path, such as `src/net/tcp.rs`. A value that is not text gives NULL. |
+| `seq` | The row's sequence number: when it last changed. A value that is not an integer is below every `since`. |
+| `patterns` | A JSON array of glob strings. NULL gives NULL. Anything else is an error. |
+| `since` | An integer, or NULL to ignore `seq`. Anything else is an error. |
+
+### Glob patterns
+
+| Syntax | Matches |
+|--------|---------|
+| `*` | Any run of characters within one path component. It does not match `/`. |
+| `?` | Any one character other than `/`. |
+| `[abc]`, `[a-z]`, `[!abc]` | One character in, or not in, the class. |
+| `{a,b}` | Either alternative. |
+| `**` as a whole component | Any number of directories: `src/**` is everything under `src`, `**/*.rs` is every `.rs` file, `a/**/b` is `a/b`, `a/x/b`, `a/x/y/b`. |
+
+A pattern without any of these names exactly one path. Matching is case-sensitive.
+
+```sql
+SELECT path FROM files
+WHERE path_sync(path, seq, '["src/**", "Cargo.toml", "crates/*/Cargo.toml"]', NULL);
+```
+
+---
+
+## The path_trie index
+
+```sql
+CREATE INDEX files_by_path ON files USING path_trie (path, seq);
+```
+
+The index takes exactly two columns: the path and the sequence number. A query whose `WHERE` clause holds `path_sync` on those two columns reads the index, with or without other terms beside it:
+
+```sql
+SELECT path, kind FROM files
+WHERE path_sync(path, seq, ?1, ?2) AND kind <> 0;
+```
+
+Two rows of the table cannot have the same path while the index exists.
+
+### What a query reads
+
+The index is a tree of directories. Each directory holds the highest sequence number of anything beneath it.
+
+- A query follows the patterns down the tree. It does not read a directory no pattern can match.
+- With `since`, it does not read a directory in which nothing is newer than `since`.
+
+So a query for one directory, or for what changed since the last sequence number, reads about the same number of pages in a table of a thousand rows as in one of a million.
+
+### Keeping a copy in step
+
+Give every write a sequence number higher than the last. Keep a deleted file's row, marked as deleted, with the sequence number of its deletion: the copy then learns of the deletion like any other change.
+
+```sql
+-- The first time: everything under the patterns.
+SELECT path, kind FROM files WHERE path_sync(path, seq, ?patterns, NULL);
+
+-- Every later time: what was added, changed or deleted since sequence number 4120.
+SELECT path, kind FROM files WHERE path_sync(path, seq, ?patterns, 4120);
+```
+
+### Writes
+
+A write to the indexed table also writes the entries of the directories above the row's path, and replaces one entry that every write shares. Two transactions that write the indexed table at once therefore conflict, and the second is refused: write the table from one transaction at a time.
+
+---
+
+## See Also
+
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for index methods
+- [Scalar Functions](/docs/sql-reference/functions/scalar) for `glob`, which matches one pattern with SQLite's rules

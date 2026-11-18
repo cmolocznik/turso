@@ -899,6 +899,9 @@ pub enum ScalarFunc {
     IfNull,
     Iif,
     Instr,
+    /// path_sync(path, seq, patterns, since): whether a path matches any of a JSON array of
+    /// globs and, unless since is NULL, seq is above since. A path_trie index serves it.
+    PathSync,
     Like,
     Abs,
     Upper,
@@ -1034,6 +1037,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::IfNull => true,
             ScalarFunc::Iif => true,
             ScalarFunc::Instr => true,
+            ScalarFunc::PathSync => true,
             ScalarFunc::Like => true,
             ScalarFunc::Abs => true,
             ScalarFunc::Upper => true,
@@ -1193,6 +1197,7 @@ impl Display for ScalarFunc {
             Self::IfNull => "ifnull",
             Self::Iif => "iif",
             Self::Instr => "instr",
+            Self::PathSync => "path_sync",
             Self::Like => "like",
             Self::Abs => "abs",
             Self::Upper => "upper",
@@ -1370,6 +1375,7 @@ impl ScalarFunc {
             | Self::Likelihood
             | Self::GetByte
             | Self::TimeDiff => &[2],
+            Self::PathSync => &[4],
             // 3-arg
             Self::Iif | Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)

@@ -261,6 +261,40 @@ impl Statement {
         )
     }
 
+    /// A statement for a trigger's or a foreign key action's subprogram, which runs in its parent's
+    /// Atoll transaction: the one `parent`, the parent statement's name, names (ASYNC1 E1b). Made in
+    /// its box, so it is not moved again; in line at its one hot caller, a trigger's firing.
+    #[inline(always)]
+    pub(crate) fn new_subprogram(
+        program: vdbe::Program,
+        pager: Arc<Pager>,
+        parent: &crate::storage::atoll::sql::mode::StatementTxn,
+    ) -> Box<Self> {
+        let mut statement = Box::new(Self::new_with_origin(
+            program,
+            pager,
+            QueryMode::Normal,
+            0,
+            StatementOrigin::Subprogram,
+        ));
+        statement.share_atoll_txn(parent);
+        statement
+    }
+
+    /// A statement for a materialized view's population or maintenance, which runs in its
+    /// connection's own Atoll transaction: no statement that keeps a materialized view lends.
+    pub(crate) fn new_view_maintenance(program: vdbe::Program, pager: Arc<Pager>) -> Box<Self> {
+        let mut statement = Box::new(Self::new_with_origin(
+            program,
+            pager,
+            QueryMode::Normal,
+            0,
+            StatementOrigin::Subprogram,
+        ));
+        statement.adopt_atoll_name();
+        statement
+    }
+
     #[turso_macros::trace_stack]
     pub(crate) fn new_with_origin(
         program: vdbe::Program,
@@ -440,6 +474,10 @@ impl Statement {
     fn release_active_root_if_counted(&mut self, statement_failed: bool) {
         // A statement that has ended takes no more part in its connection's transaction.
         self.state.txn_part = None;
+        debug_assert!(
+            self.counted_as_active_root || !self.state.atoll_member(),
+            "a member's run is counted from its start to its release"
+        );
         if self.counted_as_active_root {
             let conn = &self.program.connection;
             if let Some(hooks) = conn.hooks() {
@@ -455,16 +493,26 @@ impl Statement {
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
-            let previous = self
-                .program
-                .connection
-                .n_active_root_statements
-                .fetch_sub(1, Ordering::SeqCst);
-            if previous == 1 {
-                self.program.connection.clear_interrupt_if_idle();
+            let roots = &self.program.connection.n_active_root_statements;
+            if self.state.atoll_member() {
+                self.state.atoll_run = vdbe::AtollRun::None;
+                let previous =
+                    roots.fetch_sub(vdbe::AtollRun::Member.root_count(), Ordering::SeqCst);
+                if previous as i32 == 1 {
+                    self.program.connection.clear_interrupt_if_idle();
+                }
+                self.counted_as_active_root = false;
+                // The read served to the connection's members ends with the last of them.
+                self.program
+                    .connection
+                    .end_served_atoll_read((previous >> 32) as i32 - 1);
+            } else {
+                let previous = roots.fetch_sub(1, Ordering::SeqCst);
+                if previous as i32 == 1 {
+                    self.program.connection.clear_interrupt_if_idle();
+                }
+                self.counted_as_active_root = false;
             }
-            self.program.connection.end_served_atoll_read(previous - 1);
-            self.counted_as_active_root = false;
         }
     }
 
@@ -472,8 +520,8 @@ impl Statement {
     /// write began, has not begun (ONE-TXN rule 2). A writer's registration is let go, and its
     /// next step registers again. One that waited for Atoll's write gate holds nothing: its take
     /// is given up, its count let go, and its next step begins again from its first instruction,
-    /// through `prepare_step`. The transaction its begin opened in autocommit stays in the
-    /// connection's cell for the next statement, which ends it at its halt.
+    /// through `prepare_step`. The transaction its begin opened, which it wrote nothing in, it ends
+    /// when that is its to end ([`Connection::ends_at_give_up`]).
     #[cold]
     #[inline(never)]
     fn busy_has_not_begun(&mut self) {
@@ -484,9 +532,12 @@ impl Statement {
         if !std::mem::take(&mut self.state.atoll_taking) {
             return;
         }
-        if let Some(atoll) = self.program.connection.atoll() {
-            atoll.give_up(TxnOf::Statement(&self.state.atoll_txn));
-        }
+        let pager = self.program.connection.pager.load().clone();
+        self.program.connection.give_up_atoll_begin(
+            &pager,
+            &self.state.atoll_txn,
+            self.state.atoll_member(),
+        );
         self.release_active_root_if_counted(false);
         self.state.reset(None, None);
     }
@@ -606,7 +657,14 @@ impl Statement {
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if !self.counted_as_active_root {
             if matches!(self.origin, StatementOrigin::Root) {
-                self.program.connection.start_root_statement()?;
+                if self.program.connection.atoll().is_none() {
+                    self.program.connection.start_root_statement()?;
+                } else {
+                    let run = self.atoll_run_this_run();
+                    self.name_atoll_txn_for_run(run);
+                    self.program.connection.start_atoll_root_statement(run)?;
+                    self.state.atoll_run = run;
+                }
                 self.counted_as_active_root = true;
                 self.began_in_autocommit = self.program.connection.get_auto_commit();
                 // After the root count, so the checkpoint guard's subtraction
@@ -660,16 +718,92 @@ impl Statement {
         Ok(None)
     }
 
+    /// How this run of the statement takes part in its connection's Atoll transactions (ASYNC1
+    /// E1b): in Atoll mode, a lendable statement lends in autocommit, unless it is a schema
+    /// reparse's own or the connection's own transaction holds a schema change not yet committed;
+    /// a run stepped inside another statement's step takes no part of its own; every other run is
+    /// a member of the connection's own transaction, as one inside an explicit transaction is.
+    /// Decided once, as the run starts: the run keeps it to its release.
+    #[inline]
+    fn atoll_run_this_run(&self) -> vdbe::AtollRun {
+        let conn = &self.program.connection;
+        if conn.is_nested_stmt() {
+            // Stepped inside another statement's step (an index method's statements): it reads
+            // in the transaction its connection's state names, and takes no part of its own.
+            // Holding a lease, it would name the lent transaction an earlier run ended.
+            turso_macros::turso_debug_assert!(
+                !self.state.atoll_lease,
+                "a run stepped inside another statement's step holds a lease"
+            );
+            return vdbe::AtollRun::None;
+        }
+        if self.program.lends_in_autocommit
+            && conn.get_auto_commit()
+            && self.state.atoll_pin_permit.is_none()
+            && !conn.holds_uncommitted_schema_change()
+        {
+            vdbe::AtollRun::Lends
+        } else {
+            vdbe::AtollRun::Member
+        }
+    }
+
+    /// The statement's name of its Atoll transaction for a run that takes part as `run` says: a
+    /// run that lends, of a program that begins the main database's transaction, holds its lent
+    /// transaction from its start, lent now unless an earlier run kept the lease, which names it
+    /// at once; a member's run gives back the lease an earlier run kept, so it names the
+    /// connection's own from its start, its step's entry and its abort included; every other run
+    /// names the connection's own from the statement's first run until it is lent one
+    /// ([`Self::adopt_atoll_name`]).
+    #[inline]
+    fn name_atoll_txn_for_run(&mut self, run: vdbe::AtollRun) {
+        if run == vdbe::AtollRun::Lends
+            && self.program.lent_at_its_start
+            && self.query_mode == QueryMode::Normal
+        {
+            if !self.state.atoll_lease {
+                vdbe::execute::lend_to_run(&self.program.connection, &mut self.state);
+            }
+        } else {
+            if run == vdbe::AtollRun::Member && self.state.atoll_lease {
+                vdbe::execute::take_back_from_run(&self.program.connection, &mut self.state);
+            }
+            self.adopt_atoll_name();
+        }
+    }
+
     /// One step of a helper statement, which holds its connection's nested count while it runs.
     #[cold]
     #[inline(never)]
     fn step_as_helper(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.adopt_atoll_name();
         self.program.connection.start_nested();
         self.holds_nested = true;
         let stepped = self._step(waker);
         self.holds_nested = false;
         self.program.connection.end_nested();
         stepped
+    }
+
+    /// In Atoll mode, the statement's name of its transaction resolves to the connection's own
+    /// from its first run on, until it is lent one ([`ConnTxn::adopt`]); a subprogram's is its
+    /// parent's copy. Done here, not at the statement's making, so the making builds its state in
+    /// place as before.
+    ///
+    /// [`ConnTxn::adopt`]: crate::storage::atoll::sql::mode::ConnTxn::adopt
+    #[inline]
+    fn adopt_atoll_name(&mut self) {
+        if !self.state.atoll_txn.is_adopted() {
+            self.adopt_atoll_name_now();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn adopt_atoll_name_now(&mut self) {
+        if let Some(atoll) = self.program.connection.atoll() {
+            atoll.adopt(&mut self.state.atoll_txn);
+        }
     }
 
     /// Everything [`Self::_step`] does after the interpreter returned something
@@ -681,9 +815,13 @@ impl Statement {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
-        for attempt in 0..MAX_SCHEMA_RETRY {
+        for attempt in 0..MAX_SCHEMA_RETRY + 1 {
             // Only reprepare if we still need to update schema
             if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
+                break;
+            }
+            if attempt == MAX_SCHEMA_RETRY {
+                self.give_up_on_schema();
                 break;
             }
             // In a write transaction, reprepare may not help (e.g. cross-process
@@ -879,6 +1017,18 @@ impl Statement {
         res.map_err(|err| (*err).into_structured_constraint())
     }
 
+    /// A statement that gives up on its schema returns with its lent transaction ended: no other
+    /// statement and no ROLLBACK of its connection can end it (ASYNC1 E1b).
+    #[cold]
+    #[inline(never)]
+    fn give_up_on_schema(&mut self) {
+        if self.state.atoll_lease {
+            let conn = self.program.connection.clone();
+            let main_pager = conn.pager.load().clone();
+            self.rollback_txn_state_for_retry(&conn, &main_pager);
+        }
+    }
+
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
         self._step(None).map_err(|error| self.format_error(error))
@@ -923,6 +1073,18 @@ impl Statement {
                 }
                 _ => None,
             })
+    }
+
+    /// What the statement holds of its Atoll transaction, for a test.
+    #[cfg(test)]
+    pub(crate) fn atoll_txn_for_test(&self) -> &crate::storage::atoll::sql::mode::StatementTxn {
+        &self.state.atoll_txn
+    }
+
+    /// Whether the statement holds its lent transaction's lease, for a test.
+    #[cfg(test)]
+    pub(crate) fn holds_atoll_lease_for_test(&self) -> bool {
+        self.state.atoll_lease
     }
 
     /// The instruction the statement stands at, for a test to see it ran none.
@@ -1227,7 +1389,8 @@ impl Statement {
             || conn.next_attached_mv_tx().is_some()
             || attached_leaked
             || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
-        if conn.get_auto_commit() && has_implicit_txn_state {
+        // A lent transaction is the statement's own, open or not by the connection's state.
+        if self.state.atoll_txn.holds_lent() || (conn.get_auto_commit() && has_implicit_txn_state) {
             self.rollback_txn_state_for_retry(&conn, &main_pager);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
         }
@@ -1269,6 +1432,9 @@ impl Statement {
     #[inline(never)]
     fn rollback_txn_state_for_retry(&self, conn: &Arc<Connection>, main_pager: &Arc<Pager>) {
         conn.rollback_current_txn_state(main_pager, true, TxnOf::Statement(&self.state.atoll_txn));
+        if !self.state.atoll_txn.holds_lent() {
+            conn.serve_atoll_members_after_rollback(self.state.atoll_member());
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1749,6 +1915,17 @@ impl Statement {
         }
     }
 
+    /// Names `parent`'s Atoll transaction for this subprogram, whose operations then run in it.
+    pub(crate) fn share_atoll_txn(
+        &mut self,
+        parent: &crate::storage::atoll::sql::mode::StatementTxn,
+    ) {
+        // A parent outside Atoll mode names nothing: its subprogram's name is as made.
+        if parent.is_adopted() {
+            self.state.atoll_txn = parent.clone();
+        }
+    }
+
     /// Lightweight reset for reusing a cached subprogram statement.
     /// Skips transaction handling and abort(): the caller (op_program) has
     /// already handled trigger execution tracking. Only resets ProgramState
@@ -1772,7 +1949,7 @@ impl Statement {
             && self.began_in_autocommit
             && conn.get_auto_commit()
             && !self.has_returned_row
-            && conn.n_active_root_statements.load(Ordering::SeqCst) <= 1
+            && (self.state.atoll_txn.holds_lent() || conn.atoll_members() <= 1)
     }
 
     fn reset_internal(
@@ -2053,10 +2230,27 @@ impl Drop for Statement {
             return self.drop_as_helper();
         }
         self.reset_best_effort();
+        // The transaction its connection lent it, ended by the reset, goes back for the next; a
+        // subprogram's is its parent's.
+        if self.state.atoll_lease {
+            self.give_back_atoll_lease();
+        }
     }
 }
 
 impl Statement {
+    /// A dropped statement's lent transaction given back to its connection.
+    #[cold]
+    #[inline(never)]
+    fn give_back_atoll_lease(&mut self) {
+        let atoll = self
+            .program
+            .connection
+            .atoll()
+            .expect("a statement holding a lease is in Atoll mode");
+        atoll.take_back(&mut self.state.atoll_txn);
+    }
+
     /// A helper's drop-time reset runs nested: its cleanup consults `is_nested_stmt()` to leave
     /// the transaction's finalization to the parent, whatever the connection holds then (with
     /// no statement counted, an abort that is not nested ends a transaction left open on an

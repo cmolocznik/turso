@@ -246,6 +246,7 @@ pub fn translate_analyze(
 
         let parse_schema_where_clause =
             "tbl_name = 'sqlite_stat1' AND type != 'trigger'".to_string();
+        program.mark_runs_in_connections();
         program.emit_insn(Insn::ParseSchema {
             db: database_id,
             where_clause: Some(parse_schema_where_clause),

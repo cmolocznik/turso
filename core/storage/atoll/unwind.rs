@@ -422,6 +422,221 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "sql/mode/tests/lent.rs",
+            "a_lent_transaction_is_the_statements_own_and_is_lent_again_once_given_back",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_lent_before_begin_and_ended_inside_it_leaves_the_connections_savepoints",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_statement_that_begins_no_transaction_is_lent_nothing",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_writer_parked_at_its_take_keeps_its_connections_own_writers_and_ending_out",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_statement_of_an_attached_database_a_kept_view_or_change_capture_is_lent_nothing",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_writer_that_meets_a_conflict_beside_two_members_is_run_again",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_writers_halt_sets_its_connections_change_counts",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_reader_begun_beside_a_member_and_reset_at_its_first_row_ends_its_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_schema_writer_a_page_check_and_a_transactions_begin_run_in_their_connections_own",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_readers_end_leaves_the_explicit_transactions_virtual_tables_and_change_capture",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_readers_drop_leaves_a_members_virtual_table_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_writers_failed_deferred_key_leaves_the_explicit_transaction_as_it_was",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "two_statements_lent_at_once_hold_two_transactions",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_close_ends_every_lent_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_transaction_given_back_open_ends_the_process",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_statement_that_holds_a_lent_transaction_is_not_lent_another",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "two_readers_of_a_connection_read_in_two_transactions",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_beside_a_writer_of_its_connection_keeps_its_snapshot",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_reset_at_a_row_ends_its_transaction_and_keeps_its_lease",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "begin_beside_an_open_reader_leaves_the_reader_its_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_run_inside_begin_gives_its_lease_back_and_reads_in_the_explicit_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_writer_busy_at_its_take_ends_its_lent_transaction_and_runs_again_alone",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_writer_and_a_reader_of_one_connection_each_end_their_own_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_lent_before_begin_and_ended_inside_it_ends_its_own_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "the_read_served_to_a_member_ends_with_it_after_a_lent_statement_ran",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_member_reads_on_after_a_conflict_rolls_its_transaction_back",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_reader_leaves_the_deferred_foreign_key_violations_to_their_writer",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_beside_its_connections_uncommitted_schema_change_reads_in_that_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_writer_parked_behind_a_schema_change_begins_again_and_commits_its_row",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_writer_parked_at_its_take_keeps_its_lent_transaction_across_a_begin",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_lent_before_its_connections_schema_change_reads_its_snapshot_to_its_end",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_lent_before_an_uncommitted_schema_change_reads_its_snapshot_through_it",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_table_dropped_under_its_lent_reader_keeps_its_pages_until_the_reader_ends",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_connection_with_more_open_statements_than_slots_meets_busy_at_the_bound",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_reader_over_json_each_lends_and_one_over_a_pragma_or_extension_table_does_not",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_statement_stepped_inside_another_statements_step_is_lent_nothing",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_schema_reparse_beside_a_half_begun_transaction_reads_the_committed_cookie",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_connections_two_writing_transactions_each_keep_their_wait_group",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_writer_busy_inside_begin_leaves_no_transaction_for_its_end_to_miss",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_writer_busy_in_autocommit_then_stepped_inside_begin_writes_in_the_users_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_statement_with_a_trigger_lent_then_run_inside_begin_writes_its_trigger_in_the_users_transaction",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_close_at_a_lent_endings_wait_is_refused_until_its_statement_is_dropped",
+            "child",
+        ),
+        (
+            "sql/mode/tests/lent.rs",
+            "a_lent_endings_start_under_a_close_is_refused_and_leaves_none_counted",
+            "child",
+        ),
+        (
             "store/tests.rs",
             "a_copy_landing_in_a_claimed_slot_ends_the_process",
             "child",
@@ -981,6 +1196,21 @@ mod tests {
         (
             "sql/mode/tests.rs",
             "an_abort_in_a_frame_owes_its_rollback_and_the_next_statement_finishes_it",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_statement_kept_lent_and_stepped_inside_begin_finishes_the_rollback_its_connection_owes",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_lent_reader_stepped_while_its_connection_owes_a_rollback_leaves_it_to_the_members",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_member_run_that_kept_a_lease_and_meets_a_failed_rollback_rolls_back_whole",
             "child",
         ),
         (
@@ -1809,6 +2039,8 @@ mod tests {
     /// counters, and nothing of the engine (ASYNC1 D2e (iv)). `StatementTxn` is what a statement
     /// keeps of the transaction it runs in, nothing while a connection has one, and `TxnOf` names
     /// a statement's transaction by it or the connection's own: neither reaches a transaction.
+    /// `Names` is what a facade call takes such a name by, and `Own` names the connection's own:
+    /// how a name resolves is a private module's, so code outside Atoll resolves none (ASYNC1 E1b).
     const PLAIN: &[&str] = &[
         "AtollConfig",
         "Begin",
@@ -1817,7 +2049,9 @@ mod tests {
         "GuardKey",
         "Guarded",
         "LogConfig",
+        "Names",
         "OwedFlag",
+        "Own",
         "NO_PAGE_CAP",
         "PollBudget",
         "PinAt",
@@ -1889,7 +2123,8 @@ mod tests {
             ("", rest)
         };
         let mut words = after.split_whitespace();
-        let mut kind = words.next()?;
+        // An impl's generics are no part of its kind: `impl<'a> T for U` is an impl.
+        let mut kind = words.next()?.split('<').next()?;
         while matches!(kind, "const" | "unsafe" | "async" | "extern" | "default")
             && words
                 .clone()
@@ -1906,12 +2141,7 @@ mod tests {
         let name: String = if kind == "impl" {
             let target = match head.rsplit_once(" for ") {
                 Some((_, ty)) => ty,
-                None => {
-                    &head[head
-                        .find('>')
-                        .filter(|_| head[4..].starts_with('<'))
-                        .map_or(4, |i| i + 1)..]
-                }
+                None => &head[generics_end(head)..],
             };
             target
                 .trim()
@@ -1936,6 +2166,22 @@ mod tests {
             body,
             of_trait,
         })
+    }
+
+    /// Where an impl's head goes on past its generics, `impl<...>`: the byte after their closing
+    /// bracket, or after `impl` with none.
+    fn generics_end(head: &str) -> usize {
+        if !head[4..].starts_with('<') {
+            return 4;
+        }
+        let mut depth = 0;
+        head[4..]
+            .char_indices()
+            .find(|&(_, c)| {
+                depth += (c == '<') as i32 - (c == '>') as i32;
+                depth == 0
+            })
+            .map_or(head.len(), |(i, _)| 4 + i + 1)
     }
 
     /// The items of `code` at its own level.
@@ -2151,6 +2397,8 @@ mod tests {
                         }
                     }
                     "const" | "static" | "type" if allowed(&i.name) => {}
+                    // A trait outside code can name is plain only with no method of its own.
+                    "trait" if allowed(&i.name) && i.body.is_some_and(|b| b.trim().is_empty()) => {}
                     _ => wrong.push(format!(
                         "{file}: {} {} is open to code outside Atoll and is not the facade",
                         i.kind, i.name
@@ -2196,6 +2444,41 @@ mod tests {
             "{visible} items open to code outside Atoll found"
         );
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The item parser the censuses read Atoll with sees a generic impl as an impl, named for the
+    /// type it is for, and every item after it at its level. It once took `impl<'a,` for a kind of
+    /// its own and merged everything after it, up to the next semicolon, into one item, so the
+    /// censuses did not see those items (ASYNC1 E1b, #6084).
+    #[test]
+    fn the_item_parser_reads_generic_impls_and_every_item_after_them() {
+        let code = "pub trait Names<'a>: Copy {}\n\
+            impl<'a, 'n: 'a> Names<'a> for TxnOf<'n> {\n    fn txn(self) {}\n}\n\
+            impl<T: Into<u8>> Holder<T> {\n    fn get(&self) {}\n}\n\
+            impl<'a, N: Copy> Names<'a> for N {}\n\
+            pub struct Owner {\n    x: u8,\n    _frame: FrameEnd,\n}\n\
+            impl Drop for Owner {\n    fn drop(&mut self) {}\n}\n\
+            pub(crate) fn after() {}\n\
+            const LAST: u8 = 1;\n";
+        let seen: Vec<(&str, String)> = items(code)
+            .iter()
+            .map(|i| (i.kind, i.name.clone()))
+            .collect();
+        let want = [
+            ("trait", "Names"),
+            ("impl", "TxnOf"),
+            ("impl", "Holder"),
+            ("impl", "N"),
+            ("struct", "Owner"),
+            ("impl", "Owner"),
+            ("fn", "after"),
+            ("const", "LAST"),
+        ];
+        assert_eq!(
+            seen,
+            want.map(|(k, n)| (k, n.to_string())),
+            "the items the parser reads"
+        );
     }
 
     /// Every framed destructor in Atoll is its type's, whose last field ends the frame, and every

@@ -1,10 +1,13 @@
 //! The wait graph (DESIGN.md §17, R2): one per process, over transaction groups, so a cycle of
-//! waits across attached databases is a cycle in it.
+//! waits across connections is a cycle in it. Nothing joins a connection's transactions in two
+//! databases, so a cycle that passes through both is not seen: it ends at the busy timeout, and
+//! under the PostgreSQL frontend, whose waits have no bound, never (ATTACH-WAIT1).
 //!
-//! - **Groups.** A group is a connection's transactions across its attached Atoll databases. Its id
-//!   is its node's index and a generation bumped at every begin and end, so an edge never names a
-//!   later group; its age is drawn from one counter for the process, since each database has a
-//!   clock of its own.
+//! - **Groups.** A group is one transaction of a connection in one Atoll database, on the node of
+//!   the slot it lies in: the connection's own and each one it lent have a node each, so two
+//!   transactions of a connection that write at once are two groups. Its id is its node's index
+//!   and a generation bumped at every begin and end, so an edge never names a later group; its age
+//!   is drawn from one counter for the process, since each database has a clock of its own.
 //! - **Records.** Each waiting statement publishes a record: its edge, a state (waiting, flagged,
 //!   over) and the completion it parks on. Records sit under their group's mutex. A publisher
 //!   always walks after publishing, so of two waiters closing one cycle at least one sees it: had
@@ -196,8 +199,8 @@ pub fn graph() -> &'static WaitGraph {
     GRAPH.get_or_init(WaitGraph::default)
 }
 
-/// A connection's place in the graph, from its open to its close, holding its node so that its
-/// groups begin and end without the graph's lock.
+/// A transaction slot's place in the graph, for the slot's life, holding its node so that the
+/// groups of the transactions in it begin and end without the graph's lock.
 pub struct Seat {
     index: u32,
     node: Arc<Node>,
@@ -212,7 +215,7 @@ fn generation_of(id: GroupId) -> u32 {
 }
 
 impl WaitGraph {
-    /// A node for a new connection.
+    /// A node for a new transaction slot.
     pub fn seat(&self) -> Seat {
         if let Some(index) = lock(&self.free).pop() {
             return Seat {
@@ -235,13 +238,23 @@ impl WaitGraph {
         }
     }
 
-    /// Gives a closed connection's node back.
+    /// Gives a dropped slot's node back, its last group ended.
     pub fn unseat(&self, seat: Seat) {
+        crate::turso_debug_assert!(
+            seat.node.generation.load(Ordering::Acquire) % 2 == 0,
+            "a node given back with its group running"
+        );
         lock(&self.free).push(seat.index);
     }
 
     fn node(&self, index: u32) -> Arc<Node> {
         lock(&self.nodes)[index as usize].clone()
+    }
+
+    /// Whether group `id` is the one running on its node, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn is_live_for_test(&self, id: GroupId) -> bool {
+        self.live(id).is_some()
     }
 
     /// The node of `id`, if its group is the one running there.
@@ -259,7 +272,14 @@ impl WaitGraph {
         );
         node.doomed.store(false, Ordering::Release);
         node.exclusive.store(0, Ordering::Release);
-        let generation = node.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let previous = node.generation.fetch_add(1, Ordering::AcqRel);
+        // An even generation is a node with no group running: one slot's transactions begin
+        // their groups one after another, each ended before the next begins.
+        crate::turso_debug_assert!(
+            previous % 2 == 0,
+            "a group begun on a node whose last group is still running"
+        );
+        let generation = previous.wrapping_add(1);
         (seat.index as u64) << 32 | generation as u64
     }
 

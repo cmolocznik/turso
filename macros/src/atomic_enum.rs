@@ -226,7 +226,7 @@ pub(crate) fn derive_atomic_enum_inner(input: TokenStream) -> TokenStream {
 
             /// Decode storage representation into enum
             /// Panics on invalid discriminant
-            #[inline]
+            #[inline(always)]
             fn from_storage(val: #storage_type) -> #name {
                 let discriminant = (val & #discriminant_mask) as u8;
                 match discriminant {

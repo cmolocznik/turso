@@ -94,9 +94,14 @@ pub struct TxnSlot {
     /// Whether a schema reparse's pin is registered (`slot.pin`): written under the lock with it,
     /// read without it by the transaction's endings, which a pin refuses.
     pinned: AtomicBool,
-    /// The group in the wait graph of the transaction that lies here; 0 for none. Begun and ended
-    /// by its connection's `Waits`, read by the cursors that hold this slot.
+    /// The group in the wait graph of the transaction that lies here; 0 for none. Begun on
+    /// [`seat`](Self::seat) and ended by its connection's `Waits`, read by the cursors that hold
+    /// this slot.
     group: AtomicU64,
+    /// The slot's node in the wait graph, its own for its life: a connection can hold several
+    /// transactions at once (its own, those it lent, a sequence's), each waiting and waited on
+    /// apart, so two of them never share a group (ASYNC1 E1b).
+    seat: Option<super::wait::Seat>,
     conn: Arc<crate::storage::atoll::buffer::Conn>,
 }
 
@@ -244,6 +249,18 @@ impl Drop for FinishAfter {
 impl TxnSlot {
     /// A connection's slot, holding `txn`.
     pub fn new(txn: Option<Txn>) -> TxnCell {
+        Self::with_conn(txn, crate::storage::atoll::buffer::Conn::new())
+    }
+
+    /// A slot for another transaction of the connection `beside`'s is of (ASYNC1 E1b).
+    pub(in crate::storage::atoll) fn beside(beside: &TxnSlot) -> TxnCell {
+        Self::with_conn(
+            None,
+            crate::storage::atoll::buffer::Conn::beside(&beside.conn),
+        )
+    }
+
+    fn with_conn(txn: Option<Txn>, conn: Arc<crate::storage::atoll::buffer::Conn>) -> TxnCell {
         Arc::new(Self {
             slot: Mutex::new(Slot {
                 txn,
@@ -253,13 +270,21 @@ impl TxnSlot {
             owing: Arc::new(AtomicBool::new(false)),
             pinned: AtomicBool::new(false),
             group: AtomicU64::new(0),
-            conn: crate::storage::atoll::buffer::Conn::new(),
+            seat: Some(super::wait::graph().seat()),
+            conn,
         })
     }
 
     /// The word holding the group in the wait graph of the transaction that lies here.
     pub(in crate::storage::atoll) fn group(&self) -> &AtomicU64 {
         &self.group
+    }
+
+    /// The slot's node in the wait graph, which its transactions' groups are begun on.
+    pub(in crate::storage::atoll) fn seat(&self) -> &super::wait::Seat {
+        self.seat
+            .as_ref()
+            .expect("a seat until the slot is dropped")
     }
 
     /// The connection's identity.
@@ -571,6 +596,15 @@ impl TxnSlot {
     }
 }
 
+impl Drop for TxnSlot {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        if let Some(seat) = self.seat.take() {
+            super::wait::graph().unseat(seat);
+        }
+    }
+}
+
 /// The transaction once entered: nothing owed in it, and nothing can be recorded while it is held.
 pub(in crate::storage::atoll) struct Entered<'a>(MutexGuard<'a, Slot>);
 
@@ -738,13 +772,14 @@ impl Observed<'_> {
 
     /// Whether the rollback owed failed, and the transaction's identity: what a statement that met
     /// it marks ([`OwedRollback::failed`]).
-    pub(in crate::storage::atoll) fn failed_in(&self) -> Option<(u16, u64)> {
+    pub(in crate::storage::atoll) fn failed_in(&self) -> Option<(u16, std::num::NonZeroU64)> {
         let txn = self.slot.txn.as_ref()?;
-        self.slot
-            .owed
-            .as_deref()
-            .filter(|o| o.failed())
-            .map(|_| (txn.slot(), txn.start()))
+        self.slot.owed.as_deref().filter(|o| o.failed()).map(|_| {
+            (
+                txn.slot(),
+                std::num::NonZeroU64::new(txn.start()).expect("a transaction's start is never 0"),
+            )
+        })
     }
 }
 

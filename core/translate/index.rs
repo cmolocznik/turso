@@ -370,6 +370,7 @@ pub fn translate_create_index(
     // Parse the schema table to get the index root page and add new index to Schema
     let escaped_idx_name = escape_sql_string_literal(&resolver.mangle_name(namespace, &idx_name));
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),

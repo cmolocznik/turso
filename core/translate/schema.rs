@@ -1569,6 +1569,7 @@ pub fn translate_create_table(
         parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
     }
 
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
@@ -1769,6 +1770,7 @@ fn open_namespaces_table_for_writing(
                 root_reg,
                 Some(create_sql),
             )?;
+            program.mark_runs_in_connections();
             program.emit_insn(Insn::ParseSchema {
                 db: MAIN_DB_ID,
                 where_clause: Some(format!(
@@ -2166,6 +2168,7 @@ pub fn translate_create_virtual_table(
     let escaped_table_name = escape_sql_string_literal(&table_name);
     let parse_schema_where_clause =
         format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
@@ -3023,6 +3026,7 @@ fn persist_type_definition(
         emit_schema_cookie(resolver, program);
 
         // Parse schema to register the new table in-memory
+        program.mark_runs_in_connections();
         program.emit_insn(Insn::ParseSchema {
             db: schema_cursor_id,
             where_clause: Some(format!(

@@ -2179,6 +2179,9 @@ fn emit_fk_action_subprogram(
         param_registers.extend(new_regs.iter().copied());
     }
     let ignore_jump_target = program.allocate_label();
+    if matches!(&subprogram, Subprogram::PreparedProgram(body) if !body.lends_in_autocommit) {
+        program.mark_runs_in_connections();
+    }
     program.emit_insn(Insn::Program {
         param_registers,
         program: subprogram,

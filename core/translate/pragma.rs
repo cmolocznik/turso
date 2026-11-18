@@ -656,6 +656,7 @@ fn update_pragma(
                 .as_ref()
                 .map(|i| i.table.to_string())
                 .unwrap_or_default();
+            program.mark_runs_in_connections();
             program.emit_insn(Insn::InitCdcVersion {
                 cdc_table_name,
                 version: CDC_VERSION_CURRENT,

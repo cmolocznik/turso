@@ -320,6 +320,18 @@ pub struct ProgramBuilder {
     /// a table-valued form of the check (ICK-TVF1). Set where the translator emits the one or opens
     /// the other, so a program with neither pays nothing to find out.
     checks_pages: bool,
+    /// Whether the program holds an instruction that makes it run in its connection's transaction
+    /// in autocommit (`PreparedProgram::lends_in_autocommit`, ASYNC1 E1b): set where the translator
+    /// emits it ([`mark_runs_in_connections`](Self::mark_runs_in_connections)).
+    runs_in_connections: bool,
+    /// Whether the program holds an instruction that writes the main database's schema
+    /// ([`writes_main_schema`]): set as each instruction is emitted.
+    writes_schema: bool,
+    /// Whether the program reads or writes a database other than main: set as it begins one.
+    other_database: bool,
+    /// Whether a cursor over a virtual table that can step a statement was allocated: only then
+    /// does the build look over the cursors, as such a cursor may have been released since.
+    opened_stepping_table: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -843,6 +855,10 @@ impl ProgramBuilder {
             mvcc_enabled,
             atoll: false,
             checks_pages: false,
+            runs_in_connections: false,
+            writes_schema: false,
+            other_database: false,
+            opened_stepping_table: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -1113,6 +1129,13 @@ impl ProgramBuilder {
         self.checks_pages = true;
     }
 
+    /// The program begins or ends a transaction or a savepoint, parses the schema, sets up change
+    /// capture, or runs a trigger or foreign-key action body that would not lend: in autocommit it
+    /// runs in its connection's transaction (ASYNC1 E1b).
+    pub fn mark_runs_in_connections(&mut self) {
+        self.runs_in_connections = true;
+    }
+
     /// Whether a write into `database_id` owes its foreign-key guards (R10): only an Atoll
     /// database's do, and only main is ever one.
     pub fn owes_fk_guards(&self, database_id: usize) -> bool {
@@ -1327,6 +1350,9 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if let CursorType::VirtualTable(table) = &cursor_type {
+            self.opened_stepping_table |= table.can_step_a_statement();
+        }
         if let Some(cursor) = self.free_cursor_ids.pop() {
             self.cursor_ref[cursor] = (key, cursor_type);
             return cursor;
@@ -1395,6 +1421,7 @@ impl ProgramBuilder {
             self.emit_column_maybe_fused(cursor_id, column, dest, default);
             return;
         }
+        self.writes_schema |= writes_main_schema(&insn);
         self.insns.push((insn, self.insns.len()));
     }
 
@@ -2201,6 +2228,7 @@ impl ProgramBuilder {
         schema_cookie: u32,
     ) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
+        self.other_database |= database_id != crate::MAIN_DB_ID;
         self.write_databases.set(database_id)?;
         self.write_database_cookies
             .insert(database_id, schema_cookie);
@@ -2226,6 +2254,7 @@ impl ProgramBuilder {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
+        self.other_database |= database_id != crate::MAIN_DB_ID;
         self.read_databases.set(database_id)?;
         self.read_database_cookies
             .insert(database_id, schema_cookie);
@@ -2554,23 +2583,24 @@ impl ProgramBuilder {
             && self.may_abort();
 
         // In Atoll mode a statement writing the main database's schema takes the write gate
-        // exclusive (DESIGN.md §17, R23): known here, once.
-        let writes_schema = self.insns.iter().any(|(insn, _)| match insn {
-            Insn::CreateBtree { db, .. }
-            | Insn::ClearBtree { db, .. }
-            | Insn::Destroy { db, .. } => *db == crate::MAIN_DB_ID,
-            Insn::OpenWrite {
-                root_page: crate::vdbe::insn::RegisterOrLiteral::Literal(1),
-                db,
-                ..
-            } => *db == crate::MAIN_DB_ID,
-            Insn::SetCookie {
-                cookie: crate::vdbe::insn::Cookie::SchemaVersion,
-                db,
-                ..
-            } => *db == crate::MAIN_DB_ID,
-            _ => false,
-        });
+        // exclusive (DESIGN.md §17, R23): marked as each instruction is emitted. A debug build
+        // checks the mark against every instruction the program holds.
+        let writes_schema = self.writes_schema;
+        debug_assert_eq!(
+            writes_schema,
+            self.insns.iter().any(|(insn, _)| writes_main_schema(insn)),
+            "a program's schema-write mark differs from its instructions"
+        );
+        // The mark is set where the translator makes what it marks. A debug build checks it against
+        // every instruction the program holds.
+        debug_assert_eq!(
+            self.runs_in_connections,
+            self.insns
+                .iter()
+                .any(|(insn, _)| runs_in_its_connections_transaction(insn)),
+            "a program's mark of running in its connection's transaction differs from its \
+             instructions"
+        );
         // An integrity check of an Atoll database's pages takes the gate exclusive too, so the page
         // store holds still while it walks (DESIGN.md §17, §12, R36). So does a statement reading a
         // table-valued form of the check: the pragma its cursor runs is a nested statement, which
@@ -2607,6 +2637,36 @@ impl ProgramBuilder {
         };
         schema_reads.sort_unstable();
         schema_reads.dedup();
+        // A statement of the main database alone runs in autocommit in a transaction of its own
+        // (ASYNC1 E1b). One that begins or ends an explicit transaction, writes the schema, checks
+        // pages, reads or writes another database, keeps materialized views or captures changes
+        // (both kept on the connection for its transaction), or runs a helper statement (a
+        // virtual table's that can step one, a schema parse's, change capture's setup: the helper
+        // would need the statement's transaction) runs in its connection's.
+        // Each mark is set as the builder makes what it marks; a debug build checks the other
+        // database's against the databases the program begins.
+        debug_assert_eq!(
+            self.other_database,
+            self.write_databases
+                .iter()
+                .chain(self.read_databases.iter())
+                .any(|db| db != crate::MAIN_DB_ID),
+            "a program's mark of another database differs from the databases it begins"
+        );
+        let lends_in_autocommit = self.atoll
+            && !self.other_database
+            && !writes_schema
+            && !checks_pages
+            && !self.has_materialized_views
+            && self.capture_data_changes_info().is_none()
+            && !self.runs_in_connections
+            && !(self.opened_stepping_table
+                && self.cursor_ref.iter().any(|(_, cursor)| {
+                    matches!(cursor, CursorType::VirtualTable(table) if table.can_step_a_statement())
+                }));
+        let lent_at_its_start = lends_in_autocommit
+            && (self.write_databases.get(crate::MAIN_DB_ID)
+                || self.read_databases.get(crate::MAIN_DB_ID));
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2638,6 +2698,8 @@ impl ProgramBuilder {
             read_databases: self.read_databases,
             writes_schema_or_checks_pages: writes_schema || checks_pages,
             checks_pages,
+            lends_in_autocommit,
+            lent_at_its_start,
             schema_reads,
         };
         Ok(prepared)
@@ -2674,6 +2736,46 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+/// Whether `insn` writes the main database's schema: a schema writer takes the Atoll write gate
+/// exclusive (DESIGN.md §17, R23).
+#[inline]
+fn writes_main_schema(insn: &Insn) -> bool {
+    match insn {
+        Insn::CreateBtree { db, .. } | Insn::ClearBtree { db, .. } | Insn::Destroy { db, .. } => {
+            *db == crate::MAIN_DB_ID
+        }
+        Insn::OpenWrite {
+            root_page: crate::vdbe::insn::RegisterOrLiteral::Literal(1),
+            db,
+            ..
+        } => *db == crate::MAIN_DB_ID,
+        Insn::SetCookie {
+            cookie: crate::vdbe::insn::Cookie::SchemaVersion,
+            db,
+            ..
+        } => *db == crate::MAIN_DB_ID,
+        _ => false,
+    }
+}
+
+/// Whether `insn` makes its program run in its connection's transaction in autocommit (ASYNC1 E1b):
+/// it begins or ends a transaction or a savepoint, parses the schema, sets up change capture, or
+/// runs a trigger's or a foreign-key action's body that would not lend (a recursive action's body is
+/// the one being built, whose own instructions are these).
+fn runs_in_its_connections_transaction(insn: &Insn) -> bool {
+    match insn {
+        Insn::AutoCommit { .. }
+        | Insn::Savepoint { .. }
+        | Insn::ParseSchema { .. }
+        | Insn::InitCdcVersion { .. } => true,
+        Insn::Program {
+            program: super::insn::Subprogram::PreparedProgram(body),
+            ..
+        } => !body.lends_in_autocommit,
+        _ => false,
     }
 }
 

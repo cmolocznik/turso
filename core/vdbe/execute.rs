@@ -77,8 +77,8 @@ use crate::{
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, Statement,
+    TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -3810,7 +3810,11 @@ pub fn halt(
         }
     }
 
-    if err_code > 0 {
+    // The virtual tables' transactions, the connection's transaction state and its change
+    // capture's transaction are the connection's own transaction's: a statement in a lent one
+    // opened no virtual table's transaction, and ends nothing of the connection's (ASYNC1 E1b).
+    // Read at each use, so a halt outside Atoll mode keeps nothing for them.
+    if err_code > 0 && !state.atoll_txn.holds_lent() {
         vtab_rollback_all(&program.connection)?;
     }
 
@@ -3878,7 +3882,9 @@ pub fn halt(
             // interrupt, deadline, and progress-handler requests from
             // replacing the outcome while the staged work is in flight.
             return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
-            vtab_commit_all(&program.connection)?;
+            if !state.atoll_txn.holds_lent() {
+                vtab_commit_all(&program.connection)?;
+            }
             return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
 
@@ -3932,25 +3938,40 @@ pub fn halt(
     // control of this batch.
     return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
 
-    if auto_commit {
+    // A statement in a lent transaction ends its own at its halt, as in autocommit, even when its
+    // connection began an explicit transaction after it (ASYNC1 E1b).
+    if auto_commit || state.atoll_txn.holds_lent() {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
-        // and it also ends the transaction.
-        if can_autocommit_now && program.connection.foreign_keys_enabled() {
+        // and it also ends the transaction. The connection's count is of the transaction its
+        // writer writes in: a statement in a lent transaction that wrote nothing counts none.
+        if can_autocommit_now
+            && program.connection.foreign_keys_enabled()
+            && (!state.atoll_txn.holds_lent() || state.is_active_write())
+        {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
-                vtab_rollback_all(&program.connection)?;
-                if let Some(mv_store) = mv_store.as_ref() {
-                    if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
+                // A lent transaction is rolled back by the statement's abort, its cleanup
+                // `TxnCleanup::RollbackTxn`.
+                if !state.atoll_txn.holds_lent() {
+                    vtab_rollback_all(&program.connection)?;
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                            mv_store.rollback_tx(
+                                tx_id,
+                                pager.clone(),
+                                &program.connection,
+                                MAIN_DB_ID,
+                            );
+                        }
+                        pager.end_read_tx();
+                    } else {
+                        pager.rollback_tx(&program.connection);
                     }
-                    pager.end_read_tx();
-                } else {
-                    pager.rollback_tx(&program.connection);
+                    program.connection.set_tx_state(TransactionState::None);
                 }
-                program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
                     "FOREIGN KEY constraint failed".to_string(),
                 )
@@ -3958,7 +3979,9 @@ pub fn halt(
             }
         }
         if can_autocommit_now {
-            vtab_commit_all(&program.connection)?;
+            if !state.atoll_txn.holds_lent() {
+                vtab_commit_all(&program.connection)?;
+            }
             return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             // Sequence backing-table compaction and sqlite_sequence sync
@@ -3978,7 +4001,9 @@ pub fn halt(
                 if let Some(cdc_info) = state.pending_cdc_info.take() {
                     program.connection.set_capture_data_changes_info(cdc_info);
                 }
-                program.connection.set_cdc_transaction_id(-1);
+                if !state.atoll_txn.holds_lent() {
+                    program.connection.set_cdc_transaction_id(-1);
+                }
             }
             result
         } else {
@@ -4849,69 +4874,19 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(atoll) = conn.atoll_for_db(*db) {
-                    // Atoll mode (DESIGN.md §17): the transaction begins at the outermost
-                    // statement's first Transaction opcode, and a writing statement takes the
-                    // write gate, exclusive when it writes the schema or begins IMMEDIATE (R5,
-                    // R12), then starts its Atoll statement (R18).
-                    if matches!(tx_mode, TransactionMode::Concurrent) {
-                        // BEGIN CONCURRENT is BEGIN here, which never sets the concurrent mode.
-                        return Err(LimboError::InternalError(
-                            "a concurrent transaction mode in Atoll mode".to_string(),
-                        )
-                        .into());
-                    }
-                    if !conn.is_nested_stmt() {
-                        use crate::storage::atoll::sql::mode::Begin;
-                        let wants = if write {
-                            Begin::Write {
-                                schema: !statement_writes_db
-                                    || program.writes_schema_or_checks_pages,
-                            }
-                        } else if program.checks_pages {
-                            Begin::Write { schema: true }
-                        } else {
-                            Begin::Read
-                        };
-                        // Whether this statement begins the Atoll transaction, whatever the
-                        // connection's state says: in autocommit, it ends it at its halt. A take
-                        // of the write gate left waiting, parked or Busy, is this statement's
-                        // until it is taken or given up (R15).
-                        let begins = match atoll.begin_reading(
-                            TxnOf::Statement(&state.atoll_txn),
-                            wants,
-                            &program.schema_reads,
-                            &mut state.atoll_read,
-                            state.atoll_pin_permit,
-                        ) {
-                            Ok(IOResult::Done(began)) => {
-                                state.atoll_taking = false;
-                                began
-                            }
-                            Ok(IOResult::IO(io)) => {
-                                state.atoll_taking = true;
-                                return Ok(state.suspend_on_io(io));
-                            }
-                            Err(e) => {
-                                state.atoll_taking = matches!(e, LimboError::Busy);
-                                return Err(e.into());
-                            }
-                        };
-                        if updated
-                            && (begins || current_state.no_btree_tx_open())
-                            && conn.get_auto_commit()
-                        {
-                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                        }
-                        if statement_writes_db && state.atoll_statement.is_none() {
-                            state.atoll_statement =
-                                Some(atoll.start_statement(TxnOf::Statement(&state.atoll_txn))?);
-                        }
-                    } else if let Some(io) = atoll
-                        .admits_nested(TxnOf::Statement(&state.atoll_txn), state.atoll_pin_permit)
-                    {
-                        // Nested, it begins nothing, but a schema reparse's pin that owns its view
-                        // admits only the reparse's own statements (ASYNC1 D2e (iii-c), #5665).
-                        return Ok(state.suspend_on_io(io));
+                    match begin_in_atoll(
+                        program,
+                        state,
+                        atoll,
+                        tx_mode,
+                        write,
+                        statement_writes_db,
+                        updated,
+                        current_state,
+                    )? {
+                        AtollBegun::Own => {}
+                        AtollBegun::Lent => continue,
+                        AtollBegun::Suspended(suspended) => return Ok(suspended),
                     }
                 } else if let Some(mv_store) = mv_store.as_ref() {
                     if is_secondary_db {
@@ -5379,10 +5354,13 @@ pub fn op_transaction_inner(
                     && auto_commit
                     && state.auto_txn_cleanup == TxnCleanup::None
                 {
-                    let active_root_statements = program
-                        .connection
-                        .n_active_root_statements
-                        .load(Ordering::SeqCst);
+                    // In Atoll mode the statements sharing the connection's transaction are its
+                    // members; one in a lent transaction shares nothing (ASYNC1 E1b).
+                    let active_root_statements = if program.connection.atoll().is_some() {
+                        program.connection.atoll_members()
+                    } else {
+                        program.connection.active_root_statements()
+                    };
                     if active_root_statements > 1 {
                         // A sibling statement opened the implicit transaction
                         // before this statement joined it. Mark this statement
@@ -5403,6 +5381,145 @@ pub fn op_transaction_inner(
             }
         }
     }
+}
+
+/// What the Transaction instruction does next after its Atoll begin.
+enum AtollBegun {
+    /// Goes on to set the connection's state, for its own transaction.
+    Own,
+    /// Checks the schema cookie next: the run is in a transaction lent to it, whose state is the
+    /// statement's.
+    Lent,
+    /// Returns this to the statement's caller.
+    Suspended(InsnFunctionStepResult),
+}
+
+/// The Transaction instruction's begin in Atoll mode (DESIGN.md §17), out of line so the
+/// instruction's other modes keep their own code.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn begin_in_atoll(
+    program: &Program,
+    state: &mut ProgramState,
+    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+    tx_mode: &TransactionMode,
+    write: bool,
+    statement_writes_db: bool,
+    updated: bool,
+    current_state: TransactionState,
+) -> Result<AtollBegun, Box<LimboError>> {
+    let conn = &program.connection;
+    // Atoll mode (DESIGN.md §17): the transaction begins at the outermost
+    // statement's first Transaction opcode, and a writing statement takes the
+    // write gate, exclusive when it writes the schema or begins IMMEDIATE (R5,
+    // R12), then starts its Atoll statement (R18).
+    if matches!(tx_mode, TransactionMode::Concurrent) {
+        // BEGIN CONCURRENT is BEGIN here, which never sets the concurrent mode.
+        return Err(LimboError::InternalError(
+            "a concurrent transaction mode in Atoll mode".to_string(),
+        )
+        .into());
+    }
+    if !conn.is_nested_stmt() {
+        // A root statement's run that lends runs in a transaction of its own, lent
+        // as its first run started (`Statement::name_atoll_txn_for_run`), or here
+        // for a program the builder did not see begin the main database, and kept
+        // across its runs; one that does not runs in its connection's own, as one
+        // of its members, the lease given back as the run started. Decided as the
+        // run started (`Statement::atoll_run_this_run`, ASYNC1 E1b). A helper runs
+        // in its connection's own, a subprogram in its parent's.
+        let in_lent = match state.atoll_run {
+            crate::vdbe::AtollRun::Lends => {
+                if !state.atoll_txn.holds_lent() {
+                    lend_to_run(conn, state);
+                }
+                true
+            }
+            crate::vdbe::AtollRun::Member => {
+                turso_debug_assert!(
+                    !state.atoll_lease,
+                    "a member's run reached its Transaction instruction holding a lease"
+                );
+                false
+            }
+            crate::vdbe::AtollRun::None => false,
+        };
+        use crate::storage::atoll::sql::mode::Begin;
+        let wants = if write {
+            Begin::Write {
+                schema: !statement_writes_db || program.writes_schema_or_checks_pages,
+            }
+        } else if program.checks_pages {
+            Begin::Write { schema: true }
+        } else {
+            Begin::Read
+        };
+        // Whether this statement begins the Atoll transaction, whatever the
+        // connection's state says: in autocommit, it ends it at its halt. A take
+        // of the write gate left waiting, parked or Busy, is this statement's
+        // until it is taken or given up (R15).
+        let begins = match atoll.begin_reading(
+            &state.atoll_txn,
+            wants,
+            &program.schema_reads,
+            &mut state.atoll_read,
+            state.atoll_pin_permit,
+        ) {
+            Ok(IOResult::Done(began)) => {
+                state.atoll_taking = false;
+                began
+            }
+            Ok(IOResult::IO(io)) => {
+                state.atoll_taking = true;
+                return Ok(AtollBegun::Suspended(state.suspend_on_io(io)));
+            }
+            Err(e) => {
+                state.atoll_taking = matches!(e, LimboError::Busy);
+                return Err(e.into());
+            }
+        };
+        // A lent transaction is the statement's own, whoever began it: it ends it at
+        // its halt.
+        if state.atoll_txn.holds_lent()
+            || (updated && (begins || current_state.no_btree_tx_open()) && conn.get_auto_commit())
+        {
+            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+        }
+        if statement_writes_db && state.atoll_statement.is_none() {
+            state.atoll_statement = Some(atoll.start_statement(&state.atoll_txn)?);
+        }
+        if in_lent {
+            // A lent transaction's state is the statement's: the connection's, which
+            // the instruction worked out, describes its own transaction alone and is
+            // left as it was.
+            *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
+            return Ok(AtollBegun::Lent);
+        }
+    } else if let Some(io) = atoll.admits_nested(&state.atoll_txn, state.atoll_pin_permit) {
+        // Nested, it begins nothing, but a schema reparse's pin that owns its view
+        // admits only the reparse's own statements (ASYNC1 D2e (iii-c), #5665).
+        return Ok(AtollBegun::Suspended(state.suspend_on_io(io)));
+    }
+    Ok(AtollBegun::Own)
+}
+
+/// A run that lends and holds no transaction from an earlier run is lent one (ASYNC1 E1b). Once
+/// in a statement's life, as the lease is kept across its runs.
+#[cold]
+#[inline(never)]
+pub(crate) fn lend_to_run(conn: &Connection, state: &mut ProgramState) {
+    let atoll = conn.atoll().expect("a run that lends is in Atoll mode");
+    atoll.lend(&mut state.atoll_txn);
+    state.atoll_lease = true;
+}
+
+/// A member's run gives back the lease an earlier run of its statement kept, as it starts.
+#[cold]
+#[inline(never)]
+pub(crate) fn take_back_from_run(conn: &Connection, state: &mut ProgramState) {
+    let atoll = conn.atoll().expect("a member's run is in Atoll mode");
+    atoll.take_back(&mut state.atoll_txn);
+    state.atoll_lease = false;
 }
 
 /// The MvStore of database `db` for this statement, like
@@ -6275,18 +6392,19 @@ fn run_program<const POLLED: bool>(
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
                 // cached statements by storing them key'd by the state.pc if we are in a loop
                 let pc_key = state.pc as usize;
+                // A subprogram runs in its parent's Atoll transaction, named by the parent's token
+                // (ASYNC1 E1b): the parent's lent one, or the connection's own.
                 let mut statement =
                     if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
                         cached.reset_for_subprogram_reuse();
+                        cached.share_atoll_txn(&state.atoll_txn);
                         cached
                     } else {
-                        Box::new(Statement::new_with_origin(
+                        Statement::new_subprogram(
                             Program::from_prepared(subprogram.clone(), program.connection.clone()),
                             pager.clone(),
-                            QueryMode::Normal,
-                            0,
-                            crate::statement::StatementOrigin::Subprogram,
-                        ))
+                            &state.atoll_txn,
+                        )
                     };
 
                 // Check if this is a trigger subprogram - if so, track execution
@@ -14805,19 +14923,14 @@ fn atoll_cursor_shell(
             if let Some(sql) = (parked.as_mut() as &mut dyn Any)
                 .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
             {
-                if sql.reopened(atoll, TxnOf::Statement(&state.atoll_txn), pager, index) {
+                if sql.reopened(atoll, &state.atoll_txn, pager, index) {
                     return Ok(parked);
                 }
             }
         }
     }
     let index = atoll_index_info(cursor_type)?;
-    Ok(atoll.open_cursor_boxed(
-        TxnOf::Statement(&state.atoll_txn),
-        pager.clone(),
-        root,
-        index,
-    )?)
+    Ok(atoll.open_cursor_boxed(&state.atoll_txn, pager.clone(), root, index)?)
 }
 
 pub fn op_open_write(
@@ -15124,11 +15237,7 @@ pub fn op_create_btree(
         // (DESIGN.md §17, §5). An index's flags also mark a WITHOUT ROWID table (R29).
         let id = return_if_io!(
             state,
-            atoll.create_btree(
-                TxnOf::Statement(&state.atoll_txn),
-                &mut state.atoll_create,
-                !flags.is_table()
-            )
+            atoll.create_btree(&state.atoll_txn, &mut state.atoll_create, !flags.is_table())
         );
         state.atoll_create = None;
         state.registers[*root].set_int(id as i64);
@@ -15401,12 +15510,7 @@ pub fn op_destroy(
         let id = crate::storage::atoll::sql::mode::tree_id(*root)?;
         return_if_io!(
             state,
-            atoll.retire_tree(
-                TxnOf::Statement(&state.atoll_txn),
-                &mut state.atoll_retire,
-                id,
-                false
-            )
+            atoll.retire_tree(&state.atoll_txn, &mut state.atoll_retire, id, false)
         );
         state.atoll_retire = None;
         state.registers[*former_root_reg].set_int(0);
@@ -15487,12 +15591,7 @@ fn op_clear_btree_inner(
         let id = crate::storage::atoll::sql::mode::tree_id(*root)?;
         let removed = return_if_io!(
             state,
-            atoll.retire_tree(
-                TxnOf::Statement(&state.atoll_txn),
-                &mut state.atoll_retire,
-                id,
-                true
-            )
+            atoll.retire_tree(&state.atoll_txn, &mut state.atoll_retire, id, true)
         );
         state.atoll_retire = None;
         for cursor in state.cursors.iter_mut().flatten() {
@@ -16495,11 +16594,10 @@ pub fn op_page_count(
     load_insn!(PageCount { db, dest }, insn);
     if let Some(atoll) = program.connection.atoll_for_db(*db) {
         // Atoll mode: the page store's pages in use (DESIGN.md §17, §12).
-        let pages =
-            match atoll.pages_in(TxnOf::Statement(&state.atoll_txn), &mut state.atoll_read)? {
-                IOResult::Done(pages) => pages,
-                IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
-            };
+        let pages = match atoll.pages_in(&state.atoll_txn, &mut state.atoll_read)? {
+            IOResult::Done(pages) => pages,
+            IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+        };
         state.registers[*dest].set_int(pages.into());
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -17079,13 +17177,10 @@ pub fn op_populate_materialized_views(
                 .populate_matviews_state
                 .as_mut()
                 .expect("populate state exists")
-                .stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                .stmt = Some(crate::statement::Statement::new_view_maintenance(
                 populate_program,
                 pager.clone(),
-                crate::QueryMode::Normal,
-                0,
-                crate::statement::StatementOrigin::Subprogram,
-            )));
+            ));
         }
 
         let populate_state = state
@@ -18077,11 +18172,7 @@ pub fn op_integrity_check(
             OpIntegrityCheckState::Atoll(walk) => Some(walk),
             _ => None,
         };
-        let found = match atoll.check_pages_in(
-            TxnOf::Statement(&state.atoll_txn),
-            &mut walk,
-            *max_errors,
-        ) {
+        let found = match atoll.check_pages_in(&state.atoll_txn, &mut walk, *max_errors) {
             Ok(IOResult::IO(io)) => {
                 *state.active_op_state.integrity_check() =
                     OpIntegrityCheckState::Atoll(walk.expect("a walk kept across its IO"));
@@ -21160,12 +21251,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // This VACUUM INTO statement itself is the one active root
                 // statement. Any count other than 1 means some other
                 // top-level statement on the same connection is still active.
-                if program
-                    .connection
-                    .n_active_root_statements
-                    .load(Ordering::SeqCst)
-                    != 1
-                {
+                if program.connection.active_root_statements() != 1 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
                     )
@@ -21450,7 +21536,7 @@ where
 {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
         return Ok(atoll
-            .header_in(TxnOf::Statement(atoll_txn), atoll_read)?
+            .header_in(atoll_txn, atoll_read)?
             .map(|header| f(&header)));
     }
     if let Some(mv_store) = mv_store {
@@ -21498,7 +21584,7 @@ fn get_schema_cookie(
     db: usize,
 ) -> IOResultOr<u32> {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
-        return Ok(atoll.schema_cookie_in(TxnOf::Statement(atoll_txn), atoll_read)?);
+        return Ok(atoll.schema_cookie_in(atoll_txn, atoll_read)?);
     }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);

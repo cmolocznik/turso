@@ -110,24 +110,55 @@ pub(super) struct Place {
     generation: u64,
 }
 
-/// A connection, as the identity its operations' tenures carry: one operation of a connection
-/// that comes short takes the place of another of its own suspended in the queue (DESIGN.md
-/// 9.1.3, *Revoking an inactive tenure*).
+/// A transaction of a connection, as the identity its operations' tenures carry. One operation of
+/// a connection that comes short takes the place of another of the same connection's suspended
+/// in the queue, whichever transaction that one is of (DESIGN.md 9.1.3, *Revoking an inactive
+/// tenure*); a transaction's end ends its own suspended places and no other transaction's
+/// (ASYNC1 E1b).
 #[derive(Default)]
 pub(crate) struct Conn {
-    /// Its operations' places in the queue: read alone at a transaction's end, which then has
+    /// Its operations' places in the queue: read alone at its transaction's end, which then has
     /// nothing to cancel when it is 0.
+    live: std::sync::atomic::AtomicUsize,
+    /// The connection it is a transaction of.
+    of: Arc<ConnOf>,
+}
+
+/// A connection, as its transactions' identities share it.
+#[derive(Default)]
+pub(crate) struct ConnOf {
+    /// Its transactions' operations' places in the queue: read alone by a newcomer that came
+    /// short, which then has nothing of its connection's to revoke when it is 0.
     live: std::sync::atomic::AtomicUsize,
 }
 
 impl Conn {
+    /// The first transaction's identity of a connection.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Another transaction's identity of the connection `beside` is of.
+    pub(crate) fn beside(beside: &Conn) -> Arc<Self> {
+        Arc::new(Self {
+            live: std::sync::atomic::AtomicUsize::new(0),
+            of: beside.of.clone(),
+        })
     }
 
     /// Whether any of its operations holds a place in a shortage queue.
     pub(crate) fn queued(&self) -> bool {
         self.live.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Whether any operation of its connection's holds a place in a shortage queue.
+    fn connection_queued(&self) -> bool {
+        self.of.live.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Whether `other` is of its connection.
+    fn same_connection(&self, other: &Conn) -> bool {
+        Arc::ptr_eq(&self.of, &other.of)
     }
 }
 
@@ -202,6 +233,7 @@ impl Queue {
                 .expect("the shortage queue's count of places wrapped");
             if let Some(c) = &conn {
                 c.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                c.of.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
             let tail = s.tail;
             let slot = match s.free {
@@ -535,6 +567,7 @@ impl Queue {
         }
         if let Some(c) = &node.conn {
             c.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            c.of.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
         Released {
             reserved: node.reserved.or(handed),
@@ -579,7 +612,7 @@ impl Queue {
             if s.nodes[i]
                 .conn
                 .as_ref()
-                .is_some_and(|c| Arc::ptr_eq(c, conn))
+                .is_some_and(|c| c.same_connection(conn))
             {
                 found = Some(i);
                 if !s.nodes[i].running {
@@ -607,6 +640,12 @@ impl Queue {
         let old_turn = node.turn.replace(turn.clone());
         node.generation = generation;
         node.running = true;
+        // The place is the newcomer's from here, whichever transaction of the connection it is
+        // of: that transaction's end is the one that cancels it (ASYNC1 E1b).
+        if let Some(old) = node.conn.replace(conn.clone()) {
+            old.live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            conn.live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         let signal = node.signal.replace(notify::remote_wait());
         // The newcomer names its own demand once it holds the gate; a frame handed to this one
         // goes back with `R`.
@@ -938,7 +977,7 @@ impl Owner {
         }
         let queue = &short.pool.shortage;
         let turn = notify::remote_wait();
-        let place = match self.conn.as_ref().filter(|c| c.queued()) {
+        let place = match self.conn.as_ref().filter(|c| c.connection_queued()) {
             Some(conn) => match queue.revoke_for(conn, &turn) {
                 Revoked::Took(place, released) => {
                     released.let_go(&short.pool);
@@ -1664,6 +1703,50 @@ mod tests {
         q.exit(other);
         q.cancel(&d).into_iter().for_each(super::Released::pass);
         assert!(!d.queued() && q.len() == 0);
+    }
+
+    /// Two transactions of one connection (ASYNC1 E1b): a newcomer of one takes the place of the
+    /// other's suspended operation, as of its own connection's; a transaction's end cancels its own
+    /// suspended place and leaves the other transaction's queued.
+    #[test]
+    fn a_newcomer_of_one_transaction_revokes_another_of_its_connection_and_an_end_cancels_its_own()
+    {
+        let q = Queue::default();
+        let x = Conn::new();
+        let y = Conn::beside(&x);
+        let stranger = Conn::new();
+        let held = q.join(notify::remote_wait(), Some(x.clone()));
+        q.exit(held);
+        let new = notify::remote_wait();
+        let (place, released) = match q.revoke_for(&y, &new) {
+            super::Revoked::Took(place, released) => (place, released),
+            _ => panic!("a transaction of the connection did not revoke another's suspended place"),
+        };
+        released.pass();
+        assert!(new.finished() && q.holds_gate(place));
+        assert!(
+            matches!(
+                q.revoke_for(&stranger, &notify::remote_wait()),
+                super::Revoked::None
+            ),
+            "another connection's newcomer revoked this connection's place"
+        );
+        // Y's place, suspended, beside a new suspended place of X's.
+        q.exit(place);
+        let xs = q.join(notify::remote_wait(), Some(x.clone()));
+        q.exit(xs);
+        assert!(x.queued() && y.queued());
+        assert_eq!(
+            q.cancel(&x).len(),
+            1,
+            "X's end did not cancel its own place"
+        );
+        assert!(
+            !x.queued() && y.queued() && q.len() == 1,
+            "X's end cancelled Y's place"
+        );
+        q.cancel(&y).into_iter().for_each(super::Released::pass);
+        assert!(!y.queued() && q.len() == 0);
     }
 
     #[test]

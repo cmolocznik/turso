@@ -698,6 +698,9 @@ fn execute_trigger_commands(
     }
     drop(alloc);
 
+    if !built_subprogram.prepared().lends_in_autocommit {
+        program.mark_runs_in_connections();
+    }
     program.emit_insn(Insn::Program {
         param_registers,
         program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),

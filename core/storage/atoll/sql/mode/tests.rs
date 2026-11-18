@@ -893,9 +893,9 @@ fn a_temporary_tables_rows_take_their_rowids_and_commit_in_temps_pager() {
     );
 }
 
-/// A writer's halt commits the connection's shared autocommit transaction while a sibling
-/// statement still reads: the sibling goes on in a read transaction begun at that commit, to the
-/// end of its rows (DESIGN.md §17, §3).
+/// A writer of the connection commits in a transaction of its own while a sibling statement
+/// reads in its own (ASYNC1 E1b): the sibling reads on to the end of its snapshot, without the
+/// writer's row, and the writer's row is committed.
 #[test]
 fn a_statement_reading_while_a_sibling_writes_reads_on_after_the_writers_commit() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -911,16 +911,10 @@ fn a_statement_reading_while_a_sibling_writes_reads_on_after_the_writers_commit(
     while let Some(row) = next_row(&mut reading) {
         seen.push(row);
     }
-    // As in SQLite, where a scan reads on in the tree its connection's write changed, the row
-    // written past where the reader stood is read.
     assert_eq!(
         seen,
-        [
-            vec![text("x")],
-            vec![text("y")],
-            vec![text("z")],
-            vec![text("w")]
-        ]
+        [vec![text("x")], vec![text("y")], vec![text("z")]],
+        "the reader did not read its own snapshot"
     );
     drop(reading);
     assert_eq!(names(&conn).len(), 4, "the writer's row committed");
@@ -1322,12 +1316,13 @@ fn scan_running(
     seen
 }
 
-/// A whole-table DELETE of another statement of the connection, while a scan stands at one of
-/// the table's rows, replaces the tree under it: the scan reads no row there and goes on to the
-/// end of the new tree, as SQLite's cursor reads NULL once its table is cleared (DESIGN.md §17,
-/// §3, the writer's view).
+/// In autocommit a scan and a whole-table DELETE of another statement of its connection each run
+/// in a transaction of their own (ASYNC1 E1b): the scan reads on in its snapshot, the table as it
+/// was when the scan began, and the DELETE commits, so the connection's next statement reads the
+/// table empty. Inside an explicit transaction the scan reads the connection's own writes
+/// ([`a_scan_reads_the_row_under_it_as_its_connection_left_it`]).
 #[test]
-fn a_scan_reads_no_row_where_its_connection_cleared_the_table() {
+fn a_scan_in_autocommit_reads_its_snapshot_where_its_connection_cleared_the_table() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, "/db/cleared-under");
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -1341,14 +1336,18 @@ fn a_scan_reads_no_row_where_its_connection_cleared_the_table() {
     let seen = scan_running(&mut scan, |_, _| {
         conn.execute("DELETE FROM t1").unwrap();
     });
+    drop(scan);
+    let after = rows(&conn, "SELECT count(*) FROM t1");
     let int = Value::from_i64;
     assert_eq!(
         seen,
         vec![
             vec![Value::Null, int(3), int(4)],
-            vec![Value::Null, int(5), int(6)],
-        ]
+            vec![int(2), int(5), int(6)],
+        ],
+        "the scan did not read its own snapshot"
     );
+    assert_eq!(after, vec![vec![int(0)]], "the DELETE was not committed");
 }
 
 /// In an explicit transaction, a row another statement of the connection deletes under a scan
@@ -3138,7 +3137,10 @@ fn cursors_built() -> u64 {
 }
 
 /// A prepared statement run again takes up the cursors its last run parked, within a transaction
-/// and across transactions, and a read through one reads what the writes put there.
+/// and across transactions, and a read through one reads what the writes put there. Its first run
+/// in autocommit after an explicit transaction builds its cursor once more: the runs inside the
+/// explicit transaction parked it under the connection's transaction, and in autocommit the
+/// statement runs in a transaction of its own (ASYNC1 E1b), which it keeps across its runs.
 #[test]
 fn a_statement_run_again_takes_up_the_cursors_it_parked() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -3157,12 +3159,22 @@ fn a_statement_run_again_takes_up_the_cursors_it_parked() {
         built += cursors_built() - before;
     }
     conn.execute("COMMIT").unwrap();
-    for i in 20..25 {
+    let before = cursors_built();
+    run_with(&mut insert, &row(20));
+    let built_for_its_own = cursors_built() - before;
+    for i in 21..25 {
         let before = cursors_built();
         run_with(&mut insert, &row(i));
         built += cursors_built() - before;
     }
-    assert_eq!(built, 0, "cursors built for the inserts after the first");
+    assert_eq!(
+        built, 0,
+        "cursors built for the inserts after the first of each kind"
+    );
+    assert_eq!(
+        built_for_its_own, 1,
+        "the first insert in a transaction of its own built other than its one cursor"
+    );
     let mut select = conn.prepare("SELECT b FROM t WHERE a = ?").unwrap();
     for i in [3, 17, 24, 3] {
         select
@@ -3371,7 +3383,6 @@ fn a_repolled_wait_owns_one_timer_and_ending_it_releases_the_completion() {
     waiting.over().unwrap();
     let after_end = c.handles();
     drop(waiting);
-    drop(waits);
     assert!(all_parked);
     assert!(
         keys.iter().all(|key| key == &keys[0]),
@@ -3412,7 +3423,6 @@ fn a_changed_completion_replaces_its_timer_at_the_first_waits_deadline() {
     let unbounded_cancelled = waiting.timed.is_none() && new.handles() == 1;
     let first_park_kept = waiting.since == Some(start);
     drop(waiting);
-    drop(waits);
     assert!(
         same_start && new_target,
         "a replacement completion changed its original deadline"
@@ -3442,7 +3452,6 @@ fn dropping_a_wait_cancels_its_timer_without_waiting_for_the_deadline() {
     let mut waiting = Waiting::default();
     drop(waiting.wait::<()>(&waits, c.clone()).unwrap());
     drop(waiting);
-    drop(waits);
     assert_eq!(
         c.handles(),
         1,
@@ -3729,8 +3738,9 @@ fn sibling_place_taken(beat: &dyn Fn()) -> std::result::Result<(), String> {
     }
 }
 
-/// A transaction's end cancels its connection's suspended tenures (DESIGN.md 9.1.3): no sibling
-/// statement keeps the gate past the transaction it served.
+/// A transaction's end cancels the suspended tenures of its statements (DESIGN.md 9.1.3): no
+/// statement keeps the gate past the transaction it served. In autocommit the statement runs in a
+/// transaction of its own (ASYNC1 E1b), and its transaction's end is the one that cancels.
 #[test]
 fn a_transactions_end_cancels_its_connections_suspended_tenures() {
     if let Err(e) = end_cancels() {
@@ -3772,9 +3782,9 @@ fn end_cancels() -> std::result::Result<(), String> {
     if pool.shortage_len() != 1 {
         return Err(format!("{} places queued", pool.shortage_len()));
     }
-    // The transaction ends under the suspended statement.
+    // The statement's transaction ends under it, suspended.
     let ct = conn.atoll().expect("Atoll mode");
-    let ending = ct.end(TxnOf::Connection, false);
+    let ending = ct.end(TxnOf::Statement(insert.atoll_txn_for_test()), false);
     let queued = pool.shortage_len();
     if let Some(mut ending) = ending {
         ending.finish().map_err(|e| e.to_string())?;
@@ -5278,8 +5288,9 @@ fn an_ending_not_over_is_driven_to_its_end_outside_its_connections_place() {
 }
 
 /// A header write that waits behind another connection's write of the same field, its statement
-/// dropped so its transaction ends, leaves no header write under way in its connection, and the
-/// connection's next header write writes its own field (`ConnTxn::let_go_of_ended` lets go of the
+/// dropped so its transaction ends (in autocommit the transaction lent to it, ASYNC1 E1b), leaves
+/// no header write under way in that transaction, and the connection's next header write writes
+/// its own field (`ConnTxn::let_go_of_ended` lets go of the
 /// write under way; mutant `setting-left`: kept, the next write reuses its field and op). A child
 /// of its own.
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
@@ -5302,19 +5313,22 @@ fn a_header_write_waiting_when_its_transaction_ends_leaves_none_under_way() {
             ran_on(&holder, &crash, "PRAGMA user_version = 5").unwrap();
             let mut waiting = writer.prepare("PRAGMA user_version = 7").unwrap();
             let atoll = writer.atoll().expect("an Atoll connection");
+            let mut lent = None;
             let mut steps = 0;
-            while !atoll.header_write_under_way_for_test(atoll.own()) && steps < 100 {
+            while lent.is_none_or(|t| !atoll.header_write_under_way_for_test(t)) && steps < 100 {
                 match waiting.step() {
                     Ok(crate::StepResult::IO) => crash.step().unwrap(),
                     Ok(crate::StepResult::Yield) => crash.step().unwrap(),
                     other => panic!("the waiting write ended: {other:?}"),
                 }
+                lent = atoll.lent_for_test(waiting.atoll_txn_for_test());
                 steps += 1;
             }
-            let under_way = atoll.header_write_under_way_for_test(atoll.own());
+            let lent = lent.expect("the write ran in a transaction of its own");
+            let under_way = atoll.header_write_under_way_for_test(lent);
             // Its statement dropped: its autocommit transaction ends.
             drop(waiting);
-            let left = atoll.header_write_under_way_for_test(atoll.own());
+            let left = atoll.header_write_under_way_for_test(lent);
             ran_on(&holder, &crash, "ROLLBACK").unwrap();
             let next = ran_on(&writer, &crash, "PRAGMA application_id = 9");
             let read = |sql: &str| {
@@ -5784,11 +5798,12 @@ fn a_scan_begun_in_a_transaction_and_finished_after_its_commit_leaves_no_read_be
     assert_eq!(state, (true, crate::connection::TransactionState::None));
 }
 
-/// A scan that read on beside a `CREATE TABLE` whose commit, published, still waits, then dropped
-/// before that ending is done: the read begun for it is ended as it goes, while the ending still
-/// waits, since only the statement ending the transaction is left and it reads in no read of its
-/// own (the auditor's #4443 item 4), and with no ending of its own made beside the one waiting (the
-/// auditor's #4459); the ending then finishes, its table published.
+/// A scan that read on beside a `CREATE TABLE` of its connection whose commit, published, still
+/// waits, then dropped before that ending is done. In autocommit the scan reads in a transaction of
+/// its own (ASYNC1 E1b), so the ending serves it nothing; dropped, it gives its transaction back,
+/// and no ending is made beside the one waiting (the auditor's #4459); the ending then finishes,
+/// its table published. Before E1b the ending served the scan a read of the connection's, which
+/// the scan's drop had to end (the auditor's #4443 item 4).
 #[test]
 fn a_sibling_gone_while_its_connections_commit_waits_releases_its_read_at_once() {
     let crash = Arc::new(crate::io::crash::CrashIO::new(671));
@@ -5808,7 +5823,10 @@ fn a_sibling_gone_while_its_connections_commit_waits_releases_its_read_at_once()
     let mut ender = writer.prepare("CREATE TABLE made(a INTEGER)").unwrap();
     let waited = step_to_ending(&mut ender, &crash, true);
     let second = scan_first(&mut scan, &crash);
-    let served = writer.atoll().unwrap().is_open(TxnOf::Connection);
+    let its_own = writer
+        .atoll()
+        .unwrap()
+        .is_open(TxnOf::Statement(scan.atoll_txn_for_test()));
     let made = crate::storage::atoll::testing::endings_made();
     drop(scan);
     let after_the_sibling = (
@@ -5829,12 +5847,13 @@ fn a_sibling_gone_while_its_connections_commit_waits_releases_its_read_at_once()
     assert_eq!(first, Ok(vec![Value::from_i64(1)]));
     assert_eq!(waited, Ok(()));
     assert_eq!(second, Ok(vec![Value::from_i64(2)]));
-    assert!(served, "no read was begun for the scan");
+    assert!(its_own, "the scan did not read in a transaction of its own");
+    // The one ending the scan's drop makes is its own transaction's, not the connection's: the
+    // connection's own stays the waiting one's alone.
     assert_eq!(
         after_the_sibling,
-        (false, Some("ending"), 0),
-        "the read begun for a scan outlived it while the ending waited, or its end made a second \
-         ending of the connection"
+        (false, Some("ending"), 1),
+        "the scan's drop left the connection's transaction open, or ended other than its own"
     );
     assert_eq!(ended, Ok(()));
     assert_eq!(seen, Ok(()));
@@ -10215,6 +10234,159 @@ mod in_frames {
                 );
             }
 
+            /// A statement that kept the transaction lent to its run in autocommit, stepped inside
+            /// BEGIN after an abort in a frame left the connection's transaction owing its rollback,
+            /// finishes that rollback at its step entry and reads the transaction rolled back. The
+            /// entry settles the transaction whose flag it read, the connection's own: until its
+            /// Transaction instruction gives the lease back, the statement's name is its lent one,
+            /// which owes nothing (ASYNC1 E1b). A child of its own: settled in the lent one, the
+            /// step reads the flag again without end, and the child is killed as hung.
+            #[test]
+            fn a_statement_kept_lent_and_stepped_inside_begin_finishes_the_rollback_its_connection_owes(
+            ) {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_statement_kept_lent_and_stepped_inside_begin_finishes_the_rollback_its_connection_owes"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-kept-lent");
+                        let mut count = conn.prepare("SELECT count(*), sum(a) FROM t").unwrap();
+                        let in_autocommit = stepped_in_frames(&io, &db, &conn, &mut count, 64);
+                        count.reset().unwrap();
+                        let kept = count.holds_atoll_lease_for_test();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        let mut failing = conn
+                            .prepare(
+                                "INSERT INTO t SELECT a + 10, b FROM t UNION ALL SELECT 1, x'ff'",
+                            )
+                            .unwrap();
+                        let failed = stepped_in_frames(&io, &db, &conn, &mut failing, 64);
+                        let recorded = owed(&conn);
+                        let counted = stepped_in_frames(&io, &db, &conn, &mut count, 64);
+                        let after = (owed(&conn), count.holds_atoll_lease_for_test());
+                        drop((failing, count));
+                        conn.execute("COMMIT").unwrap();
+                        let committed = rows(&conn, "SELECT count(*), sum(a) FROM t");
+                        drop((conn, db, io));
+                        assert_eq!(
+                            in_autocommit.out,
+                            Ok(vec![vec![Value::from_i64(0), Value::Null]]),
+                            "the count in autocommit"
+                        );
+                        assert!(kept, "the count kept no lease from its run in autocommit");
+                        assert!(
+                            failed
+                                .out
+                                .as_ref()
+                                .is_err_and(|e| e.contains("UNIQUE") || e.contains("PRIMARY KEY")),
+                            "the failing statement's own error: {:?}",
+                            failed.out
+                        );
+                        assert!(
+                            recorded.is_some_and(|(_, failed)| !failed),
+                            "no rollback owed after an abort in a frame: {recorded:?}"
+                        );
+                        assert_eq!(
+                            counted.out,
+                            Ok(vec![vec![Value::from_i64(3), Value::from_i64(6)]]),
+                            "the kept statement's read inside BEGIN"
+                        );
+                        assert_eq!(
+                            after,
+                            (None, false),
+                            "(the rollback owed, the lease kept) after the kept statement"
+                        );
+                        assert_eq!(
+                            committed,
+                            vec![vec![Value::from_i64(3), Value::from_i64(6)]],
+                            "the rows committed"
+                        );
+                    },
+                );
+            }
+
+            /// A reader lent a transaction in autocommit, stepped on inside BEGIN after a ROLLBACK
+            /// TO in a frame left the connection's own transaction owing its rollback, reads on in
+            /// its own transaction and leaves the rollback to the connection's own statements: its
+            /// step's entry settles nothing, the rollback is still owed after it, and the next
+            /// statement of the connection's own finishes it (ASYNC1 E1b: the entry settled the
+            /// connection's own for any statement, so a lent reader did the members' undo work and
+            /// would meet its failure as its own).
+            #[test]
+            fn a_lent_reader_stepped_while_its_connection_owes_a_rollback_leaves_it_to_the_members()
+            {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_lent_reader_stepped_while_its_connection_owes_a_rollback_leaves_it_to_the_members"
+                    ),
+                    || {
+                        let (io, db, conn) = spilling("/db/owed-lent-reader");
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        let mut reader = conn.prepare("SELECT a FROM t ORDER BY a").unwrap();
+                        let first = loop {
+                            match reader.step() {
+                                Ok(crate::StepResult::Row) => {
+                                    break Ok(reader
+                                        .row()
+                                        .unwrap()
+                                        .get_values()
+                                        .cloned()
+                                        .collect::<Vec<_>>())
+                                }
+                                Ok(crate::StepResult::IO | crate::StepResult::Yield) => {
+                                    let _ = reader._io().step();
+                                }
+                                other => break Err(format!("{other:?}")),
+                            }
+                        };
+                        let lent = reader.atoll_txn_for_test().holds_lent();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        let recorded = owed(&conn);
+                        let settles_before = settles();
+                        let read_on = stepped_in_frames(&io, &db, &conn, &mut reader, 64);
+                        let after_reader = (owed(&conn), settles() - settles_before);
+                        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let counted = stepped_in_frames(&io, &db, &conn, &mut count, 100_000);
+                        let after_member = owed(&conn);
+                        drop((reader, back, count));
+                        conn.execute("COMMIT").unwrap();
+                        drop((conn, db, io));
+                        assert_eq!(first, Ok(vec![Value::from_i64(1)]), "the reader's first row");
+                        assert!(lent, "the reader was not lent a transaction");
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        let serial = recorded
+                            .filter(|(_, failed)| !failed)
+                            .map(|(serial, _)| serial)
+                            .expect("the ROLLBACK TO owed nothing");
+                        assert_eq!(
+                            read_on.out,
+                            Ok(vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]]),
+                            "the lent reader's rows"
+                        );
+                        assert_eq!(
+                            after_reader,
+                            (Some((serial, false)), 0),
+                            "(the rollback owed, the entries that settled one) after the lent reader"
+                        );
+                        assert_eq!(
+                            counted.out,
+                            Ok(vec![vec![Value::from_i64(3)]]),
+                            "the member's count"
+                        );
+                        assert_eq!(after_member, None, "the member left the rollback owed");
+                    },
+                );
+            }
+
             /// A ROLLBACK TO in a frame over a savepoint whose statements spilled parts records the
             /// rollback and returns Done with no IO; the next statement's step entry finishes it,
             /// returning IO while the same owed rollback, its serial, is kept, and the statement reads
@@ -11106,20 +11278,26 @@ mod in_frames {
                 // touch: open or not, changes or not, the snapshot (snapshot isolation), the
                 // statement number, a pending gate take, the failure's identity, the record, and a
                 // nested statement's admission, which reads the pin's registration alone (ASYNC1
-                // D2e (iii-c), #5665).
+                // D2e (iii-c), #5665), and whether a lent transaction given back holds nothing of
+                // a transaction (ASYNC1 E1b). A begin's transaction that stopped with nothing in it,
+                // no snapshot, no write and no command, owes no statement rollback, so ending it
+                // skips none (`end_unbegun`, ASYNC1 E1b).
                 assert_eq!(
                     found["observe"],
                     want(&[
                         "cursor.rs:lock_for_test",
                         "mode.rs:admits_nested",
                         "mode.rs:end_served",
+                        "mode.rs:end_unbegun",
                         "mode.rs:give_up",
                         "mode.rs:is_open",
+                        "mode.rs:left_in_it",
                         "mode.rs:open_savepoint",
                         "mode.rs:owed_failure",
                         "mode.rs:rollback_statement",
                         "mode.rs:serve_sibling",
                         "mode.rs:snapshot",
+                        "mode.rs:take_back",
                         "mode.rs:wrote",
                     ]),
                     "the callers of observe"
@@ -11700,6 +11878,80 @@ mod in_frames {
                         assert_eq!(
                             left,
                             vec![vec![Value::from_i64(0)]],
+                            "rows after the whole rollback"
+                        );
+                    },
+                );
+            }
+
+            /// A member's run of a statement that kept the lease from its run in autocommit meets, at
+            /// its step's entry, the failed rollback its connection's own transaction owes: it fails
+            /// with the failure, and its abort rolls the connection's own back whole, as any member's
+            /// does. The lease goes back as the member's run starts, so its entry and its abort name
+            /// the connection's own (ASYNC1 E1b, FINDING-1's last case: given back at the run's
+            /// Transaction instruction, the abort compared the failure with the lent transaction's,
+            /// and left the failed rollback in the connection's own).
+            #[test]
+            fn a_member_run_that_kept_a_lease_and_meets_a_failed_rollback_rolls_back_whole() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_member_run_that_kept_a_lease_and_meets_a_failed_rollback_rolls_back_whole"
+                    ),
+                    || {
+                        let path = "/db/owed-failed-kept-lease";
+                        let (crash, io, db, conn) = crashing(path, 709);
+                        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+                        let in_autocommit = stepped_in_frames(&io, &db, &conn, &mut count, 64);
+                        count.reset().unwrap();
+                        let kept = count.holds_atoll_lease_for_test();
+                        conn.execute("BEGIN").unwrap();
+                        conn.execute("INSERT INTO t VALUES (1, x'01'), (2, x'02'), (3, x'03')")
+                            .unwrap();
+                        conn.execute("SAVEPOINT sp").unwrap();
+                        big(&conn, 100, 100);
+                        let mut back = conn.prepare("ROLLBACK TO sp").unwrap();
+                        let rolled = stepped_in_frames(&io, &db, &conn, &mut back, 64);
+                        reads_fail(&crash, Some(path));
+                        let (at_failure, _) = parked_on_a_failure(&io, &db, &conn, &mut count);
+                        clear_faults(&crash);
+                        let met = stepped_outside(&mut count);
+                        let after = (
+                            owed(&conn),
+                            conn.get_auto_commit(),
+                            count.holds_atoll_lease_for_test(),
+                            failure_of(&db),
+                        );
+                        drop((back, count));
+                        let left = conn
+                            .prepare("SELECT count(*) FROM t")
+                            .and_then(|mut stmt| stmt.run_collect_rows())
+                            .map_err(|e| e.to_string());
+                        drop((conn, db, io, crash));
+                        assert_eq!(
+                            in_autocommit.out,
+                            Ok(vec![vec![Value::from_i64(0)]]),
+                            "the count in autocommit"
+                        );
+                        assert!(kept, "the count kept no lease from its run in autocommit");
+                        assert_eq!(rolled.out, Ok(vec![]), "the ROLLBACK TO");
+                        assert!(
+                            at_failure.is_some_and(|(_, f)| !f),
+                            "the rollback was not still owed and rolling at the failed wait: {at_failure:?}"
+                        );
+                        assert!(
+                            met.is_err(),
+                            "the statement that met the failure did not fail: {met:?}"
+                        );
+                        assert_eq!(
+                            after,
+                            (None, true, false, None),
+                            "(the rollback owed, autocommit, the lease kept, the database's failure) \
+                             after the member met the failure"
+                        );
+                        assert_eq!(
+                            left,
+                            Ok(vec![vec![Value::from_i64(0)]]),
                             "rows after the whole rollback"
                         );
                     },
@@ -13196,6 +13448,12 @@ mod in_frames {
         );
 
         /// A database opened async with `slots` transaction slots, and a table `t` of two rows.
+        /// A read of `t` that runs in the connection's own transaction in autocommit, so it meets
+        /// the connection's pin: its table-valued pragma keeps it from being lent a transaction of
+        /// its own (ASYNC1 E1b). Its count is `t`'s rows, as `SELECT count(*) FROM t`'s.
+        const READS_IN_THE_CONNECTIONS: &str =
+            "SELECT count(*) FROM t, pragma_table_info('t') WHERE cid = 0";
+
         fn slotted(path: &str, slots: usize) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let mut cfg = config();
@@ -13721,7 +13979,7 @@ mod in_frames {
                         !conn.is_nested_stmt(),
                         "a helper between its calls left its connection nested"
                     );
-                    let mut unrelated = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let mut unrelated = conn.prepare(READS_IN_THE_CONNECTIONS).unwrap();
                     let stepped = {
                         let _frame = Frame::enter();
                         unrelated.step()
@@ -13740,7 +13998,13 @@ mod in_frames {
                         let _frame = Frame::enter();
                         permitted.step()
                     };
-                    drop((unrelated, permitted, helper));
+                    // A statement lent a transaction of its own reads beside the pin (ASYNC1 E1b).
+                    let mut lent = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let beside = {
+                        let _frame = Frame::enter();
+                        lent.step()
+                    };
+                    drop((unrelated, permitted, lent, helper));
                     conn.finish_release(atoll.release_pin(TxnOf::Connection, &mut hold))
                         .unwrap();
                     assert!(
@@ -13755,6 +14019,10 @@ mod in_frames {
                     assert!(
                         matches!(read, Ok(crate::StepResult::Row)),
                         "the permitted statement did not read on: {read:?}"
+                    );
+                    assert!(
+                        matches!(beside, Ok(crate::StepResult::Row)),
+                        "a statement in a transaction of its own waited on the pin: {beside:?}"
                     );
                 },
             );
@@ -14200,7 +14468,7 @@ mod in_frames {
                     let Ok(IOResult::IO(IOCompletions(slot))) = once(&conn, &mut state) else {
                         panic!("the pin's begin did not wait for a slot");
                     };
-                    let mut reader = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let mut reader = conn.prepare(READS_IN_THE_CONNECTIONS).unwrap();
                     // The begin's own look, in a frame: the wait it returns, whether it was already
                     // finished, and the pin's phase wait.
                     let look = || {
@@ -14556,7 +14824,7 @@ mod in_frames {
                 || {
                     let (io, db, conn) = slotted("/db/pin-inside", 4);
                     let unrelated = std::rc::Rc::new(std::cell::RefCell::new(
-                        conn.prepare("SELECT count(*) FROM t").unwrap(),
+                        conn.prepare(READS_IN_THE_CONNECTIONS).unwrap(),
                     ));
                     let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
                     let (inner, record, inner_conn) =
@@ -15932,6 +16200,10 @@ mod reparse_view_taken_by_an_end {
     use std::time::Duration;
 
     type Pin = (u64, PinPhase, Option<ViewId>, bool);
+    /// A read of the main database's `t` that runs in the connection's own transaction in
+    /// autocommit, where the reparse joins it: its table-valued pragma keeps it from being lent a
+    /// transaction of its own (ASYNC1 E1b). Its rows are `t`'s.
+    const MAIN_IN_THE_CONNECTIONS: &str = "SELECT a FROM t, pragma_table_info('t') WHERE cid = 0";
 
     fn pin_of(conn: &Arc<Connection>) -> Option<Pin> {
         conn.atoll().unwrap().own().cell.pin_for_test()
@@ -16027,7 +16299,7 @@ mod reparse_view_taken_by_an_end {
         let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
 
         if kind == Kind::Control {
-            let mut reader = conn.prepare("SELECT a FROM t").unwrap();
+            let mut reader = conn.prepare(MAIN_IN_THE_CONNECTIONS).unwrap();
             let first = reader.step();
             if !matches!(first, Ok(crate::StepResult::Row)) {
                 o.fixture = Some(format!("the reader's first step: {first:?}"));
@@ -16050,7 +16322,7 @@ mod reparse_view_taken_by_an_end {
             drop(reader);
         } else {
             let sql: &'static str = match kind {
-                Kind::ReaderHalt => "SELECT a FROM t",
+                Kind::ReaderHalt => MAIN_IN_THE_CONNECTIONS,
                 Kind::RollbackDdl => "ROLLBACK",
                 _ => "SELECT a FROM tt",
             };
@@ -16359,9 +16631,10 @@ mod reparse_failed_in_its_build {
     }
 }
 
-/// A connection has one transaction of its own, made once with the connection: statements in
-/// autocommit, an explicit transaction, a savepoint, a pragma's scan, a schema change and a
-/// reset make no other.
+/// A connection has one transaction of its own, made once with the connection, and makes one more
+/// to lend only when a statement in autocommit begins while every one it made to lend is held
+/// (ASYNC1 E1b): an explicit transaction, a savepoint, a pragma's scan, a schema change and a reset
+/// make none, and statements in autocommit run one after another all take the one it lent first.
 #[test]
 fn a_connection_makes_one_transaction_whatever_its_statements_do() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -16390,6 +16663,12 @@ fn a_connection_makes_one_transaction_whatever_its_statements_do() {
     drop(reset);
     let seen = rows(&other, "SELECT count(*) FROM t");
     let with_their_statements = made() - before;
+    for i in 10..20 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'again')"))
+            .unwrap();
+        rows(&conn, "SELECT count(*) FROM t");
+    }
+    let with_twenty_more = made() - before;
     drop((conn, other, db));
     assert_eq!(
         with_the_connections, 2,
@@ -16398,8 +16677,12 @@ fn a_connection_makes_one_transaction_whatever_its_statements_do() {
     assert_eq!(scanned, 2);
     assert_eq!(seen, vec![vec![Value::from_i64(3)]]);
     assert_eq!(
-        with_their_statements, 2,
-        "a statement made its connection another transaction"
+        with_their_statements, 4,
+        "transactions made but each connection's own and one each to lend"
+    );
+    assert_eq!(
+        with_twenty_more, 4,
+        "a statement in autocommit made its connection another transaction to lend"
     );
 }
 
@@ -16629,6 +16912,8 @@ fn rows_lost_after_a_close_and_an_open(path: &str, size: usize, rows: i64) -> Ve
     lost
 }
 
+#[cfg(all(unix, not(miri)))]
+mod lent;
 #[cfg(all(unix, not(miri)))]
 mod nested_by_call;
 #[cfg(all(unix, not(miri)))]

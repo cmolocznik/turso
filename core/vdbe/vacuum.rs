@@ -1888,7 +1888,7 @@ fn vacuum_in_place_step(
                     .into());
                 }
                 // 2. No other active root statements on this connection.
-                if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
+                if connection.active_root_statements() != 1 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
                     )

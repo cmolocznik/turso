@@ -291,6 +291,7 @@ pub fn translate_create_trigger(
 
     // Parse schema to load the new trigger
     let escaped_trigger_name = escape_sql_string_literal(&mangled_trigger_name);
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(

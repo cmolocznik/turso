@@ -161,6 +161,7 @@ pub fn emit_sequence_backing_table(
 
     // ParseSchema to add the backing table to Schema.tables
     let escaped = escape_sql_string_literal(&backing_table_name);
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped}'")),

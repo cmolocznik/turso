@@ -298,6 +298,7 @@ pub fn translate_create_materialized_view(
         .map(|name| format!("name = '{name}'"))
         .collect::<Vec<_>>()
         .join(" OR ");
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(where_clause),
@@ -461,6 +462,7 @@ pub fn translate_create_view(
 
     // Parse schema to load the new view
     let escaped_view_name = escape_sql_string_literal(&stored_view_name);
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),

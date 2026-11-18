@@ -790,11 +790,17 @@ pub struct Connection {
     /// This is currently only 0 or 1. We return Busy instead of allowing a
     /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
-    /// Number of active root statements currently executing on this connection.
-    /// This is Turso's equivalent of SQLite's top-level active-VDBE count
-    /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
-    /// subprogram execution.
-    pub(crate) n_active_root_statements: AtomicI32,
+    /// Two counts, changed together by one read-modify-write as a root statement's run starts and
+    /// as it is released: in the low 32 bits, the active root statements currently executing on
+    /// this connection, Turso's equivalent of SQLite's top-level active-VDBE count
+    /// (`db->nVdbeActive`) for user statements, excluding internal helpers and subprogram
+    /// execution ([`Self::active_root_statements`]); in the high 32 bits, how many of them run in
+    /// the connection's own Atoll transaction, its members (ASYNC1 E1b): the explicit
+    /// transaction's statements, and those that do not lend in autocommit. A statement in a
+    /// transaction lent to it is not one ([`Self::atoll_members`]).
+    pub(crate) n_active_root_statements: AtomicI64,
+    /// Endings of lent Atoll transactions under way (ASYNC1 E1b): a close is refused while one is.
+    pub(crate) atoll_lent_endings: AtomicU32,
     /// How many of `n_active_root_statements` are parked incremental blob
     /// handles. A blob handle keeps a Root statement open from `blob_open`
     /// until close, but between blob operations it just sits on its row, so
@@ -925,7 +931,20 @@ impl Connection {
     }
 
     pub fn has_active_root_statement(&self) -> bool {
-        self.n_active_root_statements.load(Ordering::SeqCst) > 0
+        self.active_root_statements() > 0
+    }
+
+    /// The active root statements (`n_active_root_statements`' low half).
+    #[inline]
+    pub(crate) fn active_root_statements(&self) -> i32 {
+        self.n_active_root_statements.load(Ordering::SeqCst) as i32
+    }
+
+    /// The root statements running in the connection's own Atoll transaction
+    /// (`n_active_root_statements`' high half).
+    #[inline]
+    pub(crate) fn atoll_members(&self) -> i32 {
+        (self.n_active_root_statements.load(Ordering::SeqCst) >> 32) as i32
     }
 
     pub(crate) fn hooks(&self) -> Option<&dyn ConnectionHooks> {
@@ -1536,7 +1555,7 @@ impl Connection {
             // Atoll mode (DESIGN.md §17): the committed cookie, and a reparse through SQL whose
             // statements begin and end their own Atoll transactions. A newer schema it labels
             // with the older cookie costs one more reparse, never a stale schema (R31).
-            if self.db.schema.lock().schema_version == atoll.schema_cookie(TxnOf::Connection)? {
+            if self.db.schema.lock().schema_version == atoll.committed_schema_cookie() {
                 return Ok(());
             }
             self.reparse_schema()?;
@@ -2983,12 +3002,16 @@ impl Connection {
     /// [`Self::atoll_end`]: a close holds it.
     pub(crate) const END_CLOSING: u8 = 2;
 
-    /// Whether another statement of the connection is ending its Atoll transaction, `ender` saying
-    /// whether the asker began that ending: the transaction is that statement's, and the asker,
-    /// reading on beside it, holds no part of it to end or roll back (DESIGN.md §17).
+    /// Whether another statement of the connection is ending its own Atoll transaction, which
+    /// the statement whose state is `state` reads in: the transaction is that statement's, and
+    /// this one, reading on beside it, holds no part of it to end or roll back (DESIGN.md §17).
+    /// One that began that ending, and one in a lent transaction, which reads in nothing of the
+    /// connection's, are not.
     #[inline]
-    pub(crate) fn atoll_ending_elsewhere(&self, ender: bool) -> bool {
-        !ender && self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING
+    pub(crate) fn atoll_ending_elsewhere(&self, state: &crate::vdbe::ProgramState) -> bool {
+        self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING
+            && !state.ending_begun()
+            && !state.atoll_txn.holds_lent()
     }
 
     /// Close a connection and checkpoint.
@@ -3016,6 +3039,15 @@ impl Connection {
             }
             // Another close holds it.
             Err(_) => return Ok(()),
+        }
+        // So is a lent transaction a statement has begun to end (ASYNC1 E1b). An ending counted
+        // after this load sees the close's word and is refused (`EndingBegun::new`).
+        if self.atoll_lent_endings.load(Ordering::SeqCst) != 0 {
+            self.atoll_end.store(Self::END_FREE, Ordering::SeqCst);
+            return Err(LimboError::StatementsInProgress(
+                "a statement is ending its transaction: step it to its end, reset it or drop it \
+                 before closing",
+            ));
         }
         self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
@@ -3720,6 +3752,33 @@ impl Connection {
         if schema_did_change {
             *self.schema.write() = self.db.clone_schema();
             self.bump_prepare_context_generation();
+        }
+    }
+
+    /// After a statement rolled back the connection's own Atoll transaction, the other members
+    /// still reading in it go on in a read transaction begun now, which sees what the rollback left
+    /// and ends with the last of them, as after a commit (DESIGN.md §17). `ender_member`: whether
+    /// the statement that rolled it back counts among the members.
+    pub(crate) fn serve_atoll_members_after_rollback(&self, ender_member: bool) {
+        let Some(atoll) = self.atoll.as_ref() else {
+            return;
+        };
+        if self.atoll_members() <= i32::from(ender_member) || atoll.is_open(TxnOf::Connection) {
+            return;
+        }
+        let io = self.db.io.clone();
+        match crate::storage::atoll::drive(&io, || {
+            atoll.begin(
+                TxnOf::Connection,
+                crate::storage::atoll::sql::mode::Begin::Read,
+            )
+        }) {
+            Ok(()) => {
+                atoll.mark_served();
+                self.set_tx_state(TransactionState::Read);
+            }
+            // The members then fail at their next step, with no transaction to read in.
+            Err(e) => tracing::error!("the read for an Atoll transaction's members failed: {e}"),
         }
     }
 
@@ -5200,7 +5259,7 @@ impl Connection {
     /// Request interruption of currently running root statements on this connection.
     /// If no root statement is active, the request is ignored to match SQLite semantics.
     pub fn interrupt(&self) {
-        if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+        if self.active_root_statements() > 0 {
             self.interrupt_requested.store(true, Ordering::SeqCst);
         }
     }
@@ -5222,7 +5281,9 @@ impl Connection {
         };
         let ender_only =
             remaining == 1 && self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING;
-        if !(remaining == 0 || ender_only) || !atoll.end_served(TxnOf::Connection) {
+        if !(remaining == 0 || ender_only)
+            || !atoll.end_served(crate::storage::atoll::sql::mode::Own)
+        {
             return;
         }
         if remaining == 0 {
@@ -5230,9 +5291,49 @@ impl Connection {
         }
     }
 
+    /// A statement that stops waiting for Atoll's write gate gives up the take it left pending
+    /// (R15) and leaves no transaction its begin opened, having begun nothing: one that is its to
+    /// end it rolls back ([`ends_at_give_up`](Self::ends_at_give_up)); while no statement of the
+    /// connection has begun the connection's own (its state none, as inside a BEGIN no statement
+    /// has run in yet), what the begin left there is ended and the BEGIN stays open (ASYNC1 E1b).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn give_up_atoll_begin(
+        &self,
+        pager: &Arc<Pager>,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
+        member: bool,
+    ) {
+        let Some(atoll) = self.atoll() else {
+            return;
+        };
+        atoll.give_up(statement);
+        if self.ends_at_give_up(statement, member) {
+            self.rollback_current_txn_state(pager, true, TxnOf::Statement(statement));
+        } else if self.get_tx_state() == TransactionState::None {
+            atoll.end_unbegun(statement);
+        }
+    }
+
+    /// Whether a statement that gave up its take of Atoll's write gate, having written nothing,
+    /// ends the transaction its begin opened: a lent one is its own; the connection's own is its
+    /// to end in autocommit, outside a nested statement, when no other statement of the
+    /// connection is a member of it (`member`: whether this one counts among them). No later
+    /// statement shares a transaction to end it (ASYNC1 E1b).
+    pub(crate) fn ends_at_give_up(
+        &self,
+        statement: &crate::storage::atoll::sql::mode::StatementTxn,
+        member: bool,
+    ) -> bool {
+        statement.holds_lent()
+            || (self.get_auto_commit()
+                && !self.is_nested_stmt()
+                && self.atoll_members() == i32::from(member))
+    }
+
     /// Clear the connection interrupt once no root statements remain active.
     pub(crate) fn clear_interrupt_if_idle(&self) {
-        if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
+        if self.active_root_statements() == 0 {
             self.interrupt_requested.store(false, Ordering::SeqCst);
         }
     }
@@ -5250,6 +5351,20 @@ impl Connection {
         if activity.exclusive != Exclusive::None {
             return Err(activity.exclusive.refusal());
         }
+        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// [`Self::start_root_statement`] in Atoll mode, for a run that takes part as `atoll_run`
+    /// says: its count carries a member's.
+    pub(crate) fn start_atoll_root_statement(
+        &self,
+        atoll_run: crate::vdbe::AtollRun,
+    ) -> Result<()> {
+        let activity = self.statement_activity.lock();
+        if activity.exclusive != Exclusive::None {
+            return Err(activity.exclusive.refusal());
+        }
         // A statement ending the connection's transaction finishes it before another begins: one
         // starting meanwhile would begin a transaction, or end or roll back one, under it (the
         // auditor's #4423, #4425). It is refused, changing nothing.
@@ -5259,7 +5374,8 @@ impl Connection {
                  or drop it before starting another",
             ));
         }
-        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        self.n_active_root_statements
+            .fetch_add(atoll_run.root_count(), Ordering::SeqCst);
         Ok(())
     }
 
@@ -5283,9 +5399,7 @@ impl Connection {
         admit: impl FnOnce() -> Result<T>,
     ) -> Result<(T, IntegrityWalkGuard)> {
         let mut activity = self.statement_activity.lock();
-        if activity.exclusive == Exclusive::Checkpoint
-            || self.n_active_root_statements.load(Ordering::SeqCst) != 1
-        {
+        if activity.exclusive == Exclusive::Checkpoint || self.active_root_statements() != 1 {
             return Err(LimboError::StatementsInProgress(
                 "an integrity check while another statement of this connection is active, in a \
                  cooperative frame",
@@ -5320,8 +5434,8 @@ impl Connection {
         // next blob operation after the checkpoint's cache clear. Counting
         // them would make one open blob handle block every explicit
         // checkpoint until it is closed.
-        let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
-            - self.n_active_blob_statements.load(Ordering::SeqCst);
+        let active_non_blob =
+            self.active_root_statements() - self.n_active_blob_statements.load(Ordering::SeqCst);
         if activity.exclusive != Exclusive::None || active_non_blob != statements_expected {
             return Err(LimboError::StatementsInProgress(
                 "cannot checkpoint while another statement is active",
@@ -5338,6 +5452,17 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
+    /// Whether the connection's own transaction holds a schema change not yet committed (its state
+    /// `Write` with `schema_did_change`), read without decoding the state.
+    #[inline]
+    pub(crate) fn holds_uncommitted_schema_change(&self) -> bool {
+        self.transaction_state.0.load(Ordering::SeqCst)
+            == AtomicTransactionState::to_storage(&TransactionState::Write {
+                schema_did_change: true,
+            })
+    }
+
+    #[inline(always)]
     pub(crate) fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
@@ -5780,6 +5905,14 @@ impl Connection {
         clear_attached_schemas: bool,
         which: TxnOf<'_>,
     ) {
+        if let TxnOf::Statement(statement) = which {
+            if statement.holds_lent() {
+                // A lent transaction is its statement's alone: its rollback ends it and touches
+                // nothing of the connection's (ASYNC1 E1b).
+                self.rollback_lent_atoll(statement);
+                return;
+            }
+        }
         if let Some(mv_store) = self.mv_store().as_ref() {
             if let Some(tx_id) = self.get_mv_tx_id() {
                 self.auto_commit.store(true, Ordering::SeqCst);
@@ -5807,6 +5940,19 @@ impl Connection {
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
         self.transaction_changes.clear();
+    }
+
+    /// Rolls back the transaction lent to `statement`, driven to its end: it changed nothing of
+    /// the connection's (`PreparedProgram::lends_in_autocommit`'s statements).
+    fn rollback_lent_atoll(&self, statement: &crate::storage::atoll::sql::mode::StatementTxn) {
+        let Some(atoll) = self.atoll.as_ref() else {
+            return;
+        };
+        if let Some(mut ending) = atoll.end(TxnOf::Statement(statement), false) {
+            if let Err(e) = ending.finish() {
+                tracing::error!("rolling back a lent Atoll transaction failed: {e}");
+            }
+        }
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

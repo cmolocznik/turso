@@ -123,14 +123,17 @@ fn framed_with_the_io_thread_held(
 }
 
 /// What a writer shows at a stop: whether the connection has a registered writer, whether the
-/// statement's write has begun, and whether the connection's transaction state is open.
+/// statement's write has begun, and whether the statement's transaction is open (a lent one in
+/// autocommit, ASYNC1 E1b; else the connection's own).
 fn at_stop(conn: &Arc<Connection>, stmt: &crate::Statement) -> (bool, bool, bool) {
     (
         conn.n_active_writes
             .load(std::sync::atomic::Ordering::SeqCst)
             == 1,
         stmt.write_begun_for_test(),
-        !matches!(conn.get_tx_state(), crate::TransactionState::None),
+        conn.atoll()
+            .unwrap()
+            .is_open(TxnOf::Statement(stmt.atoll_txn_for_test())),
     )
 }
 
@@ -299,9 +302,10 @@ fn a_writer_that_came_back_busy_lets_a_second_writer_of_its_connection_run() {
     );
 }
 
-/// The first matrix's shape (#5955): X Busy; a SELECT of its connection, which reads in the
-/// transaction X's begin left in the cell and ends it at its halt; the other commits; X stepped
-/// again begins afresh, ends Done, and is committed: the other connection reads its table.
+/// The first matrix's shape (#5955): X Busy, which ends the transaction its begin opened (ASYNC1
+/// E1b: no later statement shares it to end it); a SELECT of its connection, in a transaction of
+/// its own; the other commits; X stepped again begins afresh, ends Done, and is committed: the
+/// other connection reads its table.
 #[test]
 fn a_writer_busy_then_a_select_then_stepped_again_is_done_and_committed() {
     crate::storage::atoll::testing::cleanly(
@@ -331,14 +335,16 @@ fn a_writer_busy_then_a_select_then_stepped_again_is_done_and_committed() {
             drop((conn, other, db));
             assert_eq!(set, "Ok([(), (), ()])");
             assert_eq!(busy, "Busy");
-            // Until each autocommit statement has a transaction of its own (E1b), the transaction
-            // the Busy statement's begin opened stays in the cell with nobody in it.
-            assert_eq!(after_busy, (true, true));
+            assert_eq!(
+                after_busy,
+                (false, true),
+                "the Busy statement left the transaction its begin opened"
+            );
             assert_eq!(read, "[[Numeric(Integer(0))]]");
             assert_eq!(
                 after_read,
                 (false, true),
-                "the SELECT did not end the transaction the Busy statement left"
+                "the SELECT left the connection's transaction open"
             );
             assert_eq!(committed, Ok(()));
             assert_eq!(finished, "Done");
@@ -776,11 +782,11 @@ fn a_writer_reset_between_its_begin_and_its_write_ends_the_transaction_it_began(
     );
 }
 
-/// The same reset with a reader of the connection standing at a row in the writer's transaction:
-/// the writer, which has changed nothing, leaves the transaction to the reader, which reads on
-/// to its end and ends it there. The connection's next write is committed at its halt, and
-/// another connection reads it. Ended under the reader, the reader's next step failed with "an
-/// Atoll cursor used outside a transaction" (mutant `unbegun-writer-ends-under-a-reader`).
+/// The same reset with a reader of the connection standing at a row: each runs in a transaction
+/// of its own (ASYNC1 E1b). The writer's reset ends the writer's, which changed nothing, and the
+/// reader reads on in its own to its end. The connection's next write is committed at its halt,
+/// and another connection reads it. A reset that ended the reader's transaction would fail the
+/// reader's next step with "an Atoll cursor used outside a transaction".
 #[test]
 fn a_writer_reset_between_its_begin_and_its_write_leaves_a_reader_its_transaction() {
     crate::storage::atoll::testing::cleanly(
@@ -819,7 +825,7 @@ fn a_writer_reset_between_its_begin_and_its_write_leaves_a_reader_its_transactio
                         let shown = at_stop(&conn, &x);
                         stops.push(shown);
                         if shown == (true, false, true) {
-                            // The reader joins the writer's transaction and stands at its first row.
+                            // The reader, in a transaction of its own, stands at its first row.
                             let first = loop {
                                 match y.step() {
                                     Ok(crate::StepResult::IO) => {
@@ -837,8 +843,10 @@ fn a_writer_reset_between_its_begin_and_its_write_leaves_a_reader_its_transactio
                                 }
                             };
                             let reset = x.reset().map_err(|e| e.to_string());
-                            let open_after =
-                                !matches!(conn.get_tx_state(), crate::TransactionState::None);
+                            let open_after = conn
+                                .atoll()
+                                .unwrap()
+                                .is_open(TxnOf::Statement(y.atoll_txn_for_test()));
                             beside = Some((first, reset, open_after, at_stop(&conn, &x)));
                             break;
                         }
@@ -868,9 +876,9 @@ fn a_writer_reset_between_its_begin_and_its_write_leaves_a_reader_its_transactio
             assert!(chilled, "a request still outstanding before the eviction");
             assert_eq!(
                 beside,
-                Some(("Row".to_string(), Ok(()), true, (false, false, true))),
-                "a writer reset between its begin and its write ended the transaction under a reader \
-                 at a row, or stayed registered (its stops {stops:?}, then {ended})"
+                Some(("Row".to_string(), Ok(()), true, (false, false, false))),
+                "a writer reset between its begin and its write ended the reader's transaction, \
+                 left its own open, or stayed registered (its stops {stops:?}, then {ended})"
             );
             assert_eq!(
                 rest, "Done",

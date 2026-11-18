@@ -24,6 +24,7 @@ pub fn translate_tx_begin(
         TransactionType::Deferred => {
             // SQLite emits only AutoCommit for deferred — no
             // Transaction opcodes at all (for any database).
+            program.mark_runs_in_connections();
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -55,6 +56,7 @@ pub fn translate_tx_begin(
                     schema_cookie: cookie,
                 });
             }
+            program.mark_runs_in_connections();
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -66,6 +68,7 @@ pub fn translate_tx_begin(
             // Like SQLite's begin-concurrent, BEGIN CONCURRENT is a deferred
             // transaction: nothing is opened here, and the first statement
             // materializes the MVCC transaction in concurrent mode.
+            program.mark_runs_in_connections();
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -101,6 +104,7 @@ pub fn translate_tx_commit(
         emit_cdc_explicit_commit_insns(program, schema, resolver)?;
     }
 
+    program.mark_runs_in_connections();
     program.emit_insn(Insn::AutoCommit {
         auto_commit: true,
         rollback: false,

@@ -44,6 +44,14 @@ impl VirtualTable {
         }
     }
 
+    /// Whether a cursor of the table can step a statement of its connection: a pragma's table
+    /// runs its pragma, and an extension's cursor is handed the connection
+    /// (`turso_ext::VTabModule::open`), through which it may prepare and step one. Turso's own
+    /// tables (`json_each`, `json_tree`, the types list, the page dumps) step none.
+    pub(crate) fn can_step_a_statement(&self) -> bool {
+        !matches!(self.vtab_type, VirtualTableType::Internal(_))
+    }
+
     /// Whether the table is a table-valued form of the integrity check, whose rows a walk of the
     /// database's pages finds.
     pub(crate) fn checks_pages(&self) -> bool {

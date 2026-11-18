@@ -28,7 +28,7 @@ use super::header::{Field, Header};
 use super::key;
 use super::lifecycle::Destroy;
 use super::rowid::{Counter, Seed};
-use super::wait::{graph, Edge, GroupId, Seat, WaitRecord};
+use super::wait::{graph, Edge, GroupId, WaitRecord};
 use super::AtollDb;
 use crate::io::FileSyncType;
 use crate::io::{Completion, OpenFlags, IO};
@@ -252,7 +252,6 @@ fn words_of(header: &DatabaseHeader) -> [u32; 7] {
 /// it comes back `Busy`. The edge stays published across `Busy`, so callers that retry in place
 /// still close a cycle, until the wait ends, its statement lets it go or its transaction ends.
 pub(super) struct Waits {
-    seat: Mutex<Option<Seat>>,
     /// A wait's bound in nanoseconds: 0 comes back `Busy` at once, [`UNBOUNDED`] never does.
     bound: AtomicU64,
     /// Whether the last wait came back `Busy` having waited its bound, which the busy handler
@@ -266,7 +265,6 @@ const UNBOUNDED: u64 = u64::MAX;
 impl Waits {
     fn new() -> Self {
         Self {
-            seat: Mutex::new(Some(graph().seat())),
             bound: AtomicU64::new(0),
             spent: AtomicBool::new(false),
         }
@@ -281,8 +279,7 @@ impl Waits {
         if group != 0 {
             return group;
         }
-        let seat = self.seat.lock();
-        let group = graph().begin(seat.as_ref().expect("a seat until the connection closes"));
+        let group = graph().begin(cell.seat());
         word.store(group, Ordering::Release);
         group
     }
@@ -293,15 +290,6 @@ impl Waits {
         let group = cell.group().swap(0, Ordering::AcqRel);
         if group != 0 {
             graph().end(group);
-        }
-    }
-}
-
-impl Drop for Waits {
-    fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
-        if let Some(seat) = self.seat.lock().take() {
-            graph().unseat(seat);
         }
     }
 }
@@ -646,14 +634,22 @@ pub(in crate::storage::atoll) struct SqlTxn {
     /// statement of the connection meets it steps it, the one that began it to its end, a
     /// sibling still reading until its commit is published.
     ending: Mutex<Option<Ending>>,
+    /// How many times a statement gave it back, which a debug build compares with the count a
+    /// statement's name was lent at ([`StatementTxn::lease`]).
+    #[cfg(debug_assertions)]
+    given_back: AtomicU64,
 }
 
 impl SqlTxn {
-    fn new() -> Self {
+    /// A connection's own transaction, or with `beside`, another of the connection it is of.
+    fn new(beside: Option<&SqlTxn>) -> Self {
         #[cfg(test)]
         SQL_TXNS_MADE.with(|n| n.set(n.get() + 1));
         Self {
-            cell: super::cursor::TxnSlot::new(None),
+            cell: match beside {
+                None => super::cursor::TxnSlot::new(None),
+                Some(own) => super::cursor::TxnSlot::beside(&own.cell),
+            },
             written: Mutex::new(Vec::new()),
             setting: Mutex::new(None),
             taking: Mutex::new(None),
@@ -661,14 +657,133 @@ impl SqlTxn {
             changes: Arc::new(TreeChanges::new()),
             stamped: Arc::new(Mutex::new(HashMap::default())),
             ending: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            given_back: AtomicU64::new(0),
+        }
+    }
+
+    /// What of a transaction is left in it, the first found, or None: a transaction in its cell, a
+    /// wait group, an ending in its place, a header write or a gate take under way, a header field
+    /// written, a stamp. What a statement gives back holds none ([`ConnTxn::take_back`]).
+    #[cfg(debug_assertions)]
+    fn left_in_it(&self) -> Option<&'static str> {
+        if self.cell.observe().is_some() {
+            Some("a transaction in its cell")
+        } else if self.cell.group().load(Ordering::Acquire) != 0 {
+            Some("a group in the wait graph")
+        } else if self.ending.lock().is_some() {
+            Some("an ending in its place")
+        } else if self.setting.lock().is_some() {
+            Some("a header write under way")
+        } else if self.taking.lock().is_some() {
+            Some("a take of the write gate under way")
+        } else if !self.written.lock().is_empty() {
+            Some("a header field written")
+        } else if !self.stamped.lock().is_empty() {
+            Some("a tree's stamp")
+        } else {
+            None
         }
     }
 }
 
-/// What a statement holds of the transaction it runs in, in its own state: nothing yet, while a
-/// connection has one transaction. [`TxnOf::Statement`] names that transaction by it.
+/// What a statement holds of the transaction it runs in, in its own state: a transaction its
+/// connection lent it ([`ConnTxn::lend`]), or nothing while it runs in the connection's own.
+/// [`TxnOf::Statement`] names that transaction by it. A copy names the same transaction for what
+/// runs inside the statement (a trigger's subprogram, an index method's cursor); only the
+/// statement it was lent to gives it back, which its state records beside it
+/// (`ProgramState::atoll_lease`). It owns nothing: the connection keeps every transaction it
+/// lends until it is dropped, so a copy or a drop of the name changes no count.
 #[derive(Default, Clone)]
-pub struct StatementTxn(());
+pub struct StatementTxn {
+    /// The transaction the connection lent the statement, if one: its first to lend
+    /// (`Transactions::first`) or one of its list (`Lendable::every`).
+    lent: Option<Resolved>,
+    /// The transaction the name resolves to now: the lent one, or the connection's own. Set by the
+    /// only places that change which it is ([`ConnTxn::adopt`], [`ConnTxn::lend`],
+    /// [`ConnTxn::take_back`]), so a call that takes the name reads it with one load (ASYNC1
+    /// E1b, the auditor's #6077 item 2).
+    resolved: Resolved,
+    /// How many times the lent transaction had been given back when it was lent to the statement,
+    /// which a copy of the name keeps: a debug build checks it at each resolution, so a copy used
+    /// after its statement gave the transaction back, perhaps to be lent to another, fails there.
+    #[cfg(debug_assertions)]
+    lease: u64,
+}
+
+/// A pointer to one of a connection's transactions, opened only by this module. Each transaction
+/// it can point to outlives every statement of the connection: the connection's own and its first
+/// to lend lie in the connection, which its statements hold, and the connection keeps every other
+/// transaction it lent until it is dropped (`Lendable::every`). Dangling until the statement is
+/// adopted; debug builds check it against the name's resolution at every use.
+#[derive(Clone, Copy)]
+struct Resolved(std::ptr::NonNull<SqlTxn>);
+
+// SAFETY: a pointer to a `SqlTxn`, which the connection shares between threads behind `Arc`s and
+// its own transaction; this module opens it only as a shared reference.
+unsafe impl Send for Resolved {}
+// SAFETY: as above.
+unsafe impl Sync for Resolved {}
+
+impl Default for Resolved {
+    fn default() -> Self {
+        Self(std::ptr::NonNull::dangling())
+    }
+}
+
+impl Resolved {
+    fn to(sql_txn: &SqlTxn) -> Self {
+        Self(std::ptr::NonNull::from(sql_txn))
+    }
+}
+
+impl StatementTxn {
+    /// A name of `lent`, one of the transactions its connection lends.
+    fn holding(lent: Resolved) -> Self {
+        let mut name = Self::default();
+        name.hold(lent);
+        name
+    }
+
+    /// The name now of `lent`, one of the transactions its connection lends.
+    #[inline(always)]
+    fn hold(&mut self, lent: Resolved) {
+        self.lent = Some(lent);
+        self.resolved = lent;
+        #[cfg(debug_assertions)]
+        {
+            // SAFETY: as `Resolved`'s: one of the connection's transactions.
+            self.lease = unsafe { lent.0.as_ref() }
+                .given_back
+                .load(Ordering::Relaxed);
+        }
+    }
+
+    /// In a debug build, that a copy of the name is not used after its statement gave `lent`, its
+    /// lent transaction, back (#6090).
+    #[inline(always)]
+    fn check_lease(&self, lent: &SqlTxn) {
+        #[cfg(debug_assertions)]
+        crate::turso_debug_assert!(
+            lent.given_back.load(Ordering::Relaxed) == self.lease,
+            "a copy of a statement's name used after its statement gave its lease back"
+        );
+        let _ = lent;
+    }
+
+    /// Whether the name resolves to one of its connection's transactions yet
+    /// ([`ConnTxn::adopt`]).
+    #[inline]
+    pub fn is_adopted(&self) -> bool {
+        self.resolved.0 != std::ptr::NonNull::dangling()
+    }
+
+    /// Whether the statement runs in a transaction its connection lent: its own or its parent's.
+    #[inline]
+    pub fn holds_lent(&self) -> bool {
+        self.lent.is_some()
+    }
+}
 
 /// Which of a connection's transactions a call is for.
 #[derive(Clone, Copy)]
@@ -680,38 +795,243 @@ pub enum TxnOf<'a> {
     Connection,
 }
 
+/// A name of one of a connection's transactions, as the methods a statement calls on its way take
+/// it: a [`TxnOf`], resolved at the call; a statement's own name, read with one load
+/// ([`StatementTxn`]'s kept resolution); or [`Own`], the connection's own with no test. Code
+/// outside Atoll can pass a name and resolve none: the resolution is a private module's.
+pub trait Names<'a>: Copy + names::Resolves<'a> {}
+
+impl<'a, N: Copy + names::Resolves<'a>> Names<'a> for N {}
+
+/// The connection's own transaction, named with no test: for what is always the connection's, as
+/// a member's release of the read served to it.
+#[derive(Clone, Copy)]
+pub struct Own;
+
+/// How each name resolves to a transaction, private to this module.
+mod names {
+    use super::{ConnTxn, Own, SqlTxn, StatementTxn, TxnOf};
+
+    pub trait Resolves<'a> {
+        /// The transaction named, of `ct`'s.
+        fn txn(self, ct: &'a ConnTxn) -> Named<'a>;
+    }
+
+    /// The transaction a name resolved to.
+    #[derive(Clone, Copy)]
+    pub struct Named<'a>(pub(super) &'a SqlTxn);
+
+    impl<'a, 'n: 'a> Resolves<'a> for TxnOf<'n> {
+        #[inline(always)]
+        fn txn(self, ct: &'a ConnTxn) -> Named<'a> {
+            Named(ct.transactions.of(self))
+        }
+    }
+
+    impl<'a, 's: 'a> Resolves<'a> for &'s StatementTxn {
+        #[inline(always)]
+        fn txn(self, ct: &'a ConnTxn) -> Named<'a> {
+            crate::turso_debug_assert!(
+                std::ptr::eq(
+                    self.resolved.0.as_ptr(),
+                    ct.transactions.of(TxnOf::Statement(self))
+                ),
+                "a statement's kept transaction is not the one its name resolves to"
+            );
+            // SAFETY: set from this connection's transactions, each of which outlives the
+            // statement (`Resolved`); the debug check says it is the one the name resolves to.
+            Named(unsafe { self.resolved.0.as_ref() })
+        }
+    }
+
+    impl<'a> Resolves<'a> for Own {
+        #[inline(always)]
+        fn txn(self, ct: &'a ConnTxn) -> Named<'a> {
+            Named(ct.transactions.own())
+        }
+    }
+}
+
 /// A connection's transactions, kept where a name is the only way to one: the field is private to
 /// this module, so no method of [`ConnTxn`] can read a transaction it was not given a name for.
 mod transactions {
-    use super::{SqlTxn, TxnOf};
+    use super::{Resolved, SqlTxn, StatementTxn, TxnOf};
+    use crate::storage::atoll::locks::Mutex;
+    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sync::{Arc, OnceLock};
 
     pub(super) struct Transactions {
         own: SqlTxn,
+        /// The first transaction the connection lends, made at its first lend and kept here: a
+        /// statement takes it by one compare-and-swap of `first_lent` and gives it back by one
+        /// store, so a statement run once with no other lent beside it meets no lock.
+        first: OnceLock<SqlTxn>,
+        /// Whether a statement holds `first`.
+        first_lent: AtomicBool,
+        /// Those made for a lease held while a statement holds `first`.
+        lendable: Mutex<Lendable>,
+    }
+
+    /// The transactions a connection made to lend while its first was held: every one, kept until
+    /// the connection is dropped, so there are as many as the most statements that held a lease at
+    /// once less one; and those no statement holds, the last given back first.
+    #[derive(Default)]
+    struct Lendable {
+        /// Each behind a pointer of its own, so it keeps its address as the list grows.
+        every: Vec<Arc<SqlTxn>>,
+        free: Vec<Resolved>,
     }
 
     impl Transactions {
         pub(super) fn new() -> Self {
-            Self { own: SqlTxn::new() }
+            Self {
+                own: SqlTxn::new(None),
+                first: OnceLock::new(),
+                first_lent: AtomicBool::new(false),
+                lendable: Mutex::default(),
+            }
         }
 
-        /// The transaction `which` names. A connection has one, so every name is it.
+        /// Whether `sql_txn` is the connection's own.
         #[inline]
-        pub(super) fn of(&self, which: TxnOf<'_>) -> &SqlTxn {
-            let _ = which;
-            &self.own
+        pub(super) fn is_own(&self, sql_txn: &SqlTxn) -> bool {
+            std::ptr::eq(sql_txn, &self.own)
         }
 
-        /// The connection's own transaction, for Atoll's tests.
-        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        /// The connection's own transaction.
+        #[inline(always)]
         pub(super) fn own(&self) -> &SqlTxn {
             &self.own
         }
 
-        /// Every transaction of the connection by its name, for what must see them all: a
-        /// close's ending, and the wait groups a dropped connection ends.
+        /// The statement made in Atoll mode runs in the connection's own until it is lent one.
+        pub(super) fn adopt(&self, statement: &mut StatementTxn) {
+            debug_assert!(
+                statement.lent.is_none(),
+                "a statement adopted with a lent transaction"
+            );
+            statement.resolved = Resolved::to(&self.own);
+        }
+
+        /// The transaction `which` names: the one lent to the statement, or the connection's own.
         #[inline]
+        pub(super) fn of<'a>(&'a self, which: TxnOf<'_>) -> &'a SqlTxn {
+            match which {
+                TxnOf::Statement(
+                    statement @ StatementTxn {
+                        lent: Some(lent), ..
+                    },
+                ) => {
+                    // SAFETY: as `Resolved`'s: the connection's first to lend or one of its list,
+                    // which it keeps until it is dropped.
+                    let lent = unsafe { lent.0.as_ref() };
+                    statement.check_lease(lent);
+                    lent
+                }
+                TxnOf::Statement(StatementTxn { lent: None, .. }) | TxnOf::Connection => &self.own,
+            }
+        }
+
+        /// Lends `statement` a transaction: the connection's first if no statement holds it, by
+        /// one compare-and-swap, else one of the list ([`lend_listed`](Self::lend_listed)).
+        #[inline]
+        pub(super) fn lend(&self, statement: &mut StatementTxn) {
+            if self
+                .first_lent
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                let first = self.first.get_or_init(|| SqlTxn::new(Some(&self.own)));
+                statement.hold(Resolved::to(first));
+                return;
+            }
+            self.lend_listed(statement);
+        }
+
+        /// Lends `statement` one of the list while another statement holds the first: the one
+        /// given back last, or one made now.
+        #[cold]
+        #[inline(never)]
+        fn lend_listed(&self, statement: &mut StatementTxn) {
+            let mut lendable = self.lendable.lock();
+            let lent = match lendable.free.pop() {
+                Some(free) => free,
+                None => {
+                    let made = Arc::new(SqlTxn::new(Some(&self.own)));
+                    let lent = Resolved::to(&made);
+                    lendable.every.push(made);
+                    lent
+                }
+            };
+            drop(lendable);
+            statement.hold(lent);
+        }
+
+        /// Takes back the transaction lent to `statement`, for the next statement to be lent: the
+        /// first by one store, one of the list back onto its free ones.
+        #[inline]
+        pub(super) fn take_back(&self, statement: &mut StatementTxn) {
+            statement.resolved = Resolved::to(&self.own);
+            let Some(lent) = statement.lent.take() else {
+                return;
+            };
+            #[cfg(debug_assertions)]
+            {
+                // SAFETY: as `Resolved`'s: the transaction the statement was lent.
+                unsafe { lent.0.as_ref() }
+                    .given_back
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if self
+                .first
+                .get()
+                .is_some_and(|first| std::ptr::eq(first, lent.0.as_ptr()))
+            {
+                self.first_lent.store(false, Ordering::Release);
+            } else {
+                self.take_back_listed(lent);
+            }
+        }
+
+        /// One of the list given back.
+        #[cold]
+        #[inline(never)]
+        fn take_back_listed(&self, lent: Resolved) {
+            self.lendable.lock().free.push(lent);
+        }
+
+        /// How many transactions the connection made to lend, and how many of them are free.
+        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        pub(super) fn lendable(&self) -> (usize, usize) {
+            let lendable = self.lendable.lock();
+            let first = self.first.get().is_some();
+            let first_free = first && !self.first_lent.load(Ordering::Acquire);
+            (
+                usize::from(first) + lendable.every.len(),
+                usize::from(first_free) + lendable.free.len(),
+            )
+        }
+
+        /// Every transaction of the connection by its name, for what must see them all: a
+        /// close's ending, and the wait groups a dropped connection ends. The connection's own
+        /// first, then each made to lend, whether a statement holds it or none does.
         pub(super) fn every(&self, mut each: impl FnMut(TxnOf<'_>)) {
-            each(TxnOf::Connection)
+            each(TxnOf::Connection);
+            if let Some(first) = self.first.get() {
+                let first = StatementTxn::holding(Resolved::to(first));
+                each(TxnOf::Statement(&first));
+            }
+            // Copied out: `each` takes the transaction's own locks, and may lend.
+            let listed: Vec<Resolved> = self
+                .lendable
+                .lock()
+                .every
+                .iter()
+                .map(|lent| Resolved::to(lent))
+                .collect();
+            for lent in listed {
+                each(TxnOf::Statement(&StatementTxn::holding(lent)));
+            }
         }
     }
 }
@@ -951,7 +1271,8 @@ fn created_now(txn: &Txn, entry: Entry) -> bool {
 
 /// Slots the trees a connection changes fall into: a cursor whose tree shares a slot with
 /// another the connection changed reads its entry again for nothing, which costs a seek and never
-/// a wrong read; 256 keep any two trees apart but for one in 256, at 4 KiB a connection.
+/// a wrong read; 256 keep any two trees apart but for one in 256, at 4 KiB a transaction object
+/// that has written.
 const CHANGE_SLOTS: usize = 256;
 
 /// What a connection's statements changed in its trees (DESIGN.md §17, §3). They share the trees
@@ -964,7 +1285,10 @@ pub(in crate::storage::atoll) struct TreeChanges {
     epoch: AtomicU64,
     /// The epoch of the last rollback of statements, which may have changed any tree.
     rolled_back: AtomicU64,
-    slots: Box<[[AtomicU64; 2]]>,
+    /// Each slot's epoch of its last row change and of its last Clear, made at the first of
+    /// either: null until then, as a transaction object only read in keeps it; then a box of
+    /// [`CHANGE_SLOTS`] slots, freed by the drop.
+    slots: crate::sync::atomic::AtomicPtr<[[AtomicU64; 2]; CHANGE_SLOTS]>,
     /// The trees a Destroy took in the open transaction, with the statement that ran it: a cursor
     /// that statement opens on one after it reads it as empty, as SQLite's does a freed root.
     /// Changed only through [`Self::destroyed`], which keeps `destroying`, its length, beside it.
@@ -987,9 +1311,7 @@ impl TreeChanges {
         Self {
             epoch: AtomicU64::new(0),
             rolled_back: AtomicU64::new(0),
-            slots: (0..CHANGE_SLOTS)
-                .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
-                .collect(),
+            slots: crate::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             destroyed_list: Mutex::new(Vec::new()),
             destroying: AtomicUsize::new(0),
         }
@@ -1012,20 +1334,49 @@ impl TreeChanges {
         self.epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn slot(&self, id: u64) -> &[AtomicU64; 2] {
-        &self.slots[(id % CHANGE_SLOTS as u64) as usize]
-    }
-
     /// A row of tree `id` written or removed.
     fn wrote(&self, id: u64) {
         let e = self.next();
-        self.slot(id)[0].store(e, Ordering::Release);
+        self.changed_slot(id)[0].store(e, Ordering::Release);
     }
 
     /// Tree `id`'s catalog row pointed at a new, empty tree.
     fn cleared(&self, id: u64) {
         let e = self.next();
-        self.slot(id)[1].store(e, Ordering::Release);
+        self.changed_slot(id)[1].store(e, Ordering::Release);
+    }
+
+    /// Tree `id`'s slot, the slots made at the first change.
+    #[inline]
+    fn changed_slot(&self, id: u64) -> &[AtomicU64; 2] {
+        let mut slots = self.slots.load(Ordering::Acquire);
+        if slots.is_null() {
+            slots = self.make_slots();
+        }
+        // SAFETY: made once and never moved, freed only by the drop, which no reference outlives.
+        unsafe { &(*slots)[slot_of(id)] }
+    }
+
+    /// The slots, made now unless another change made them first.
+    #[cold]
+    #[inline(never)]
+    fn make_slots(&self) -> *mut [[AtomicU64; 2]; CHANGE_SLOTS] {
+        let made = Box::into_raw(Box::new(std::array::from_fn(|_| {
+            [AtomicU64::new(0), AtomicU64::new(0)]
+        })));
+        match self.slots.compare_exchange(
+            std::ptr::null_mut(),
+            made,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => made,
+            Err(first) => {
+                // SAFETY: `made` was never shared.
+                drop(unsafe { Box::from_raw(made) });
+                first
+            }
+        }
     }
 
     /// Statements rolled back, whichever trees they wrote.
@@ -1038,9 +1389,18 @@ impl TreeChanges {
         self.epoch.load(Ordering::Acquire)
     }
 
-    /// What changed in tree `id` after `seen`.
+    /// What changed in tree `id` after `seen`: with no slots made, no tree's rows or Clear.
     fn since(&self, id: u64, seen: u64) -> Behind {
-        let [rows, clears] = self.slot(id);
+        let slots = self.slots.load(Ordering::Acquire);
+        if slots.is_null() {
+            return if self.rolled_back.load(Ordering::Acquire) > seen {
+                Behind::Rows
+            } else {
+                Behind::Nothing
+            };
+        }
+        // SAFETY: as `changed_slot`'s.
+        let [rows, clears] = unsafe { &(*slots)[slot_of(id)] };
         if clears.load(Ordering::Acquire) > seen {
             Behind::Cleared
         } else if rows.load(Ordering::Acquire) > seen
@@ -1051,6 +1411,23 @@ impl TreeChanges {
             Behind::Nothing
         }
     }
+}
+
+impl Drop for TreeChanges {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        let slots = self.slots.load(Ordering::Acquire);
+        if !slots.is_null() {
+            // SAFETY: made by `make_slots` from a box, freed here once, no reference left.
+            drop(unsafe { Box::from_raw(slots) });
+        }
+    }
+}
+
+/// The slot tree `id` falls into.
+#[inline(always)]
+fn slot_of(id: u64) -> usize {
+    (id % CHANGE_SLOTS as u64) as usize
 }
 
 /// The Atoll tree id Turso holds as a root page (DESIGN.md §17): ids are positive, from 1,
@@ -1078,8 +1455,8 @@ impl ConnTxn {
     /// `max` of it. A transaction that does not hold it is refused: beside another writer the
     /// pages move under the walk, which would report as wrong what that writer has not finished.
     #[turso_macros::atoll_entry]
-    pub fn check_pages(&self, which: TxnOf<'_>, max: usize) -> Result<Vec<String>> {
-        let sql_txn = self.txn_of(which);
+    pub fn check_pages<'a>(&'a self, which: impl Names<'a>, max: usize) -> Result<Vec<String>> {
+        let sql_txn = which.txn(self).0;
         // Admitted first, before the slot and the full checkpoint: a cooperative walk holding the
         // connection would otherwise wait on this check's slot while this one waits on its lease.
         let _walk = self.host_walk()?;
@@ -1098,13 +1475,13 @@ impl ConnTxn {
     /// its findings hands over its claim, which the check keeps to its first row or its end: its
     /// row and index pass reads in the same transaction (the auditor's III-D-I2).
     #[turso_macros::atoll_entry]
-    pub fn check_pages_in(
-        &self,
-        which: TxnOf<'_>,
+    pub fn check_pages_in<'a>(
+        &'a self,
+        which: impl Names<'a>,
         walk: &mut Option<Box<IntegrityWalk>>,
         max: usize,
     ) -> Result<IOResult<(Vec<String>, Option<WalkClaim>)>> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         if walk.is_none() {
             if !crate::storage::atoll::cooperative::inside() {
                 return self
@@ -1249,14 +1626,87 @@ impl ConnTxn {
 
     /// The transaction `which` names.
     #[inline]
-    fn txn_of(&self, which: TxnOf<'_>) -> &SqlTxn {
+    fn txn_of<'a>(&'a self, which: TxnOf<'_>) -> &'a SqlTxn {
         self.transactions.of(which)
+    }
+
+    /// The transaction lent to `statement`, which the connection keeps past the statement's drop,
+    /// for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn lent_for_test(
+        &self,
+        statement: &StatementTxn,
+    ) -> Option<&SqlTxn> {
+        statement
+            .holds_lent()
+            .then(|| self.txn_of(TxnOf::Statement(statement)))
+    }
+
+    /// Whether the transaction `which` names has a group in the wait graph that is still the one
+    /// running on its node, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn group_is_live_for_test(&self, which: TxnOf<'_>) -> bool {
+        let group = self.txn_of(which).cell.group().load(Ordering::Acquire);
+        group != 0 && graph().is_live_for_test(group)
     }
 
     /// The connection's own transaction, for Atoll's tests.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(in crate::storage::atoll) fn own(&self) -> &SqlTxn {
         self.transactions.own()
+    }
+
+    /// A statement's first run in Atoll mode: from then its name resolves to the connection's own
+    /// transaction until it is lent one.
+    #[turso_macros::atoll_entry]
+    pub fn adopt(&self, statement: &mut StatementTxn) {
+        self.transactions.adopt(statement);
+    }
+
+    /// Lends `statement` a transaction of its own, which every [`TxnOf::Statement`] made of it
+    /// names from now on: the one a statement gave back last, warm whoever that was, or one made
+    /// now. The statement keeps it across its runs and gives it back before it is dropped or
+    /// runs in the connection's own ([`take_back`](Self::take_back)).
+    #[turso_macros::atoll_entry]
+    pub fn lend(&self, statement: &mut StatementTxn) {
+        crate::turso_assert!(
+            !statement.holds_lent(),
+            "a statement that holds a lent transaction is lent another"
+        );
+        self.transactions.lend(statement);
+    }
+
+    /// Takes back the transaction lent to `statement`, if it holds one, from the statement it was
+    /// lent to: nothing of a transaction is left in it, and no copy of `statement` is used again.
+    #[turso_macros::atoll_entry]
+    pub fn take_back(&self, statement: &mut StatementTxn) {
+        if statement.holds_lent() {
+            let lent = self.txn_of(TxnOf::Statement(statement));
+            // The transaction itself, in every build; the rest of what a transaction leaves
+            // (its wait group, ending, header write, gate take, fields and stamps) goes with it,
+            // checked one by one in a debug build.
+            crate::turso_assert!(
+                lent.cell.observe().is_none(),
+                "a lent transaction is given back with something of a transaction left in it",
+                { "left": "a transaction in its cell" }
+            );
+            #[cfg(debug_assertions)]
+            if let Some(left) = lent.left_in_it() {
+                crate::turso_assert!(
+                    false,
+                    "a lent transaction is given back with something of a transaction left in it",
+                    { "left": left }
+                );
+            }
+        }
+        self.transactions.take_back(statement);
+    }
+
+    /// How many transactions the connection made to lend, and how many of them are free, for
+    /// Atoll's tests.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn lendable(&self) -> (usize, usize) {
+        self.transactions.lendable()
     }
 
     /// Ends every transaction of the connection by rollback, each ending driven to its end
@@ -1285,8 +1735,8 @@ impl ConnTxn {
     /// kept in `hold`, and goes on where it stopped. A refused registration leaves `hold`
     /// unarmed; a failed step leaves it armed, `Failed`, for its release.
     #[turso_macros::atoll_entry]
-    pub fn pin_in(&self, which: TxnOf<'_>, hold: &mut PinHold) -> Result<IOResult<()>> {
-        let sql_txn = self.txn_of(which);
+    pub fn pin_in<'a>(&'a self, which: impl Names<'a>, hold: &mut PinHold) -> Result<IOResult<()>> {
+        let sql_txn = which.txn(self).0;
         loop {
             match hold.at {
                 PinAt::Unregistered => {
@@ -1366,8 +1816,11 @@ impl ConnTxn {
     /// [`complete_owed_release`](Self::complete_owed_release), for a test of its frame assertion.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     #[turso_macros::atoll_entry]
-    pub(crate) fn complete_owed_release_for_test(&self, which: TxnOf<'_>) -> Result<()> {
-        let sql_txn = self.txn_of(which);
+    pub(crate) fn complete_owed_release_for_test<'a>(
+        &'a self,
+        which: impl Names<'a>,
+    ) -> Result<()> {
+        let sql_txn = which.txn(self).0;
         self.complete_owed_release(sql_txn).map(|_| ())
     }
 
@@ -1375,13 +1828,13 @@ impl ConnTxn {
     /// through the connection's one consumer.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     #[turso_macros::atoll_entry]
-    pub(crate) fn end_for_pin_for_test(
-        &self,
-        which: TxnOf<'_>,
+    pub(crate) fn end_for_pin_for_test<'a>(
+        &'a self,
+        which: impl Names<'a>,
         id: u64,
         connection: &crate::Connection,
     ) -> Result<()> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         connection.finish_release(self.end_for_pin(sql_txn, id))
     }
 
@@ -1398,14 +1851,14 @@ impl ConnTxn {
     pub fn permit(&self, hold: &PinHold) -> Option<PinPermit> {
         hold.id.map(|id| PinPermit {
             txn: self.serial,
-            id,
+            id: std::num::NonZeroU64::new(id).expect("a pin's id is never 0"),
         })
     }
 
     /// Whether `hold`'s pin is registered and the open transaction is its view.
     #[turso_macros::atoll_entry]
-    pub fn pin_view_is(&self, which: TxnOf<'_>, hold: &PinHold) -> bool {
-        let sql_txn = self.txn_of(which);
+    pub fn pin_view_is<'a>(&'a self, which: impl Names<'a>, hold: &PinHold) -> bool {
+        let sql_txn = which.txn(self).0;
         hold.id.is_some_and(|id| sql_txn.cell.pin_view_is(id))
     }
 
@@ -1414,8 +1867,8 @@ impl ConnTxn {
     /// left for [`crate::Connection::finish_release`] to publish and clear; in a cooperative
     /// frame its ending is owed to a host, the registration owning it ([`PinPhase::ReleaseOwed`]).
     #[turso_macros::atoll_entry]
-    pub fn release_pin(&self, which: TxnOf<'_>, hold: &mut PinHold) -> ReleaseStep {
-        let sql_txn = self.txn_of(which);
+    pub fn release_pin<'a>(&'a self, which: impl Names<'a>, hold: &mut PinHold) -> ReleaseStep {
+        let sql_txn = which.txn(self).0;
         let Some(id) = hold.id.take() else {
             return ReleaseStep::nothing();
         };
@@ -1485,8 +1938,8 @@ impl ConnTxn {
     /// Clears the pin `clear` names, its release done, consuming the token: what waited on the pin
     /// is woken once the slot's lock is let go.
     #[turso_macros::atoll_entry]
-    pub fn clear_pin(&self, which: TxnOf<'_>, clear: PinClear) {
-        let sql_txn = self.txn_of(which);
+    pub fn clear_pin<'a>(&'a self, which: impl Names<'a>, clear: PinClear) {
+        let sql_txn = which.txn(self).0;
         let id = clear.id;
         std::mem::forget(clear);
         sql_txn.cell.clear_pin(id);
@@ -1591,14 +2044,14 @@ impl ConnTxn {
     /// SAVEPOINT: records where the transaction stands, at no statement when none has begun, as a
     /// deferred transaction's first read begins it.
     #[turso_macros::atoll_entry]
-    pub fn open_savepoint(
-        &self,
-        which: TxnOf<'_>,
+    pub fn open_savepoint<'a>(
+        &'a self,
+        which: impl Names<'a>,
         name: String,
         starts_transaction: bool,
         deferred_fk: isize,
     ) {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         let at = sql_txn.cell.observe().as_ref().map_or(0, Txn::command);
         self.savepoints.lock().push(Savepoint {
             name,
@@ -1629,7 +2082,11 @@ impl ConnTxn {
     /// which stays, and forgets every one after it. Returns the deferred foreign-key count to
     /// restore, `None` with no such savepoint.
     #[turso_macros::atoll_entry]
-    pub fn rollback_to_savepoint(&self, which: TxnOf<'_>, name: &str) -> Result<Option<isize>> {
+    pub fn rollback_to_savepoint<'a>(
+        &'a self,
+        which: impl Names<'a>,
+        name: &str,
+    ) -> Result<Option<isize>> {
         let (at, deferred_fk) = {
             let mut savepoints = self.savepoints.lock();
             let Some(i) = savepoints.iter().rposition(|s| s.name == name) else {
@@ -1674,22 +2131,22 @@ impl ConnTxn {
 
     /// Whether a transaction is open.
     #[turso_macros::atoll_entry]
-    pub fn is_open(&self, which: TxnOf<'_>) -> bool {
-        let sql_txn = self.txn_of(which);
+    pub fn is_open<'a>(&'a self, which: impl Names<'a>) -> bool {
+        let sql_txn = which.txn(self).0;
         sql_txn.cell.observe().is_some()
     }
 
     /// Whether a schema reparse holds the transaction ([`pin`](Self::pin)).
     #[turso_macros::atoll_entry]
-    pub fn is_pinned(&self, which: TxnOf<'_>) -> bool {
-        let sql_txn = self.txn_of(which);
+    pub fn is_pinned<'a>(&'a self, which: impl Names<'a>) -> bool {
+        let sql_txn = which.txn(self).0;
         sql_txn.cell.pinned()
     }
 
     /// Whether the open transaction has written.
     #[turso_macros::atoll_entry]
-    pub fn wrote(&self, which: TxnOf<'_>) -> bool {
-        let sql_txn = self.txn_of(which);
+    pub fn wrote<'a>(&'a self, which: impl Names<'a>) -> bool {
+        let sql_txn = which.txn(self).0;
         sql_txn.cell.observe().as_ref().is_some_and(Txn::wrote)
     }
 
@@ -1698,9 +2155,9 @@ impl ConnTxn {
     /// without. Its open is under way: the caller steps it with
     /// [`finish_open`](CursorTrait::finish_open) until done, as the instruction does.
     #[turso_macros::atoll_entry]
-    pub fn open_cursor(
-        &self,
-        which: TxnOf<'_>,
+    pub fn open_cursor<'a>(
+        &'a self,
+        which: impl Names<'a>,
         pager: Arc<Pager>,
         root: i64,
         index: Option<Arc<IndexInfo>>,
@@ -1711,9 +2168,9 @@ impl ConnTxn {
     /// [`open_cursor`](Self::open_cursor), the cursor built in its box: allocated first, so the
     /// cursor is not built beside it and copied in, as a cursor returned and then boxed is.
     #[turso_macros::atoll_entry]
-    pub fn open_cursor_boxed(
-        &self,
-        which: TxnOf<'_>,
+    pub fn open_cursor_boxed<'a>(
+        &'a self,
+        which: impl Names<'a>,
         pager: Arc<Pager>,
         root: i64,
         index: Option<Arc<IndexInfo>>,
@@ -1730,9 +2187,9 @@ impl ConnTxn {
     /// a cooperative frame its open is finished here, so it is bound when made; in one it is left
     /// under way, for the index method's own open to finish before it is done (ASYNC1 D2e (ii)).
     #[turso_macros::atoll_entry]
-    pub fn open_cursor_no_wait(
-        &self,
-        which: TxnOf<'_>,
+    pub fn open_cursor_no_wait<'a>(
+        &'a self,
+        which: impl Names<'a>,
         pager: Arc<Pager>,
         root: i64,
         index: Option<Arc<IndexInfo>>,
@@ -1753,8 +2210,8 @@ impl ConnTxn {
 
     /// The snapshot timestamp of the open transaction's current statement, once it has one.
     #[turso_macros::atoll_entry]
-    pub fn snapshot(&self, which: TxnOf<'_>) -> Option<u64> {
-        let sql_txn = self.txn_of(which);
+    pub fn snapshot<'a>(&'a self, which: impl Names<'a>) -> Option<u64> {
+        let sql_txn = which.txn(self).0;
         // Observed: every transaction here is begun at snapshot isolation, whose snapshot a
         // statement rollback never moves (ASYNC1 D2e (iii-b)).
         sql_txn
@@ -1770,7 +2227,7 @@ impl ConnTxn {
     /// §6). Behind another's take it comes back with the completion to wait on; stepping it again
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
     #[turso_macros::atoll_entry]
-    pub fn begin(&self, which: TxnOf<'_>, wants: Begin) -> Result<IOResult<()>> {
+    pub fn begin<'a>(&'a self, which: impl Names<'a>, wants: Begin) -> Result<IOResult<()>> {
         Ok(self
             .begin_reading(which, wants, &[], &mut None, None)?
             .map(|_| ()))
@@ -1789,16 +2246,16 @@ impl ConnTxn {
     /// `permit` is the one the statement's reparse gave it, if one did, which passes while that
     /// reparse's pin owns its view.
     #[turso_macros::atoll_entry]
-    pub fn begin_reading(
-        &self,
-        which: TxnOf<'_>,
+    pub fn begin_reading<'a>(
+        &'a self,
+        which: impl Names<'a>,
         wants: Begin,
         reads: &[u64],
         read: &mut Option<Box<FacadeRead>>,
         permit: Option<PinPermit>,
     ) -> Result<IOResult<bool>> {
-        let sql_txn = self.txn_of(which);
-        let who = Admit::Statement(permit.filter(|p| p.txn == self.serial).map(|p| p.id));
+        let sql_txn = which.txn(self).0;
+        let who = Admit::Statement(permit.filter(|p| p.txn == self.serial).map(|p| p.id.get()));
         self.begin_admitted(sql_txn, wants, reads, read, who, &sql_txn.begin_wait)
     }
 
@@ -1807,16 +2264,16 @@ impl ConnTxn {
     /// schema reparse may run nested beside it, and must still wait while the reparse's pin owns its
     /// view. None to go on; else the pin's phase wait.
     #[turso_macros::atoll_entry]
-    pub fn admits_nested(
-        &self,
-        which: TxnOf<'_>,
+    pub fn admits_nested<'a>(
+        &'a self,
+        which: impl Names<'a>,
         permit: Option<PinPermit>,
     ) -> Option<IOCompletions> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         if !sql_txn.cell.pinned() {
             return None;
         }
-        let who = Admit::Statement(permit.filter(|p| p.txn == self.serial).map(|p| p.id));
+        let who = Admit::Statement(permit.filter(|p| p.txn == self.serial).map(|p| p.id.get()));
         sql_txn.cell.observe().pin_admits(who).map(IOCompletions)
     }
 
@@ -2031,10 +2488,23 @@ impl ConnTxn {
         }
     }
 
+    /// Ends the transaction `which` names if a begin that stopped left it there with nothing
+    /// begun in it: no snapshot, nothing written. For a statement that gave up its take while no
+    /// statement of the connection has begun its own transaction, as inside a BEGIN no statement
+    /// has run in yet, so the BEGIN's end finds none to miss (ASYNC1 E1b, the simulator's #6084).
+    #[turso_macros::atoll_entry]
+    pub fn end_unbegun<'a>(&'a self, which: impl Names<'a>) {
+        let sql_txn = which.txn(self).0;
+        let mut guard = sql_txn.cell.observe();
+        if guard.as_ref().is_some_and(|txn| !txn.snapped()) {
+            self.end_if_fresh(sql_txn, &mut guard);
+        }
+    }
+
     /// Gives up a pending exclusive take, as a statement that stops waiting for it does (R15).
     #[turso_macros::atoll_entry]
-    pub fn give_up(&self, which: TxnOf<'_>) {
-        let sql_txn = self.txn_of(which);
+    pub fn give_up<'a>(&'a self, which: impl Names<'a>) {
+        let sql_txn = which.txn(self).0;
         if let Some(txn) = sql_txn.cell.observe().as_mut() {
             self.db.atoll().transactions().give_up(txn);
         }
@@ -2045,8 +2515,8 @@ impl ConnTxn {
     /// Starts the Atoll statement of a statement that writes: returns the number to roll back
     /// to if it fails (R18).
     #[turso_macros::atoll_entry]
-    pub fn start_statement(&self, which: TxnOf<'_>) -> Result<Statement> {
-        let sql_txn = self.txn_of(which);
+    pub fn start_statement<'a>(&'a self, which: impl Names<'a>) -> Result<Statement> {
+        let sql_txn = which.txn(self).0;
         let mut guard = self.enter_now(sql_txn, "start_statement")?;
         let txn = guard.as_mut().ok_or_else(outside)?;
         let n = txn.command();
@@ -2062,8 +2532,8 @@ impl ConnTxn {
     /// trees they destroyed) is forgotten now, and every cache of what they changed is told, once,
     /// when the rollback is first owed: nothing reads the transaction until it is finished.
     #[turso_macros::atoll_entry]
-    pub fn rollback_statement(&self, which: TxnOf<'_>, n: Statement) -> Result<()> {
-        let sql_txn = self.txn_of(which);
+    pub fn rollback_statement<'a>(&'a self, which: impl Names<'a>, n: Statement) -> Result<()> {
+        let sql_txn = which.txn(self).0;
         {
             let mut slot = sql_txn.cell.observe();
             let Some(owing) = slot.owe(n, &self.db, sql_txn.cell.conn()) else {
@@ -2095,8 +2565,8 @@ impl ConnTxn {
     /// Finishes the statement rollback the transaction owes, at the top of a call of the
     /// connection ([`TxnSlot::settle`]): a statement step's entry, before its first instruction.
     #[turso_macros::atoll_entry]
-    pub fn settle(&self, which: TxnOf<'_>) -> Result<IOResult<()>> {
-        self.settle_of(self.txn_of(which))
+    pub fn settle<'a>(&'a self, which: impl Names<'a>) -> Result<IOResult<()>> {
+        self.settle_of(which.txn(self).0)
     }
 
     #[inline]
@@ -2112,8 +2582,8 @@ impl ConnTxn {
     /// The flag that says whether the transaction owes a statement rollback, for the connection to
     /// read at each statement step's entry with no frame. Taken once, as the connection is made.
     #[turso_macros::atoll_entry]
-    pub fn owed_flag(&self, which: TxnOf<'_>) -> OwedFlag {
-        let sql_txn = self.txn_of(which);
+    pub fn owed_flag<'a>(&'a self, which: impl Names<'a>) -> OwedFlag {
+        let sql_txn = which.txn(self).0;
         OwedFlag(sql_txn.cell.owing())
     }
 
@@ -2130,15 +2600,18 @@ impl ConnTxn {
     /// The open transaction's slot and start, if the statement rollback it owes failed: what a
     /// statement that met the failure marks, so its abort rolls that transaction back whole.
     #[turso_macros::atoll_entry]
-    pub fn owed_failure(&self, which: TxnOf<'_>) -> Option<(u16, u64)> {
-        let sql_txn = self.txn_of(which);
+    pub fn owed_failure<'a>(
+        &'a self,
+        which: impl Names<'a>,
+    ) -> Option<(u16, std::num::NonZeroU64)> {
+        let sql_txn = which.txn(self).0;
         sql_txn.cell.observe().failed_in()
     }
 
     /// The ending of the open transaction: its commit, or its rollback. `None` with none open, or
     /// while a schema reparse holds it.
     #[turso_macros::atoll_entry]
-    pub fn end(&self, which: TxnOf<'_>, commit: bool) -> Option<Ending> {
+    pub fn end<'a>(&'a self, which: impl Names<'a>, commit: bool) -> Option<Ending> {
         self.end_publishing(which, commit, None)
     }
 
@@ -2147,18 +2620,18 @@ impl ConnTxn {
     /// sees what it publishes: the SQL schema a commit changed (DESIGN.md §17). Dropped unrun by a
     /// rollback, or by a commit that fails before it is published.
     #[turso_macros::atoll_entry]
-    pub fn end_publishing(
-        &self,
-        which: TxnOf<'_>,
+    pub fn end_publishing<'a>(
+        &'a self,
+        which: impl Names<'a>,
         commit: bool,
         publish: Option<Box<dyn FnOnce() + Send>>,
     ) -> Option<Ending> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         if sql_txn.cell.pinned() {
             return None;
         }
         crate::race::point("end.after_pinned_read");
-        self.served.store(false, Ordering::Release);
+        self.unmark_served_if_own(sql_txn);
         let (mut owed, mut written, mut stamped) = (None, Vec::new(), Vec::new());
         let txn = self.take_to_end(sql_txn, &mut owed, &mut written, &mut stamped);
         txn.as_ref()?;
@@ -2181,18 +2654,18 @@ impl ConnTxn {
     /// (`Connection::atoll_end`). The place's lock is taken once the transaction is out of the
     /// connection.
     #[turso_macros::atoll_entry]
-    pub fn end_into_place(
-        &self,
-        which: TxnOf<'_>,
+    pub fn end_into_place<'a>(
+        &'a self,
+        which: impl Names<'a>,
         commit: bool,
         publish: Option<Box<dyn FnOnce() + Send>>,
     ) -> bool {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         if sql_txn.cell.pinned() {
             return false;
         }
         crate::race::point("end.after_pinned_read");
-        self.served.store(false, Ordering::Release);
+        self.unmark_served_if_own(sql_txn);
         // Taken out of the cell straight into this frame, and from here into the ending in the
         // place: two copies, the cell's lock and the place's never held together (D2E-COST2
         // item 9).
@@ -2244,7 +2717,8 @@ impl ConnTxn {
     }
 
     /// The open transaction, taken out of the connection to be ended, with a statement rollback
-    /// it owes in `owed`, and the connection's part of it let go, its savepoints with it: what it
+    /// it owes in `owed`, and the connection's part of it let go, the connection's savepoints with
+    /// it when it is the connection's own: what it
     /// wrote to the header in `written`, the stamps of the trees it wrote in `stamped`
     /// ([`let_go_of_ended`](Self::let_go_of_ended)). Returned as the cell's take returns it, so
     /// it is copied once, into the caller's frame; what the caller needs besides comes back
@@ -2257,7 +2731,10 @@ impl ConnTxn {
         written: &mut Vec<(Statement, Field, u32)>,
         stamped: &mut Vec<super::trees::Stamp>,
     ) -> Option<Txn> {
-        self.savepoints.lock().clear();
+        // The savepoints are the connection's own transaction's: a lent one's end leaves them.
+        if self.transactions.is_own(sql_txn) {
+            self.savepoints.lock().clear();
+        }
         let txn = sql_txn.cell.take(owed);
         // Matched, not borrowed: a borrow of `txn` would keep it apart from the caller's, and
         // returning it would copy it there.
@@ -2296,8 +2773,12 @@ impl ConnTxn {
     /// owe). Whether it ended one: not while a schema reparse holds the transaction, nor one a
     /// later statement wrote in, which that statement ends.
     #[turso_macros::atoll_entry]
-    pub fn end_served(&self, which: TxnOf<'_>) -> bool {
-        let sql_txn = self.txn_of(which);
+    pub fn end_served<'a>(&'a self, which: impl Names<'a>) -> bool {
+        let sql_txn = which.txn(self).0;
+        crate::turso_debug_assert!(
+            self.transactions.is_own(sql_txn),
+            "a lent transaction's read is ended as a served one"
+        );
         if sql_txn.cell.pinned() || !self.served.swap(false, Ordering::AcqRel) {
             return false;
         }
@@ -2322,8 +2803,8 @@ impl ConnTxn {
 
     /// Steps the ending in the place; done with none there.
     #[turso_macros::atoll_entry]
-    pub fn step_placed(&self, which: TxnOf<'_>) -> Result<IOResult<()>> {
-        let sql_txn = self.txn_of(which);
+    pub fn step_placed<'a>(&'a self, which: impl Names<'a>) -> Result<IOResult<()>> {
+        let sql_txn = which.txn(self).0;
         match sql_txn.ending.lock().as_mut() {
             Some(ending) => ending.step(),
             None => Ok(IOResult::Done(())),
@@ -2332,8 +2813,8 @@ impl ConnTxn {
 
     /// Whether the ending in the place commits and has published its commit.
     #[turso_macros::atoll_entry]
-    pub fn placed_published(&self, which: TxnOf<'_>) -> bool {
-        let sql_txn = self.txn_of(which);
+    pub fn placed_published<'a>(&'a self, which: impl Names<'a>) -> bool {
+        let sql_txn = which.txn(self).0;
         sql_txn
             .ending
             .lock()
@@ -2343,8 +2824,8 @@ impl ConnTxn {
 
     /// Hands the ending in the place the failure an IO it waited on met ([`Ending::failed`]).
     #[turso_macros::atoll_entry]
-    pub fn fail_placed(&self, which: TxnOf<'_>, failure: LimboError) {
-        let sql_txn = self.txn_of(which);
+    pub fn fail_placed<'a>(&'a self, which: impl Names<'a>, failure: LimboError) {
+        let sql_txn = which.txn(self).0;
         if let Some(ending) = sql_txn.ending.lock().as_mut() {
             ending.failed(failure);
         }
@@ -2353,8 +2834,8 @@ impl ConnTxn {
     /// Drops the ending in the place: one over where it lies; one not over taken out first, since
     /// its drop drives it to its end, which is not done under the place's lock.
     #[turso_macros::atoll_entry]
-    pub fn drop_placed(&self, which: TxnOf<'_>) {
-        let sql_txn = self.txn_of(which);
+    pub fn drop_placed<'a>(&'a self, which: impl Names<'a>) {
+        let sql_txn = which.txn(self).0;
         let mut place = sql_txn.ending.lock();
         match place.as_ref() {
             None => {}
@@ -2396,8 +2877,12 @@ impl ConnTxn {
     /// a read transaction is begun, which sees what the commit left, as the one the ending begins
     /// for its siblings at its end does (DESIGN.md §17). Done at once with a transaction open.
     #[turso_macros::atoll_entry]
-    pub fn serve_sibling(&self, which: TxnOf<'_>) -> Result<IOResult<()>> {
-        let sql_txn = self.txn_of(which);
+    pub fn serve_sibling<'a>(&'a self, which: impl Names<'a>) -> Result<IOResult<()>> {
+        let sql_txn = which.txn(self).0;
+        crate::turso_debug_assert!(
+            self.transactions.is_own(sql_txn),
+            "a lent transaction is served as a sibling's read"
+        );
         if sql_txn.cell.observe().is_some() {
             return Ok(IOResult::Done(()));
         }
@@ -2420,17 +2905,33 @@ impl ConnTxn {
         self.db.atoll().transactions().hold_horizon(hold);
     }
 
+    /// Lets the served read's mark go when `sql_txn` is the connection's own: the read begun for
+    /// siblings is of the connection's own transaction, which a lent one's end leaves as it is.
+    #[inline]
+    fn unmark_served_if_own(&self, sql_txn: &SqlTxn) {
+        if self.transactions.is_own(sql_txn) {
+            self.served.store(false, Ordering::Release);
+        }
+    }
+
     /// Marks the open transaction a read begun for siblings (`served`).
     #[turso_macros::atoll_entry]
     pub fn mark_served(&self) {
         self.served.store(true, Ordering::Release);
     }
 
+    /// The schema cookie as committed, whatever transaction of the connection is open or half begun:
+    /// what a schema reparse outside a transaction compares its schema with.
+    #[turso_macros::atoll_entry]
+    pub fn committed_schema_cookie(&self) -> u32 {
+        self.db.header().committed(Field::SchemaCookie)
+    }
+
     /// The schema cookie: at the transaction's view, or committed outside one. Driven to its end
     /// here, for a blocking host.
     #[turso_macros::atoll_entry]
-    pub fn schema_cookie(&self, which: TxnOf<'_>) -> Result<u32> {
-        let sql_txn = self.txn_of(which);
+    pub fn schema_cookie<'a>(&'a self, which: impl Names<'a>) -> Result<u32> {
+        let sql_txn = which.txn(self).0;
         let mut guard = self.enter_now(sql_txn, "schema_cookie")?;
         match guard.as_mut() {
             None => Ok(self.db.header().committed(Field::SchemaCookie)),
@@ -2442,12 +2943,12 @@ impl ConnTxn {
     /// in a cooperative frame, the IO it waits for, and it goes on where it stopped when called
     /// again with the same `read` (ASYNC1 D2e §2.2).
     #[turso_macros::atoll_entry]
-    pub fn schema_cookie_in(
-        &self,
-        which: TxnOf<'_>,
+    pub fn schema_cookie_in<'a>(
+        &'a self,
+        which: impl Names<'a>,
         read: &mut Option<Box<FacadeRead>>,
     ) -> Result<IOResult<u32>> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         if read.is_none() {
             // Outside a frame the read ends in this call, as the synchronous form drives it.
             if !crate::storage::atoll::cooperative::inside() {
@@ -2472,8 +2973,8 @@ impl ConnTxn {
     /// list in its files, a freed slot being erased and taken again. Driven to its end here, for a
     /// blocking host.
     #[turso_macros::atoll_entry]
-    pub fn header(&self, which: TxnOf<'_>) -> Result<DatabaseHeader> {
-        let sql_txn = self.txn_of(which);
+    pub fn header<'a>(&'a self, which: impl Names<'a>) -> Result<DatabaseHeader> {
+        let sql_txn = which.txn(self).0;
         let mut guard = self.enter_now(sql_txn, "header")?;
         let mut words = [0u32; 7];
         for field in Field::ALL {
@@ -2488,12 +2989,12 @@ impl ConnTxn {
     /// [`header`](Self::header) for a caller that keeps `read` across its returns, as
     /// [`schema_cookie_in`](Self::schema_cookie_in).
     #[turso_macros::atoll_entry]
-    pub fn header_in(
-        &self,
-        which: TxnOf<'_>,
+    pub fn header_in<'a>(
+        &'a self,
+        which: impl Names<'a>,
         read: &mut Option<Box<FacadeRead>>,
     ) -> Result<IOResult<DatabaseHeader>> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         if read.is_none() {
             // Outside a frame the read ends in this call, as the synchronous form drives it.
             if !crate::storage::atoll::cooperative::inside() {
@@ -2510,8 +3011,8 @@ impl ConnTxn {
     /// units, rounded up, as `PRAGMA page_count` reports them; past `u32::MAX`, the most a header
     /// word holds. Driven to its end here, for a blocking host.
     #[turso_macros::atoll_entry]
-    pub fn pages(&self, which: TxnOf<'_>) -> Result<u32> {
-        let sql_txn = self.txn_of(which);
+    pub fn pages<'a>(&'a self, which: impl Names<'a>) -> Result<u32> {
+        let sql_txn = which.txn(self).0;
         let store = self.db.atoll().store();
         let mut bytes: u64 = 0;
         for class in 0..crate::storage::atoll::page::CLASS_COUNT {
@@ -2527,12 +3028,12 @@ impl ConnTxn {
     /// [`pages`](Self::pages) for a caller that keeps `read` across its returns, as
     /// [`schema_cookie_in`](Self::schema_cookie_in).
     #[turso_macros::atoll_entry]
-    pub fn pages_in(
-        &self,
-        which: TxnOf<'_>,
+    pub fn pages_in<'a>(
+        &'a self,
+        which: impl Names<'a>,
         read: &mut Option<Box<FacadeRead>>,
     ) -> Result<IOResult<u32>> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         // Outside a frame the read ends in this call, as the synchronous form drives it.
         if read.is_none() && !crate::storage::atoll::cooperative::inside() {
             return self.pages(which).map(IOResult::Done);
@@ -2763,14 +3264,14 @@ impl ConnTxn {
     /// statement. Step it with the same `op` until done; a Clear returns the rows the tree held at
     /// the view, which its statement counts as changed.
     #[turso_macros::atoll_entry]
-    pub fn retire_tree(
-        &self,
-        which: TxnOf<'_>,
+    pub fn retire_tree<'a>(
+        &'a self,
+        which: impl Names<'a>,
         op: &mut Option<RetireOp>,
         id: u64,
         clear: bool,
     ) -> Result<IOResult<u64>> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         let op = op.get_or_insert_with(|| RetireOp {
             destroy: Destroy::new(id),
             waiting: Waiting::default(),
@@ -2923,13 +3424,13 @@ impl ConnTxn {
     /// table's. Step it with the same `op` until done; returns the tree id, which Turso calls the
     /// root page.
     #[turso_macros::atoll_entry]
-    pub fn create_btree(
-        &self,
-        which: TxnOf<'_>,
+    pub fn create_btree<'a>(
+        &'a self,
+        which: impl Names<'a>,
         op: &mut Option<CreateOp>,
         index: bool,
     ) -> Result<IOResult<u64>> {
-        let sql_txn = self.txn_of(which);
+        let sql_txn = which.txn(self).0;
         let op = op.get_or_insert_with(|| CreateOp {
             id: self.db.draw_tree_id(),
             root: None,
@@ -3402,7 +3903,8 @@ impl Default for PinHold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinPermit {
     txn: u64,
-    id: u64,
+    /// Never 0: ids are handed out from 1 ([`ConnTxn::permit`]).
+    id: std::num::NonZeroU64,
 }
 
 /// What a pin's release left for its connection to finish ([`ConnTxn::release_pin`]), consumed
@@ -4291,14 +4793,14 @@ impl SqlCursor {
     /// ROWID table's keys.
     #[turso_macros::atoll_entry]
     #[inline(always)]
-    pub fn new(
-        ct: &ConnTxn,
-        which: TxnOf<'_>,
+    pub fn new<'a>(
+        ct: &'a ConnTxn,
+        which: impl Names<'a>,
         pager: Arc<Pager>,
         id: u64,
         index: Option<Arc<IndexInfo>>,
     ) -> Self {
-        let sql_txn = ct.txn_of(which);
+        let sql_txn = which.txn(ct).0;
         Self {
             db: ct.db.clone(),
             cell: sql_txn.cell.clone(),
@@ -4483,14 +4985,14 @@ impl SqlCursor {
     /// catalog row the statement reads is the one it was over; else it resolves afresh. `false`
     /// for a cursor of another connection, which the caller drops.
     #[turso_macros::atoll_entry]
-    pub fn reopened(
+    pub fn reopened<'a>(
         &mut self,
-        ct: &ConnTxn,
-        which: TxnOf<'_>,
+        ct: &'a ConnTxn,
+        which: impl Names<'a>,
         pager: &Arc<Pager>,
         index: Option<Arc<IndexInfo>>,
     ) -> bool {
-        let sql_txn = ct.txn_of(which);
+        let sql_txn = which.txn(ct).0;
         if !Arc::ptr_eq(&self.cell, &sql_txn.cell) || !Arc::ptr_eq(&self.db, &ct.db) {
             return false;
         }

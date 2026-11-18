@@ -54,6 +54,9 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         | LimboError::Busy
         | LimboError::BusySnapshot
         | LimboError::WriteWriteConflict
+        // Atoll's answer to a true cycle of waits: the victim's transaction is rolled back whole,
+        // as a write conflict's is.
+        | LimboError::Deadlock
         | LimboError::CommitDependencyAborted
         | LimboError::InvalidArgument(..)
         | LimboError::ParseError(..)
@@ -89,6 +92,13 @@ mod tests {
             name: "s".into(),
             ascending: false,
         };
+        assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
+        assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
+    }
+
+    #[test]
+    fn deadlock_victim_is_rolled_back_like_a_conflict() {
+        let err = LimboError::Deadlock;
         assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
         assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
     }

@@ -90,6 +90,8 @@ COMMIT; -- Alice with balance 1000 is committed
 
 A few failures cannot be undone statement-by-statement (for example running out of space mid-write); those roll back the whole transaction, and a later COMMIT reports that no transaction is active. A failure while undoing a failed statement (for example an I/O error reading back what it wrote) also rolls back the whole transaction, as in SQLite.
 
+A deadlock also rolls back the whole transaction. With the Atoll storage engine, transactions on different connections can each wait for a row or for the write lock that another one holds, so that none of them can go on. One of them is then chosen and rolled back, and its statement fails with `database is deadlocked: this transaction was rolled back to break a cycle of waits`; the others go on. Run the rolled-back transaction again. A wait that is not part of such a cycle ends with busy once the busy timeout passes.
+
 ## One Write Statement at a Time
 
 A connection runs one write statement at a time. A write statement is the connection's writer from the moment it starts until it finishes, fails, or is reset or finalized. That includes the time it spends waiting: for another connection's lock, for I/O, or between the rows of a `RETURNING` clause.
@@ -105,7 +107,7 @@ While a write statement is still in progress on a connection:
 
 A refused statement changes nothing: the transaction stays open with everything it held. Finish, reset or finalize the write statement first, then run the statement again.
 
-A write statement that returns busy has not started. It holds nothing, the connection can run another write statement, and stepping the busy statement again starts it afresh.
+A write statement that returns busy has not started. It holds nothing, the connection can run another write statement, and stepping the busy statement again starts it afresh. Inside `BEGIN`, a write statement that returns busy before any statement of the transaction has run leaves the transaction open and holding nothing: `COMMIT` or `ROLLBACK` ends it, and stepping the statement again starts it inside the transaction.
 
 ## Implicit Transactions
 

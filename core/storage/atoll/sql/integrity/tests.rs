@@ -120,7 +120,8 @@ fn copies(adb: &AtollDb, root: PageId) -> Vec<(PageId, u64)> {
     crate::storage::atoll::sql::mode::full_checkpoint(adb).unwrap();
     let tree = adb
         .open_plain(root)
-        .with_head(crate::storage::atoll::txn::versioned::HEADER);
+        .with_head(crate::storage::atoll::txn::versioned::HEADER)
+        .with_reserves();
     let mut op = Check::default();
     let stats = drive(adb.io(), || tree.check(&mut op)).unwrap();
     let store = adb.atoll().store();
@@ -309,7 +310,8 @@ fn a_freed_page_a_tree_reaches_is_found() {
     };
     let tree = adb
         .open_plain(entry.root)
-        .with_head(crate::storage::atoll::txn::versioned::HEADER);
+        .with_head(crate::storage::atoll::txn::versioned::HEADER)
+        .with_reserves();
     let mut op = Check::default();
     let stats = drive(&io, || tree.check(&mut op)).unwrap();
     let leaf = *stats

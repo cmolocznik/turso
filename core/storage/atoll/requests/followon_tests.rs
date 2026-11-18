@@ -256,6 +256,7 @@ fn superblock(seq: u64) -> Superblock {
         clock: 0,
         snapshot: 0,
         checkpoint: 0,
+        retired: None,
         continuations: Vec::new(),
     }
 }

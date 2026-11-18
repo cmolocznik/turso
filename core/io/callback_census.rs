@@ -161,6 +161,13 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "records how many superblock bytes were read",
     ),
     (
+        "storage/atoll/gc/retired.rs",
+        "read",
+        "new_read",
+        "reports the read's error",
+    ),
+    ("storage/atoll/gc/retired.rs", "sync", "new_sync", "nothing"),
+    (
         "storage/atoll/log/mod.rs",
         "open_segments",
         "new_sync",

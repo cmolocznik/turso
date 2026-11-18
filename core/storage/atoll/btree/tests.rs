@@ -587,6 +587,417 @@ fn long_values(temporary: bool) {
     assert_eq!((stats.nodes, stats.entries), (1, 0));
 }
 
+/// What a test's body comes to: the words of the first check that failed. The body returns them
+/// so that its test fails only once every Atoll object is dropped.
+type Words<T> = std::result::Result<T, String>;
+
+/// Ends the body with `words` unless `cond` holds.
+macro_rules! ensure {
+    ($cond:expr, $($words:tt)+) => {
+        if !$cond {
+            return Err(format!($($words)+));
+        }
+    };
+}
+
+/// A value a put retires stays, its pages marked retired. Freed a page a step, its chunks first
+/// and its directory last, by a free that a new free goes on from by its count of pages freed, it
+/// leaves nothing allocated that the tree does not reach (DESIGN.md §6.5, §11.5; RET-FREE1).
+// Its pool helpers are built outside shuttle and loom alone.
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+#[test]
+fn a_retired_value_is_freed_a_page_a_step_its_chunks_before_its_directory() {
+    with_db(|io, db| {
+        let tree = tree_of(
+            io,
+            db,
+            go(io, "create", || Tree::create(db.pool(), class(0)))?,
+        );
+        for (key, len) in [(&b"one"[..], 5_000), (b"two", value::chunk() + 12_345)] {
+            let mut op = Put::new(key, stamp(key, 1, len), Mode::Insert);
+            let put = go(io, "insert", || tree.put(&mut op))?;
+            ensure!(put == Outcome::Inserted, "{key:?} inserted: {put:?}");
+        }
+        let (one, two) = (
+            out_of_line(io, &tree, b"one")?,
+            out_of_line(io, &tree, b"two")?,
+        );
+        let pages_of = |r: ValueRef| match go(io, "pages", || value::pages(db.pool(), r, &|| true))
+        {
+            Ok(Ok(pages)) => Ok(pages),
+            Ok(Err(_)) => Err(format!("{r:?} lost its pages")),
+            Err(words) => Err(words),
+        };
+        let (one_pages, two_pages) = (pages_of(one)?, pages_of(two)?);
+        ensure!(
+            (one_pages.len(), two_pages.len()) == (1, 3),
+            "pages the values take: {} and {}",
+            one_pages.len(),
+            two_pages.len()
+        );
+        // Imaged first, so each page has a copy the map names: what an open finds allocated and
+        // never used once the value is retired and nothing frees it.
+        checkpoint_or(io, db)?;
+        for key in [&b"one"[..], b"two"] {
+            let mut op = Put::new(key, b"small".to_vec(), Mode::Update).retiring();
+            let put = go(io, "update", || tree.put(&mut op))?;
+            ensure!(put == Outcome::Updated, "{key:?} updated: {put:?}");
+        }
+        let entry = |pid| go(io, "entry", || db.store().entry(pid));
+        for &p in one_pages.iter().chain(&two_pages) {
+            ensure!(
+                db.store().retired(p) && entry(p)? != FREE,
+                "{p:?} retired and allocated"
+            );
+        }
+        checkpoint_or(io, db)?;
+        db.pool().evict_all_clean();
+        let freed_of = |pages: &[PageId]| {
+            pages
+                .iter()
+                .map(|&p| Ok(entry(p)? == FREE))
+                .collect::<Words<Vec<_>>>()
+        };
+        // The first step reads the directory in, then frees the first chunk and no other page.
+        let loaded = |pid: PageId| db.pool().loaded_pages().contains(&pid.raw());
+        ensure!(!loaded(two.pid), "the directory read in before the free");
+        let mut free = value::RetiredFree::new(two, 0);
+        let done = go(io, "the first step", || free.step(db.pool(), db.store()))?;
+        ensure!(loaded(two.pid), "the directory was not read in");
+        ensure!(
+            !done && free.freed() == 1,
+            "after one step: {done}, {}",
+            free.freed()
+        );
+        let freed = freed_of(&two_pages)?;
+        ensure!(
+            freed == [false, true, false],
+            "the first chunk alone: {freed:?}"
+        );
+        // A new free goes on from the count: the directory read again, and freed last.
+        let mut free = value::RetiredFree::new(two, 1);
+        let done = go(io, "the second step", || free.step(db.pool(), db.store()))?;
+        let freed = freed_of(&two_pages)?;
+        ensure!(
+            !done && freed == [false, true, true],
+            "the chunks: {done}, {freed:?}"
+        );
+        let done = go(io, "the third step", || free.step(db.pool(), db.store()))?;
+        ensure!(
+            done && free.freed() == 3,
+            "the directory: {done}, {}",
+            free.freed()
+        );
+        let mut free = value::RetiredFree::new(one, 0);
+        let done = go(io, "the one page", || free.step(db.pool(), db.store()))?;
+        ensure!(done, "a value of one page freed in one step");
+        for &p in one_pages.iter().chain(&two_pages) {
+            ensure!(
+                entry(p)? == FREE && !db.store().retired(p),
+                "{p:?} freed and its mark cleared"
+            );
+        }
+        checkpoint_or(io, db)?;
+        whole(io, &tree, db, "the retired values freed")
+    });
+}
+
+/// A free of a retired value whose page is no longer marked retired is refused: freed already,
+/// its number can be another page's by now, which the free would take from under it (RET-FREE1).
+#[test]
+fn a_free_of_a_page_no_longer_marked_retired_is_refused() {
+    with_db(|io, db| {
+        let tree = tree_of(
+            io,
+            db,
+            go(io, "create", || Tree::create(db.pool(), class(0)))?,
+        );
+        let mut op = Put::new(b"old", stamp(b"old", 1, 5_000), Mode::Insert);
+        go(io, "insert", || tree.put(&mut op))?;
+        let old = out_of_line(io, &tree, b"old")?;
+        let mut op = Put::new(b"old", b"small".to_vec(), Mode::Update).retiring();
+        go(io, "update", || tree.put(&mut op))?;
+        let mut free = value::RetiredFree::new(old, 0);
+        ensure!(
+            go(io, "the free", || free.step(db.pool(), db.store()))?,
+            "a value of one page freed in one step"
+        );
+        // Its number made reusable, and taken by a new value's page.
+        checkpoint_or(io, db)?;
+        checkpoint_or(io, db)?;
+        let value = stamp(b"new", 2, 5_000);
+        let mut op = Put::new(b"new", value.clone(), Mode::Insert);
+        go(io, "a new value", || tree.put(&mut op))?;
+        let new = out_of_line(io, &tree, b"new")?;
+        ensure!(new.pid == old.pid, "the number not taken again: {new:?}");
+        let mut stale = value::RetiredFree::new(old, 0);
+        let out = drive(io, || stale.step(db.pool(), db.store()));
+        ensure!(
+            matches!(out, Err(LimboError::Corrupt(_))),
+            "the stale free: {out:?}"
+        );
+        let mut lookup = Lookup::new(b"new");
+        let read = go(io, "the new value", || tree.lookup(&mut lookup))?;
+        ensure!(read == Some(value), "the new value lost");
+        whole(io, &tree, db, "a stale free refused")
+    });
+}
+
+/// A root records whether its tree is versioned or plain, as a leaf and as an inner node, through
+/// every growth and every shrink, in memory and in its checkpoint's copy; a tree opened as the
+/// other kind, or one whose node other than the root bears the inner root's mark, fails its check
+/// as corrupt (DESIGN.md §13; ROOT-KIND1).
+// Its pool helpers are built outside shuttle and loom alone.
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+#[test]
+fn a_root_keeps_its_trees_kind_through_every_growth_and_shrink() {
+    for versioned in [true, false] {
+        with_db(|io, db| root_kept(io, db, versioned));
+    }
+}
+
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+fn root_kept(io: &Arc<dyn IO>, db: &Atoll, versioned: bool) -> Words<()> {
+    use crate::storage::atoll::txn::versioned::{Version, HEADER};
+    let label = if versioned { "versioned" } else { "plain" };
+    let root = match versioned {
+        true => go(io, "create", || Tree::create_versioned(db.pool(), class(0)))?,
+        false => go(io, "create", || Tree::create(db.pool(), class(0)))?,
+    };
+    let opened_as = |versioned: bool| {
+        let tree = tree_of(io, db, root).with_head(HEADER);
+        match versioned {
+            true => tree.with_reserves(),
+            false => tree,
+        }
+    };
+    let tree = opened_as(versioned);
+    let key = |i: u32| i.to_be_bytes();
+    let head = Version::SETTLED.encode().to_vec();
+    let mut inserted = 0;
+    while root_kind(io, db, root)?.0 < 2 {
+        let mut op = Put::with_head(&key(inserted), head.clone(), vec![7; 400], Mode::Insert);
+        go(io, "insert", || tree.put(&mut op))?;
+        inserted += 1;
+        let (level, kind) = root_kind(io, db, root)?;
+        ensure!(
+            kind == versioned,
+            "{label}: the root at level {level} records {kind}, {inserted} keys"
+        );
+    }
+    whole(io, &tree, db, &format!("{label}, grown"))?;
+    checkpoint_or(io, db)?;
+    db.pool().evict_all_clean();
+    let read = root_kind(io, db, root)?;
+    ensure!(read == (2, versioned), "{label}: read back {read:?}");
+    whole(io, &tree, db, &format!("{label}, read back"))?;
+    let mut check = Check::default();
+    let other = opened_as(!versioned);
+    let out = drive(io, || other.check(&mut check));
+    ensure!(
+        matches!(&out, Err(LimboError::Corrupt(m)) if m.contains("opened as")),
+        "{label}: opened as the other kind, {:?}",
+        out.as_ref().map(|s| s.nodes)
+    );
+    // The mark on a node that is not the root fails the check too.
+    let child = go(io, "the root", || db.pool().fix_optimistic(root, None))?
+        .read(|p| View::new(p).next().0)
+        .ok_or("the root not read whole")?;
+    let mark = |on: bool| -> Words<()> {
+        let mut page = go(io, "the child", || db.pool().fix_exclusive(child, None))?;
+        node::set_versioned_root(&mut page.page_mut(), on);
+        page.changed();
+        Ok(())
+    };
+    mark(true)?;
+    let mut check = Check::default();
+    let out = drive(io, || tree.check(&mut check));
+    mark(false)?;
+    ensure!(
+        matches!(&out, Err(LimboError::Corrupt(m)) if m.contains("not the root")),
+        "{label}: a child marked as the root, {:?}",
+        out.as_ref().map(|s| s.nodes)
+    );
+    for i in (1..inserted).rev() {
+        let mut op = Remove::new(&key(i));
+        go(io, "remove", || tree.remove(&mut op))?;
+        let (level, kind) = root_kind(io, db, root)?;
+        ensure!(
+            kind == versioned,
+            "{label}: the root at level {level} records {kind}, {i} keys"
+        );
+    }
+    let shrunk = root_kind(io, db, root)?;
+    ensure!(shrunk == (0, versioned), "{label}: shrunk to {shrunk:?}");
+    whole(io, &tree, db, &format!("{label}, shrunk"))
+}
+
+/// Opens a database, runs `body` on it, drops it, then fails with the body's words, if any.
+fn with_db(body: impl FnOnce(&Arc<dyn IO>, &Atoll) -> Words<()>) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 64 << 20, 1);
+    let outcome = body(&io, &db);
+    drop(db);
+    if let Err(words) = outcome {
+        panic!("{words}");
+    }
+}
+
+/// The reference of the value out of line stored under `key`.
+fn out_of_line(io: &Arc<dyn IO>, tree: &Tree, key: &[u8]) -> Words<ValueRef> {
+    match go(io, "stored", || tree.stored(key))?.map(|s| s.value) {
+        Some(StoredValue::OutOfLine(r)) => Ok(r),
+        Some(StoredValue::Inline(_)) => Err(format!("{key:?} is inline")),
+        None => Err(format!("{key:?} is not stored")),
+    }
+}
+
+/// A full checkpoint, done.
+fn checkpoint_or(io: &Arc<dyn IO>, db: &Atoll) -> Words<()> {
+    let mut ticket = db.checkpointer().request_full();
+    go(io, "a checkpoint", || {
+        db.checkpointer().step_full(&mut ticket, db.transactions())
+    })
+}
+
+/// [`check_whole`], its finding returned: the tree's structure checked, and the pages allocated in
+/// the store exactly those of its nodes and values.
+fn whole(io: &Arc<dyn IO>, tree: &Tree, db: &Atoll, label: &str) -> Words<()> {
+    let mut check = Check::default();
+    let stats = go(io, label, || tree.check(&mut check))?;
+    let mut expected: BTreeSet<PageId> = stats.pages.iter().copied().collect();
+    for &v in &stats.values {
+        match go(io, label, || value::pages(db.pool(), v, &|| true))? {
+            Ok(pages) => expected.extend(pages),
+            Err(_) => return Err(format!("{label}: value {v:?} lost its pages")),
+        }
+    }
+    let mut allocated = BTreeSet::new();
+    for c in 0..CLASS_COUNT {
+        let class = class(c);
+        for number in 0..crate::storage::atoll::testing::page_numbers(db.store(), class) {
+            let pid = PageId::new(class, number);
+            if go(io, label, || db.store().entry(pid))? != FREE {
+                allocated.insert(pid);
+            }
+        }
+    }
+    let leaked: Vec<_> = allocated.difference(&expected).collect();
+    let lost: Vec<_> = expected.difference(&allocated).collect();
+    ensure!(
+        leaked.is_empty() && lost.is_empty(),
+        "{label}: pages allocated and unreachable {leaked:?}; reachable and free {lost:?}"
+    );
+    Ok(())
+}
+
+/// The root's level, and the kind of tree it records.
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+fn root_kind(io: &Arc<dyn IO>, db: &Atoll, root: PageId) -> Words<(u8, bool)> {
+    loop {
+        let page = go(io, "the root", || db.pool().fix_optimistic(root, None))?;
+        if let Some(read) = page.read(|p| {
+            let v = View::new(p);
+            (v.level(), v.records_versioned())
+        }) {
+            return Ok(read);
+        }
+    }
+}
+
+/// Every place outside tests that opens an Atoll tree: its file, its function, the call, how many
+/// times that function makes it, and the kind it opens the tree as. A versioned tree opened as
+/// plain is right only where nothing reads a head or checks the tree, and those four places say
+/// why (ROOT-KIND1, the auditor's #6209 item 3).
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+const TREE_OPENS: &[(&str, &str, &str, usize, &str)] = &[
+    ("replay.rs", "tree", "Tree::open(", 1, "as the change says: plain, or versioned with its reserves"),
+    ("sql/catalog.rs", "open", "VersionedTree::open(", 1, "versioned: the catalog"),
+    ("sql/cursor.rs", "new", "VersionedTree::open(", 1, "versioned: a table or an index, an index method's backing store among them"),
+    ("sql/header.rs", "open", "VersionedTree::open(", 1, "versioned: the database header"),
+    ("sql/integrity.rs", "step", ".open_plain(", 3, "OTHER KIND for the dropped list, read as plain for its keys alone (a seek and a next); the abandoned list as plain, its kind; then each tree as System::plain says"),
+    ("sql/lifecycle.rs", "drain_claimed", ".open_plain(", 2, "the abandoned list as plain, its kind; OTHER KIND for a dropped tree, drained as plain: a drain reads each reference from the value's last 24 bytes, whatever the head"),
+    ("sql/lifecycle.rs", "drain_lists", ".open_plain(", 2, "OTHER KIND for the dropped list, read as plain for its keys and an entry removed by key; OTHER KIND for each tree it names, drained as plain, as above"),
+    ("sql/lifecycle.rs", "open_plain", "Tree::open(", 1, "the plain open those functions call"),
+    ("sql/mod.rs", "open_holding", "VersionedTree::open(", 1, "versioned: the dropped list"),
+    ("sql/sequence.rs", "sequences", ".open_plain(", 1, "plain: the sequences"),
+    ("txn/rollback.rs", "step", ".open_plain(", 1, "plain: the abandoned list"),
+    ("txn/rollback.rs", "step", ".open_tree(", 1, "versioned: the keys a rollback puts back"),
+    ("txn/versioned.rs", "open_plain", "Tree::open(", 1, "the plain open its callers ask for"),
+    ("txn/versioned.rs", "open_tree", "VersionedTree::open(", 1, "versioned"),
+    ("txn/versioned.rs", "open", "Tree::open(", 1, "versioned: with its head and reserves"),
+];
+
+/// Every open of an Atoll tree outside tests is one [`TREE_OPENS`] lists, as many times as it
+/// says, and every listed open is still there: a new open, or one moved, fails until it is listed
+/// with its kind (ROOT-KIND1).
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+#[test]
+fn every_open_of_an_atoll_tree_outside_tests_is_listed_with_its_kind() {
+    use crate::storage::atoll::testing::{atoll_dir, atoll_sources, code_of};
+    let dir = atoll_dir();
+    let mut found: BTreeMap<(String, String, &str), usize> = BTreeMap::new();
+    for path in atoll_sources() {
+        let file = path.strip_prefix(&dir).unwrap().display().to_string();
+        let name = path.file_name().unwrap().to_string_lossy();
+        let tests_only = ["tests.rs", "testing.rs", "bench.rs"].contains(&&*name)
+            || name.ends_with("_tests.rs")
+            || file.split('/').any(|part| part == "tests");
+        if tests_only {
+            continue;
+        }
+        let code = code_of(&std::fs::read_to_string(&path).unwrap());
+        for form in [
+            "VersionedTree::open(",
+            "Tree::open(",
+            ".open_plain(",
+            ".open_tree(",
+        ] {
+            let mut from = 0;
+            while let Some(i) = code[from..].find(form) {
+                let at = from + i;
+                from = at + form.len();
+                if form == "Tree::open(" && code[..at].ends_with("Versioned") {
+                    continue;
+                }
+                let before = &code[..at];
+                let function = before
+                    .rfind("fn ")
+                    .map(|f| {
+                        before[f + 3..]
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                *found.entry((file.clone(), function, form)).or_default() += 1;
+            }
+        }
+    }
+    let listed: BTreeMap<(String, String, &str), usize> = TREE_OPENS
+        .iter()
+        .map(|&(file, function, form, count, _)| ((file.into(), function.into(), form), count))
+        .collect();
+    let new: Vec<_> = found
+        .iter()
+        .filter(|(k, n)| listed.get(*k) != Some(*n))
+        .collect();
+    let gone: Vec<_> = listed
+        .iter()
+        .filter(|(k, n)| found.get(*k) != Some(*n))
+        .collect();
+    assert!(
+        new.is_empty() && gone.is_empty(),
+        "opens of an Atoll tree outside tests not as TREE_OPENS lists them: found {new:?}; listed \
+         and not found {gone:?}"
+    );
+}
+
+/// `op` stepped to its end, its failure the words of a failed check.
+fn go<T>(io: &Arc<dyn IO>, what: &str, op: impl FnMut() -> Result<IOResult<T>>) -> Words<T> {
+    drive(io, op).map_err(|e| format!("{what}: {e}"))
+}
+
 #[test]
 fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

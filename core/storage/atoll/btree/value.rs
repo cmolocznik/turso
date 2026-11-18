@@ -428,3 +428,103 @@ pub fn pages(
         IOResult::IO(io) => IOResult::IO(io),
     })
 }
+
+/// Freeing a retired value (DESIGN.md §6.5, §11.5): its chunks in the order its directory lists
+/// them, then the page its reference names, one page a call. The count of pages freed is its
+/// progress: a free made again from that count goes on where the last stopped, reading the
+/// directory again if it must, since the directory is freed last. Its collector's passes call it
+/// once E1b commits (the auditor's #6174); until then only tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct RetiredFree {
+    reference: ValueRef,
+    /// The chunks its directory lists, once read.
+    chunks: Option<Vec<PageId>>,
+    freed: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RetiredFree {
+    /// The free of the value `reference` names, its first `freed` pages freed already.
+    pub fn new(reference: ValueRef, freed: usize) -> Self {
+        Self {
+            reference,
+            chunks: None,
+            freed,
+        }
+    }
+
+    /// How many of its pages are freed.
+    pub fn freed(&self) -> usize {
+        self.freed
+    }
+
+    /// How many pages the value takes: its chunks and their directory, or its one page.
+    pub fn pages(&self) -> usize {
+        self.reference.chunks().map_or(1, |chunks| chunks + 1)
+    }
+
+    /// Frees the value's next page: `Done(true)` once every page is free, `Done(false)` once one
+    /// more is. A return of IO has freed nothing. A page not marked retired is corruption: freed
+    /// already, its number may be another page's now.
+    pub fn step(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+    ) -> Result<IOResult<bool>> {
+        let pages = self.pages();
+        if self.freed >= pages {
+            return match self.freed == pages {
+                true => Ok(IOResult::Done(true)),
+                false => Err(self.corrupt(format!("{} pages freed of {pages}", self.freed))),
+            };
+        }
+        let pid = match self.freed + 1 == pages {
+            true => self.reference.pid,
+            false => {
+                if self.chunks.is_none() {
+                    // Retired: nothing else frees its pages under this read.
+                    match directory(pool, self.reference, pages - 1, &|| true)? {
+                        IOResult::Done(Ok(chunks)) => self.chunks = Some(chunks),
+                        IOResult::Done(Err(_)) => {
+                            return Err(self.corrupt("its directory does not read back".into()))
+                        }
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    }
+                }
+                match self.chunks.as_ref().and_then(|c| c.get(self.freed)) {
+                    Some(&pid) => pid,
+                    None => return Err(self.corrupt("its directory lists too few chunks".into())),
+                }
+            }
+        };
+        if !store.retired(pid) {
+            return Err(self.corrupt(format!("{pid:?} is not marked retired")));
+        }
+        // A value whose item a checkpoint left out: the image held it free only if no image
+        // ever gave it a slot (DESIGN.md §6.5).
+        #[cfg(test)]
+        if store.was_left_out(pid) {
+            let entry = match store.entry(pid)? {
+                IOResult::Done(entry) => entry,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            assert_eq!(
+                entry,
+                crate::storage::atoll::radix::ALLOCATED,
+                "{pid:?}, of a value whose item a checkpoint left out, has a slot at its free"
+            );
+        }
+        if let IOResult::IO(io) = pool.free_unreferenced(pid)? {
+            return Ok(IOResult::IO(io));
+        }
+        self.freed += 1;
+        Ok(IOResult::Done(self.freed == pages))
+    }
+
+    fn corrupt(&self, what: String) -> LimboError {
+        LimboError::Corrupt(format!(
+            "the retired value at {:?} (id {:x}): {what}",
+            self.reference.pid, self.reference.id
+        ))
+    }
+}

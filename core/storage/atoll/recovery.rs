@@ -22,6 +22,7 @@ use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::db::AtollConfig;
 use super::drive;
 use super::executor::Executor;
+use super::gc::Retired;
 use super::log::{Log, LogConfig, Lsn};
 use super::meta::MetaId;
 use super::page::PageId;
@@ -97,6 +98,7 @@ pub fn create(
         store.clone(),
     )?;
     partial.pool = Some(pool.clone());
+    let retired = Arc::new(Retired::create(&counted, base, &pool, config.txn.slots)?);
     // Its ring in frames the pool lends: the pool first.
     let log = Log::open_in(counted, base, config.log.clone(), 0, &pool, executor)?;
     partial.log = Some(log.clone());
@@ -110,6 +112,7 @@ pub fn create(
         store,
         log,
         control,
+        retired,
         superblock.clone(),
         config.log_budget(),
         config.checkpoint_write_bytes(),
@@ -180,6 +183,17 @@ pub fn recover(
             }
         }
     }
+    // The retired items of the checkpoint in charge, owed from before the crash, before replay:
+    // the file holds only items committed at or below the snapshot, and replay applies only
+    // bodies above it, so no value is freed by both (DESIGN.md §6.5, §12).
+    let retired = Arc::new(Retired::open(
+        &counted,
+        base,
+        &superblock,
+        &pool,
+        &store,
+        config.txn.slots,
+    )?);
     // Roots the mapping holds are judged before anything is replayed.
     let mut opened = Vec::new();
     for &root in &scan.drained {
@@ -226,11 +240,14 @@ pub fn recover(
     let txns = &*partial
         .txns
         .insert(Transactions::new(&config.txn, clock, log.clone()));
+    #[cfg(test)]
+    let store_at_end = store.clone();
     let checkpointer = &*partial.checkpointer.insert(Checkpointer::new(
         pool,
         store,
         log,
         control,
+        retired,
         in_charge,
         config.log_budget(),
         config.checkpoint_write_bytes(),
@@ -238,6 +255,8 @@ pub fn recover(
     // What was recovered is in memory alone until a checkpoint writes it.
     let mut ticket = checkpointer.request_full();
     drive(&io, || checkpointer.step_full(&mut ticket, txns))?;
+    #[cfg(test)]
+    checkpointer.retired().assert_owed_unfreed(&store_at_end);
     partial.recovered()
 }
 

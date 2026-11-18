@@ -44,6 +44,9 @@ mod executor;
 // the stream catalog) are not built.
 #[cfg(test)]
 mod floors;
+// Garbage collection: the lists of retired values, their collector, and the retired file the
+// checkpoint writes and the open reads (DESIGN.md §6.5, §11.5).
+mod gc;
 mod guarded;
 mod latch;
 mod locks;

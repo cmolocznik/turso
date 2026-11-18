@@ -4,8 +4,8 @@
 //! ```text
 //! magic: u64 | version: u32 | segment_growth: u32 | seq: u64 | redo: u64 | segment_bytes: u64 |
 //! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 2] | clock: u64 |
-//! snapshot: u64 | checkpoint: u64 | continuations: u64 | (ended: u64, resumed: u64) *
-//! continuations | zeros |
+//! snapshot: u64 | checkpoint: u64 | retired place + 1: u64 | retired checkpoint: u64 |
+//! continuations: u64 | (ended: u64, resumed: u64) * continuations | zeros |
 //! crc32c: u32
 //! ```
 //!
@@ -39,7 +39,9 @@ const HEIGHTS: usize = 64;
 const CLOCK: usize = HEIGHTS + TREES * CLASS_COUNT;
 const SNAPSHOT: usize = CLOCK + 8;
 const CHECKPOINT: usize = SNAPSHOT + 8;
-const CONTINUATIONS: usize = CHECKPOINT + 8;
+const RETIRED_PLACE: usize = CHECKPOINT + 8;
+const RETIRED_CHECKPOINT: usize = RETIRED_PLACE + 8;
+const CONTINUATIONS: usize = RETIRED_CHECKPOINT + 8;
 /// Continuations a superblock holds: all that fit between their count and the checksum.
 pub const MAX_CONTINUATIONS: usize = (SIZE - 4 - CONTINUATIONS - 8) / 16;
 
@@ -65,6 +67,10 @@ pub struct Superblock {
     pub snapshot: u64,
     /// The checkpoint in charge (audit 18): the metadata is the copies numbered at or below it.
     pub checkpoint: u64,
+    /// The retired file's header in charge: its place and the checkpoint that wrote it, which a
+    /// checkpoint with nothing new to write leaves as it was (DESIGN.md 6.5). `None` until a
+    /// checkpoint first writes the file.
+    pub retired: Option<(u8, u64)>,
     /// Where the log goes on past a gap, in order: it ended at `.0`, and goes on at `.1`. A
     /// recovery reopens the log past where it ends, at the next block, and records the gap here,
     /// durably, before it appends anything: a recovery that crashes and starts again from this
@@ -90,6 +96,9 @@ impl Superblock {
         out[CLOCK..CLOCK + 8].copy_from_slice(&self.clock.to_le_bytes());
         out[SNAPSHOT..SNAPSHOT + 8].copy_from_slice(&self.snapshot.to_le_bytes());
         out[CHECKPOINT..CHECKPOINT + 8].copy_from_slice(&self.checkpoint.to_le_bytes());
+        let (place, retired) = self.retired.map_or((0, 0), |(p, c)| (p as u64 + 1, c));
+        out[RETIRED_PLACE..RETIRED_PLACE + 8].copy_from_slice(&place.to_le_bytes());
+        out[RETIRED_CHECKPOINT..RETIRED_CHECKPOINT + 8].copy_from_slice(&retired.to_le_bytes());
         assert!(
             self.continuations.len() <= MAX_CONTINUATIONS,
             "{} continuations",
@@ -169,6 +178,16 @@ impl Superblock {
                 }
             }
         }
+        let retired = match word(RETIRED_PLACE) {
+            0 => None,
+            place @ 1..=2 => Some(((place - 1) as u8, word(RETIRED_CHECKPOINT))),
+            place => {
+                return Err(LimboError::Corrupt(format!(
+                    "a superblock naming retired header place {}, where there are two",
+                    place - 1
+                )))
+            }
+        };
         Ok(Some(Self {
             seq: word(16),
             redo: word(24),
@@ -180,6 +199,7 @@ impl Superblock {
             clock: word(CLOCK),
             snapshot: word(SNAPSHOT),
             checkpoint: word(CHECKPOINT),
+            retired,
             continuations,
         }))
     }
@@ -443,6 +463,7 @@ mod tests {
             clock: 1 << 40,
             snapshot: (1 << 40) - 7,
             checkpoint: 5,
+            retired: Some((1, 4)),
             continuations: vec![(20_000, 20_480), (40_100, 40_960)],
         }
     }
@@ -460,6 +481,8 @@ mod tests {
             CLOCK,
             SNAPSHOT,
             CHECKPOINT,
+            RETIRED_PLACE,
+            RETIRED_CHECKPOINT,
             CONTINUATIONS,
             CONTINUATIONS + 8,
             SIZE - 1,
@@ -476,6 +499,10 @@ mod tests {
 
     #[test]
     fn a_superblock_holds_as_many_continuations_as_fit_and_refuses_a_count_past_them() {
+        assert_eq!(
+            MAX_CONTINUATIONS, 247,
+            "the continuations that fit beside the retired header"
+        );
         let mut sb = superblock(3);
         sb.continuations = (0..MAX_CONTINUATIONS as u64)
             .map(|i| (i * 8192 + 100, i * 8192 + 4096))

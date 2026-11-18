@@ -1187,6 +1187,7 @@ impl Tree {
             return Ok(IOResult::Done(Split::Done));
         }
         let level = v.level();
+        let versioned = v.records_versioned();
         if let Err(refused) = self.pool.keep(&[&root], room) {
             root.release_unchanged();
             return Ok(IOResult::Done(Split::Refused(refused)));
@@ -1194,6 +1195,8 @@ impl Tree {
         let mut child = done!(self.allocate(&[root.pid()]));
         let image = node::image(root.page());
         node::apply_image(&mut child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
+        // The root's mark came with its image: the child is no root.
+        node::set_versioned_root(&mut child.page_mut(), false);
         node::build(
             &mut root.page_mut(),
             &Layout {
@@ -1206,6 +1209,7 @@ impl Tree {
             },
             [],
         );
+        node::set_versioned_root(&mut root.page_mut(), versioned);
         child.changed();
         root.changed();
         Ok(IOResult::Done(Split::Again))
@@ -1504,8 +1508,14 @@ impl Tree {
             child.release_unchanged();
             return Ok(IOResult::Done(Some(refused)));
         }
+        let versioned = rv.records_versioned();
         let image = node::image(child.page());
         node::apply_image(&mut root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
+        // A leaf records the kind by its reserving, an inner root by its mark, which the child,
+        // no root, lacked.
+        if !View::new(root.page()).is_leaf() {
+            node::set_versioned_root(&mut root.page_mut(), versioned);
+        }
         root.changed();
         child.abandon();
         drop(root);
@@ -1823,6 +1833,20 @@ impl Tree {
             node::check(&bytes).map_err(fail)?;
             if v.root() != self.root {
                 return Err(fail("belongs to another tree".into()));
+            }
+            let kind = |versioned| match versioned {
+                true => "versioned",
+                false => "plain",
+            };
+            if pid == self.root && v.records_versioned() != self.reserving {
+                return Err(fail(format!(
+                    "the root of a {} tree, opened as a {} one",
+                    kind(v.records_versioned()),
+                    kind(self.reserving)
+                )));
+            }
+            if pid != self.root && v.versioned_root() {
+                return Err(fail("marked as an inner root, and not the root".into()));
             }
             if level.is_some_and(|l| l != v.level()) {
                 return Err(fail(format!(

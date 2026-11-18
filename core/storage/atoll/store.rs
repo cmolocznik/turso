@@ -178,6 +178,15 @@ pub struct PageStore {
     reserved: [GrowBits; CLASS_COUNT],
     /// Pages holding a version a snapshot may still read, by class.
     retired: [GrowBits; CLASS_COUNT],
+    /// The pages of values whose items a checkpoint left out of the retired file.
+    #[cfg(test)]
+    left_out: crate::storage::atoll::locks::Mutex<std::collections::HashSet<PageId>>,
+    /// Edits a checkpoint made to the page table as of its cut, which its image writes.
+    #[cfg(test)]
+    cut_edits: AtomicU64,
+    /// Each page a checkpoint left out of its image, with the phase whose edit did it.
+    #[cfg(test)]
+    left_out_by: crate::storage::atoll::locks::Mutex<Vec<(PageId, &'static str)>>,
     /// Slots claimed in memory, by class: a swap copy's for as long as it lives, a checkpoint
     /// copy's until the free space marks it. Every taker claims first, so no two take one slot.
     claimed: [GrowBits; CLASS_COUNT],
@@ -488,6 +497,12 @@ impl PageStore {
             erasure: Mutex::new(Eraser::default()),
             reserved: Default::default(),
             retired: Default::default(),
+            #[cfg(test)]
+            left_out: crate::storage::atoll::locks::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            cut_edits: AtomicU64::new(0),
+            #[cfg(test)]
+            left_out_by: crate::storage::atoll::locks::Mutex::new(Vec::new()),
             claimed: Default::default(),
             gate: AtomicU64::new(0),
             reopened: Mutex::new(None),
@@ -1196,6 +1211,40 @@ impl PageStore {
         self.retired[pid.class().index()].get(pid.number())
     }
 
+    /// Flags `pid`, a page of a value whose item a checkpoint left out of the retired file.
+    #[cfg(test)]
+    pub fn flag_left_out(&self, pid: PageId) {
+        self.left_out.lock().insert(pid);
+    }
+
+    #[cfg(test)]
+    pub fn was_left_out(&self, pid: PageId) -> bool {
+        self.left_out.lock().contains(&pid)
+    }
+
+    /// A checkpoint's phase `road` left `pid` out of its image, for a test to read.
+    #[cfg(test)]
+    pub fn note_left_out(&self, pid: PageId, road: &'static str) {
+        self.left_out_by.lock().push((pid, road));
+    }
+
+    /// The phases that left `pid` out of an image, in the order they did, for a test.
+    #[cfg(test)]
+    pub fn left_out_by(&self, pid: PageId) -> Vec<&'static str> {
+        self.left_out_by
+            .lock()
+            .iter()
+            .filter(|&&(p, _)| p == pid)
+            .map(|&(_, road)| road)
+            .collect()
+    }
+
+    /// Edits checkpoints have made to the page table as of their cuts, for a test.
+    #[cfg(test)]
+    pub fn cut_edits(&self) -> u64 {
+        self.cut_edits.load(Ordering::Relaxed)
+    }
+
     // ---------------------------------------------------------------- slots
 
     /// A free slot of `class`, claimed: in no free space, claimed by no one, not being erased. Its
@@ -1603,6 +1652,8 @@ impl PageStore {
         drop(deferred);
         let edited = locked.edited(space);
         locked.commit(&self.meta);
+        #[cfg(test)]
+        self.cut_edits.fetch_add(1, Ordering::Relaxed);
         Ok(IOResult::Done(edited))
     }
 

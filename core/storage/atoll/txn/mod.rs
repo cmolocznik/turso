@@ -1617,6 +1617,24 @@ pub mod versioned;
 use rollback::Rollback;
 use versioned::Versions;
 
+/// The transactions as garbage collection's lists and collector read them (DESIGN.md §11.5).
+impl crate::storage::atoll::gc::Writers for Transactions {
+    fn running(&self, slot: u16, start: Ts) -> bool {
+        self.running
+            .get(slot as usize)
+            .is_some_and(|running| running.load(Ordering::Acquire) == start)
+    }
+
+    fn commit_of(&self, slot: u16, start: Ts) -> Option<Ts> {
+        let log = self.slots.get(slot as usize)?;
+        let n = log.count(|(s, _)| s < start);
+        (n < log.len.load(Ordering::Acquire))
+            .then(|| log.pair(n))
+            .filter(|&(s, _)| s == start)
+            .map(|(_, commit)| commit)
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -2008,6 +2008,9 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("buffer/shortage.rs", "short", "Completion::new_yield", 1, "held: memory, reserved at the operation's top (the shortage queue)"),
     ("checkpoint.rs", "step_full", "Completion::new_yield", 1, "change: a step of its own done and more of the full checkpoint to do"),
     ("checkpoint.rs", "claim_full", "Completion::new_yield", 2, "change: a claimed step done and more of the full checkpoint to do, or the task over since the writer looked"),
+    ("gc/list.rs", "cut_back", "Completion::new_yield", 1, "change: the list's last page written, moved or evicted while read"),
+    ("gc/list.rs", "give_back", "Completion::new_yield", 1, "change: the list's first page moved or evicted while read"),
+    ("gc/list.rs", "look", "Completion::new_yield", 1, "change: a list page written by an append past the end, moved or evicted while read"),
     ("log/mod.rs", "run_preparer", "Completion::new_yield", 1, "change: a step of the preparer done and more of it to do now"),
     ("meta.rs", "join", "Completion::new_yield", 1, "change: a load's phase moved before the wait was registered"),
     ("meta.rs", "wait_while_held", "Completion::new_yield", 2, "change: the hold let go or changed before the mark"),
@@ -2318,3 +2321,6 @@ fn a_new_database_writes_small_first_log_segments() {
         "the reopened database took the configuration's sizes over its superblock's"
     );
 }
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+mod retired;

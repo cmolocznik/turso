@@ -450,6 +450,7 @@ impl Opening {
             clock: 0,
             snapshot: 0,
             checkpoint: 0,
+            retired: None,
             continuations: Vec::new(),
         };
         let store = PageStore::open(

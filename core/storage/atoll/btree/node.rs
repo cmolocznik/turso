@@ -66,6 +66,10 @@ const LOWER_INFINITE: u8 = 1;
 const UPPER_INFINITE: u8 = 2;
 /// `fences`' bit for a reserving leaf.
 const RESERVING: u8 = 4;
+/// `fences`' bit for the inner root of a versioned tree. A root that is a leaf records its tree's
+/// kind by [`RESERVING`], as every leaf of a versioned tree does; an inner root records it here
+/// (DESIGN.md §13).
+const VERSIONED_ROOT: u8 = 8;
 /// Where a reserving leaf's value holds its reserve: a version header's bytes, their top bit not
 /// the reserve's.
 pub const RESERVE: std::ops::Range<usize> = 2..4;
@@ -294,6 +298,19 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
     /// Whether the node is a reserving leaf.
     pub fn reserving(&self) -> bool {
         self.0.u8_at(FENCES) & RESERVING != 0
+    }
+
+    /// Whether the node is marked as the inner root of a versioned tree.
+    pub fn versioned_root(&self) -> bool {
+        self.0.u8_at(FENCES) & VERSIONED_ROOT != 0
+    }
+
+    /// The kind of tree the node records as its root: versioned or plain (DESIGN.md §13).
+    pub fn records_versioned(&self) -> bool {
+        match self.is_leaf() {
+            true => self.reserving(),
+            false => self.versioned_root(),
+        }
     }
 
     /// Bytes kept free for its entries' reserves.
@@ -831,6 +848,12 @@ pub fn shape<P: Bytes + ?Sized>(page: &P) -> Shape {
 /// The child an inner node is left with once a drain has removed its last ([`super::Drain`]). Its
 /// class byte is no size class's, so it names no page.
 pub const NO_CHILD: PageId = PageId::from_raw(u64::MAX);
+
+/// Marks `page`, an inner node, as the root of a versioned tree, or takes the mark off.
+pub fn set_versioned_root<P: BytesMut + ?Sized>(page: &mut P, versioned: bool) {
+    let fences = page.u8_at(FENCES) & !VERSIONED_ROOT;
+    page.put_u8(FENCES, fences | if versioned { VERSIONED_ROOT } else { 0 });
+}
 
 pub fn set_next<P: BytesMut + ?Sized>(page: &mut P, pid: PageId, hint: u32) {
     page.put_u64(NEXT, pid.raw());
@@ -1390,6 +1413,9 @@ pub fn check<P: Bytes + ?Sized>(page: &P) -> Result<(), String> {
     if v.reserving() && !v.is_leaf() {
         return Err("a reserving inner node".into());
     }
+    if v.versioned_root() && v.is_leaf() {
+        return Err("a leaf marked as an inner root".into());
+    }
     let reserved: usize = (0..count).map(|i| v.reserve(i).unwrap()).sum();
     if reserved != v.reserved() {
         return Err(format!(
@@ -1442,6 +1468,27 @@ mod tests {
             next: (PageId::from_raw(0), 0),
             reserving: false,
         }
+    }
+
+    /// The mark of a versioned tree's inner root is an inner node's: a leaf bearing it fails its
+    /// check, and an inner node bearing it passes (ROOT-KIND1).
+    #[test]
+    fn a_leaf_marked_as_an_inner_root_fails_its_check() {
+        let mut page = vec![0u8; class(0).size()];
+        build(&mut page[..], &leaf(None, None), []);
+        set_versioned_root(&mut page[..], true);
+        assert_eq!(
+            check(&page[..]),
+            Err("a leaf marked as an inner root".to_string())
+        );
+        let inner = Layout {
+            level: 1,
+            ..leaf(None, None)
+        };
+        build(&mut page[..], &inner, []);
+        set_versioned_root(&mut page[..], true);
+        assert_eq!(check(&page[..]), Ok(()));
+        assert!(View::new(&page[..]).records_versioned());
     }
 
     /// A key's head is its first four bytes as a big-endian integer, zero-padded: for every

@@ -1913,6 +1913,31 @@ mod tests {
             "a_wait_that_lands_before_its_waker_is_set_still_wakes_it",
             "child",
         ),
+        (
+            "gc/tests.rs",
+            "a_block_handed_short_to_its_decoder_ends_the_process",
+            "child",
+        ),
+        (
+            "gc/tests.rs",
+            "a_header_place_handed_short_to_its_decoder_ends_the_process",
+            "child",
+        ),
+        (
+            "gc/tests.rs",
+            "a_record_block_handed_short_to_its_decoder_ends_the_process",
+            "child",
+        ),
+        (
+            "gc/tests.rs",
+            "a_block_freed_while_free_ends_the_process",
+            "child",
+        ),
+        (
+            "gc/tests.rs",
+            "a_block_freed_past_the_files_end_ends_the_process",
+            "child",
+        ),
     ];
 
     /// Every `should_panic`, `catch_unwind` and child-process test in Atoll is listed with its

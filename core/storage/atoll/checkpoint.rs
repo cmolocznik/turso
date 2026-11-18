@@ -39,6 +39,7 @@ use super::buffer::{BufferPool, CutScan, EndCut, Relief, Relieved, Retry, Source
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::epoch::Notify;
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
+use super::gc::{Retired, RetiredRun};
 use super::guarded::{Contender, Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, LogWait, Lsn};
 use super::meta::{MetaId, MetaRef, Tree, TREES};
@@ -228,6 +229,8 @@ pub struct Checkpointer {
     store: Arc<PageStore>,
     log: Arc<Log>,
     control: Control,
+    /// The retired lists and their file, which each checkpoint writes (DESIGN.md §6.5).
+    retired: Arc<Retired>,
     /// How much log recovery should replay at most.
     budget: u64,
     /// Full checkpoints asked for so far.
@@ -702,6 +705,8 @@ struct Run {
     syncing: Vec<(Completion, Completion)>,
     written: Option<Completion>,
     superblock: Option<Superblock>,
+    /// Its part of the retired file, from its cut on.
+    retired: RetiredRun,
     /// Where the walk of `frames` a run at a time is, in the phases that take one.
     frames_at: usize,
     /// The last root of the registry of trees created read, once a run of it has been, and the
@@ -734,6 +739,9 @@ enum Phase {
     /// Page numbers taken before the cut whose page the cut did not find owed, so neither imaged
     /// nor left out: left out now, a page-table leaf read or a number left out a unit.
     Untaken,
+    /// The retired items its snapshot sees committed, then its record and header, written to the
+    /// retired file (DESIGN.md §6.5).
+    Retired,
     /// The pool's cut ended, a run of its copies or lend batches a unit.
     EndCut,
     Intent,
@@ -796,11 +804,13 @@ struct Flying {
 impl Checkpointer {
     /// A checkpointer for a database whose superblock in charge is `superblock`, keeping the log
     /// recovery replays to about `budget` bytes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: Arc<BufferPool>,
         store: Arc<PageStore>,
         log: Arc<Log>,
         control: Control,
+        retired: Arc<Retired>,
         superblock: Superblock,
         budget: u64,
         write_bytes: usize,
@@ -812,6 +822,7 @@ impl Checkpointer {
             store,
             log,
             control,
+            retired,
             budget,
             full_wanted: AtomicU64::new(0),
             began_at,
@@ -1381,6 +1392,12 @@ impl Checkpointer {
             .redo
     }
 
+    /// The retired lists and their file, which S5's writes and the passes reach through it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn retired(&self) -> &Arc<Retired> {
+        &self.retired
+    }
+
     /// The superblock in charge.
     #[cfg(test)]
     pub fn superblock(&self) -> Superblock {
@@ -1555,6 +1572,15 @@ impl Checkpointer {
         let state = self.try_hold()?;
         let run = state.run.as_ref()?;
         (!matches!(run.phase, Phase::Gate | Phase::Cut | Phase::Scan)).then_some(run.n)
+    }
+
+    /// The phase of the checkpoint under way, by name, if one is: for a test that steps it a unit
+    /// at a time.
+    #[cfg(test)]
+    pub(crate) fn phase_for_test(&self) -> Option<String> {
+        let state = self.try_hold()?;
+        let run = state.run.as_ref()?;
+        Some(format!("{:?}", run.phase))
     }
 
     /// Asks for a full checkpoint: one begun after the ask, done. Step it with
@@ -1778,12 +1804,14 @@ const CREATION_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<(PageId, u
 const ORPHAN_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<PageId>();
 
 /// Where a checkpoint that cannot finish stands in letting go of what it holds, a unit at a time
-/// as its work was (DESIGN.md 22.1, the auditor's #4347 and #4350): the gate, its cut's end a run a
-/// unit, its frames' cut copies a run a unit, what it holds element by element a run a unit (its
-/// frames, then the metadata pages), the orphans handed back a run a unit, then its snapshot.
+/// as its work was (DESIGN.md 22.1, the auditor's #4347 and #4350): the gate, the retired file's
+/// blocks it took a run a unit, its cut's end a run a unit, its frames' cut copies a run a unit,
+/// what it holds element by element a run a unit (its frames, then the metadata pages), the
+/// orphans handed back a run a unit, then its snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Letting {
     Gate,
+    Retired,
     EndCut,
     Frames(usize),
     Held,
@@ -1938,6 +1966,7 @@ impl Run {
             syncing: Vec::new(),
             written: None,
             superblock: None,
+            retired: RetiredRun::default(),
             frames_at: 0,
             creations_at: None,
             creations_end: None,
@@ -1975,6 +2004,26 @@ impl Run {
                 Letting::Gate => {
                     if matches!(self.phase, Phase::Gate | Phase::Cut | Phase::Scan) {
                         cp.store.open_gate();
+                    }
+                    // Its superblock not durable: nothing it planned is in charge.
+                    if !matches!(
+                        self.phase,
+                        Phase::InCharge
+                            | Phase::LetGo
+                            | Phase::After
+                            | Phase::Forget
+                            | Phase::Release
+                            | Phase::Released
+                            | Phase::Erase
+                    ) {
+                        cp.retired.failed(&mut self.retired);
+                    }
+                    self.letting = Letting::Retired;
+                }
+                // The retired file's blocks it took, a run a unit.
+                Letting::Retired => {
+                    if !cp.retired.give_back_taken(&mut self.retired) {
+                        return false;
                     }
                     self.letting = Letting::EndCut;
                 }
@@ -2065,6 +2114,8 @@ impl Run {
                     self.c = c;
                     self.clock = txns.clock_now();
                     txns.hold_checkpoint(c);
+                    // Under the closed gate, as the frees it judges are made.
+                    cp.retired.cut(&mut self.retired);
                     self.phase = Phase::Scan;
                     return Ok(Unit::Again);
                 }
@@ -2141,6 +2192,8 @@ impl Run {
                                 .store
                                 .left_out(self.n, &self.heights, pid, &mut self.leaving));
                         self.meta.extend(edited.iter().copied());
+                        #[cfg(test)]
+                        cp.store.note_left_out(pid, "orphans");
                         self.freed.insert(pid);
                         return Ok(Unit::Again);
                     }
@@ -2176,7 +2229,21 @@ impl Run {
                     if let Some(unit) = self.untaken_unit(cp)? {
                         return Ok(unit);
                     }
-                    self.phase = Phase::EndCut;
+                    self.phase = Phase::Retired;
+                    return Ok(Unit::Again);
+                }
+                Phase::Retired => {
+                    // A unit of the retired file's work, one page at most.
+                    if unit!(cp.retired.step(
+                        &mut self.retired,
+                        txns,
+                        self.c,
+                        self.n,
+                        &self.heights,
+                        &cp.store
+                    )) {
+                        self.phase = Phase::EndCut;
+                    }
                     return Ok(Unit::Again);
                 }
                 Phase::EndCut => {
@@ -2259,6 +2326,15 @@ impl Run {
                     if self.syncing.len() >= WRITES {
                         return Ok(Unit::Wait(self.syncing[0].1.clone()));
                     }
+                    // The retired file's, with the data files': its blocks and header are durable
+                    // before the superblock that names the header.
+                    if let Some(sync) = cp.retired.sync(&mut self.retired)? {
+                        let retired = crate::storage::atoll::notify::wait();
+                        let place = retired.clone();
+                        sync.on_retired(move || place.complete(0));
+                        self.syncing.push((sync, retired));
+                        return Ok(Unit::Again);
+                    }
                     // The files as they stand once every image is written: those opened later need
                     // no sync of this checkpoint's.
                     let ends = *self
@@ -2307,6 +2383,7 @@ impl Run {
                             snapshot: self.c,
                             clock: self.clock,
                             heights: self.heights,
+                            retired: cp.retired.written(&self.retired).or(in_charge.retired),
                             continuations,
                             ..in_charge.clone()
                         }
@@ -2324,6 +2401,7 @@ impl Run {
                         return Ok(Unit::Again);
                     }
                     cp.store.meta().put_in_charge(self.n);
+                    cp.retired.durable(&mut self.retired);
                     let sb = self.superblock.as_ref().expect("the superblock written");
                     cp.published
                         .replace(Some(Arc::new(sb.clone())), &cp.releasing);
@@ -2507,6 +2585,16 @@ impl Run {
             if let Some((_, c)) = self.writing.first() {
                 return Ok(Unit::Wait(c.clone()));
             }
+            // Every metadata page written, and every page still read as of the cut: each retired
+            // item judged again by the image, one a unit. Once changes stop keeping a page first,
+            // a page-table leaf that kept none reads as it stands.
+            #[cfg(test)]
+            if unit!(cp
+                .retired
+                .recheck(&mut self.retired, &cp.store, self.n, &self.heights))
+            {
+                return Ok(Unit::Again);
+            }
             cp.store.meta().stop_keeping(self.n);
             self.frames_at = 0;
             self.phase = Phase::Uncut;
@@ -2582,6 +2670,8 @@ impl Run {
                             return Ok(Unit::Wait(c));
                         }
                     }
+                    #[cfg(test)]
+                    cp.store.note_left_out(pid, "values");
                     return Ok(Unit::Again);
                 }
                 unit::visit();
@@ -2650,6 +2740,8 @@ impl Run {
                                 .store
                                 .left_out(self.n, &self.heights, pid, &mut self.leaving));
                         self.meta.extend(edited.iter().copied());
+                        #[cfg(test)]
+                        cp.store.note_left_out(pid, "set aside");
                         self.imaging = None;
                         return Ok(Unit::Again);
                     }
@@ -2829,6 +2921,8 @@ impl Run {
                 IOResult::Done(edited) => self.meta.extend(edited.iter().copied()),
                 IOResult::IO(IOCompletions(c)) => return Ok(Some(Unit::Wait(c))),
             }
+            #[cfg(test)]
+            cp.store.note_left_out(pid, "untaken");
             self.untaken.numbers.pop_front();
             return Ok(Some(Unit::Again));
         }
@@ -2914,6 +3008,33 @@ impl Run {
         self.flying_bytes -= f.bytes;
         self.flying.swap_remove(i);
         Ok(IOResult::Done(true))
+    }
+}
+
+/// Whether the image checkpoint `n` writes keeps `pid` allocated: the page table's entry for it as
+/// of the cut, at the cut's `heights`, with the checkpoint's own edits applied, is not free
+/// (DESIGN.md §6.5). After the Untaken phase every road that leaves a page out has made its edit,
+/// so the Retired phase judges each item's value by it.
+pub(super) fn kept_by_image(
+    store: &Arc<PageStore>,
+    n: u64,
+    heights: &[[u8; CLASS_COUNT]; TREES],
+    pid: PageId,
+) -> Result<IOResult<bool>> {
+    let (class, number) = (pid.class(), pid.number());
+    let height = heights[Tree::Map as usize][class.index()].max(1);
+    let leaf = radix::path(Tree::Map, class, height, number)[0];
+    let frame = match store.meta().get(leaf)? {
+        IOResult::Done(frame) => frame,
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+    };
+    match frame.read_cut(
+        n,
+        |live| radix::map_entry(live, number),
+        |cut| radix::map_entry(cut, number),
+    ) {
+        Some(entry) => Ok(IOResult::Done(entry != radix::FREE)),
+        None => Ok(IOResult::IO(IOCompletions(frame.wait_while_held()))),
     }
 }
 
@@ -3501,9 +3622,11 @@ mod tests {
         const A_RUN_A_UNIT: &[&str] = &["frames", "meta", "dirty"];
         // `writing`, `flying` and `syncing` are held to `WRITES`; `imaging` to one page;
         // `landing` and `leaving` to one edit of the cut each, `CUT_PAGES` frames at most;
-        // `copying` and `freeing` to one slot's path each, `SLOT_PAGES` frames at most.
+        // `copying` and `freeing` to one slot's path each, `SLOT_PAGES` frames at most; `retired`
+        // holds its writes in flight to `WRITES`, and its heads, items, plan and bytes a free each.
         const BOUNDED: &[&str] = &[
             "writing", "flying", "syncing", "imaging", "landing", "leaving", "copying", "freeing",
+            "retired",
         ];
         const ONE_FREE: &[&str] = &[
             "set_aside",

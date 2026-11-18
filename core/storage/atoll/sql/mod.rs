@@ -266,6 +266,12 @@ impl AtollDb {
         &self.catalog
     }
 
+    /// The dropped list, versioned: trees dropped by a transaction, to free once no snapshot sees
+    /// them.
+    pub(in crate::storage::atoll) fn dropped(&self) -> &VersionedTree {
+        &self.dropped
+    }
+
     pub(in crate::storage::atoll) fn header(&self) -> &Header {
         &self.header
     }

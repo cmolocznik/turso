@@ -2288,6 +2288,61 @@ fn table_state(conn: &Arc<Connection>) -> std::collections::BTreeMap<i64, String
         .collect()
 }
 
+/// A process killed while a DROP TABLE is not committed keeps the table (DROPPED-OPEN1, the
+/// auditor's #6432): the drop's entry on the dropped list is versioned, and an open drains that
+/// list. Images are taken right after the uncommitted drop, after another connection's commit has
+/// made the log durable past the drop's records, and after a checkpoint has written pages since.
+/// Each reopens with the table, its row, and an integrity check that finds nothing.
+#[test]
+fn a_kill_before_a_drop_commits_keeps_the_table_at_the_reopen() {
+    use crate::io::crash::CrashIO;
+    let path = "/db/drop-uncommitted-kill";
+    let crash = Arc::new(CrashIO::new(6432));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, path);
+    let dropper = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    dropper.execute("CREATE TABLE kept(x)").unwrap();
+    dropper.execute("INSERT INTO kept VALUES (7)").unwrap();
+    other.execute("CREATE TABLE beside(y)").unwrap();
+    dropper.execute("BEGIN").unwrap();
+    dropper.execute("DROP TABLE kept").unwrap();
+    let mut images = vec![("after the drop", crash.crash(1))];
+    if other.execute("INSERT INTO beside VALUES (1)").is_ok() {
+        images.push(("after another commit", crash.crash(2)));
+    }
+    if other.execute("PRAGMA wal_checkpoint(TRUNCATE)").is_ok() {
+        images.push(("after a checkpoint", crash.crash(3)));
+    }
+    drop((dropper, other, db));
+    // Another connection's commit is Busy behind the open transaction, so no image is taken
+    // after one; the image after a checkpoint is the one a later write could have made durable.
+    assert!(
+        images.iter().any(|(l, _)| *l == "after a checkpoint"),
+        "no image after a checkpoint: {:?}",
+        images.iter().map(|(l, _)| *l).collect::<Vec<_>>()
+    );
+    for (label, image) in images {
+        let io: Arc<dyn IO> = Arc::new(image);
+        let db = open(&io, path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let got = conn
+            .prepare("SELECT x FROM kept")
+            .and_then(|mut s| s.run_collect_rows())
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            got,
+            Ok(vec![vec![Value::from_i64(7)]]),
+            "{label}: the table an uncommitted drop named is not there with its row"
+        );
+        assert_eq!(
+            rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![text("ok")]],
+            "{label}"
+        );
+    }
+}
+
 /// A crash anywhere in a SQL workload leaves a database that opens and holds exactly the
 /// transactions committed before it (DESIGN.md §17, §12): an image taken while transactions write
 /// and commit recovers to the state after some prefix of them, never part of one; one taken once a

@@ -284,6 +284,74 @@ fn a_tree_the_catalog_names_and_a_list_holds_is_found() {
     );
 }
 
+/// A tree the catalog names that the dropped list also holds is found with what both say
+/// (DROPPED-LIST1): the tree id the catalog names it by at the check's snapshot, the check's
+/// transaction, whether that snapshot sees the list's entry, and the entry as stored. The entry is
+/// a real one, a dropped table's, kept from its drain by a reader's snapshot and copied under the
+/// named tree's root, so the list's versioned read takes it as it takes any committed drop.
+#[test]
+fn a_tree_the_catalog_names_and_the_dropped_list_holds_is_found_with_both_sides() {
+    // In a child: a failure unwinds through the reader's open transaction, an Atoll frame, which
+    // ends the process; the parent shows the child's words.
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_tree_the_catalog_names_and_the_dropped_list_holds_is_found_with_both_sides"
+        ),
+        || {
+            let (db, conn) = used("/db/integrity-dropped-both");
+            let adb = atoll(&db);
+            conn.execute("CREATE TABLE u(x)").unwrap();
+            conn.execute("INSERT INTO u VALUES (1)").unwrap();
+            let gone = entry_of(&conn, adb, "u").root;
+            let reader = db.connect(ConnectOpts::new()).unwrap();
+            reader.execute("BEGIN").unwrap();
+            assert_eq!(rows(&reader, "SELECT count(*) FROM u").len(), 1);
+            conn.execute("DROP TABLE u").unwrap();
+            let list = adb.dropped().tree();
+            let stored = {
+                let mut cursor = crate::storage::atoll::btree::Cursor::new();
+                let key = gone.raw().to_be_bytes();
+                let found = drive(adb.io(), || {
+                    list.seek(&mut cursor, &key, crate::storage::atoll::btree::Seek::Ge)
+                })
+                .unwrap();
+                assert!(
+                    found && cursor.key() == Some(&key[..]),
+                    "u's root on the dropped list"
+                );
+                cursor.value().unwrap().to_vec()
+            };
+            let root = entry_of(&conn, adb, "t").root;
+            let Value::Numeric(crate::numeric::Numeric::Integer(id)) =
+                rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0].clone()
+            else {
+                panic!("t's rootpage");
+            };
+            // The stored entry starts with its version header, the tree's head of 24 bytes.
+            let mut put = crate::storage::atoll::btree::Put::with_entry(
+                &root.raw().to_be_bytes(),
+                stored,
+                24,
+                crate::storage::atoll::btree::Mode::Insert,
+            );
+            drive(adb.io(), || list.put(&mut put)).unwrap();
+            found(
+                &conn,
+                &[
+                    format!(
+                    "tree {} is named by the catalog and on the Dropped list, to be freed: the \
+                     catalog names it as tree id {id} at the check's snapshot (transaction ",
+                    root.raw()
+                ),
+                    "the list's entry is seen by that snapshot, its stored value ".to_string(),
+                ],
+            );
+            reader.execute("ROLLBACK").unwrap();
+        },
+    );
+}
+
 /// A page a tree reaches, freed behind its back once written back, is found as reached and free.
 #[test]
 fn a_freed_page_a_tree_reaches_is_found() {
@@ -3069,5 +3137,152 @@ fn a_page_walk_without_the_write_gate_exclusive_is_refused() {
                 "the database after the refusal in frames"
             );
         },
+    );
+}
+
+/// A check holds the write gate from its first step (integrity.rs, module comment): another
+/// connection's DROP INDEX begun while the check is suspended at its first return for IO gets Busy,
+/// whatever its transaction then does, and the check ends "ok" (DROPPED-LIST1, #6432-#6433).
+fn a_drop_while_a_check_is_suspended(path: &str, ending: &str) {
+    let (io, db, conn) = used_with_worker(path);
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    other.execute("PRAGMA busy_timeout = 0").unwrap();
+    let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
+    let first = {
+        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+        stmt.step()
+    };
+    assert!(
+        matches!(first, Ok(crate::StepResult::IO)),
+        "the check's first step: {first:?}"
+    );
+    other.execute("BEGIN").unwrap();
+    let dropped = other.execute("DROP INDEX t_v").map_err(|e| e.to_string());
+    assert_eq!(dropped, Err("Database is busy".to_string()), "{ending}");
+    let _ = other.execute(match ending {
+        "commit" => "COMMIT",
+        _ => "ROLLBACK",
+    });
+    let mut out = Vec::new();
+    for _ in 0..100_000 {
+        let stepped = {
+            let _frame = crate::storage::atoll::cooperative::Frame::enter();
+            stmt.step()
+        };
+        match stepped.unwrap() {
+            crate::StepResult::Row => out.push(
+                stmt.row()
+                    .unwrap()
+                    .get_values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            crate::StepResult::Done => break,
+            crate::StepResult::IO => {
+                if let Some(c) = stmt.pending_io_for_test() {
+                    io.wait(&c);
+                }
+            }
+            crate::StepResult::Yield => {}
+            other => panic!("the check stepped to {other:?}"),
+        }
+    }
+    assert_eq!(out, ok(), "{ending}");
+}
+
+#[test]
+fn a_drop_while_a_check_is_suspended_is_busy_and_the_check_finds_nothing_left_open() {
+    a_drop_while_a_check_is_suspended("/db/drop-under-check-open", "open");
+}
+
+#[test]
+fn a_drop_while_a_check_is_suspended_is_busy_and_the_check_finds_nothing_then_committed() {
+    a_drop_while_a_check_is_suspended("/db/drop-under-check-commit", "commit");
+}
+
+#[test]
+fn a_drop_while_a_check_is_suspended_is_busy_and_the_check_finds_nothing_then_rolled_back() {
+    a_drop_while_a_check_is_suspended("/db/drop-under-check-rollback", "rollback");
+}
+
+/// DROPPED-LIST1, the auditor's #6434 item 1: a drop rolled back, then a check from another
+/// connection, "ok" wanted. For DROP INDEX and DROP TABLE.
+#[test]
+fn a_drop_rolled_back_leaves_nothing_a_check_finds() {
+    for (n, sql) in [(1, "DROP INDEX t_v"), (2, "DROP TABLE t")] {
+        let (_io, db, conn) = used_with_worker(&format!("/db/drop-rolled-{n}"));
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        other.execute("BEGIN").unwrap();
+        other.execute(sql).unwrap();
+        other.execute("ROLLBACK").unwrap();
+        assert_eq!(integrity(&conn), ok(), "{sql} rolled back");
+    }
+}
+
+/// DROPPED-LIST1, #6434 items 2 and 3: an autocommit DROP INDEX stepped in frames and abandoned
+/// (its statement dropped) at its k-th return for IO, for every k it reaches, leaving its
+/// statement's rollback to be settled; then at once a check from another connection with no busy
+/// timeout. Busy or "ok" each time; any finding is the cause. The pool is chilled once, before
+/// the drop's first step, so each stop is one the drop meets on its own.
+#[test]
+fn a_drop_abandoned_at_each_of_its_stops_leaves_nothing_a_check_finds() {
+    let mut outcomes = Vec::new();
+    for k in 1..=2_000usize {
+        let (io, db, conn) = used_with_worker(&format!("/db/drop-abandoned-{k}"));
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA busy_timeout = 0").unwrap();
+        let mut stmt = other.prepare("DROP INDEX t_v").unwrap();
+        let mut stops = 0;
+        let mut finished = false;
+        chill(&db);
+        loop {
+            let stepped = {
+                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                stmt.step()
+            };
+            match stepped {
+                Ok(crate::StepResult::IO) => {
+                    stops += 1;
+                    if stops == k {
+                        break;
+                    }
+                    if let Some(c) = stmt.pending_io_for_test() {
+                        io.wait(&c);
+                    }
+                }
+                Ok(crate::StepResult::Done) | Err(_) => {
+                    finished = true;
+                    break;
+                }
+                Ok(crate::StepResult::Yield) => {}
+                Ok(other) => panic!("the drop stepped to {other:?}"),
+            }
+        }
+        if finished {
+            outcomes.push(format!("k={k}: the drop finished at {stops} stops"));
+            break;
+        }
+        drop(stmt);
+        let checked = conn
+            .prepare("PRAGMA integrity_check")
+            .and_then(|mut s| s.run_collect_rows())
+            .map_err(|e| e.to_string());
+        let after = format!("{:?}", integrity(&other));
+        let line = format!("k={k}: check {checked:?}; other's check after {after}");
+        let bad = |t: &str| t.contains("named by the catalog");
+        outcomes.push(line.clone());
+        assert!(
+            !bad(&format!("{checked:?}")) && !bad(&after),
+            "an abandoned drop left an entry a check finds: {line}"
+        );
+    }
+    eprintln!(
+        "the sweep: {} abandonments, then {}",
+        outcomes.len() - 1,
+        outcomes.last().map_or("nothing", |o| o.as_str())
+    );
+    assert!(
+        outcomes.last().is_some_and(|o| o.contains("finished")),
+        "the drop never finished within the bound: {outcomes:?}"
     );
 }

@@ -108,18 +108,27 @@ pub(super) struct Pages {
 }
 
 enum PagesAt {
-    /// Every catalog row the statement's snapshot sees, each tree it names.
+    /// Every catalog row the statement's snapshot sees: each tree it names, by root, with its id.
     Catalog {
         cursor: VersionedCursor,
         at: CatalogAt,
-        named: BTreeSet<PageId>,
+        named: BTreeMap<PageId, u64>,
     },
-    /// Every tree on the abandoned list, then on the dropped list.
+    /// Every entry of the dropped list the statement's snapshot sees, so a finding about a tree on
+    /// the list can say whether the snapshot sees its entry (DROPPED-LIST1).
+    DroppedSeen {
+        cursor: VersionedCursor,
+        at: ListAt,
+        named: BTreeMap<PageId, u64>,
+        seen: BTreeSet<PageId>,
+    },
+    /// Every tree on the abandoned list, then on the dropped list, each read as it is stored.
     Lists {
         list: usize,
         cursor: Cursor,
         at: ListAt,
-        named: BTreeSet<PageId>,
+        named: BTreeMap<PageId, u64>,
+        seen: BTreeSet<PageId>,
         roots: BTreeSet<PageId>,
     },
     /// Each tree checked whole, then each of its values' pages read.
@@ -199,6 +208,18 @@ fn injected(at: &'static str) -> bool {
     false
 }
 
+/// A list's or the catalog's 8-byte big-endian key.
+fn list_key(key: &[u8], what: &str) -> Result<u64> {
+    let raw: [u8; 8] = key
+        .try_into()
+        .map_err(|_| LimboError::Corrupt(format!("a {what} key of {} bytes", key.len())))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn injected_failure(at: &str) -> LimboError {
     LimboError::InternalError(format!("an injected failure at {at}"))
 }
@@ -220,6 +241,12 @@ impl Pages {
                 at: CatalogAt::Next,
                 ..
             } => "catalog.next",
+            PagesAt::DroppedSeen {
+                at: ListAt::Seek, ..
+            } => "dropped.seek",
+            PagesAt::DroppedSeen {
+                at: ListAt::Next, ..
+            } => "dropped.next",
             PagesAt::Lists {
                 at: ListAt::Seek, ..
             } => "lists.seek",
@@ -261,7 +288,7 @@ impl Pages {
             at: PagesAt::Catalog {
                 cursor: VersionedCursor::new(),
                 at: CatalogAt::Seek,
-                named: BTreeSet::new(),
+                named: BTreeMap::new(),
             },
         }
     }
@@ -290,22 +317,51 @@ impl Pages {
                                 *at = CatalogAt::Load;
                                 None
                             } else {
-                                Some(PagesAt::Lists {
-                                    list: 0,
-                                    cursor: Cursor::new(),
+                                Some(PagesAt::DroppedSeen {
+                                    cursor: VersionedCursor::new(),
                                     at: ListAt::Seek,
                                     named: std::mem::take(named),
-                                    roots: System::ALL.iter().map(|s| s.root()).collect(),
+                                    seen: BTreeSet::new(),
                                 })
                             }
                         }
                         CatalogAt::Load => {
                             done!(catalog.load(cursor));
+                            let id = list_key(cursor.key().expect("a key"), "catalog")?;
                             let row = cursor.value().expect("a row");
-                            named.insert(super::catalog::Entry::decode(row)?.root);
+                            named.insert(super::catalog::Entry::decode(row)?.root, id);
                             *at = CatalogAt::Next;
                             None
                         }
+                    }
+                }
+                PagesAt::DroppedSeen {
+                    cursor,
+                    at,
+                    named,
+                    seen,
+                } => {
+                    let (txns, dropped) = (db.atoll().transactions(), db.dropped());
+                    let found = match at {
+                        ListAt::Seek => {
+                            done!(dropped.seek(txns, db.versions(), txn, cursor, &[0; 8], Seek::Ge,))
+                        }
+                        ListAt::Next => done!(dropped.next(txns, db.versions(), txn, cursor)),
+                    };
+                    if found {
+                        let raw = list_key(cursor.key().expect("an entry"), "Dropped")?;
+                        seen.insert(PageId::from_raw(raw));
+                        *at = ListAt::Next;
+                        None
+                    } else {
+                        Some(PagesAt::Lists {
+                            list: 0,
+                            cursor: Cursor::new(),
+                            at: ListAt::Seek,
+                            named: std::mem::take(named),
+                            seen: std::mem::take(seen),
+                            roots: System::ALL.iter().map(|s| s.root()).collect(),
+                        })
                     }
                 }
                 PagesAt::Lists {
@@ -313,27 +369,40 @@ impl Pages {
                     cursor,
                     at,
                     named,
+                    seen,
                     roots,
                 } => {
                     let which = LISTS[*list];
-                    let tree = db.open_plain(which.root());
+                    // The dropped list is versioned: its own tree's handle, whose leaves reserve
+                    // room for version headers; the abandoned list is plain.
+                    let plain;
+                    let tree = match which {
+                        System::Dropped => db.dropped().tree(),
+                        _ => {
+                            plain = db.open_plain(which.root());
+                            &plain
+                        }
+                    };
                     let found = match at {
                         ListAt::Seek => done!(tree.seek(cursor, &[], Seek::Ge)),
                         ListAt::Next => done!(tree.next(cursor)),
                     };
                     if found {
-                        let key = cursor.key().expect("an entry");
-                        let raw: [u8; 8] = key.try_into().map_err(|_| {
-                            LimboError::Corrupt(format!(
-                                "a {which:?} list key of {} bytes",
-                                key.len()
-                            ))
-                        })?;
-                        let root = PageId::from_raw(u64::from_be_bytes(raw));
-                        if named.contains(&root) {
+                        let root = PageId::from_raw(list_key(
+                            cursor.key().expect("an entry"),
+                            &format!("{which:?}"),
+                        )?);
+                        if let Some(id) = named.get(&root) {
+                            let stored = cursor.value().unwrap_or(&[]);
                             self.findings.add(format!(
-                                "tree {} is named by the catalog and on the {which:?} list, to be freed",
-                                root.raw()
+                                "tree {} is named by the catalog and on the {which:?} list, to be freed: \
+                                 the catalog names it as tree id {id} at the check's snapshot \
+                                 (transaction {:?}); the list's entry is {} that snapshot, its \
+                                 stored value {}",
+                                root.raw(),
+                                txn.start(),
+                                if seen.contains(&root) { "seen by" } else { "not seen by" },
+                                hex(&stored[..stored.len().min(48)]),
                             ));
                         }
                         roots.insert(root);
@@ -346,7 +415,7 @@ impl Pages {
                         None
                     } else {
                         let mut all = std::mem::take(roots);
-                        all.extend(std::mem::take(named));
+                        all.extend(std::mem::take(named).into_keys());
                         Some(PagesAt::Trees {
                             roots: all.into_iter().collect(),
                             index: 0,

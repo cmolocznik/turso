@@ -1884,6 +1884,11 @@ mod tests {
             "child",
         ),
         (
+            "sql/integrity/tests.rs",
+            "a_tree_the_catalog_names_and_the_dropped_list_holds_is_found_with_both_sides",
+            "child",
+        ),
+        (
             "buffer/kept/tests.rs",
             "a_held_lease_holds_the_workers_units_off_on_its_one_wait_until_released",
             "child",

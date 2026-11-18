@@ -638,8 +638,10 @@ impl Completion {
         Self::new(CompletionType::Yield)
     }
 
-    /// A wait that another thread completes, never an IO step on this one: the end of another
-    /// transaction, or a timer. A synchronous waiter blocks on it ([`block_on`](Self::block_on)).
+    /// A wait another caller's act completes, never its waiter's own IO: the end of another
+    /// transaction, or a timer. A synchronous waiter parks on it ([`block_on`](Self::block_on)),
+    /// stepping a pumped backend first while it delivers, as for a request (`IO::wait`): the act
+    /// may run in a callback only a step delivers.
     pub fn new_remote_wait() -> Self {
         Self::new(CompletionType::Remote)
     }
@@ -760,10 +762,11 @@ impl Completion {
         }
     }
 
-    /// Blocks the calling thread until the completion finishes: for a [remote
-    /// wait](Self::new_remote_wait), which another thread completes and no IO step does, so the
-    /// thread neither spins on an IO step with nothing to do nor sleeps past the finish. A waker
-    /// unparks it; an unpark before the park leaves the thread's token, so no wake is lost.
+    /// Blocks the calling thread until the completion finishes, stepping no IO: `IO::wait`'s park
+    /// on a backend whose steps deliver nothing (inline, or on a thread of its own), and for a
+    /// remote wait on a pumped backend that cannot say what its steps find, which stepping would
+    /// poll. The thread neither spins on an IO step nor sleeps past the finish. A waker unparks
+    /// it; an unpark before the park leaves the thread's token, so no wake is lost.
     pub fn block_on(&self) {
         struct Unpark(crate::thread::Thread);
         impl std::task::Wake for Unpark {

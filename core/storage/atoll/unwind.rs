@@ -1050,6 +1050,16 @@ mod tests {
         ),
         (
             "buffer/tests.rs",
+            "a_drain_waiting_on_a_load_in_flight_delivers_it_and_goes_on",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "an_open_after_a_close_on_one_thread_waits_on_nothing_in_the_registry",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
             "two_statements_taking_turns_over_one_batch_each_run_with_their_page_within_two_loads",
             "child",
         ),

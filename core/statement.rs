@@ -2855,6 +2855,67 @@ mod tests {
         );
     }
 
+    /// SHORT-HOLD1's F3 through a host's blocking step: a statement suspended on a remote wait,
+    /// and `wait_io` on the one thread that could deliver the request whose callback finishes it,
+    /// over a pumped backend (the SDK kit's synchronous step and the C API's `sqlite3_step` wait
+    /// so). The remote wait is set as the statement's pending IO by hand, since no real step at
+    /// this head returns such a wait: every Atoll wait a delivery finishes is of the stepped kind.
+    /// The test is of the host's wait, not a picture of something a step does. Mutant
+    /// `remote-blocks`: the remote branch put back, which parks with the write never delivered,
+    /// and the child's watchdog ends it.
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    fn wait_io_on_a_remote_wait_delivers_the_request_whose_callback_finishes_it() {
+        let test = concat!(
+            module_path!(),
+            "::wait_io_on_a_remote_wait_delivers_the_request_whose_callback_finishes_it"
+        );
+        let Some(ended) = crate::child_test::in_child(test, || {
+            let crash = Arc::new(crate::io::crash::CrashIO::new(1));
+            let io: Arc<dyn IO> = crash.clone();
+            let db =
+                Database::open_file(io.clone(), "/db/remote-wait-io.db", Arc::new(SqliteDialect))
+                    .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let mut stmt = conn.prepare("SELECT 1").unwrap();
+            let remote = crate::Completion::new_remote_wait();
+            let file = io
+                .open_file("/db/remote-wait-io.side", OpenFlags::Create, false)
+                .unwrap();
+            let finisher = {
+                let remote = remote.clone();
+                crate::Completion::new_write(move |_| remote.complete(0))
+            };
+            let write = file
+                .pwrite(0, Arc::new(crate::Buffer::new_temporary(512)), finisher)
+                .unwrap();
+            stmt.state
+                .set_pending_io(crate::types::IOCompletions(remote.clone()), None);
+            let before = (crash.in_flight(), remote.finished());
+            let waited = crate::child_test::watched(
+                "a statement's wait_io on a remote wait",
+                std::time::Duration::from_secs(10),
+                || stmt.wait_io(),
+            );
+            assert_eq!(
+                before,
+                (1, false),
+                "before the wait: the write in flight and the remote wait unfinished"
+            );
+            assert!(waited.is_ok(), "wait_io failed: {waited:?}");
+            assert!(
+                write.finished() && remote.succeeded(),
+                "wait_io returned with the write undelivered or the remote wait unfinished"
+            );
+            drop(stmt);
+            drop(conn);
+            drop(db);
+        }) else {
+            return;
+        };
+        crate::child_test::assert_ended_cleanly(&ended);
+    }
+
     /// Counts the steps and sleeps asked of a memory IO.
     #[derive(Default)]
     struct WaitCountingIO {

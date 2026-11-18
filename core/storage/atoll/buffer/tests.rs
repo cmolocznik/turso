@@ -9108,6 +9108,154 @@ mod group {
         );
     }
 
+    /// A source whose every read is a request of the store's first slot of the page's class, submitted
+    /// through the pool's hook to the IO under the pool: on a pumped backend it stays in flight until a
+    /// step delivers it, and it lands whole whatever the file held.
+    struct PumpedSource;
+    struct PumpedLocated(PageId);
+
+    impl source::PageSource for PumpedSource {
+        fn locate(&self, pid: PageId) -> Result<IOResult<Box<dyn source::Located>>> {
+            Ok(IOResult::Done(Box::new(PumpedLocated(pid))))
+        }
+    }
+
+    impl source::Located for PumpedLocated {
+        fn read(
+            self: Box<Self>,
+            into: Arc<crate::io::Buffer>,
+            done: source::ReadDone,
+            submitting: source::Submitting<'_>,
+        ) -> Result<IOResult<Option<Completion>>> {
+            let (fill, done) = (
+                into.clone(),
+                crate::storage::atoll::once::TakeOnce::new(done),
+            );
+            let c = Completion::new_read(into, move |_| {
+                let done = done.take()?;
+                fill.as_mut_slice().fill(0);
+                done(Ok(()));
+                None
+            });
+            let place = Place::new(false, false, self.0.class(), 0);
+            Ok(IOResult::Done(Some(submitting.read(place, c)?)))
+        }
+    }
+
+    /// A pool of the smallest budget over `io`, its pages read through [`PumpedSource`].
+    fn pumped_reads_pool(io: &Arc<dyn IO>, base: &str) -> Arc<BufferPool> {
+        let store = PageStore::open(
+            crate::storage::atoll::requests::counted_for_test(io.clone()),
+            base,
+            StoreConfig {
+                file_bytes: 1 << 30,
+                meta_pages: 1 << 10,
+            },
+            [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
+            0,
+        );
+        BufferPool::new(
+            BufferConfig::with_budget(MIN_BUDGET),
+            Arc::new(PumpedSource),
+            store,
+        )
+        .unwrap()
+    }
+
+    /// SHORT-HOLD1's F3 at the pool: A's load of a class 3 page is submitted to a pumped backend
+    /// and not delivered, A outside any owner, so no one keeps the page once it lands. Class 3
+    /// holds one batch and class 4 none, and every other batch went to class 0 while a step that
+    /// began before is under way. B's read of a class 4 page drains class 3's only batch, whose one
+    /// taken frame is A's, loading, and B then drives its read to its end on this one thread,
+    /// blocking on each wait as `drive` does, a watchdog beside it. F3 read the drain's wait there
+    /// as remote; it is of the stepped kind while the pool's own read is at the backend
+    /// (`supply_wait`), so the wait steps the backend before packet 2's change as after it: B's
+    /// wait delivers A's load, the drain takes the frame, and B's read lands. The kinds of B's
+    /// waits are asserted, since a blocking wait now steps a pumped backend for both kinds and no
+    /// hang would show a drain's wait made remote (mutant `supply-wait-remote`: `supply_wait`
+    /// always remote).
+    #[test]
+    fn a_drain_waiting_on_a_load_in_flight_delivers_it_and_goes_on() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_drain_waiting_on_a_load_in_flight_delivers_it_and_goes_on"
+            ),
+            || {
+                let crash = Arc::new(CrashIO::new(1));
+                let io: Arc<dyn IO> = crash.clone();
+                let pool = pumped_reads_pool(&io, "/db/f3-drain");
+                let loading = PageId::new(class(3), 1);
+                let wanted = PageId::new(class(4), 1);
+                let a_waited = !fixed_unowned(&pool, loading);
+                let frame = frame_of(&pool, loading);
+                let a_in_flight = (crash.in_flight(), pool.header(frame).status() == LOADING);
+                let step = pool.store.epochs().enter();
+                let to_class_0 = pool.hold_free_batches(class(0));
+                let mut b = Owner::new();
+                let mut read = || {
+                    b.call(|| {
+                        Ok(match pool.fix_optimistic(wanted, None)? {
+                            IOResult::Done(_) => IOResult::Done(()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    })
+                };
+                // The call that chooses the drain, with the step under way.
+                let first = read();
+                drop(step);
+                let leaving = pool.memory.leaving();
+                // Each wait B blocked on: whether remote, and the requests in flight then.
+                let mut waits = Vec::new();
+                let done = crate::child_test::watched(
+                    "B's blocking read behind a drain of a frame loading",
+                    std::time::Duration::from_secs(10),
+                    || loop {
+                        match read() {
+                            Ok(IOResult::Done(())) => return Ok(()),
+                            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => {
+                                crate::storage::atoll::park::yield_now()
+                            }
+                            Ok(IOResult::IO(IOCompletions(c))) => {
+                                waits.push((c.is_remote_wait(), crash.in_flight()));
+                                crate::storage::atoll::park::wait(io.as_ref(), &c);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    },
+                );
+                let after = (crash.in_flight(), pool.header(frame).status());
+                drop(b);
+                drop(pool);
+                assert!(
+                    a_waited && a_in_flight == (1, true),
+                    "A's load was not left in flight: waited {a_waited}, in flight and loading \
+                     {a_in_flight:?}"
+                );
+                assert_eq!(to_class_0, 4, "the batches handed to class 0");
+                assert!(
+                    matches!(first, Ok(IOResult::IO(_))),
+                    "B's first call was done: {first:?}"
+                );
+                assert!(
+                    leaving.len() == 1
+                        && leaving[0].holder == class(3)
+                        && leaving[0].draining
+                        && leaving[0].beneficiary == Some(memory::Beneficiary::Class(class(4))),
+                    "the drain chose class 3's only batch for class 4: {leaving:?}"
+                );
+                assert!(done.is_ok(), "B's read failed: {done:?}");
+                assert_eq!(
+                    waits,
+                    [(false, 1), (false, 1)],
+                    "B's waits as (remote, requests in flight): the drain's wait on A's load and \
+                     then B's own read, each of the stepped kind with one request in flight"
+                );
+                assert_eq!(after.0, 0, "a request left in flight after B's read");
+            },
+        );
+    }
+
     /// SHORT-HOLD1's park, built in a small pool, and its end (SHORT-HOLD1b). Owner A's load of a
     /// 32 KiB page (class 3) lands after A's call returned, so A keeps its reference in the load's
     /// group, the page it last loaded, idle: a statement whose call returned in a cooperative frame

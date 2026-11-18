@@ -925,19 +925,26 @@ pub trait IO: Clock + Send + Sync {
         let _ = key;
     }
 
-    /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
-    /// completes, or a request of a backend that delivers inline or on a thread of its own, parks
-    /// until it is finished; a pumped backend is stepped while it delivers, and once it holds
-    /// nothing the waiter parks until `c` finishes or the backend holds something, whoever submits
-    /// it (a backend that cannot say is stepped with the processor yielded between steps). Its
-    /// result is its owner's to read. A step that fails ends the process, the backend having lost
-    /// what it accepted.
+    /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): on a backend that delivers
+    /// inline or on a thread of its own, it parks until `c` is finished. A pumped backend is
+    /// stepped while it delivers, for a request and a remote wait alike, since a remote wait's
+    /// finish may be made by a callback only a step delivers; once it holds nothing the waiter
+    /// parks until `c` finishes or the backend holds something, whoever submits it. A pumped
+    /// backend that cannot say what its steps find is stepped for a request with the processor
+    /// yielded between steps, and not at all for a remote wait, which parks: stepping it would poll
+    /// for as long as the finishing thread takes. Its result is its owner's to read. A step that
+    /// fails ends the process, the backend having lost what it accepted.
     fn wait(&self, c: &Completion) {
         refuse_on_any_delivering_thread("a wait for a completion");
         if c.finished() {
             return;
         }
-        if c.is_remote_wait() || self.delivery() != Delivery::Pumped {
+        let parks = if c.is_remote_wait() {
+            self.delivery() != Delivery::Pumped || !self.says_what_a_step_found()
+        } else {
+            self.delivery() != Delivery::Pumped
+        };
+        if parks {
             c.block_on();
             return;
         }

@@ -425,6 +425,124 @@ fn a_backend_that_says_it_delivers_inline_does() {
     }
 }
 
+/// SHORT-HOLD1's F3: on a pumped backend that says what its steps find, a blocking wait on a
+/// remote wait steps the backend as a wait on a request does. Here the one thread waiting is the
+/// only one that could deliver the write whose callback finishes the wait, so the wait returns
+/// only by stepping it in (mutant `remote-blocks`: the remote branch put back, which parks on the
+/// completion with the write never delivered, and the child's watchdog ends it).
+#[test]
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn a_blocking_remote_wait_delivers_the_request_whose_callback_finishes_it() {
+    let test = concat!(
+        module_path!(),
+        "::a_blocking_remote_wait_delivers_the_request_whose_callback_finishes_it"
+    );
+    let Some(ended) = crate::child_test::in_child(test, || {
+        let backend = Arc::new(CrashIO::new(1));
+        let io = StepCounting::new(backend.clone());
+        let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+        let remote = Completion::new_remote_wait();
+        let finisher = {
+            let remote = remote.clone();
+            Completion::new_write(move |_| remote.complete(0))
+        };
+        let write = file
+            .pwrite(0, Arc::new(Buffer::new_temporary(512)), finisher)
+            .unwrap();
+        let before = (backend.in_flight(), remote.finished());
+        crate::child_test::watched("a blocking wait on a remote wait", BOUND, || {
+            io.wait(&remote)
+        });
+        assert_eq!(
+            before,
+            (1, false),
+            "before the wait: the write in flight and the remote wait unfinished"
+        );
+        assert!(
+            write.finished() && remote.succeeded(),
+            "the wait returned with the write undelivered or the remote wait unfinished"
+        );
+        assert_eq!(backend.in_flight(), 0);
+        assert!(io.steps() >= 1, "the wait returned without a step");
+    }) else {
+        return;
+    };
+    crate::child_test::assert_ended_cleanly(&ended);
+}
+
+/// A blocking remote wait on a pumped backend that holds nothing looks once, registering with the
+/// backend, parks until another thread finishes it, and takes its registration back as it ends:
+/// it pays one look and one withdrawal for the stepping F3 gives it, and never polls.
+#[test]
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn a_blocking_remote_wait_on_an_empty_pumped_backend_looks_once_and_parks_until_finished() {
+    let backend = Arc::new(CrashIO::new(1));
+    let io = StepCounting::new(backend.clone());
+    let remote = Completion::new_remote_wait();
+    // The finisher completes the wait once the waiter has looked and registered, whatever the
+    // schedule. A waiter that never registers is finished anyway after half of BOUND, within the
+    // waiter's own bound, so it fails at the assertions below rather than at a timeout.
+    let finisher = {
+        let (remote, backend) = (remote.clone(), backend.clone());
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + BOUND / 2;
+            while backend.registered() == 0 && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let seen = backend.registered();
+            remote.complete(0);
+            seen
+        })
+    };
+    let waiter = (io.clone(), remote.clone());
+    let returned = returns_within(BOUND, move || waiter.0.wait(&waiter.1));
+    let registered_before_finish = finisher.join().unwrap();
+    let (steps, withdrawals, registered) = (io.steps(), io.withdrawals(), backend.registered());
+    assert!(
+        returned && remote.succeeded(),
+        "the wait did not return once another thread finished it"
+    );
+    // A spurious return from the park is one look more; a poll is many.
+    assert!(
+        (1..=3).contains(&steps) && withdrawals == 1 && registered == 0,
+        "a remote wait on an empty pumped backend took {steps} steps and {withdrawals} \
+         withdrawals, and left {registered} registrations: one look, then a park, then its \
+         registration taken back"
+    );
+    assert_eq!(
+        registered_before_finish, 1,
+        "the waiter was not registered with the backend when the wait was finished"
+    );
+}
+
+/// A blocking remote wait on a pumped backend that cannot say what its steps find parks on the
+/// completion and never steps it: stepping it would poll it for as long as the finishing thread
+/// takes, and such a backend holds no Atoll database (mutant `remote-polls-unsaying`: the guard
+/// gone, the wait steps and yields until the finish).
+#[test]
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn a_blocking_remote_wait_on_a_backend_that_cannot_say_parks_without_stepping() {
+    let io = StepCounting::new(Arc::new(Unsaying(Arc::new(CrashIO::new(1)))));
+    assert_eq!(io.delivery(), Delivery::Pumped);
+    assert!(!io.says_what_a_step_found());
+    let remote = Completion::new_remote_wait();
+    let finisher = {
+        let remote = remote.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            remote.complete(0);
+        })
+    };
+    io.wait(&remote);
+    finisher.join().unwrap();
+    assert!(remote.succeeded());
+    assert_eq!(
+        io.steps(),
+        0,
+        "a blocking remote wait stepped a pumped backend that cannot say what its steps find"
+    );
+}
+
 #[test]
 #[cfg(not(any(shuttle, atoll_loom)))]
 fn an_async_remote_wait_does_not_pump_or_wake_itself() {

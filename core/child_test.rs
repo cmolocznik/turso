@@ -132,3 +132,39 @@ pub(crate) fn record(name: &str, what: &str) {
 pub(crate) fn recorded(ended: &Ended, name: &str) -> String {
     std::fs::read_to_string(ended.dir.path().join(name)).unwrap_or_default()
 }
+
+/// In a child process, runs `wait` on this thread with a watchdog beside it: a `wait` that has not
+/// returned within `bound` is taken for parked for good, and the watchdog ends the child with code
+/// 3, saying `what` parked, which the parent reads as the verdict. A `wait` that panics ends the
+/// child with its own failure and wakes the watchdog to nothing.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+pub(crate) fn watched<T>(what: &str, bound: std::time::Duration, wait: impl FnOnce() -> T) -> T {
+    let (returned, watch) = std::sync::mpsc::channel::<()>();
+    let what = what.to_string();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(bound) {
+            eprintln!(
+                "watchdog: {what} parked: not returned within {} s",
+                bound.as_secs()
+            );
+            std::process::exit(3);
+        }
+    });
+    let out = wait();
+    let _ = returned.send(());
+    out
+}
+
+/// Fails unless the child ended with its test passed: neither aborted, killed as hung, nor ended
+/// by its watchdog. The child's own words are the failure's.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+pub(crate) fn assert_ended_cleanly(ended: &Ended) {
+    assert!(
+        !ended.aborted && !ended.hung && ended.code == Some(0),
+        "the child ended {:?} (aborted {}, hung {}): {}",
+        ended.code,
+        ended.aborted,
+        ended.hung,
+        ended.stderr
+    );
+}

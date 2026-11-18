@@ -4139,6 +4139,67 @@ fn locked(file: &std::fs::File) -> bool {
     lock.l_type != libc::F_UNLCK as libc::c_short
 }
 
+/// An open and a close of one database on one thread, over a pumped backend (SHORT-HOLD1 packet
+/// 2's census of `Database::open`'s waits on the registry): the close runs inside the drop of the
+/// database's last handle, and drains every request on its files there, stepping the backend
+/// itself, so the database's files have all closed when the drop returns. An open of the file next,
+/// on the same thread, finds no database of it closing, waits on nothing in the registry, and reads
+/// what the first wrote. A child's watchdog ends a wait for ever.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn an_open_after_a_close_on_one_thread_waits_on_nothing_in_the_registry() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_open_after_a_close_on_one_thread_waits_on_nothing_in_the_registry"
+        ),
+        || {
+            use crate::database::REGISTRY_WAITS;
+            let crash = Arc::new(crate::io::crash::CrashIO::new(6353));
+            let io: Arc<dyn IO> = crash.clone();
+            let path = "/db/open-after-close";
+            let (told, heard) = std::sync::mpsc::channel::<&'static str>();
+            REGISTRY_WAITS.with(|w| *w.borrow_mut() = Some(told));
+            let read = crate::child_test::watched(
+                "an open after a close on one thread",
+                std::time::Duration::from_secs(60),
+                || {
+                    let first = open(&io, path);
+                    let conn = first.connect(ConnectOpts::new()).unwrap();
+                    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+                        .unwrap();
+                    conn.execute("INSERT INTO t (b) VALUES ('kept')").unwrap();
+                    drop(conn);
+                    drop(first);
+                    let second = open(&io, path);
+                    let conn = second.connect(ConnectOpts::new()).unwrap();
+                    let read = rows(&conn, "SELECT b FROM t");
+                    drop(conn);
+                    drop(second);
+                    read
+                },
+            );
+            REGISTRY_WAITS.with(|w| *w.borrow_mut() = None);
+            let waits: Vec<&str> = heard.try_iter().collect();
+            assert_eq!(
+                waits,
+                Vec::<&str>::new(),
+                "an open on the thread that closed the database waited in the registry"
+            );
+            assert_eq!(
+                read,
+                vec![vec![text("kept")]],
+                "the row the first open wrote"
+            );
+            assert_eq!(
+                crash.in_flight(),
+                0,
+                "a request left in flight after both closed"
+            );
+        },
+    );
+}
+
 /// A database closing keeps its files, and the locks they hold, until they close, and an open of
 /// the file meanwhile waits for them: no probe and no second open closes a descriptor of the file
 /// while they are open, which would drop every lock the process holds on it (R17), the reopened

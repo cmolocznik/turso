@@ -292,25 +292,21 @@ impl BufferPool {
             .filter(|e| e.frame == frame)
             .map(|e| match e.keeper {
                 Keeper::Owner { conn, serial, at } => format!(
-                    "owner #{serial} (connection {conn:#x}, at {at:#x}, page {:#x})",
-                    e.pid
+                    "owner #{serial} (connection {conn:#x}, at {at:#x}, page {:#x}, {})",
+                    e.pid,
+                    if e.idle { "idle" } else { "active" }
                 ),
                 Keeper::Checkpoint => "the checkpoint's demand".to_string(),
             })
             .collect();
         format!(
             "{page}, {status}, {}, flags {:#x}, latch {:#x}, record {record:#x} ({}), group \
-             {word:#x} ({}, references {}), keepers [{}]",
+             {word:#x} ({}), keepers [{}]",
             if h.dirty() { "dirty" } else { "clean" },
             h.flags.load(Ordering::Acquire),
             h.latch.word(),
             frame::record_marks(record),
-            if group::word_open(word) {
-                "open"
-            } else {
-                "closed"
-            },
-            group::word_references(word),
+            group::describe(word),
             keepers.join(", ")
         )
     }

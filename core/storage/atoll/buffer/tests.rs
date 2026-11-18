@@ -8582,6 +8582,7 @@ fn the_census_names_a_frame_taken_and_put_in_no_place_and_one_put_in_two() {
 
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 mod group {
+    use super::super::group as group_word;
     use super::*;
 
     /// A pool over a source whose reads land only when the test lands them, each request leaving the
@@ -9107,22 +9108,19 @@ mod group {
         );
     }
 
-    /// SHORT-HOLD1's park, built in a small pool. Owner A's load of a 32 KiB page (class 3) lands
-    /// after A's call returned, so A keeps its reference in the load's group, the page it last
-    /// loaded, and is never called again: a statement whose call returned in a cooperative frame
-    /// while its only thread waits elsewhere. Class 3 holds one batch and class 4 none, and every
+    /// SHORT-HOLD1's park, built in a small pool, and its end (SHORT-HOLD1b). Owner A's load of a
+    /// 32 KiB page (class 3) lands after A's call returned, so A keeps its reference in the load's
+    /// group, the page it last loaded, idle: a statement whose call returned in a cooperative frame
+    /// while its only thread steps another. Class 3 holds one batch and class 4 none, and every
     /// other batch went to class 0 while a step that began before is under way, so a drain passes
     /// them over. Owner B's read of a 64 KiB page (class 4, a version arena's) then drains class
-    /// 3's only batch for class 4 and comes back waiting. The drain's choice does not look at the
-    /// group's reference, so the batch's one taken frame stays: resident, clean and unlatched, its
-    /// record waited and grouped, its group closed with one reference, A's, which the registry of
-    /// keepers names. The census finds the frame in the page table alone.
-    ///
-    /// SHORT-HOLD1's fix turns over the first assertion, that the drain chose class 3's only
-    /// batch: a choice that looks at group references passes over a batch whose taken frame is
-    /// kept, which then does not drain for class 4 with A's frame in it.
+    /// 3's only batch for class 4. On SHORT-HOLD1a's base B parked there: the batch's one taken
+    /// frame stayed, kept by A's reference alone. Now the drain revokes A's idle keep, the
+    /// group's generation rising, and takes the frame: B's read gets its frame in that batch, and
+    /// A's next call finds its keep revoked and reads its page in again, keeping it sturdy.
     #[test]
     fn a_read_drains_the_only_batch_of_a_class_whose_one_frame_a_suspended_owner_keeps() {
+        use std::{cell::RefCell, rc::Rc};
         crate::storage::atoll::testing::cleanly(
             concat!(
                 module_path!(),
@@ -9136,6 +9134,25 @@ mod group {
                 let a_waited = !fixed_as(&mut a, &pool, kept);
                 let landed = land(&reads, Ok(()));
                 let frame = frame_of(&pool, kept);
+                // The park report as the drain is about to revoke A's keep, and the batches leaving
+                // and the frame's group word once it did.
+                let (report, at_revocation) =
+                    (Rc::new(RefCell::new(None)), Rc::new(RefCell::new(None)));
+                {
+                    let (seen, weak) = (report.clone(), Arc::downgrade(&pool));
+                    crate::race::at("group.revoke_seen", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            *seen.borrow_mut() = Some(pool.park_report());
+                        }
+                    });
+                    let (seen, weak) = (at_revocation.clone(), Arc::downgrade(&pool));
+                    crate::race::at("buffer.revoked", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            *seen.borrow_mut() =
+                                Some((pool.memory.leaving(), pool.group(frame).word()));
+                        }
+                    });
+                }
                 // Every free batch to class 0, handed over while a step that began before is under
                 // way: held for class 0 until the step ends, so B's claim drains none of them.
                 let step = pool.store.epochs().enter();
@@ -9149,40 +9166,44 @@ mod group {
                         })
                     })
                 };
-                // The call that chooses the drain; the next ones, with the step ended, come short
-                // and reserve at the top, holding nothing.
+                // The call that chooses the drain; the next ones, with the step ended, reserve at
+                // the top and go on to the frame, each read landed as it is made.
                 let first = read();
                 drop(step);
-                let mut parked = None;
-                for _ in 0..8 {
+                let mut b_done = false;
+                for _ in 0..16 {
                     match read() {
-                        Ok(IOResult::IO(IOCompletions(wait))) if !wait.finished() => {
-                            parked = Some(wait);
+                        Ok(IOResult::Done(())) => {
+                            b_done = true;
                             break;
                         }
-                        Ok(IOResult::IO(_)) => {}
-                        Ok(IOResult::Done(())) | Err(_) => break,
+                        Ok(IOResult::IO(_)) => {
+                            land(&reads, Ok(()));
+                        }
+                        Err(_) => break,
                     }
                 }
-                let report = pool.park_report();
+                let b_frame = pool.table.find(&pool.frames.headers, wanted.raw());
+                let a_revoked_seen = a.keep_seen();
+                let a_reloads = !fixed_as(&mut a, &pool, kept);
+                let a_sturdy = a.keep_seen().0.map(|(_, _, _, sturdy)| sturdy);
+                let relanded = land(&reads, Ok(()));
+                let a_done = fixed_as(&mut a, &pool, kept);
+                let loads_of_kept = pool
+                    .loaded_pages()
+                    .iter()
+                    .filter(|&&p| p == kept.raw())
+                    .count();
                 let census = pool.taken_frames_census();
-                let leaving = pool.memory.leaving();
-                let keepers: Vec<_> = pool
-                    .keepers
-                    .entries()
-                    .into_iter()
-                    .filter(|e| e.frame == frame)
-                    .map(|e| e.keeper)
-                    .collect();
-                let h = pool.header(frame);
-                let latched = h.latch.word() & 1 != 0;
-                let (status, dirty) = (h.status(), h.dirty());
                 let a_serial = a.serial();
-                let b_parked = parked.is_some();
-                drop(parked);
+                let a_revocations = a.revocations();
+                let seen = at_revocation.borrow_mut().take();
+                let report = report.borrow_mut().take().unwrap_or_default();
                 drop(b);
                 drop(a);
                 drop((pool, reads));
+                assert!(b_done, "B's read never got its frame behind A's idle keep");
+                let (leaving, word) = seen.expect("the drain revoked A's keep");
                 assert!(
                     leaving.len() == 1
                         && leaving[0].holder == class(3)
@@ -9199,64 +9220,62 @@ mod group {
                     matches!(first, Ok(IOResult::IO(_))),
                     "B's first call was done"
                 );
-                assert!(b_parked, "B's read never came back waiting\n{report}");
-                let batch = format!(
-                    "batch {} of class 3 (32 KiB frames): draining for class 4, 1 of 64 frames \
-                     taken",
-                    leaving[0].batch
+                assert_eq!(
+                    (
+                        group_word::references(word),
+                        group_word::idle(word),
+                        group_word::generation(word)
+                    ),
+                    (0, 0, 1),
+                    "the group word as A's keep was revoked: (references, idle, generation)"
+                );
+                assert_eq!(
+                    b_frame.map(|f| f / memory::GRAINS),
+                    Some(frame / memory::GRAINS),
+                    "B's frame is in class 3's old batch"
                 );
                 assert!(
-                    report.contains(&batch),
-                    "the report's batch is not `{batch}`\n{report}"
+                    matches!(a_revoked_seen, (Some((f, 0, true, false)), None) if f == frame),
+                    "A still kept its frame, idle and ordinary, before its next call: {a_revoked_seen:?}"
                 );
+                assert!(
+                    a_reloads && a_sturdy == Some(true) && relanded == 1 && a_done,
+                    "A's next call reloaded its page into a sturdy keep ({a_reloads}, {a_sturdy:?}, \
+                     {relanded}), and the one after was done ({a_done})"
+                );
+                assert_eq!(
+                    (a_revocations, loads_of_kept),
+                    (1, 2),
+                    "(A's calls that found its keep revoked, the loads of its page)"
+                );
+                // The report as the drain was about to revoke: A's frame alone taken in the batch,
+                // kept by A's idle ordinary keep, which the registry names idle.
                 let frames: Vec<&str> = report
                     .lines()
                     .filter(|l| l.starts_with("  frame "))
                     .collect();
-                assert_eq!(
-                    frames.len(),
-                    1,
-                    "the frames the report shows taken\n{report}"
-                );
-                let line = frames[0];
                 assert!(
-                    line.starts_with(&format!("  frame {frame}: page {:#x} ", kept.raw()))
-                        && line.contains("resident, clean"),
+                    frames.len() == 1
+                        && frames[0]
+                            .starts_with(&format!("  frame {frame}: page {:#x} ", kept.raw()))
+                        && frames[0].contains("resident, clean"),
                     "the taken frame is A's page, resident and clean\n{report}"
                 );
                 assert!(
-                    status == RESIDENT && !dirty && !latched,
-                    "the taken frame: status {status}, dirty {dirty}, latched {latched}"
+                    frames[0].contains("record 0xc (waited|group)")
+                        || frames[0].contains("record 0x8 (group)"),
+                    "the frame's record is grouped\n{report}"
                 );
                 assert!(
-                    line.contains("record 0xc (waited|group)"),
-                    "the frame's record is waited and grouped\n{report}"
-                );
-                assert!(
-                    line.contains("group 0x2 (closed, references 1)"),
-                    "the frame's group holds one reference\n{report}"
-                );
-                assert!(
-                    matches!(
-                        keepers.as_slice(),
-                        [super::keepers::Keeper::Owner { conn: 0, serial, .. }] if *serial == a_serial
+                    frames[0].contains(
+                        "group 0x2002 (closed, references 1, idle 1, sturdy 0, generation 0)"
                     ),
-                    "the registry's keepers of the frame: {keepers:?}, not A (#{a_serial}) alone"
+                    "the frame's group holds one idle ordinary keep\n{report}"
                 );
                 assert!(
-                    line.contains(&format!("keepers [owner #{a_serial} (connection 0x0, ")),
-                    "the report names A as the frame's keeper\n{report}"
-                );
-                assert!(
-                    line.ends_with("R of a place: no"),
-                    "the frame is no place's R\n{report}"
-                );
-                assert!(
-                    report.contains(
-                        "holds the gate, suspended, connection 0x0, demand class 4 for a read, \
-                         reserved none"
-                    ),
-                    "B's place holds the gate, its demand class 4 for a read\n{report}"
+                    frames[0].contains(&format!("keepers [owner #{a_serial} (connection 0x0, "))
+                        && frames[0].contains(", idle)]"),
+                    "the report names A as the frame's keeper, idle\n{report}"
                 );
                 assert!(
                     census.is_empty(),
@@ -9264,5 +9283,2256 @@ mod group {
                 );
             },
         );
+    }
+
+    // ---------------------------------------------------------------- the revocable keep
+
+    /// Every read the source holds landed: how many.
+    fn land_small(reads: &PendingReads) -> usize {
+        land(reads, Ok(()))
+    }
+
+    /// A pool of five batches whose claims of classes 3 and 4 can drain one batch alone, the one
+    /// the first page read into a free batch takes, and with `spare` one more, of class 0, holding
+    /// two pages read this epoch: dearer than one keep's page, cheaper than a frame held. Every
+    /// other batch holds a 2 MiB page whose read never lands while the test runs, as held as a step
+    /// under way: a drain chooses one only where nothing else can be. Those reads are kept apart,
+    /// the third value, which the test lands at its end.
+    fn shaped(base: &str, spare: bool) -> (Arc<BufferPool>, PendingReads, PendingReads) {
+        let (pool, reads) = held_reads_pool(base);
+        let fillers = if spare { 3 } else { 4 };
+        for n in 1..=fillers {
+            assert!(
+                !fixed_unowned(&pool, PageId::new(class(9), n)),
+                "a filler's read waits"
+            );
+        }
+        let held: PendingReads = Arc::new(crate::storage::atoll::locks::Mutex::new(
+            std::mem::take(&mut *reads.lock()),
+        ));
+        if spare {
+            for n in 1..=2 {
+                assert!(!fixed_unowned(&pool, PageId::new(class(0), n)));
+            }
+            assert_eq!(land_small(&reads), 2, "the spare batch's pages");
+        }
+        (pool, reads, held)
+    }
+
+    /// Moves the epoch past the steps that fixed pages so far, as frees and evictions do in a pool
+    /// at work: a page a turn fixed reads as held by no step under way in the next turn's.
+    fn later(pool: &BufferPool) {
+        pool.store.epochs().stamp();
+    }
+
+    /// The loads begun of `pid`.
+    fn loads_of(pool: &BufferPool, pid: PageId) -> usize {
+        pool.loaded_pages()
+            .iter()
+            .filter(|&&p| p == pid.raw())
+            .count()
+    }
+
+    /// One call of an operation of `owner`'s that fixes `pid` and, once it has, goes on later: it
+    /// returns a yield, keeping the page. Whether it ran with its page.
+    fn ran_as(owner: &mut Owner, pool: &Arc<BufferPool>, pid: PageId) -> bool {
+        let mut ran = false;
+        let out = owner.call(|| {
+            Ok(match pool.fix_optimistic(pid, None)? {
+                IOResult::Done(_) => {
+                    ran = true;
+                    IOResult::<()>::IO(IOCompletions(Completion::new_yield()))
+                }
+                IOResult::IO(io) => IOResult::IO(io),
+            })
+        });
+        assert!(matches!(out, Ok(IOResult::IO(_))), "the operation's call");
+        ran
+    }
+
+    /// Calls a statement of `owner`'s reading `pid` until it comes back with a wait nothing has
+    /// finished yet, the fillers' reads landed after its first call, once its drain is chosen: no
+    /// request of the pool is left at the backend then, so the wait is one a let-go finishes, not
+    /// a landing alone (DESIGN.md 9.1.3, wait kinds).
+    fn waiting_after_choice(
+        owner: &mut Owner,
+        pool: &Arc<BufferPool>,
+        pid: PageId,
+        fillers: &PendingReads,
+    ) -> Option<Completion> {
+        for call in 0..8 {
+            let out = owner.call(|| {
+                Ok(match pool.fix_optimistic(pid, None)? {
+                    IOResult::Done(_) => IOResult::Done(()),
+                    IOResult::IO(io) => IOResult::IO(io),
+                })
+            });
+            if call == 0 {
+                land(fillers, Ok(()));
+            }
+            match out {
+                Ok(IOResult::IO(IOCompletions(wait))) if !wait.finished() => return Some(wait),
+                Ok(IOResult::IO(_)) => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// How a statement driven to its end came out.
+    #[derive(Debug)]
+    enum Driven {
+        Done,
+        Failed(LimboError),
+        /// A wait that neither a landing nor five seconds finished: a park.
+        Parked,
+    }
+
+    /// Drives a statement of `owner`'s that fixes `pids` in turn to its end, as a host's blocking
+    /// step does: each wait it comes back with is landed or, if still unfinished, waited for, up to
+    /// five seconds, the watchdog's verdict past that.
+    fn drive_statement(
+        owner: &mut Owner,
+        pool: &Arc<BufferPool>,
+        reads: &PendingReads,
+        pids: &[PageId],
+    ) -> Driven {
+        let mut next = 0;
+        for _ in 0..64 {
+            let out = owner.call(|| {
+                while next < pids.len() {
+                    match pool.fix_optimistic(pids[next], None)? {
+                        IOResult::Done(_) => next += 1,
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    }
+                }
+                Ok(IOResult::Done(()))
+            });
+            match out {
+                Ok(IOResult::Done(())) => return Driven::Done,
+                Err(e) => return Driven::Failed(e),
+                Ok(IOResult::IO(IOCompletions(wait))) => {
+                    land_small(reads);
+                    let since = std::time::Instant::now();
+                    while !wait.finished() {
+                        if since.elapsed() > std::time::Duration::from_secs(5) {
+                            return Driven::Parked;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+        Driven::Parked
+    }
+
+    /// Draft 3 section 7: two connections, one thread, the blocking API. Connection A's operation
+    /// loads its 32 KiB page and returns IO to its host, keeping the page, idle. The host then
+    /// runs connection B's operation on the same thread through the blocking drive
+    /// (`drive_for`, which a statement's header read takes): a new 64 KiB page, in a pool where
+    /// only A's batch can be drained for it. On SHORT-HOLD1a's base B parks there for good, its
+    /// wait finished by nothing (the child's watchdog says so); now the drain revokes A's idle
+    /// keep, B's drive returns its page, and A's next calls read A's page in again and run with it.
+    #[test]
+    fn on_one_thread_a_blocking_drive_behind_another_connections_idle_keep_returns() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::on_one_thread_a_blocking_drive_behind_another_connections_idle_keep_returns"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/blocking", false);
+                let p = PageId::new(class(3), 1);
+                let mut a = Owner::of(Conn::new());
+                let a_first = ran_as(&mut a, &pool, p);
+                land(&reads, Ok(()));
+                later(&pool);
+                let a_frame = frame_of(&pool, p);
+                // The watchdog: a park of B's drive is reported, and ends the child.
+                let returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let watchdog = {
+                    let (returned, pool) = (returned.clone(), Arc::downgrade(&pool));
+                    std::thread::spawn(move || {
+                        let since = std::time::Instant::now();
+                        while since.elapsed() < std::time::Duration::from_secs(20) {
+                            if returned.load(std::sync::atomic::Ordering::Acquire) {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        let report = pool.upgrade().map(|p| p.park_report()).unwrap_or_default();
+                        eprintln!(
+                            "the watchdog: B's blocking drive parked behind A's idle keep\n{report}"
+                        );
+                        std::process::abort();
+                    })
+                };
+                let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+                let b_conn = Conn::new();
+                let b_page = crate::storage::atoll::drive_for(&b_conn, &io, || {
+                    Ok(match pool.allocate(class(4))? {
+                        IOResult::Done(page) => IOResult::Done(page.pid()),
+                        IOResult::IO(io) => IOResult::IO(io),
+                    })
+                });
+                returned.store(true, std::sync::atomic::Ordering::Release);
+                watchdog.join().unwrap();
+                let b_frame = b_page
+                    .as_ref()
+                    .ok()
+                    .and_then(|pid| pool.table.find(&pool.frames.headers, pid.raw()));
+                let mut a_ran = false;
+                for _ in 0..16 {
+                    a_ran = ran_as(&mut a, &pool, p);
+                    land(&reads, Ok(()));
+                    if a_ran {
+                        break;
+                    }
+                }
+                let (a_revoked, a_loads) = (a.revocations(), loads_of(&pool, p));
+                drop(a);
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first, "A's first call loads its page and returns IO");
+                assert!(
+                    b_frame.is_some_and(|f| f / memory::GRAINS == a_frame / memory::GRAINS),
+                    "B's drive returned no page in A's old batch: {b_page:?}, {b_frame:?}"
+                );
+                assert!(
+                    a_ran && a_revoked == 1 && a_loads == 2,
+                    "A's next calls read its page in again and ran with it: ran {a_ran}, \
+                     revocations {a_revoked}, loads {a_loads}"
+                );
+            },
+        );
+    }
+
+    /// F1's alternation (SHORT-HOLD1b): two statements on one thread take turns over the one batch
+    /// classes 3 and 4 can share, with a spare batch beside it. A's operation loads its 32 KiB page
+    /// and returns IO; B's statement wants a 64 KiB page, and its drain takes the batch, revoking
+    /// A's idle keep; A's next call finds the keep revoked and reads its page in again, its drain
+    /// taking the batch back from B's page, unkept now; B's next statement wants its page again.
+    /// A's new keep is sturdy, so that drain takes the spare batch, at its real cost, and A runs
+    /// with its page within two loads of it, B within no revocation. Once A has run with its page
+    /// its keep is ordinary again: a third statement's drain then takes A's batch, holding one
+    /// page, rather than B's, holding two (mutants `sturdy-revocable`, `sturdy-never-set`,
+    /// `sturdy-left-set`).
+    #[test]
+    fn two_statements_taking_turns_over_one_batch_each_run_with_their_page_within_two_loads() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::two_statements_taking_turns_over_one_batch_each_run_with_their_page_within_two_loads"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/turns", true);
+                let p = PageId::new(class(3), 1);
+                let (q, q2, r) = (
+                    PageId::new(class(4), 1),
+                    PageId::new(class(4), 2),
+                    PageId::new(class(5), 1),
+                );
+                let (mut a, mut b, mut c) = (Owner::new(), Owner::new(), Owner::new());
+                let mut runs = Vec::new();
+                let first = ran_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let b_first = drive_statement(&mut b, &pool, &reads, &[q]);
+                later(&pool);
+                // A's next calls, until it runs with its page, each read landed as the host steps.
+                let mut a_ran = false;
+                for _ in 0..8 {
+                    a_ran = ran_as(&mut a, &pool, p);
+                    runs.push((a_ran, a.keep_seen(), loads_of(&pool, p)));
+                    land_small(&reads);
+                    later(&pool);
+                    if a_ran {
+                        break;
+                    }
+                    let b_next = drive_statement(&mut b, &pool, &reads, &[q, q2]);
+                    later(&pool);
+                    if !matches!(b_next, Driven::Done) {
+                        runs.push((false, (None, None), usize::MAX));
+                        break;
+                    }
+                }
+                let a_loads = loads_of(&pool, p);
+                let a_revoked = a.revocations();
+                let a_after_run = a.keep_seen();
+                // A's operation goes on to another page of its class: revoked once, it keeps that
+                // one sturdy too (the mark carried on, the auditor's #6341).
+                let p2 = PageId::new(class(3), 2);
+                let a_moved_ran = ran_as(&mut a, &pool, p2);
+                land_small(&reads);
+                later(&pool);
+                let a_moved = a.keep_seen();
+                // A third statement, of a class with no batch: A's batch holds A's sturdy keep, B's
+                // two pages no keep, so it drains B's.
+                let c_done = drive_statement(&mut c, &pool, &reads, &[r]);
+                let a_again = ran_as(&mut a, &pool, p2);
+                let a_revoked_by_c = a.revocations() - a_revoked;
+                land(&reads, Ok(()));
+                let census = pool.taken_frames_census();
+                let b_revoked = b.revocations();
+                drop((a, b, c));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!first, "A's first call loads its page");
+                assert!(
+                    matches!(b_first, Driven::Done),
+                    "B's first statement: {b_first:?}"
+                );
+                assert!(
+                    a_ran && a_loads <= 2,
+                    "A never ran with its page within two loads of it: ran {a_ran}, loads \
+                     {a_loads}, calls (ran, keep, loads) {runs:?}"
+                );
+                assert_eq!(
+                    (a_revoked, b_revoked),
+                    (1, 0),
+                    "(A's revocations before it ran, B's): {runs:?}"
+                );
+                assert!(
+                    matches!(a_after_run, (Some((_, _, true, true)), None)),
+                    "A's keep once A ran with its page, idle and still sturdy: {a_after_run:?}"
+                );
+                assert!(
+                    !a_moved_ran && matches!(a_moved, (Some((_, _, true, true)), None)),
+                    "A's next keep, of another page, sturdy too: loaded {}, {a_moved:?}",
+                    !a_moved_ran
+                );
+                assert!(
+                    matches!(c_done, Driven::Done) && a_again && a_revoked_by_c == 0,
+                    "the third statement drained B's batch and left A's sturdy keep: {c_done:?}, A \
+                     ran again {a_again}, revocations {a_revoked_by_c}"
+                );
+                assert!(census.is_empty(), "the census: {census:#?}");
+            },
+        );
+    }
+
+    /// F1's alternation with no spare batch (SHORT-HOLD1b, A3): A's reloaded page keeps the one
+    /// batch sturdy, so B's next statement has nothing it can drain, every frame it waits behind
+    /// kept by a sturdy idle keep alone. With no busy timeout B's claim ends at once in the
+    /// shortage error, naming the class it wants, the batch and the sturdy keep (mutant
+    /// `error-never-raised`: the claim parks, and the watchdog's verdict says so).
+    #[test]
+    fn taking_turns_with_no_spare_batch_ends_at_once_in_the_shortage_error_with_no_busy_timeout() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::taking_turns_with_no_spare_batch_ends_at_once_in_the_shortage_error_with_no_busy_timeout"
+            ),
+            || {
+                let (outcome, elapsed) =
+                    taking_turns_with_no_spare("/db/turns-0", BOwner::Connection(0));
+                assert!(
+                    matches!(&outcome, Driven::Failed(LimboError::CacheError(
+                        crate::storage::page_cache::CacheError::TooSmall(e)
+                    )) if e.starts_with(
+                        "the page cache is too small for the statements open: a frame of class 4 \
+                         (64 KiB) for a read waits on batch "
+                    ) && e.contains(" of class 3, held by statements between their steps; sturdy \
+                                     keeps: 1")),
+                    "B's second statement: {outcome:?}"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(1),
+                    "the error came after {elapsed:?}"
+                );
+            },
+        );
+    }
+
+    /// [`taking_turns_with_no_spare_batch_ends_at_once_in_the_shortage_error_with_no_busy_timeout`]
+    /// with a busy timeout of 200 ms: the claim waits that long behind the sturdy keep, the timer
+    /// waking it, and then ends in the shortage error.
+    #[test]
+    fn taking_turns_with_no_spare_batch_ends_in_the_shortage_error_once_the_busy_timeout_passed() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::taking_turns_with_no_spare_batch_ends_in_the_shortage_error_once_the_busy_timeout_passed"
+            ),
+            || {
+                let bound = std::time::Duration::from_millis(200);
+                let (outcome, elapsed) =
+                    taking_turns_with_no_spare("/db/turns-200", BOwner::Connection(bound.as_nanos() as u64));
+                assert!(
+                    matches!(&outcome, Driven::Failed(LimboError::CacheError(
+                        crate::storage::page_cache::CacheError::TooSmall(e)
+                    )) if e.starts_with(
+                        "the page cache is too small for the statements open"
+                    )),
+                    "B's second statement: {outcome:?}"
+                );
+                assert!(
+                    elapsed >= bound && elapsed < bound * 10,
+                    "the error came after {elapsed:?}, against a busy timeout of {bound:?}"
+                );
+            },
+        );
+    }
+
+    /// A statement of a connection whose busy timeout is set on the connection's own transaction
+    /// (`ConnTxn::shortage_bound`) and whose claim is of a transaction the connection lent it
+    /// (ASYNC1 E1b, `Conn::beside`): the claim waits its connection's busy timeout, 200 ms, then
+    /// ends in the shortage error (the timeout on `ConnOf`, which every transaction of the
+    /// connection shares; on the transaction's own identity it would read 0 and end at once).
+    #[test]
+    fn a_lent_statements_claim_waits_its_connections_busy_timeout_then_ends_in_too_small() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_lent_statements_claim_waits_its_connections_busy_timeout_then_ends_in_too_small"
+            ),
+            || {
+                let bound = std::time::Duration::from_millis(200);
+                let (outcome, elapsed) = taking_turns_with_no_spare(
+                    "/db/turns-lent",
+                    BOwner::Lent(bound.as_nanos() as u64),
+                );
+                assert!(
+                    matches!(&outcome, Driven::Failed(LimboError::CacheError(
+                        crate::storage::page_cache::CacheError::TooSmall(_)
+                    ))),
+                    "the lent statement's second statement: {outcome:?}"
+                );
+                assert!(
+                    elapsed >= bound && elapsed < bound * 10,
+                    "the lent statement's claim waited {elapsed:?}, against its connection's busy \
+                     timeout of {bound:?}"
+                );
+            },
+        );
+    }
+
+    /// An owner of no connection (`Owner::new`, every `drive` site outside the tests, the
+    /// synchronous integrity check among them): its busy timeout is 0 (`Owner::busy`), so at the
+    /// end of the road it gets the shortage error at once, whatever any connection's busy timeout
+    /// is (the auditor's #6341: until connection operations run as their connection's).
+    #[test]
+    fn an_owner_of_no_connection_ends_at_once_in_too_small_at_the_end_of_the_road() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::an_owner_of_no_connection_ends_at_once_in_too_small_at_the_end_of_the_road"
+            ),
+            || {
+                let (outcome, elapsed) =
+                    taking_turns_with_no_spare("/db/turns-unowned", BOwner::NoConnection);
+                assert!(
+                    matches!(
+                        &outcome,
+                        Driven::Failed(LimboError::CacheError(
+                            crate::storage::page_cache::CacheError::TooSmall(_)
+                        ))
+                    ),
+                    "the owner of no connection's statement: {outcome:?}"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(1),
+                    "the error came after {elapsed:?}"
+                );
+            },
+        );
+    }
+
+    /// B's owner in the turns with no spare batch.
+    enum BOwner {
+        /// Of its connection's own transaction, the connection's busy timeout this many
+        /// nanoseconds.
+        Connection(u64),
+        /// Of a transaction its connection lent it, the connection's busy timeout set on the
+        /// connection's own transaction.
+        Lent(u64),
+        /// Of no connection.
+        NoConnection,
+    }
+
+    /// The turns with no spare batch, B's owner `b_owner`: how B's second statement came out,
+    /// and how long it took.
+    fn taking_turns_with_no_spare(base: &str, b_owner: BOwner) -> (Driven, std::time::Duration) {
+        let (pool, reads, fillers) = shaped(base, false);
+        let p = PageId::new(class(3), 1);
+        let q = PageId::new(class(4), 1);
+        let b = match b_owner {
+            BOwner::Connection(busy) => {
+                let conn = Conn::new();
+                conn.set_busy(busy);
+                Owner::of(conn)
+            }
+            BOwner::Lent(busy) => {
+                let own = Conn::new();
+                own.set_busy(busy);
+                Owner::of(Conn::beside(&own))
+            }
+            BOwner::NoConnection => Owner::new(),
+        };
+        let (mut a, mut b) = (Owner::new(), b);
+        let mut steps = vec![ran_as(&mut a, &pool, p)];
+        land_small(&reads);
+        later(&pool);
+        let b_first = drive_statement(&mut b, &pool, &reads, &[q]);
+        later(&pool);
+        steps.push(ran_as(&mut a, &pool, p));
+        land_small(&reads);
+        later(&pool);
+        let a_sturdy = a.keep_seen();
+        let since = std::time::Instant::now();
+        let outcome = drive_statement(&mut b, &pool, &reads, &[q]);
+        let elapsed = since.elapsed();
+        let report = pool.park_report();
+        drop(b);
+        let a_ran = ran_as(&mut a, &pool, p);
+        land(&reads, Ok(()));
+        drop(a);
+        land(&fillers, Ok(()));
+        drop((pool, reads, fillers));
+        assert!(
+            steps == [false, false] && matches!(b_first, Driven::Done),
+            "A's two loads and B's first statement: {steps:?}, {b_first:?}"
+        );
+        assert!(
+            matches!(a_sturdy, (Some((_, _, true, true)), None)),
+            "A's reloaded page, kept idle and sturdy: {a_sturdy:?}"
+        );
+        assert!(
+            !matches!(outcome, Driven::Parked),
+            "B's claim parked behind A's sturdy keep, its wait never finished\n{report}"
+        );
+        assert!(a_ran, "A ran with its page after B's statement ended");
+        (outcome, elapsed)
+    }
+
+    /// F4 (SHORT-HOLD1b): a kept page that another statement changed while its keep was idle. B's
+    /// drain writes the page out, holding its frame until the write lands, and only then revokes
+    /// A's keep and frees the frame; A's next call reads its page in again and reads the change.
+    #[test]
+    fn a_dirty_kept_page_is_written_out_then_its_keep_revoked_and_the_change_read_after_the_reload()
+    {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_dirty_kept_page_is_written_out_then_its_keep_revoked_and_the_change_read_after_the_reload"
+            ),
+            || {
+                let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+                let pool = open_on(&io, "/db/dirty-kept", MIN_BUDGET);
+                // A page of class 3 written to its copy and out of the pool, so a fix reads it in.
+                let p = {
+                    let mut g = drive(&io, || pool.allocate(class(3))).unwrap();
+                    let p = g.pid();
+                    stamp(&mut g.page_mut(), p, 1);
+                    g.changed();
+                    let frame = g.frame;
+                    drop(g);
+                    let hold = pool
+                        .latch_to_evict(class(3), frame, || FrameLatch {
+                            frames: pool.frames.clone(),
+                            frame,
+                        })
+                        .expect("the page is held by no one");
+                    let out = pool.start_write_out(hold);
+                    pool.write_out(class(3), vec![out]);
+                    drive(&io, || pool.settle_writes()).unwrap();
+                    p
+                };
+                let mut a = Owner::new();
+                let a_first = ran_as(&mut a, &pool, p);
+                let frame = frame_of(&pool, p);
+                // Another statement changes the page while A's keep is idle.
+                {
+                    let mut g = drive(&io, || pool.fix_exclusive(p, None)).unwrap();
+                    stamp(&mut g.page_mut(), p, 2);
+                    g.changed();
+                }
+                let dirty = pool.header(frame).dirty();
+                later(&pool);
+                let step = pool.store.epochs().enter();
+                let to_class_0 = pool.hold_free_batches(class(0));
+                let mut b = Owner::new();
+                let mut allocate = || {
+                    b.call(|| {
+                        Ok(match pool.allocate(class(4))? {
+                            IOResult::Done(page) => IOResult::Done(page.pid()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    })
+                };
+                // The frame as the drain revokes A's keep: written out, clean, still held for the
+                // write-out and kept.
+                let at_revocation = std::rc::Rc::new(std::cell::RefCell::new(None));
+                {
+                    let (seen, weak) = (at_revocation.clone(), Arc::downgrade(&pool));
+                    crate::race::at("buffer.revoked", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            let h = pool.header(frame);
+                            *seen.borrow_mut() = Some((h.status(), h.dirty(), h.grouped()));
+                        }
+                    });
+                }
+                let first = allocate();
+                drop(step);
+                let mut b_page = None;
+                for _ in 0..64 {
+                    match allocate() {
+                        Ok(IOResult::Done(pid)) => {
+                            b_page = Some(pid);
+                            break;
+                        }
+                        Ok(IOResult::IO(IOCompletions(wait))) => {
+                            if !wait.finished() {
+                                io.step().unwrap();
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let written_while_kept = at_revocation.borrow_mut().take();
+                let b_frame = b_page.and_then(|pid| pool.table.find(&pool.frames.headers, pid.raw()));
+                let word = pool.group(frame).word();
+                let a_reloaded = ran_as(&mut a, &pool, p);
+                let read = drive(&io, || pool.fix_optimistic(p, None))
+                    .unwrap()
+                    .read(|page| stamped(page, p))
+                    .flatten();
+                let loads = loads_of(&pool, p);
+                let a_revoked = a.revocations();
+                drop((a, b));
+                drop(pool);
+                assert!(!a_first || dirty, "A's first call read its page in: {a_first}");
+                assert!(dirty, "the page was dirty while A's keep was idle");
+                assert_eq!(to_class_0, 4, "the batches handed to class 0");
+                assert!(matches!(first, Ok(IOResult::IO(_))), "B's first call was done");
+                assert!(
+                    b_frame.is_some_and(|f| f / memory::GRAINS == frame / memory::GRAINS),
+                    "B's new page got no frame in class 3's old batch: {b_page:?}, {b_frame:?}"
+                );
+                assert_eq!(
+                    written_while_kept,
+                    Some((OUTGOING, false, true)),
+                    "as A's keep was revoked, the page was written, clean, held for its write-out and \
+                     kept: (status, dirty, grouped)"
+                );
+                assert_eq!(
+                    (group_word::references(word), group_word::generation(word)),
+                    (0, 1),
+                    "A's keep revoked once the write landed: (references, generation)"
+                );
+                assert!(
+                    a_reloaded && a_revoked == 1 && loads == 2,
+                    "A's next call reloaded its page: ran {a_reloaded}, revocations {a_revoked}, \
+                     loads {loads}"
+                );
+                assert_eq!(read, Some(2), "the page read after the reload");
+            },
+        );
+    }
+
+    /// A1 (SHORT-HOLD1b): a frame whose generation is one below its last value still takes a keep,
+    /// and its revocation takes it to the last; the revoked keep's next call finds another
+    /// generation and its release changes nothing. A load into a frame at the last generation
+    /// keeps nothing, a fix that finds that load is refused its join, and both complete unkept.
+    #[test]
+    fn a_frame_at_its_last_generation_takes_no_keep_and_a_stale_release_changes_nothing() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_frame_at_its_last_generation_takes_no_keep_and_a_stale_release_changes_nothing"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/last-generation", false);
+                // Every grain no group holds, at `generation`.
+                let preset = |generation: u32| {
+                    let word = group_word::word_of(false, 0, 0, 0, generation);
+                    for grain in 0..pool.memory.grains() {
+                        if group_word::released(pool.group(grain).word()) {
+                            pool.group(grain).preset(word);
+                        }
+                    }
+                };
+                let last = group_word::LAST_GENERATION;
+                preset(last - 1);
+                let p = PageId::new(class(3), 1);
+                let (q, q2) = (PageId::new(class(4), 1), PageId::new(class(4), 2));
+                let mut a = Owner::new();
+                let a_first = ran_as(&mut a, &pool, p);
+                let a_kept = a.keep_seen();
+                land_small(&reads);
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                // E's statement drains the batch, revoking A's keep.
+                let mut e = Owner::new();
+                let e_done = drive_statement(&mut e, &pool, &reads, &[q]);
+                let revoked = pool.group(frame).word();
+                // A's next call's entry: its keep revoked, its release refused, the word left as it
+                // was; then the call, which reads A's page in again.
+                a.enter_for_test();
+                let after = pool.group(frame).word();
+                let a_revoked = a.revocations();
+                drop(a);
+                land_small(&reads);
+                later(&pool);
+                // Every frame at the last generation: B's load keeps nothing, and C's join of it is
+                // refused.
+                preset(last);
+                let (mut b, mut c) = (Owner::new(), Owner::new());
+                let b_first = fixed_as(&mut b, &pool, q2);
+                let mut b_calls = 1;
+                while pool.table.find(&pool.frames.headers, q2.raw()).is_none() && b_calls < 16 {
+                    assert!(!fixed_as(&mut b, &pool, q2), "B's read before its load");
+                    b_calls += 1;
+                }
+                let b_frame = frame_of(&pool, q2);
+                let at_load = pool.group(b_frame).word();
+                let b_kept = b.keep_seen();
+                let c_first = fixed_as(&mut c, &pool, q2);
+                let c_kept = c.keep_seen();
+                let landed = land_small(&reads);
+                let (b_done, c_done) = (fixed_as(&mut b, &pool, q2), fixed_as(&mut c, &pool, q2));
+                land(&reads, Ok(()));
+                drop((b, c, e));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(
+                    !a_first
+                        && matches!(a_kept, (Some((_, at, true, false)), None) if at == last - 1),
+                    "A's load keeps its page one generation below the last: {a_kept:?}"
+                );
+                assert!(
+                    matches!(e_done, Driven::Done)
+                        && group_word::generation(revoked) == last
+                        && group_word::released(revoked),
+                    "E's statement revoked A's keep, its frame at the last generation: {e_done:?}, \
+                     {revoked:#x}"
+                );
+                assert!(
+                    a_revoked == 1 && after == revoked,
+                    "A's stale release changed the word: revocations {a_revoked}, {revoked:#x} to \
+                     {after:#x}"
+                );
+                assert!(!b_first, "B's first call reads its page in");
+                assert!(
+                    group_word::generation(at_load) == last
+                        && group_word::references(at_load) == 1
+                        && b_kept.0.is_none(),
+                    "B's load at the last generation, its guard alone, B keeping nothing: \
+                     {at_load:#x}, {b_kept:?}"
+                );
+                assert!(
+                    !c_first && c_kept.0.is_none(),
+                    "C's join refused at the last generation: {c_first}, {c_kept:?}"
+                );
+                assert!(
+                    landed == 1 && b_done && c_done,
+                    "B's and C's fixes completed unkept: landed {landed}, {b_done}, {c_done}"
+                );
+            },
+        );
+    }
+
+    /// A2 (SHORT-HOLD1b): the references of a load's group at their bound, 4,095. A fix that finds
+    /// the load under way is refused its join, keeps nothing, and waits for the load unkept; once
+    /// the read lands it fixes the page without reading it again.
+    #[test]
+    fn a_join_at_the_references_limit_is_refused_and_its_fixer_waits_for_the_load_unkept() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_join_at_the_references_limit_is_refused_and_its_fixer_waits_for_the_load_unkept"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/references-limit", false);
+                let p = PageId::new(class(3), 1);
+                let (mut a, mut c) = (Owner::new(), Owner::new());
+                let a_first = ran_as(&mut a, &pool, p);
+                let frame = frame_of(&pool, p);
+                let real = pool.group(frame).word();
+                pool.group(frame)
+                    .preset(group_word::word_of(true, group_word::MOST, 1, 0, 0));
+                let c_first = fixed_as(&mut c, &pool, p);
+                let c_kept = c.keep_seen();
+                let at_bound = pool.group(frame).word();
+                pool.group(frame).preset(real);
+                let landed = land_small(&reads);
+                let c_done = fixed_as(&mut c, &pool, p);
+                let a_ran = ran_as(&mut a, &pool, p);
+                let loads = loads_of(&pool, p);
+                land(&reads, Ok(()));
+                drop((a, c));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first, "A's call reads its page in");
+                assert_eq!(
+                    real,
+                    group_word::word_of(true, 2, 1, 0, 0),
+                    "the load's group: open, its guard and A's idle keep"
+                );
+                assert!(
+                    !c_first
+                        && c_kept.0.is_none()
+                        && group_word::references(at_bound) == group_word::MOST,
+                    "C's join at the bound was admitted or kept: {c_first}, {c_kept:?}, \
+                     {at_bound:#x}"
+                );
+                assert!(
+                    landed == 1 && c_done && a_ran && loads == 1,
+                    "C completed unkept on the one load: landed {landed}, {c_done}, A {a_ran}, \
+                     loads {loads}"
+                );
+            },
+        );
+    }
+
+    /// A revoked keep dropped after its page came back to its very frame (draft 3 section 7): the
+    /// frame's group is at a later generation, so the stale keep's release changes nothing, and
+    /// the new keeper's reference stands (mutant `revoke-keeps-generation`).
+    #[test]
+    fn a_revoked_keep_dropped_after_its_page_came_back_to_its_frame_releases_nothing() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_revoked_keep_dropped_after_its_page_came_back_to_its_frame_releases_nothing"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/stale-drop", false);
+                let p = PageId::new(class(3), 1);
+                let q = PageId::new(class(4), 1);
+                let (mut a, mut b, mut c) = (Owner::new(), Owner::new(), Owner::new());
+                let a_first = ran_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                let q_evicted = pool.evict_clean(q);
+                later(&pool);
+                // C reads A's page in again: the batch drained back, the page in its old frame.
+                let c_first = fixed_as(&mut c, &pool, p);
+                land_small(&reads);
+                let c_frame = pool.table.find(&pool.frames.headers, p.raw());
+                let c_kept = c.keep_seen();
+                let before = pool.group(frame).word();
+                drop(a);
+                let after = pool.group(frame).word();
+                let intact = after == before;
+                let c_done = intact && fixed_as(&mut c, &pool, p);
+                land(&reads, Ok(()));
+                if intact {
+                    drop(c);
+                } else {
+                    // Its reference is gone: releasing it would end the process first.
+                    std::mem::forget(c);
+                }
+                drop(b);
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(
+                    intact,
+                    "A's stale keep released C's reference: {before:#x} to {after:#x}"
+                );
+                assert!(
+                    !a_first && matches!(b_done, Driven::Done) && q_evicted,
+                    "A's load, B's statement and its page's eviction: {b_done:?}"
+                );
+                assert!(
+                    !c_first && c_frame == Some(frame),
+                    "C's load of A's page into A's frame: {c_frame:?}, not {frame}"
+                );
+                assert!(
+                    matches!(c_kept, (Some((f, 1, true, false)), None) if f == frame),
+                    "C keeps the frame, idle, at the next generation: {c_kept:?}"
+                );
+                assert_eq!(
+                    before,
+                    group_word::word_of(false, 1, 1, 0, 1),
+                    "C's keep, closed and idle, at the next generation"
+                );
+                assert!(c_done, "C's next call fixed its page");
+            },
+        );
+    }
+
+    /// Wake against revoke (draft 3.1, packet 1): the first swap wins. With the owner's entry
+    /// first, the drain passes the frame over, its keep active; the owner's IO return then leaves
+    /// the frame revocable and tells the claim, which goes on and revokes. With the drain first,
+    /// the owner's entry finds another generation and its next fix reads the page in again (mutant
+    /// `revoke-active`).
+    #[test]
+    fn a_wake_racing_a_revocation_keeps_the_page_if_it_is_first_and_reloads_it_if_not() {
+        use std::{cell::RefCell, rc::Rc};
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_wake_racing_a_revocation_keeps_the_page_if_it_is_first_and_reloads_it_if_not"
+            ),
+            || {
+                let p = PageId::new(class(3), 1);
+                let q = PageId::new(class(4), 1);
+                // The owner first: its entry runs where the drain is about to swap.
+                let (pool, reads, fillers) = shaped("/db/wake-first", false);
+                let a = Rc::new(RefCell::new(Owner::new()));
+                let a_first = ran_as(&mut a.borrow_mut(), &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                {
+                    let a = a.clone();
+                    crate::race::at("group.revoke_seen", move || a.borrow_mut().enter_for_test());
+                }
+                let mut b = Owner::new();
+                let b_wait = waiting_after_choice(&mut b, &pool, q, &fillers);
+                let passed_over = pool.group(frame).word();
+                let a_active = a.borrow().keep_seen();
+                let waited_before = b_wait.as_ref().map(Completion::finished);
+                a.borrow_mut().return_io_for_test();
+                let told = b_wait.as_ref().map(Completion::finished);
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                let a_reloads = !ran_as(&mut a.borrow_mut(), &pool, p);
+                for _ in 0..16 {
+                    if loads_of(&pool, p) == 2 || ran_as(&mut a.borrow_mut(), &pool, p) {
+                        break;
+                    }
+                }
+                let first_case = (a.borrow().revocations(), loads_of(&pool, p));
+                land(&reads, Ok(()));
+                drop(b_wait);
+                drop(b);
+                drop(a);
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                // The drain first: it runs where the owner's entry is about to swap.
+                let (pool, reads, fillers) = shaped("/db/revoke-first", false);
+                let mut a = Owner::new();
+                let a_first_again = ran_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let frame_again = frame_of(&pool, p);
+                let b_outcome = Rc::new(RefCell::new(None));
+                {
+                    let (weak, reads, outcome) =
+                        (Arc::downgrade(&pool), reads.clone(), b_outcome.clone());
+                    crate::race::at("group.wake_seen", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            let mut b = Owner::new();
+                            *outcome.borrow_mut() =
+                                Some(drive_statement(&mut b, &pool, &reads, &[q]));
+                        }
+                    });
+                }
+                let a_ran = ran_as(&mut a, &pool, p);
+                let revoked = pool.group(frame_again).word();
+                let second_case = (a.revocations(), a.keep_seen(), loads_of(&pool, p));
+                land(&reads, Ok(()));
+                let b_outcome = b_outcome.borrow_mut().take();
+                drop(a);
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first && !a_first_again, "A's first calls load its page");
+                assert_eq!(
+                    passed_over,
+                    group_word::word_of(false, 1, 0, 0, 0),
+                    "with A's entry first, the drain passed the frame over, A's keep active"
+                );
+                assert!(
+                    matches!(a_active, (Some((f, 0, false, false)), None) if f == frame),
+                    "A's keep, active and held: {a_active:?}"
+                );
+                assert_eq!(
+                    (waited_before, told),
+                    (Some(false), Some(true)),
+                    "B's claim waited behind A's active keep until A's IO return told it"
+                );
+                assert!(
+                    matches!(b_done, Driven::Done) && a_reloads && first_case == (1, 2),
+                    "then B's drain revoked A's idle keep and A reloaded: {b_done:?}, \
+                     (revocations, loads) {first_case:?}"
+                );
+                assert!(
+                    matches!(b_outcome, Some(Driven::Done)),
+                    "with the drain first, B's statement: {b_outcome:?}"
+                );
+                assert!(
+                    !a_ran
+                        && group_word::generation(revoked) >= 1
+                        && matches!(second_case, (1, (Some((_, _, true, true)), None), 2)),
+                    "A's entry found its keep revoked and reloaded the page, sturdy: ran {a_ran}, \
+                     {revoked:#x}, {second_case:?}"
+                );
+            },
+        );
+    }
+
+    /// Join against revoke (draft 3.1, packet 1): the join's swap holds the generation. A join
+    /// first leaves a reference that is not idle, so the drain passes the frame over until it is
+    /// let go; a revocation first leaves no reference, so the join is refused and its fixer keeps
+    /// nothing, reading the page in again itself.
+    #[test]
+    fn a_join_racing_a_revocation_holds_the_frame_if_it_is_first_and_keeps_nothing_if_not() {
+        use std::{cell::RefCell, rc::Rc};
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_join_racing_a_revocation_holds_the_frame_if_it_is_first_and_keeps_nothing_if_not"
+            ),
+            || {
+                let p = PageId::new(class(3), 1);
+                let q = PageId::new(class(4), 1);
+                // The join first, as a fix that probed the load before it landed joins after.
+                let (pool, reads, fillers) = shaped("/db/join-first", false);
+                let mut a = Owner::new();
+                let a_first = ran_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                let joined = Rc::new(RefCell::new(None));
+                {
+                    let (weak, joined) = (Arc::downgrade(&pool), joined.clone());
+                    crate::race::at("group.revoke_seen", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            let step = pool.store.epochs().enter();
+                            *joined.borrow_mut() =
+                                pool.group(frame).join(&step, group_word::Keep::Ordinary);
+                        }
+                    });
+                }
+                let mut b = Owner::new();
+                let b_wait = waiting_after_choice(&mut b, &pool, q, &fillers);
+                let passed_over = pool.group(frame).word();
+                let joined = joined.borrow_mut().take();
+                if let Some(at) = joined {
+                    pool.release_kept(frame, p, at, false, group_word::Keep::Ordinary);
+                }
+                let told = b_wait.as_ref().map(Completion::finished);
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                land(&reads, Ok(()));
+                drop(b_wait);
+                drop((a, b));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                // The revocation first: the fix probed the load under way, the read landed, and the
+                // drain revokes A's keep before the join's swap.
+                let (pool, reads, fillers) = shaped("/db/revoke-before-join", false);
+                let mut a = Owner::new();
+                let a_first_again = ran_as(&mut a, &pool, p);
+                let frame_again = frame_of(&pool, p);
+                {
+                    let reads = reads.clone();
+                    crate::race::at("buffer.join_probed", move || {
+                        land_small(&reads);
+                    });
+                }
+                let b_outcome = Rc::new(RefCell::new(None));
+                {
+                    let (weak, reads, outcome) =
+                        (Arc::downgrade(&pool), reads.clone(), b_outcome.clone());
+                    crate::race::at("group.join_seen", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            pool.store.epochs().stamp();
+                            let mut b = Owner::new();
+                            *outcome.borrow_mut() =
+                                Some(drive_statement(&mut b, &pool, &reads, &[q]));
+                        }
+                    });
+                }
+                later(&pool);
+                let mut c = Owner::new();
+                let c_first = fixed_as(&mut c, &pool, p);
+                let revoked = pool.group(frame_again).word();
+                let c_refused = c.keep_seen();
+                // B's drain handed the batch over during C's step, so C's own claim may have
+                // chosen a filler's: its read lands, as reads do.
+                land(&fillers, Ok(()));
+                // C's fix goes on to read the page in itself.
+                let mut c_calls = Vec::new();
+                for _ in 0..16 {
+                    if loads_of(&pool, p) == 2 {
+                        break;
+                    }
+                    let fixed = fixed_as(&mut c, &pool, p);
+                    c_calls.push((fixed, c.keep_seen(), loads_of(&pool, p)));
+                    if fixed {
+                        break;
+                    }
+                }
+
+                let c_kept = c.keep_seen();
+                let loads = loads_of(&pool, p);
+                land(&reads, Ok(()));
+                let b_outcome = b_outcome.borrow_mut().take();
+                drop((a, c));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first && !a_first_again, "A's first calls load its page");
+                assert!(
+                    joined == Some(0) && passed_over == group_word::word_of(false, 2, 1, 0, 0),
+                    "with the join first, it was admitted and the drain passed the frame over: \
+                     {joined:?}, {passed_over:#x}"
+                );
+                assert!(
+                    told == Some(true) && matches!(b_done, Driven::Done),
+                    "the joined reference's release told B's claim, which went on: {told:?}, \
+                     {b_done:?}"
+                );
+                assert!(
+                    matches!(b_outcome, Some(Driven::Done)),
+                    "with the revocation first, B's statement: {b_outcome:?}"
+                );
+                assert!(
+                    !c_first && group_word::generation(revoked) >= 1 && c_refused.0.is_none(),
+                    "C's join was refused after the revocation: {c_first}, {revoked:#x}, \
+                     {c_refused:?}"
+                );
+                assert!(
+                    matches!(c_kept, (Some((_, _, true, false)), None)) && loads == 2,
+                    "C read the page in itself, keeping it: {c_kept:?}, loads {loads}, calls \
+                     {c_calls:?}"
+                );
+            },
+        );
+    }
+
+    /// Release against revoke (draft 3.1, packet 1): the generation decides. A release first takes
+    /// the group to no reference, its releaser letting the group's keep go, and the drain frees
+    /// the frame once, no revocation made; a revocation first leaves the release another
+    /// generation, and it releases nothing.
+    #[test]
+    fn a_release_racing_a_revocation_lets_the_frame_go_once_whichever_is_first() {
+        use std::{cell::RefCell, rc::Rc};
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_release_racing_a_revocation_lets_the_frame_go_once_whichever_is_first"
+            ),
+            || {
+                let p = PageId::new(class(3), 1);
+                let q = PageId::new(class(4), 1);
+                // The release first: A's owner dropped where the drain is about to swap.
+                let (pool, reads, fillers) = shaped("/db/release-first", false);
+                let a = Rc::new(RefCell::new(Some(Owner::new())));
+                let a_first = ran_as(a.borrow_mut().as_mut().unwrap(), &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                {
+                    let a = a.clone();
+                    crate::race::at("group.revoke_seen", move || drop(a.borrow_mut().take()));
+                }
+                let mut b = Owner::new();
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                let released = pool.group(frame).word();
+                let dropped = a.borrow().is_none();
+                land(&reads, Ok(()));
+                let census = pool.taken_frames_census();
+                drop(b);
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                // The revocation first: B's statement drains where A's release is about to swap.
+                let (pool, reads, fillers) = shaped("/db/revoke-before-release", false);
+                let mut a = Owner::new();
+                let a_first_again = ran_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let frame_again = frame_of(&pool, p);
+                let b_outcome = Rc::new(RefCell::new(None));
+                {
+                    let (weak, reads, outcome) =
+                        (Arc::downgrade(&pool), reads.clone(), b_outcome.clone());
+                    crate::race::at("group.release_seen", move || {
+                        if let Some(pool) = weak.upgrade() {
+                            let mut b = Owner::new();
+                            *outcome.borrow_mut() =
+                                Some(drive_statement(&mut b, &pool, &reads, &[q]));
+                        }
+                    });
+                }
+                drop(a);
+                let after = pool.group(frame_again).word();
+                let q_frame = pool.table.find(&pool.frames.headers, q.raw());
+                land(&reads, Ok(()));
+                let census_again = pool.taken_frames_census();
+                let b_outcome = b_outcome.borrow_mut().take();
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first && !a_first_again, "A's first calls load its page");
+                assert!(
+                    dropped && matches!(b_done, Driven::Done) && released == 0,
+                    "with the release first, the frame let go and drained with no revocation: \
+                     {b_done:?}, {released:#x}"
+                );
+                assert!(census.is_empty(), "the census: {census:#?}");
+                assert!(
+                    matches!(b_outcome, Some(Driven::Done))
+                        && q_frame.is_some()
+                        && after == group_word::word_of(false, 0, 0, 0, 1),
+                    "with the revocation first, A's release released nothing: {b_outcome:?}, \
+                     {q_frame:?}, {after:#x}"
+                );
+                assert!(census_again.is_empty(), "the census: {census_again:#?}");
+            },
+        );
+    }
+
+    /// Ordinary eviction honours an idle keep (draft 3 section 5): a class evicting its own pages
+    /// never revokes, so an operation under pressure runs with its page at its first load. Class 9
+    /// holds every batch, one frame each, four of them being read in: B's claim finds A's page, kept
+    /// idle, the class's one page to evict, passes it over and waits; A's next call runs with its
+    /// page and lets it go, which tells B (mutant `evict-revokes`).
+    #[test]
+    fn an_operation_whose_class_evicts_its_own_runs_with_its_page_at_its_first_load() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::an_operation_whose_class_evicts_its_own_runs_with_its_page_at_its_first_load"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/evict-own", false);
+                let p = PageId::new(class(9), 10);
+                let q = PageId::new(class(9), 11);
+                let (mut a, mut b) = (Owner::new(), Owner::new());
+                let a_first = fixed_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let mut b_wait = None;
+                for _ in 0..8 {
+                    match b.call(|| {
+                        Ok(match pool.fix_optimistic(q, None)? {
+                            IOResult::Done(_) => IOResult::Done(()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    }) {
+                        Ok(IOResult::IO(IOCompletions(wait))) if !wait.finished() => {
+                            b_wait = Some(wait);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let b_loads_before = loads_of(&pool, q);
+                let b_waited = b_wait.as_ref().map(Completion::finished);
+                let a_done = fixed_as(&mut a, &pool, p);
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                let (a_loads, a_revoked) = (loads_of(&pool, p), a.revocations());
+                land(&reads, Ok(()));
+                drop(b_wait);
+                drop((a, b));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first, "A's first call loads its page");
+                assert!(
+                    a_done && a_loads == 1 && a_revoked == 0,
+                    "A ran with its page at its first load: done {a_done}, loads {a_loads}, \
+                     revocations {a_revoked}"
+                );
+                assert!(
+                    b_loads_before == 0
+                        && b_waited == Some(false)
+                        && matches!(b_done, Driven::Done),
+                    "B waited behind A's keep until A let it go: loads before {b_loads_before}, \
+                     waited {b_waited:?}, {b_done:?}"
+                );
+            },
+        );
+    }
+
+    /// F2 (SHORT-HOLD1b): a swap that would leave more idle keeps than references ends the process.
+    #[test]
+    fn a_keep_counted_idle_beyond_its_references_ends_the_process() {
+        let test = concat!(
+            module_path!(),
+            "::a_keep_counted_idle_beyond_its_references_ends_the_process"
+        );
+        if let Some(ended) = crate::storage::atoll::testing::in_child(test, || {
+            let g = group_word::GroupWord::default();
+            let at = g.open(Some(group_word::Keep::Ordinary)).expect("a keep");
+            assert!(!g.close(), "the loader's keep is left");
+            g.idle(at);
+            g.idle(at);
+        }) {
+            assert!(
+                ended.code != Some(0)
+                    && ended.stderr.contains(
+                        "a keep going idle left more idle or sturdy keeps than references"
+                    ),
+                "the child ended {:?}: {}",
+                ended.code,
+                ended.stderr
+            );
+        }
+    }
+
+    /// A claim that passed a frame over for a step's mark (SHORT-HOLD1b): the page's keeps are
+    /// revocable, but a step under way may hold the page, so the drain leaves it and the claim
+    /// waits on the epoch one past the mark. The step's end, on another thread, is what wakes it:
+    /// no other let-go comes. Woken, its drain revokes the keep (mutant `held-mark-no-wake`: the
+    /// claim waits on nothing the step's end finishes, and parks).
+    #[test]
+    fn a_claim_passed_over_for_a_steps_mark_is_woken_when_the_step_ends() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_claim_passed_over_for_a_steps_mark_is_woken_when_the_step_ends"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/step-mark", false);
+                let p = PageId::new(class(3), 1);
+                let q = PageId::new(class(4), 1);
+                let mut a = Owner::new();
+                let a_first = ran_as(&mut a, &pool, p);
+                land(&reads, Ok(()));
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                // A step under way on another thread, entered before A's next fix marks the page.
+                let (entered, entered_seen) = std::sync::mpsc::channel();
+                let (end, end_seen) = std::sync::mpsc::channel::<()>();
+                let stepper = {
+                    let pool = pool.clone();
+                    std::thread::spawn(move || {
+                        let step = pool.store.epochs().enter();
+                        entered.send(()).unwrap();
+                        let _ = end_seen.recv();
+                        drop(step);
+                    })
+                };
+                entered_seen.recv().unwrap();
+                let a_ran = ran_as(&mut a, &pool, p);
+                let mut b = Owner::new();
+                let b_wait = waiting_after_choice(&mut b, &pool, q, &fillers);
+                let word_while_held = pool.group(frame).word();
+                let waited = b_wait.as_ref().map(Completion::finished);
+                end.send(()).unwrap();
+                stepper.join().unwrap();
+                let since = std::time::Instant::now();
+                let told = b_wait.as_ref().is_some_and(|w| {
+                    while !w.finished() && since.elapsed() < std::time::Duration::from_secs(5) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    w.finished()
+                });
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                let a_next = ran_as(&mut a, &pool, p);
+                let a_revoked = a.revocations();
+                land(&reads, Ok(()));
+                drop((a, b));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first && a_ran, "A's load, then its run with its page");
+                assert!(
+                    waited == Some(false)
+                        && word_while_held == group_word::word_of(false, 1, 1, 0, 0),
+                    "B's claim waited, A's idle keep left while the step was under way: {waited:?}, \
+                     {word_while_held:#x}"
+                );
+                assert!(
+                    told,
+                    "the step's end never woke the claim it held back from A's frame"
+                );
+                assert!(
+                    matches!(b_done, Driven::Done) && !a_next && a_revoked == 1,
+                    "then B's drain revoked A's keep: {b_done:?}, A ran {a_next}, revocations \
+                     {a_revoked}"
+                );
+            },
+        );
+    }
+
+    /// A request's retirement from a frame its load's group still keeps (SHORT-HOLD1b, the
+    /// auditor's #6317): a claim passes the frame over for its record, which holds the load's
+    /// request still; once the request retires, the frame's keeps are idle ordinary ones a drain
+    /// revokes, and the retirement tells the claim, which goes on (mutant `retirement-silent`).
+    #[test]
+    fn a_requests_retirement_tells_a_claim_that_passed_a_kept_frame_over_for_its_record() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_requests_retirement_tells_a_claim_that_passed_a_kept_frame_over_for_its_record"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/retirement", false);
+                let p = PageId::new(class(3), 1);
+                let q = PageId::new(class(4), 1);
+                let mut a = Owner::new();
+                let a_first = ran_as(&mut a, &pool, p);
+                land(&reads, Ok(()));
+                later(&pool);
+                let frame = frame_of(&pool, p);
+                // The load's request still held by the frame's record, the backend yet to retire it.
+                let held = pool.header(frame).hold_record(frame, class(3));
+                let mut b = Owner::new();
+                let b_wait = waiting_after_choice(&mut b, &pool, q, &fillers);
+                let waited = b_wait.as_ref().map(Completion::finished);
+                pool.give_back(held);
+                let told = b_wait.as_ref().map(Completion::finished);
+                let b_done = drive_statement(&mut b, &pool, &reads, &[q]);
+                let a_next = ran_as(&mut a, &pool, p);
+                let a_revoked = a.revocations();
+                land(&reads, Ok(()));
+                drop((a, b));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(!a_first, "A's call loads its page");
+                assert_eq!(
+                    (waited, told),
+                    (Some(false), Some(true)),
+                    "the retirement told the claim that passed the frame over for its record"
+                );
+                assert!(
+                    matches!(b_done, Driven::Done) && !a_next && a_revoked == 1,
+                    "then B's drain revoked A's keep: {b_done:?}, A ran {a_next}, revocations \
+                     {a_revoked}"
+                );
+            },
+        );
+    }
+
+    /// A load that lost the page table's insert to another frame (SHORT-HOLD1b, the auditor's
+    /// #6325): the loser fixes for no owner, so keeps nothing; between its load's publication and
+    /// its insert, another fix of the page loads it into a frame of its own and inserts it, and
+    /// an owner's fix follows a hint to the loser's frame, joins its group and returns IO, idle;
+    /// a claim passes the frame over for that keep and waits. The loser's close leaves the group
+    /// revocable, the joiner's keep alone in it, and its free defers the frame to the group; no
+    /// landing comes, and the joiner never acts again. The signal after the loser's free tells
+    /// the claim (mutant `lost-insert-silent`).
+    #[test]
+    fn a_load_that_lost_its_insert_tells_a_claim_that_passed_its_frame_over_for_a_joiners_keep() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_load_that_lost_its_insert_tells_a_claim_that_passed_its_frame_over_for_a_joiners_keep"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/lost-insert");
+                let p = PageId::new(class(3), 1);
+                // What the race point's action saw: the loser's frame, the joiner's call, whether
+                // the claim's pass marked the frame, and the claim's wait.
+                type Seen = (u32, bool, bool, Completion);
+                let seen: std::rc::Rc<std::cell::RefCell<Option<Seen>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let joiner: std::rc::Rc<std::cell::RefCell<Owner>> = std::rc::Rc::new(std::cell::RefCell::new(Owner::new()));
+                let (weak, reads_in, seen_in, joiner_in) = (
+                    Arc::downgrade(&pool),
+                    reads.clone(),
+                    seen.clone(),
+                    joiner.clone(),
+                );
+                crate::race::at("buffer.load_published", move || {
+                    let pool = weak.upgrade().expect("the pool outlives the loser's load");
+                    // The winner: no frame holds the page yet, so it loads it into its own and
+                    // inserts it; its read lands.
+                    assert!(!fixed_unowned(&pool, p), "the winner's load");
+                    land(&reads_in, Ok(()));
+                    let loser = (0..pool.frames.headers.len() as u32)
+                        .find(|&f| {
+                            let h = pool.header(f);
+                            h.pid() == p.raw() && h.status() == LOADING
+                        })
+                        .expect("the loser's frame, published and loading");
+                    // The joiner: a hint to the loser's frame, whose load it waits for, keeping it.
+                    let hint = std::sync::atomic::AtomicU32::new(loser + 1);
+                    let out = joiner_in.borrow_mut().call(|| {
+                        Ok(match pool.fix_optimistic(p, Some(&hint))? {
+                            IOResult::Done(_) => IOResult::Done(()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    });
+                    // The claim: its ticket before its look, its pass over the frame, its wait.
+                    let ticket = pool.ticket();
+                    let mut room = Room::default();
+                    pool.pass_over_kept(loser, &mut None, &mut room);
+                    let wait = pool.supply_wait(ticket);
+                    *seen_in.borrow_mut() =
+                        Some((loser, matches!(out, Ok(IOResult::IO(_))), room.marked, wait));
+                });
+                let loser_fixed = fixed_unowned(&pool, p);
+                let (loser, joiner_waited, marked, wait) =
+                    seen.borrow_mut().take().expect("the race point's action ran");
+                let told = wait.finished();
+                let word = pool.group(loser).word();
+                let freed = pool.header(loser).status() == FREE;
+                drop(wait);
+                drop(std::rc::Rc::try_unwrap(joiner).ok().expect("the joiner").into_inner());
+                drop((pool, reads));
+                assert!(
+                    loser_fixed && joiner_waited && marked,
+                    "the loser found the winner's page, the joiner waited keeping the loser's \
+                     frame, the claim marked it: {loser_fixed}, {joiner_waited}, {marked}"
+                );
+                assert!(
+                    freed && group_word::revocable(word),
+                    "the loser's close left the frame freed and its group revocable: {}",
+                    group_word::describe(word)
+                );
+                assert!(
+                    told,
+                    "the lost insert's signal told the claim that passed the loser's frame over"
+                );
+            },
+        );
+    }
+
+    /// A page source that refuses every read at its submission, for the refused read's test.
+    struct RefusingSource;
+
+    /// The location [`RefusingSource`] gives every page: its read refused.
+    struct RefusingLocated;
+
+    impl source::PageSource for RefusingSource {
+        fn locate(&self, _pid: PageId) -> Result<IOResult<Box<dyn source::Located>>> {
+            Ok(IOResult::Done(Box::new(RefusingLocated)))
+        }
+    }
+    impl source::Located for RefusingLocated {
+        fn read(
+            self: Box<Self>,
+            _into: Arc<crate::io::Buffer>,
+            _done: source::ReadDone,
+            _submitting: source::Submitting<'_>,
+        ) -> Result<IOResult<Option<Completion>>> {
+            Err(LimboError::InternalError("the read refused".to_string()))
+        }
+    }
+
+    /// A read refused at its submission (SHORT-HOLD1b, the auditor's #6325, the close of a read
+    /// given up before it started): between the load's publication and the submission, an
+    /// owner's fix of the page joins the load's group and returns IO, idle, and a claim passes
+    /// the frame over for that keep and waits; then the source refuses the read. The read,
+    /// dropped inside the submission's scope, unloads the frame: its close leaves the group
+    /// revocable, the joiner's keep alone in it, and its free defers the frame to the group. The
+    /// scope's arm tells the claim (mutant `refused-read-unarmed`, which takes out the scope's
+    /// arm and the dropped read's own).
+    #[test]
+    fn a_read_refused_at_submission_tells_a_claim_that_passed_its_frame_over_for_a_joiners_keep() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_read_refused_at_submission_tells_a_claim_that_passed_its_frame_over_for_a_joiners_keep"
+            ),
+            || {
+                let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+                let store = PageStore::open(
+                    crate::storage::atoll::requests::counted_for_test(io),
+                    "/db/refused-read",
+                    StoreConfig {
+                        file_bytes: 1 << 30,
+                        meta_pages: 1 << 10,
+                    },
+                    [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
+                    0,
+                );
+                let pool = BufferPool::new(
+                    BufferConfig::with_budget(MIN_BUDGET),
+                    Arc::new(RefusingSource),
+                    store,
+                )
+                .unwrap();
+                let p = PageId::new(class(3), 1);
+                // What the race point's action saw: the loading frame, the joiner's call, whether
+                // the claim's pass marked the frame, and the claim's wait.
+                type Seen = (u32, bool, bool, Completion);
+                let seen: std::rc::Rc<std::cell::RefCell<Option<Seen>>> =
+                    std::rc::Rc::new(std::cell::RefCell::new(None));
+                let joiner: std::rc::Rc<std::cell::RefCell<Owner>> =
+                    std::rc::Rc::new(std::cell::RefCell::new(Owner::new()));
+                let (weak, seen_in, joiner_in) =
+                    (Arc::downgrade(&pool), seen.clone(), joiner.clone());
+                crate::race::at("buffer.read_submit", move || {
+                    let pool = weak.upgrade().expect("the pool outlives the load");
+                    let frame = frame_of(&pool, p);
+                    // The joiner: the page found loading, its load waited for, keeping it.
+                    let out = joiner_in.borrow_mut().call(|| {
+                        Ok(match pool.fix_optimistic(p, None)? {
+                            IOResult::Done(_) => IOResult::Done(()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    });
+                    // The claim: its ticket before its look, its pass over the frame, its wait.
+                    let ticket = pool.ticket();
+                    let mut room = Room::default();
+                    pool.pass_over_kept(frame, &mut None, &mut room);
+                    let wait = pool.supply_wait(ticket);
+                    *seen_in.borrow_mut() =
+                        Some((frame, matches!(out, Ok(IOResult::IO(_))), room.marked, wait));
+                });
+                let refused = matches!(
+                    pool.fix_optimistic(p, None),
+                    Err(LimboError::InternalError(ref words)) if words == "the read refused"
+                );
+                let (frame, joiner_waited, marked, wait) =
+                    seen.borrow_mut().take().expect("the race point's action ran");
+                let told = wait.finished();
+                let word = pool.group(frame).word();
+                let freed = pool.header(frame).status() == FREE;
+                drop(wait);
+                drop(
+                    std::rc::Rc::try_unwrap(joiner)
+                        .ok()
+                        .expect("the joiner")
+                        .into_inner(),
+                );
+                drop(pool);
+                assert!(
+                    refused && joiner_waited && marked,
+                    "the loader's read was refused, the joiner waited keeping the frame, the claim \
+                     marked it: {refused}, {joiner_waited}, {marked}"
+                );
+                assert!(
+                    freed && group_word::revocable(word),
+                    "the refused read's close left the frame freed and its group revocable: {}",
+                    group_word::describe(word)
+                );
+                assert!(
+                    told,
+                    "the refused read's scope told the claim that passed its frame over"
+                );
+            },
+        );
+    }
+
+    /// The checkpoint's demand behind sturdy idle keeps alone (SHORT-HOLD1b, the designer's #6344),
+    /// at the default cache, eight owners each revoked once and suspended at their reloaded pages
+    /// ([`eight_sturdy`]), no read at the backend: the demand's claims are the demand's
+    /// (`upkeep::claim`), which run as no owner's and note no end of the road, so it waits, not
+    /// ending in the shortage error; the owner in its drain's way ends its operation, letting its
+    /// keep go, which tells the demand, and the demand's next claims get its frame.
+    #[test]
+    fn a_checkpoints_demand_behind_a_sturdy_idle_keep_waits_and_gets_its_frame_once_it_is_let_go() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_checkpoints_demand_behind_a_sturdy_idle_keep_waits_and_gets_its_frame_once_it_is_let_go"
+            ),
+            || {
+                let (pool, reads, mut owners) = eight_sturdy("/db/upkeep-eight");
+                let mut upkeep = super::Upkeep::default();
+                let first = checkpoint_claims(&pool, &mut upkeep, class(4), None);
+                let waits = match &first {
+                    Ok(IOResult::IO(IOCompletions(w))) => Some(w.finished()),
+                    _ => None,
+                };
+                let first_seen = format!("{first:?}");
+                let leaving: Vec<u32> = pool.memory.leaving().iter().map(|l| l.batch).collect();
+                let in_the_way = owners.iter().position(|(o, _)| {
+                    o.keep_seen()
+                        .0
+                        .is_some_and(|(f, ..)| leaving.contains(&(f / memory::GRAINS)))
+                });
+                // The owner in the demand's way ends its operation with its page.
+                let ended = in_the_way.map(|i| {
+                    let (owner, page) = &mut owners[i];
+                    fixed_as(owner, &pool, *page)
+                });
+                let told = match &first {
+                    Ok(IOResult::IO(IOCompletions(w))) => w.finished(),
+                    _ => false,
+                };
+                let got = checkpoint_claims(&pool, &mut upkeep, class(4), None);
+                let got_frame = match &got {
+                    Ok(IOResult::Done(f)) => Some(*f),
+                    _ => None,
+                };
+                drop(first);
+                if let Some(f) = got_frame {
+                    pool.free_frame(class(4), f, pool.take_free_latch(f));
+                }
+                drop((upkeep, owners));
+                land(&reads, Ok(()));
+                drop((pool, reads));
+                assert_eq!(
+                    waits,
+                    Some(false),
+                    "the checkpoint's demand behind the sturdy keeps waited, not failing: {first_seen}"
+                );
+                assert!(
+                    in_the_way.is_some() && ended == Some(true),
+                    "the owner in the demand's way ended its operation with its page: \
+                     {in_the_way:?}, {ended:?}"
+                );
+                assert!(told, "its operation's end told the checkpoint's demand");
+                assert!(
+                    got_frame.is_some(),
+                    "the checkpoint's demand got its frame once the keep was let go: {got:?}"
+                );
+            },
+        );
+    }
+
+    /// The checkpoint's demand behind an ordinary idle keep (SHORT-HOLD1b, the designer's #6346,
+    /// the auditor's chaos 127 park): the demand's drain revokes the suspended statement's keep
+    /// and the checkpoint gets its frame; the statement's next call finds its keep revoked, reads
+    /// its page in again, sturdy, and its call after runs with its page.
+    #[test]
+    fn a_checkpoints_drain_revokes_an_ordinary_idle_keep_and_the_statement_reloads_and_runs() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_checkpoints_drain_revokes_an_ordinary_idle_keep_and_the_statement_reloads_and_runs"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/upkeep-ordinary", false);
+                let p = PageId::new(class(3), 1);
+                let mut a = Owner::new();
+                let a_loaded = ran_as(&mut a, &pool, p);
+                land_small(&reads);
+                later(&pool);
+                let a_kept = a.keep_seen();
+                let mut upkeep = super::Upkeep::default();
+                let got = checkpoint_claims(&pool, &mut upkeep, class(4), Some(&fillers));
+                let got_frame = match &got {
+                    Ok(IOResult::Done(f)) => Some(*f),
+                    _ => None,
+                };
+                // A's next calls, each read landed as the host steps, until it runs with its page.
+                let a_reload = ran_as(&mut a, &pool, p);
+                let a_revoked = a.revocations();
+                let mut a_ran = false;
+                for _ in 0..8 {
+                    land_small(&reads);
+                    later(&pool);
+                    a_ran = ran_as(&mut a, &pool, p);
+                    if a_ran {
+                        break;
+                    }
+                }
+                let a_loads = loads_of(&pool, p);
+                let a_after = a.keep_seen();
+                if let Some(f) = got_frame {
+                    pool.free_frame(class(4), f, pool.take_free_latch(f));
+                }
+                drop((upkeep, a));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(
+                    !a_loaded && matches!(a_kept, (Some((_, _, true, false)), None)),
+                    "A's load, its keep idle and ordinary: {a_kept:?}"
+                );
+                assert!(
+                    got_frame.is_some(),
+                    "the checkpoint's demand got its frame, its drain revoking A's keep: {got:?}"
+                );
+                assert!(
+                    !a_reload && a_revoked == 1 && a_ran && a_loads == 2,
+                    "A's next call found its keep revoked and read its page in again, and a call \
+                     after ran with it: reload {}, revocations {a_revoked}, ran {a_ran}, loads \
+                     {a_loads}",
+                    !a_reload
+                );
+                assert!(
+                    matches!(a_after, (Some((_, _, true, true)), None)),
+                    "A's page kept sturdy after its reload: {a_after:?}"
+                );
+            },
+        );
+    }
+
+    /// Calls the checkpoint's demand's claim of a frame of `class`, as its stepper would, until
+    /// it is done or comes back with a wait nothing has finished, `fillers`' reads landed after
+    /// its first call if given: what the last call came to.
+    fn checkpoint_claims(
+        pool: &Arc<BufferPool>,
+        upkeep: &mut super::Upkeep,
+        class: SizeClass,
+        fillers: Option<&PendingReads>,
+    ) -> Result<IOResult<u32>> {
+        let mut out = super::upkeep_scope(upkeep, || pool.claim(class, Purpose::New, &[]));
+        if let Some(fillers) = fillers {
+            land(fillers, Ok(()));
+        }
+        for _ in 0..8 {
+            match &out {
+                Ok(IOResult::IO(IOCompletions(w))) if w.finished() => {}
+                _ => return out,
+            }
+            out = super::upkeep_scope(upkeep, || pool.claim(class, Purpose::New, &[]));
+        }
+        out
+    }
+
+    /// A tenure's advance that fails ends the operation (SHORT-HOLD1b): B's claim waits behind A's
+    /// sturdy keep alone, C queued behind B, and once B's busy timeout passed its advance fails with
+    /// the shortage error. B's tenure is ended with it, its place freed, and C, next in the queue,
+    /// holds the gate (mutant `advance-error-keeps-tenure`).
+    #[test]
+    fn an_advance_that_fails_ends_its_operation_and_the_next_place_holds_the_gate() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::an_advance_that_fails_ends_its_operation_and_the_next_place_holds_the_gate"
+            ),
+            || {
+                let (pool, reads, fillers) = shaped("/db/advance-fails", false);
+                let p = PageId::new(class(3), 1);
+                let (q, q2) = (PageId::new(class(4), 1), PageId::new(class(4), 2));
+                let (b_conn, c_conn) = (Conn::new(), Conn::new());
+                b_conn.set_busy(std::time::Duration::from_millis(200).as_nanos() as u64);
+                c_conn.set_busy(std::time::Duration::from_secs(60).as_nanos() as u64);
+                let (mut a, mut b, mut c) = (Owner::new(), Owner::of(b_conn), Owner::of(c_conn));
+                let mut e = Owner::new();
+                // A's page kept sturdy in the one batch, as in the turns with no spare batch.
+                let a_first = ran_as(&mut a, &pool, p);
+                land(&reads, Ok(()));
+                later(&pool);
+                let e_done = drive_statement(&mut e, &pool, &reads, &[q]);
+                later(&pool);
+                let a_reloads = ran_as(&mut a, &pool, p);
+                land(&reads, Ok(()));
+                later(&pool);
+                let read = |o: &mut Owner, pid: PageId| {
+                    o.call(|| {
+                        Ok(match pool.fix_optimistic(pid, None)? {
+                            IOResult::Done(_) => IOResult::Done(()),
+                            IOResult::IO(io) => IOResult::IO(io),
+                        })
+                    })
+                };
+                // B at the head, waiting out its busy timeout behind A's sturdy keep.
+                let mut b_wait = None;
+                for _ in 0..8 {
+                    if let Ok(IOResult::IO(IOCompletions(w))) = read(&mut b, q) {
+                        if !w.finished() {
+                            b_wait = Some(w);
+                            break;
+                        }
+                    }
+                }
+                // C behind it, waiting for its turn.
+                let c_turn = match read(&mut c, q2) {
+                    Ok(IOResult::IO(IOCompletions(w))) => Some(w),
+                    _ => None,
+                };
+                let before = (pool.shortage_len(), b.holds_gate(), c.holds_gate());
+                let since = std::time::Instant::now();
+                while b_wait.as_ref().is_some_and(|w| !w.finished())
+                    && since.elapsed() < std::time::Duration::from_secs(5)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let b_failed = read(&mut b, q);
+                let after = (
+                    pool.shortage_len(),
+                    b.queued(),
+                    c_turn.as_ref().map(Completion::finished),
+                    c.holds_gate(),
+                );
+                drop(b_wait);
+                drop(c_turn);
+                drop((b, c));
+                let a_ran = ran_as(&mut a, &pool, p);
+                land(&reads, Ok(()));
+                drop((a, e));
+                land(&fillers, Ok(()));
+                drop((pool, reads, fillers));
+                assert!(
+                    !a_first && matches!(e_done, Driven::Done) && !a_reloads,
+                    "A's load, E's statement, A's sturdy reload: {e_done:?}"
+                );
+                assert_eq!(
+                    before,
+                    (2, true, false),
+                    "(places, B holds the gate, C holds the gate) as B waits"
+                );
+                assert!(
+                    matches!(
+                        b_failed,
+                        Err(LimboError::CacheError(
+                            crate::storage::page_cache::CacheError::TooSmall(_)
+                        ))
+                    ),
+                    "B's advance after its busy timeout: {b_failed:?}"
+                );
+                assert_eq!(
+                    after,
+                    (1, false, Some(true), true),
+                    "B's failed advance ended its tenure and handed the gate on: (places, B queued, \
+                     C's turn finished, C holds the gate)"
+                );
+                assert!(a_ran, "A ran with its page");
+            },
+        );
+    }
+
+    /// A pool of the default configuration (`config_for(None)`: MIN_DB_BUDGET, 11 batches of 2 MiB,
+    /// the log's ring and the image bank lent at open, 8 a cache claim can drain), over a source
+    /// whose reads the test lands. Eight owners, each reading a page of its own class into a batch
+    /// of its own, are each revoked once, by a statement of class 4 draining that batch, and
+    /// suspended at their reload: eight sturdy idle keeps, one in each batch. Returns the pool, its
+    /// reads and the eight owners with their pages.
+    fn eight_sturdy(base: &str) -> (Arc<BufferPool>, PendingReads, Vec<(Owner, PageId)>) {
+        let config = crate::storage::atoll::sql::mode::config_for(None);
+        let mut buffer = config.buffer.clone();
+        buffer.lent_at_open = LentAtOpen {
+            ring: crate::storage::atoll::log::ring_chunks(&config.log),
+            bank: bank_frames(config.checkpoint_write_bytes()),
+        };
+        let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+        let store = PageStore::open(
+            crate::storage::atoll::requests::counted_for_test(io),
+            base,
+            StoreConfig {
+                file_bytes: 1 << 30,
+                meta_pages: 1 << 10,
+            },
+            [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
+            0,
+        );
+        let reads: PendingReads = Arc::new(crate::storage::atoll::locks::Mutex::new(Vec::new()));
+        let pool =
+            BufferPool::new(buffer, Arc::new(SubmittingSource(reads.clone())), store).unwrap();
+        let mut owners: Vec<(Owner, PageId)> = [0, 1, 2, 3, 5, 6, 7, 8]
+            .into_iter()
+            .map(|c| (Owner::new(), PageId::new(class(c), 1)))
+            .collect();
+        for (owner, page) in owners.iter_mut() {
+            assert!(!ran_as(owner, &pool, *page), "an owner's load");
+            land(&reads, Ok(()));
+        }
+        later(&pool);
+        let mut d = Owner::new();
+        for round in 0..owners.len() as u64 {
+            let q = PageId::new(class(4), 100 + round);
+            assert!(
+                matches!(drive_statement(&mut d, &pool, &reads, &[q]), Driven::Done),
+                "the drain's statement of round {round}"
+            );
+            assert!(pool.evict_clean(q), "its page evicted");
+            later(&pool);
+            // The owner it revoked, its keep's generation passed.
+            let revoked = owners.iter().position(|(o, _)| {
+                o.keep_seen()
+                    .0
+                    .is_some_and(|(f, at, _, _)| group_word::generation(pool.group(f).word()) != at)
+            });
+            let i = revoked.expect("an owner revoked this round");
+            let (owner, page) = &mut owners[i];
+            assert!(!ran_as(owner, &pool, *page), "the revoked owner's reload");
+            land(&reads, Ok(()));
+            later(&pool);
+        }
+        for (owner, _) in &owners {
+            assert!(
+                matches!(owner.keep_seen(), (Some((_, 1, true, true)), None)),
+                "an owner's keep, revoked once, reloaded sturdy and idle: {:?}",
+                owner.keep_seen()
+            );
+        }
+        let batches: std::collections::BTreeSet<u32> = owners
+            .iter()
+            .filter_map(|(o, _)| o.keep_seen().0.map(|(f, ..)| f / memory::GRAINS))
+            .collect();
+        assert_eq!(batches.len(), 8, "a sturdy keep in each of eight batches");
+        (pool, reads, owners)
+    }
+
+    /// The default configuration's end of the road (SHORT-HOLD1b, A3, the auditor's #6311): eight
+    /// sturdy idle keeps, one in each batch a cache claim can drain, and a ninth claim that needs a
+    /// batch: it waits its busy timeout, 200 ms, and ends in `TooSmall`, its words naming the
+    /// class wanted, the batch and the sturdy keep.
+    #[test]
+    fn at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small"
+            ),
+            || {
+                let (pool, reads, owners) = eight_sturdy("/db/default-eight");
+                let conn = Conn::new();
+                let bound = std::time::Duration::from_millis(200);
+                conn.set_busy(bound.as_nanos() as u64);
+                let mut ninth = Owner::of(conn);
+                let since = std::time::Instant::now();
+                let outcome =
+                    drive_statement(&mut ninth, &pool, &reads, &[PageId::new(class(4), 1)]);
+                let elapsed = since.elapsed();
+                let lent = (0..pool.memory.batches)
+                    .filter(|&b| pool.memory.is_lend_batch(b))
+                    .count();
+                let batches = pool.memory.batches;
+                drop(ninth);
+                drop(owners);
+                land(&reads, Ok(()));
+                drop((pool, reads));
+                assert_eq!(
+                    (batches, lent),
+                    (11, 3),
+                    "the default pool: (batches, lent at open)"
+                );
+                assert!(
+                    matches!(&outcome, Driven::Failed(LimboError::CacheError(
+                        crate::storage::page_cache::CacheError::TooSmall(e)
+                    )) if e.starts_with(
+                        "the page cache is too small for the statements open: a frame of class 4 \
+                         (64 KiB) for a read waits on batch "
+                    ) && e.ends_with(", held by statements between their steps; sturdy keeps: 1")),
+                    "the ninth claim: {outcome:?}"
+                );
+                assert!(
+                    elapsed >= bound && elapsed < bound * 10,
+                    "the error came after {elapsed:?}, against a busy timeout of {bound:?}"
+                );
+            },
+        );
+    }
+
+    /// [`at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small`] with the owner in
+    /// the ninth claim's way run to its operation's end while the claim waits: its keep, sturdy to
+    /// that end (the mark carried on, the auditor's #6341), is released there, which frees the
+    /// frame and tells the claim; the claim gets its frame.
+    #[test]
+    fn at_the_default_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::at_the_default_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame"
+            ),
+            || {
+                let (pool, reads, mut owners) = eight_sturdy("/db/default-eight-ended");
+                let conn = Conn::new();
+                conn.set_busy(std::time::Duration::from_secs(60).as_nanos() as u64);
+                let mut ninth = Owner::of(conn);
+                let wanted = PageId::new(class(4), 1);
+                let none: PendingReads =
+                    Arc::new(crate::storage::atoll::locks::Mutex::new(Vec::new()));
+                let wait = waiting_after_choice(&mut ninth, &pool, wanted, &none);
+                let leaving: Vec<u32> = pool.memory.leaving().iter().map(|l| l.batch).collect();
+                let in_the_way = owners.iter().position(|(o, _)| {
+                    o.keep_seen()
+                        .0
+                        .is_some_and(|(f, ..)| leaving.contains(&(f / memory::GRAINS)))
+                });
+                let ended = in_the_way.map(|i| {
+                    let (owner, page) = &mut owners[i];
+                    fixed_as(owner, &pool, *page)
+                });
+                let told = wait.as_ref().map(Completion::finished);
+                let outcome = drive_statement(&mut ninth, &pool, &reads, &[wanted]);
+                let revoked: Vec<u64> = owners.iter().map(|(o, _)| o.revocations()).collect();
+                drop(wait);
+                drop(ninth);
+                drop(owners);
+                land(&reads, Ok(()));
+                drop((pool, reads));
+                assert!(
+                    in_the_way.is_some() && ended == Some(true),
+                    "the owner in the ninth claim's way ended its operation with its page: \
+                     {in_the_way:?}, {ended:?}"
+                );
+                assert_eq!(told, Some(true), "its operation's end told the waiting claim");
+                assert!(
+                    matches!(outcome, Driven::Done),
+                    "the ninth claim: {outcome:?}"
+                );
+                assert_eq!(
+                    revoked.iter().filter(|&&n| n == 1).count(),
+                    8,
+                    "each owner revoked once before the ninth: {revoked:?}"
+                );
+            },
+        );
+    }
+
+    /// SHORT-HOLD1b's cost probes (COST-PROBES.md), measurement only, each `#[ignore]`d and run
+    /// alone: instructions in user space over this thread, through the harness's counter and
+    /// `measure` (cost_probe.rs), with this thread's allocations (`testing::allocations`, which the
+    /// base has too). The same text builds on c0fe4b832, but for the one probe marked packet only.
+    #[cfg(target_os = "linux")]
+    mod cost {
+        use super::*;
+
+        /// A user-space instruction counter over this thread and the threads it starts after it
+        /// opens.
+        struct Instructions(i32);
+
+        impl Instructions {
+            fn start() -> Self {
+                let mut attr = [0u64; 8];
+                // type PERF_TYPE_HARDWARE (0), size 64 (VER0); config PERF_COUNT_HW_INSTRUCTIONS.
+                attr[0] = 64 << 32;
+                attr[1] = 1;
+                // read_format: TOTAL_TIME_ENABLED | TOTAL_TIME_RUNNING.
+                attr[4] = 1 | 2;
+                // disabled, inherit, exclude_kernel, exclude_hv.
+                attr[5] = 1 | 2 | (1 << 5) | (1 << 6);
+                // SAFETY: a perf_event_attr of VER0's 64 bytes, for this thread, any CPU.
+                let fd = unsafe {
+                    libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0)
+                } as i32;
+                assert!(
+                    fd >= 0,
+                    "perf_event_open: {}",
+                    std::io::Error::last_os_error()
+                );
+                for (op, what) in [(0x2403, "RESET"), (0x2400, "ENABLE")] {
+                    // SAFETY: an ioctl on the counter's own descriptor.
+                    let r = unsafe { libc::ioctl(fd, op, 0) };
+                    assert_eq!(r, 0, "{what}: {}", std::io::Error::last_os_error());
+                }
+                Self(fd)
+            }
+
+            /// (instructions, time enabled, time running).
+            fn stop(self) -> (u64, u64, u64) {
+                // SAFETY: an ioctl on the counter's own descriptor.
+                let r = unsafe { libc::ioctl(self.0, 0x2401, 0) };
+                assert_eq!(r, 0, "DISABLE: {}", std::io::Error::last_os_error());
+                let mut v = [0u64; 3];
+                // SAFETY: reads 24 bytes into `v`, which holds 24.
+                let n = unsafe { libc::read(self.0, v.as_mut_ptr() as *mut libc::c_void, 24) };
+                // SAFETY: the counter's own descriptor, closed once.
+                unsafe { libc::close(self.0) };
+                assert_eq!(n, 24, "read: {n}, {}", std::io::Error::last_os_error());
+                assert!(v[0] > 0, "a zero instruction count");
+                assert!(
+                    v[1] > 0 && v[1] == v[2],
+                    "the counter multiplexed: enabled {} running {}",
+                    v[1],
+                    v[2]
+                );
+                (v[0], v[1], v[2])
+            }
+        }
+
+        /// Counts `f`, `ops` operations, and prints the exact totals.
+        fn measure(label: &str, ops: u64, f: impl FnOnce()) {
+            let a = crate::storage::atoll::testing::allocations();
+            let t = std::time::Instant::now();
+            let i = Instructions::start();
+            f();
+            let (n, enabled, running) = i.stop();
+            let ns = t.elapsed().as_nanos();
+            let a = crate::storage::atoll::testing::allocations() - a;
+            println!(
+                "COST {label} ops={ops} instructions={n} enabled={enabled} running={running} \
+                 allocs={a} ns={ns}"
+            );
+        }
+
+        /// One call of an operation of `owner`'s that fixes `pid`, a hit, and returns a yield,
+        /// keeping its page: what an operation that runs with its page and goes on later does.
+        fn hit_and_yield(owner: &mut Owner, pool: &Arc<BufferPool>, pid: PageId) {
+            let out = owner.call(|| {
+                Ok(match pool.fix_optimistic(pid, None)? {
+                    IOResult::Done(_) => IOResult::<()>::IO(IOCompletions(Completion::new_yield())),
+                    IOResult::IO(io) => IOResult::IO(io),
+                })
+            });
+            assert!(matches!(out, Ok(IOResult::IO(_))), "the probe's call");
+        }
+
+        /// keep-io-return: one owner's calls, each a miss that loads a page of its own and
+        /// returns IO with its read pending, the page kept: N of them. The reads are landed after
+        /// the count.
+        #[test]
+        #[ignore]
+        fn sh1b_cost_keep_io_return() {
+            const N: u64 = 2_000;
+            let (pool, reads) = held_reads_pool("/db/cost-keep-io-return");
+            let mut owner = Owner::new();
+            measure("keep-io-return", N, || {
+                for n in 1..=N {
+                    assert!(!fixed_as(&mut owner, &pool, PageId::new(class(0), n)));
+                }
+            });
+            drop(owner);
+            land(&reads, Ok(()));
+        }
+
+        /// keep-next-entry: one owner whose keep is valid and idle, called N times with an
+        /// operation that fixes its page, a hit, and returns a yield: each call enters with the
+        /// keep idle and leaves it idle again.
+        #[test]
+        #[ignore]
+        fn sh1b_cost_keep_next_entry() {
+            const N: u64 = 10_000;
+            let (pool, reads) = held_reads_pool("/db/cost-keep-next-entry");
+            let pid = PageId::new(class(0), 1);
+            let mut owner = Owner::new();
+            assert!(!fixed_as(&mut owner, &pool, pid), "the page's load");
+            land(&reads, Ok(()));
+            hit_and_yield(&mut owner, &pool, pid);
+            measure("keep-next-entry", N, || {
+                for _ in 0..N {
+                    hit_and_yield(&mut owner, &pool, pid);
+                }
+            });
+            drop(owner);
+            land(&reads, Ok(()));
+        }
+
+        /// keep-next-entry's split form (packet only: the base has no keep states): a call's entry
+        /// and its IO return alone, N times, the keep idle at each entry.
+        #[test]
+        #[ignore]
+        fn sh1b_cost_keep_entry_and_return() {
+            const N: u64 = 10_000;
+            let (pool, reads) = held_reads_pool("/db/cost-keep-entry-return");
+            let pid = PageId::new(class(0), 1);
+            let mut owner = Owner::new();
+            assert!(!fixed_as(&mut owner, &pool, pid), "the page's load");
+            land(&reads, Ok(()));
+            hit_and_yield(&mut owner, &pool, pid);
+            measure("keep-entry-and-return", N, || {
+                for _ in 0..N {
+                    owner.enter_for_test();
+                    owner.return_io_for_test();
+                }
+            });
+            drop(owner);
+            land(&reads, Ok(()));
+        }
+
+        /// drain-weighs: a drain's weighing of one class-0 batch whose 512 frames hold resident
+        /// pages no one keeps, N times.
+        #[test]
+        #[ignore]
+        fn sh1b_cost_drain_weighs() {
+            const N: u64 = 1_000;
+            let (pool, reads) = held_reads_pool("/db/cost-drain-weighs");
+            let per = memory::frames_per_batch(class(0)) as u64;
+            for n in 1..=per {
+                assert!(!fixed_unowned(&pool, PageId::new(class(0), n)));
+            }
+            land(&reads, Ok(()));
+            let batch = frame_of(&pool, PageId::new(class(0), 1)) / memory::GRAINS;
+            for n in 1..=per {
+                assert_eq!(
+                    frame_of(&pool, PageId::new(class(0), n)) / memory::GRAINS,
+                    batch,
+                    "every page in the one batch"
+                );
+            }
+            let horizon = pool.store.epochs().horizon();
+            let mut held = 0;
+            measure("drain-weighs", N, || {
+                for _ in 0..N {
+                    held += pool.drain_cost(class(1), batch, horizon).0;
+                }
+            });
+            assert_eq!(held, 0, "a page held");
+            drop((pool, reads));
+        }
+
+        /// lookup-no-io: a fix of a resident page no one keeps, N times outside any owner, and N
+        /// times as an owner's call that is done.
+        #[test]
+        #[ignore]
+        fn sh1b_cost_lookup_no_io() {
+            const N: u64 = 100_000;
+            let (pool, reads) = held_reads_pool("/db/cost-lookup-no-io");
+            let pid = PageId::new(class(0), 1);
+            assert!(!fixed_unowned(&pool, pid), "the page's load");
+            land(&reads, Ok(()));
+            measure("lookup-no-io", N, || {
+                for _ in 0..N {
+                    assert!(fixed_unowned(&pool, pid));
+                }
+            });
+            let mut owner = Owner::new();
+            measure("lookup-no-io-owned", N, || {
+                for _ in 0..N {
+                    assert!(fixed_as(&mut owner, &pool, pid));
+                }
+            });
+            drop(owner);
+            drop((pool, reads));
+        }
     }
 }

@@ -2104,6 +2104,7 @@ impl ConnTxn {
     #[turso_macros::atoll_entry]
     pub fn park_waits(&self) {
         self.waits.bound.store(UNBOUNDED, Ordering::Release);
+        self.shortage_bound(crate::storage::atoll::buffer::UNBOUNDED);
     }
 
     /// Bounds each wait by the client's busy timeout: it parks until then, and then comes back
@@ -2114,6 +2115,21 @@ impl ConnTxn {
         self.waits
             .bound
             .store(nanos.min(UNBOUNDED - 1), Ordering::Release);
+        self.shortage_bound(nanos.min(UNBOUNDED - 1));
+    }
+
+    /// The connection as the registry of keepers of the buffer pool names it: the address of its
+    /// buffer pool identity, for the simulator's report of a park.
+    #[cfg(feature = "simulator")]
+    #[turso_macros::atoll_entry]
+    pub fn keeper_name(&self) -> usize {
+        Arc::as_ptr(self.txn_of(TxnOf::Connection).cell.conn()).addr()
+    }
+
+    /// Bounds a claim of the connection's statements that waits behind sturdy idle keeps alone by
+    /// `nanos`, then the shortage error (SHORT-HOLD1b, A3): the busy timeout's.
+    fn shortage_bound(&self, nanos: u64) {
+        self.txn_of(TxnOf::Connection).cell.conn().set_busy(nanos);
     }
 
     /// Whether the last wait came back `Busy` having waited its bound: the busy handler then

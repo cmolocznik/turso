@@ -305,6 +305,21 @@ PRAGMA cache_size = 2000;          -- positive: number of pages
 PRAGMA cache_size = -2000;         -- negative: kilobytes of memory
 ```
 
+In Atoll mode the page cache is the database's buffer pool, sized when the database opens from its
+Atoll configuration's buffer budget. With no configuration it is 22 MiB, the smallest pool Atoll
+takes: eleven 2 MiB batches, of which 8 can hold cached pages. Pages of one size are held in whole
+batches, so a statement that needs a page of a size no batch holds takes a batch from another size,
+even one whose page another statement, between two of its steps, keeps for its next step. That
+statement then reads its page in again, and the pages it keeps from then on, until it finishes what
+it was doing, are not taken from it. When every batch a statement could take holds such a page (at
+the default cache, 8 statements, each suspended between its steps), the statement waits up to its
+connection's busy timeout (`PRAGMA busy_timeout`, or the client's busy timeout) and then fails with
+the error `the page cache is too small for the statements open`, which names the page size it
+wanted, the batch it waited on and the pages kept there. Work the database does outside any
+connection's statement, such as the synchronous integrity check, has no busy timeout to wait: in
+that position it fails with this error at once. A host that gets this error steps or finishes its
+other open statements, which lets their pages go, or opens the database with a larger buffer budget.
+
 ### cache_spill
 
 Enables or disables cache spilling (writing dirty pages to the WAL before the cache is full).

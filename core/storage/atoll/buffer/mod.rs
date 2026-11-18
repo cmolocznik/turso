@@ -76,7 +76,7 @@ pub(crate) use shortage::unowned;
 pub(crate) use shortage::OWED_WAITED_ON_RUNNING;
 pub(crate) use shortage::{
     cancel as cancel_shortage, forget_short, gate_closed, keep_meta, kept_page, owner_installed,
-    Conn, Owner,
+    Conn, Owner, UNBOUNDED,
 };
 pub(crate) use upkeep::{scope as upkeep_scope, Upkeep};
 
@@ -441,8 +441,14 @@ struct Room {
     /// (DESIGN.md 9.1.3, rule 4).
     gate: Option<Completion>,
     /// The lowest stamp holding a batch it passed over, being held for the class it was handed to,
-    /// with nothing else to drain: the epoch the claim waits on (DESIGN.md 9.1.3).
+    /// with nothing else to drain, or a page a step under way may hold, whose keeps a drain would
+    /// otherwise revoke: the epoch the claim waits on (DESIGN.md 9.1.3).
     held: Option<u64>,
+    /// Frames a drain passed over that sturdy idle keeps alone hold (SHORT-HOLD1b, A3).
+    sturdy: usize,
+    /// A frame it passed over that something else holds: a step under way, a keep active in a
+    /// call, a load or a write in flight.
+    blocked: bool,
 }
 
 impl std::ops::BitOrAssign for Room {
@@ -450,6 +456,8 @@ impl std::ops::BitOrAssign for Room {
         self.started |= other.started;
         self.marked |= other.marked;
         self.changed |= other.changed;
+        self.sturdy += other.sturdy;
+        self.blocked |= other.blocked;
         if self.gate.is_none() {
             self.gate = other.gate;
         }
@@ -465,6 +473,54 @@ impl std::ops::BitOrAssign for Room {
 enum Drained {
     Ran(bool),
     GateLost(Completion),
+}
+
+/// What a drain's revocation of a frame's keeps came to (SHORT-HOLD1b).
+enum Revocation {
+    /// Every keep revoked: the drain lets the group's keep go.
+    Revoked,
+    /// The last keep was let go meanwhile, and its releaser lets the group's keep go.
+    Released,
+    /// A keep went active or sturdy, or a fix joined, meanwhile.
+    Refused,
+}
+
+/// A claim that waits behind frames sturdy idle keeps alone hold (SHORT-HOLD1b, A3): their count,
+/// and the batches draining for it.
+struct Stuck {
+    sturdy: usize,
+    batches: Vec<(SizeClass, u32)>,
+}
+
+impl Stuck {
+    /// The shortage error a claim of `class` for `purpose` ends in once its wait is over: the cache
+    /// cannot hold what the statements open keep.
+    fn error(&self, class: SizeClass, purpose: Purpose) -> LimboError {
+        let batches: Vec<String> = self
+            .batches
+            .iter()
+            .map(|(holder, batch)| format!("batch {batch} of class {}", holder.index()))
+            .collect();
+        let purpose = match purpose {
+            Purpose::Read => "a read",
+            Purpose::New => "a new page",
+        };
+        let batches = if batches.is_empty() {
+            "no batch".to_string()
+        } else {
+            batches.join(", ")
+        };
+        let words = format!(
+            "the page cache is too small for the statements open: a frame of class {} ({} KiB) for \
+             {purpose} waits on {batches}, held by statements between their steps; sturdy keeps: {}",
+            class.index(),
+            class.size() / 1024,
+            self.sturdy
+        );
+        LimboError::CacheError(crate::storage::page_cache::CacheError::TooSmall(
+            words.into_boxed_str(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -988,7 +1044,7 @@ impl BufferPool {
                 // A waiter of the load: the running operation keeps the page in the load's group
                 // until it comes back, if it is an owner's (ASYNC1 D2e §2.2b).
                 crate::race::point("buffer.join_probed");
-                shortage::keep_joined(self, frame, pid, || self.group(frame).join(step));
+                shortage::keep_joined(self, frame, pid, |keep| self.group(frame).join(step, keep));
                 crate::race::point("buffer.joined");
             }
             match probe {
@@ -1128,13 +1184,13 @@ impl BufferPool {
         // load under way finds its group open: the frame kept for the load's waiters until its
         // last reference goes, the loader's own if it runs for an owner (ASYNC1 D2e §2.2b).
         h.group_kept();
-        let loader_keeps = shortage::keeping();
-        self.group(frame).open(loader_keeps);
-        if loader_keeps {
-            shortage::keep_loaded(self, frame, pid);
+        let loader = shortage::keeping();
+        if let (Some(keep), Some(at)) = (loader, self.group(frame).open(loader)) {
+            shortage::keep_loaded(self, frame, pid, at, keep);
         }
         let loaded = crate::storage::atoll::notify::wait();
         self.transit(frame).put(loaded.clone());
+        crate::race::point("buffer.load_published");
         if self
             .table
             .insert(&self.frames.headers, pid.raw(), frame)
@@ -1143,6 +1199,11 @@ impl BufferPool {
             self.frames.end_transit(frame);
             self.close_group(frame);
             self.free_frame(pid.class(), frame, hold);
+            // The close may have left the group's keeps a drain revokes: a fix that followed a
+            // hint here and returned IO is idle in it, and a loader running for no owner keeps
+            // nothing (SHORT-HOLD1b). As a landing's scope does for a read's close, the latch's
+            // release tells a claim that passed the frame over meanwhile.
+            self.signal_released();
             // The loader's own reference, for a page another frame holds: let go now, which frees
             // the frame unless a fix that followed a hint here joined the group meanwhile.
             shortage::let_go_kept();
@@ -1331,11 +1392,17 @@ impl BufferPool {
         self.protecting.store(!set.is_empty(), Ordering::Release);
     }
 
-    /// Whether `frame` holds a page the gate's holder keeps resident.
+    /// Whether `frame` holds a page the gate's holder keeps resident. Every frame the eviction
+    /// weighs asks, so the test of a gate holder is inline at each caller and the set's lookup is
+    /// not.
+    #[inline(always)]
     fn protected(&self, frame: u32) -> bool {
-        if !self.protecting.load(Ordering::Acquire) {
-            return false;
-        }
+        self.protecting.load(Ordering::Acquire) && self.protected_by_holder(frame)
+    }
+
+    /// [`protected`](Self::protected) with a gate holder: whether its set holds `frame`'s page.
+    #[inline(never)]
+    fn protected_by_holder(&self, frame: u32) -> bool {
         let pid = self.header(frame).pid();
         self.protected.lock().contains(&pid)
     }
@@ -1433,12 +1500,18 @@ impl BufferPool {
         }
     }
 
-    /// Releases a reference in the group of the load of `frame`, which read `pid` into it, holding
-    /// no latch: the last one lets the group's keep go, and the frame goes free or a claim is told
-    /// if nothing else keeps it (ASYNC1 D2e §2.2b).
-    fn release_kept(&self, frame: u32, pid: PageId) {
-        if !self.group(frame).release() {
-            return;
+    /// Releases a reference of kind `keep`, idle if `idle`, added at generation `at`, in the group
+    /// of the load of `frame`, which read `pid` into it, holding no latch: the last one lets the
+    /// group's keep go, and the frame goes free or a claim is told if nothing else keeps it (ASYNC1
+    /// D2e §2.2b). One a drain revoked releases nothing (SHORT-HOLD1b).
+    fn release_kept(&self, frame: u32, pid: PageId, at: u32, idle: bool, keep: group::Keep) {
+        match self.group(frame).release(at, idle, keep) {
+            group::Released::Last => {}
+            group::Released::Left(word) => {
+                self.tell_revocable(frame, word);
+                return;
+            }
+            group::Released::Revoked => return,
         }
         // Read before the keep goes, while nothing can open the word again or join the group.
         #[cfg(test)]
@@ -1450,6 +1523,17 @@ impl BufferPool {
         if found.freed {
             self.release_free(pid.class(), frame);
         } else if found.waited {
+            self.signal_released();
+        }
+    }
+
+    /// A keep's change left the group of `frame` as `word`: if a drain may now revoke it, a claim
+    /// that passed over the frame for its keeps is told (SHORT-HOLD1b). One of a pair with the
+    /// drain's pass ([`pass_over_kept`](Self::pass_over_kept)): this side changes the group word,
+    /// fences, and reads the record's mark; that one marks the record, fences, and reads the group
+    /// word, so either the claim reads the frame revocable or this reads it marked.
+    fn tell_revocable(&self, frame: u32, word: u64) {
+        if group::to_tell(word, self.header(frame)) {
             self.signal_released();
         }
     }
@@ -1833,6 +1917,19 @@ impl BufferPool {
         purpose: Purpose,
         held: &[PageId],
     ) -> Result<IOResult<u32>> {
+        self.claim_noting(class, purpose, held, None)
+    }
+
+    /// [`claim`](Self::claim), noting in `stuck`, if given, a wait behind frames that sturdy idle
+    /// keeps alone hold (SHORT-HOLD1b, A3), for phase A of a shortage, which bounds that wait by its
+    /// connection's busy timeout. A plain claim gives none, so its caller holds no `Stuck` to drop.
+    fn claim_noting(
+        self: &Arc<Self>,
+        class: SizeClass,
+        purpose: Purpose,
+        held: &[PageId],
+        stuck: Option<&mut Option<Stuck>>,
+    ) -> Result<IOResult<u32>> {
         self.failed()?;
         // The checkpoint's claims are its demand's, never an operation's (DESIGN.md 9.1.3,
         // *Maintenance keeps what it owns*).
@@ -1924,6 +2021,16 @@ impl BufferPool {
         if let Some(at) = room.held {
             if !self.store.epochs().wait_for(at, fresh.clone()) {
                 return Ok(Self::look_again());
+            }
+        }
+        // Every frame the drains left was kept by sturdy idle keeps alone: only their owners'
+        // next calls let them go.
+        if room.sturdy > 0 && !room.blocked && room.held.is_none() {
+            if let Some(stuck) = stuck {
+                *stuck = Some(Stuck {
+                    sturdy: room.sturdy,
+                    batches: self.memory.draining(),
+                });
             }
         }
         Ok(IOResult::IO(IOCompletions(fresh)))
@@ -2235,8 +2342,10 @@ impl BufferPool {
 
     /// What draining the memory around `batch` for `class` gives up: how many of its pages a step
     /// under way may hold, marked at or above the epochs' `horizon` or being read in or claimed
-    /// for a new page; how many are in use, those and the pages read this epoch; and per byte it
-    /// frees, the value of every page in it. A page being written out is leaving anyway.
+    /// for a new page, or kept by a keep other than an idle ordinary one; how many are in use,
+    /// those, the pages read this epoch and the pages idle ordinary keeps alone keep, each a
+    /// re-read and its owner's one revocation (SHORT-HOLD1b, F1); and per byte it frees, the value
+    /// of every page in it. A page being written out is leaving anyway.
     fn drain_cost(&self, class: SizeClass, batch: u32, horizon: u64) -> (usize, usize, f32) {
         let count = 1u32 << memory::order(class);
         let start = batch & !(count - 1);
@@ -2246,9 +2355,12 @@ impl BufferPool {
             let h = self.header(frame);
             match h.status() {
                 RESIDENT => {
-                    let marked = h.held.load(Ordering::Relaxed) >= horizon;
+                    let word = self.group(frame).word();
+                    let kept = !group::released(word);
+                    let marked = h.held.load(Ordering::Relaxed) >= horizon
+                        || (kept && !group::revocable(word));
                     held += marked as usize;
-                    in_use += (marked || h.tracker.last() >= now) as usize;
+                    in_use += (marked || kept || h.tracker.last() >= now) as usize;
                     value += h.tracker.value(now);
                 }
                 OUTGOING => {}
@@ -2375,10 +2487,12 @@ impl BufferPool {
             frame,
         };
         if self.protected(frame) {
+            room.blocked = true;
             return false;
         }
         let Some(hold) = self.latch_to_evict(class, frame, latch) else {
             crate::race::point("buffer.evict_lost");
+            room.blocked = true;
             // The take was lost: the latch was held, or let go or taken again since it was read.
             // Marked whatever it reads now (a free latch's mark reports it changed), so a release
             // between the lost take and the mark is the change it is, never nothing (DESIGN.md
@@ -2441,17 +2555,223 @@ impl BufferPool {
     fn drain(self: &Arc<Self>, class: SizeClass, batch: u32) -> Result<Room> {
         let mut outgoing = Vec::new();
         let mut room = Room::default();
+        let mut horizon = None;
         for i in 0..memory::frames_per_batch(class) {
             let frame = memory::frame_at(class, batch, i);
             if self.memory.is_free(class, frame) {
                 continue;
             }
-            let took = self.evict_or_write(class, frame, &mut outgoing, &mut room);
+            let took = match self.drain_kept(class, frame, &mut horizon, &mut outgoing, &mut room) {
+                Some(took) => took,
+                None => self.evict_or_write(class, frame, &mut outgoing, &mut room),
+            };
             room.started |= took;
         }
         room.started |= !outgoing.is_empty();
         self.write_out(class, outgoing);
         Ok(room)
+    }
+
+    /// Drains `frame` of `class` if its load's group keeps it and nothing else does (SHORT-HOLD1b):
+    /// a drain, and nothing else, revokes the keeps of a group closed with every reference an idle
+    /// ordinary keep, in one swap, and then drains the frame as any page, a resident one under
+    /// its hold, clean, unlatched, and held by no step under way, one freed while kept at once. A
+    /// dirty one is written out first, and its keeps revoked as the write lands
+    /// ([`written_out`](Self::written_out)), so no change is lost to a revocation. Whether it took
+    /// the frame, or `None` for a frame the group does not keep alone, drained as any page.
+    /// `horizon` is the epochs' horizon, read at the first frame that needs it.
+    fn drain_kept(
+        self: &Arc<Self>,
+        class: SizeClass,
+        frame: u32,
+        horizon: &mut Option<u64>,
+        outgoing: &mut Vec<Outgoing>,
+        room: &mut Room,
+    ) -> Option<bool> {
+        let h = self.header(frame);
+        if !h.grouped_alone() || self.protected(frame) {
+            return None;
+        }
+        let word = self.group(frame).word();
+        // Its last reference let go, the group's keep about to go: passed over as today, its
+        // let-go telling the claim.
+        if group::released(word) {
+            return None;
+        }
+        if !group::revocable(word) {
+            self.pass_over_kept(frame, horizon, room);
+            return Some(false);
+        }
+        match h.status() {
+            RESIDENT => Some(self.revoke_resident(class, frame, horizon, outgoing, room)),
+            FREE => Some(self.revoke_freed(class, frame, horizon, room)),
+            // Between a load's close and its page's publication, under the loader's hold, whose
+            // release tells the claim; or written out, the write's landing doing so.
+            _ => {
+                room.blocked = true;
+                Some(false)
+            }
+        }
+    }
+
+    /// Takes the resident `frame` of `class`, whose keeps a drain may revoke, under its hold: the
+    /// keeps revoked and the page evicted, or a dirty one written out first. Whether it did.
+    fn revoke_resident(
+        self: &Arc<Self>,
+        class: SizeClass,
+        frame: u32,
+        horizon: &mut Option<u64>,
+        outgoing: &mut Vec<Outgoing>,
+        room: &mut Room,
+    ) -> bool {
+        let h = self.header(frame);
+        let latch = || FrameLatch {
+            frames: self.frames.clone(),
+            frame,
+        };
+        let taken = h.latch.optimistic().and_then(|version| {
+            let holds = h.status() == RESIDENT && PageId::from_raw(h.pid()).class() == class;
+            if !holds || !h.latch.validate(version) {
+                return None;
+            }
+            Held::try_take_at(latch(), version)
+        });
+        let Some(hold) = taken else {
+            // Latched by a step under way, or changed since it was read: its release, or the
+            // change, is what the claim looks again on.
+            match h.latch.mark_waited() {
+                Marked::Waits => room.marked = true,
+                Marked::Changed => room.changed = true,
+            }
+            room.blocked = true;
+            return false;
+        };
+        // Held: no step latches or changes the page now, and no load opens its group; a keep may
+        // still go active or be let go, and a fix that found the load may still join.
+        if h.has(WRITING) {
+            hold.release_unchanged();
+            room.blocked = true;
+            return false;
+        }
+        let marked = h.held.load(Ordering::Relaxed);
+        if marked >= *horizon.get_or_insert_with(|| self.store.epochs().horizon()) {
+            // A step under way may hold the page: the claim waits for its end, which W1 bounds.
+            hold.release_unchanged();
+            room.blocked = true;
+            *room |= Room {
+                held: Some(self.unmarked_at(marked)),
+                ..Room::default()
+            };
+            return false;
+        }
+        if h.dirty() {
+            outgoing.push(self.start_write_out(hold));
+            return true;
+        }
+        match self.revoke(frame) {
+            Revocation::Revoked => {
+                let found = h.ungroup();
+                crate::turso_assert!(!found.freed, "a resident frame was freed while kept");
+            }
+            // Its last keep's releaser lets the group's keep go: the free waits for that.
+            Revocation::Released => {}
+            Revocation::Refused => {
+                hold.release_unchanged();
+                self.pass_over_kept(frame, horizon, room);
+                return false;
+            }
+        }
+        self.evict(class, frame, hold);
+        true
+    }
+
+    /// Takes `frame` of `class`, freed while kept and held back for its keeps, whose keeps a drain
+    /// may revoke: nothing reads a freed frame, and no one else holds it, so no latch is taken; the
+    /// revocation is the group's last let-go, and the frame goes to the free frames, by this drain
+    /// or, if it is not yet held back, by its freeing caller. Whether it revoked them.
+    fn revoke_freed(
+        &self,
+        class: SizeClass,
+        frame: u32,
+        horizon: &mut Option<u64>,
+        room: &mut Room,
+    ) -> bool {
+        match self.revoke(frame) {
+            Revocation::Revoked => {
+                // Not yet marked freed, its freeing caller hands it to the free frames itself.
+                if self.header(frame).ungroup().freed {
+                    self.release_free(class, frame);
+                }
+                true
+            }
+            // Its last keep's releaser hands it to the free frames, and tells the claim.
+            Revocation::Released => {
+                room.changed = true;
+                false
+            }
+            Revocation::Refused => {
+                self.pass_over_kept(frame, horizon, room);
+                false
+            }
+        }
+    }
+
+    /// Revokes every keep of the group of `frame`, all of them idle ordinary keeps as read again
+    /// now: a lost swap is an owner's change or a join, and the word is read again.
+    fn revoke(&self, frame: u32) -> Revocation {
+        let g = self.group(frame);
+        loop {
+            let word = g.word();
+            if group::released(word) {
+                return Revocation::Released;
+            }
+            if !group::revocable(word) {
+                return Revocation::Refused;
+            }
+            if g.revoke(word) {
+                crate::race::point("buffer.revoked");
+                return Revocation::Revoked;
+            }
+        }
+    }
+
+    /// Passes over `frame`, whose load's group keeps it and whose keeps no drain may revoke now: a
+    /// sturdy one, one active in a call under way, a fix that joined the load. Its record is marked,
+    /// so the release that takes its group to no reference tells the claim; then, across a fence,
+    /// its group word is read again, so a keep that went idle meanwhile, which reads the mark
+    /// across its own fence ([`tell_revocable`](Self::tell_revocable)), is not missed either way.
+    /// Counted for the end of the road (SHORT-HOLD1b, A3) if its keeps are idle and one is sturdy,
+    /// and no step under way may hold the page.
+    fn pass_over_kept(&self, frame: u32, horizon: &mut Option<u64>, room: &mut Room) {
+        let h = self.header(frame);
+        let word = match group::pass_over(h, self.group(frame)) {
+            group::Passed::Changed => {
+                room.changed = true;
+                return;
+            }
+            group::Passed::Waits(word) => word,
+        };
+        room.marked = true;
+        let marked = h.status() == RESIDENT
+            && h.held.load(Ordering::Relaxed)
+                >= *horizon.get_or_insert_with(|| self.store.epochs().horizon());
+        if group::sturdy_idle(word) && !marked {
+            room.sturdy += 1;
+        } else {
+            room.blocked = true;
+        }
+    }
+
+    /// The epoch every step that may hold the page a fix marked with `marked` has ended at: one
+    /// past the mark, the global epoch raised past it first if it is not yet, so a step entered
+    /// from here announces above the mark.
+    fn unmarked_at(&self, marked: u64) -> u64 {
+        let epochs = self.store.epochs();
+        if epochs.current() > marked {
+            marked + 1
+        } else {
+            epochs.stamp()
+        }
     }
 
     /// Latches `frame` exclusively, through `latch`, to evict its page, if it holds a page of
@@ -2555,12 +2875,18 @@ impl BufferPool {
                 let h = self.header(frame);
                 h.written.fetch_max(count, Ordering::AcqRel);
                 debug_assert!(!h.dirty(), "{pid:?} changed while held for its write-out");
-                let waiting = self.frames.end_transit(frame);
-                self.table.remove(&self.frames.headers, pid.raw(), frame);
-                self.free_frame(pid.class(), frame, hold);
-                self.evicted(pid.class());
-                if let Some(c) = waiting {
-                    notify::finish(&c, Ok(0));
+                if h.grouped() && !self.revoked_written(frame) {
+                    // Written out by a drain for keeps that went active or sturdy as it was in
+                    // flight: the page stays, clean, for the drain's next look (SHORT-HOLD1b, F4).
+                    self.frames.kept(hold);
+                } else {
+                    let waiting = self.frames.end_transit(frame);
+                    self.table.remove(&self.frames.headers, pid.raw(), frame);
+                    self.free_frame(pid.class(), frame, hold);
+                    self.evicted(pid.class());
+                    if let Some(c) = waiting {
+                        notify::finish(&c, Ok(0));
+                    }
                 }
             }
             Err(e) => {
@@ -2570,6 +2896,21 @@ impl BufferPool {
         }
         self.writes_in_flight.fetch_sub(1, Ordering::AcqRel);
         self.signal_released();
+    }
+
+    /// The keeps of the page whose write-out just landed in `frame`, which a drain started for
+    /// keeps it meant to revoke (SHORT-HOLD1b, F4), revoked under the write-out's hold if they are
+    /// still idle ordinary ones: whether they are gone, the frame then freed as any written out.
+    fn revoked_written(&self, frame: u32) -> bool {
+        match self.revoke(frame) {
+            Revocation::Revoked => {
+                let found = self.header(frame).ungroup();
+                crate::turso_assert!(!found.freed, "a frame written out was freed while kept");
+                true
+            }
+            Revocation::Released => true,
+            Revocation::Refused => false,
+        }
     }
 
     /// Leaves the page whose write-out failed in the frame `hold` holds, and wakes whoever waits.

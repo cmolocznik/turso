@@ -5214,6 +5214,14 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// The connection as the registry of keepers of an Atoll database's buffer pool names it, for
+    /// the simulator's report of a park: the address of its buffer pool identity. `None` outside
+    /// Atoll mode.
+    #[cfg(feature = "simulator")]
+    pub fn atoll_keeper_name(&self) -> Option<usize> {
+        self.atoll().map(|atoll| atoll.keeper_name())
+    }
+
     /// Get the busy timeout duration.
     pub fn get_busy_timeout(&self) -> Duration {
         match &*self.busy_handler.read() {

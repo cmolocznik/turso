@@ -965,10 +965,10 @@ impl Whopper {
             return Ok(StepResult::Ok);
         }
 
-        let _watched = self.watchdog.as_ref().map(watchdog::Watchdog::watch);
+        let fiber_idx = self.current_step % self.context.fibers.len();
+        let _watched = self.watchdog.as_ref().map(|w| w.watch(Some(fiber_idx)));
         let _cache_override =
             fts::FtsCacheOverride::new(self.fts_profile == Some(fts::FtsProfile::Snapshots));
-        let fiber_idx = self.current_step % self.context.fibers.len();
         self.perform_work(fiber_idx)?;
         self.io.step()?;
         self.step_fts_faults(fiber_idx)?;
@@ -1112,6 +1112,18 @@ impl Whopper {
                     },
                     stmt,
                 );
+                if let Some(watchdog) = &self.watchdog {
+                    let returned = match &step_result {
+                        Ok(result) => format!("{result:?}"),
+                        Err(e) => format!("an error: {e}"),
+                    };
+                    watchdog.stepped(
+                        fiber_idx,
+                        connection.atoll_keeper_name(),
+                        stmt.get_sql(),
+                        returned,
+                    );
+                }
                 match step_result {
                     Ok(result) => {
                         trace!("{:?}", result);
@@ -1636,7 +1648,7 @@ impl Whopper {
             self.context.fibers.len()
         );
 
-        let _watched = self.watchdog.as_ref().map(watchdog::Watchdog::watch);
+        let _watched = self.watchdog.as_ref().map(|w| w.watch(None));
         self.drain_active_statements("reopen")?;
         if let Some(watchdog) = &self.watchdog {
             watchdog.closing();

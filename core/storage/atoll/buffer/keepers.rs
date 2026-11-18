@@ -10,7 +10,7 @@
 //! neither shuttle nor loom schedules, and none waits or takes a lock: an entry recorded or
 //! cleared adds no step to any schedule and takes nothing the engine's own paths take.
 
-use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Keepers the table names at once: an operation's top keeps one frame at most, and a statement
 /// has a top for each of its cursors.
@@ -45,6 +45,9 @@ pub(super) struct Entry {
     pub(super) frame: u32,
     pub(super) pid: u64,
     pub(super) keeper: Keeper,
+    /// An owner's keep: whether it is idle, its owner returned IO and not called again
+    /// (SHORT-HOLD1b).
+    pub(super) idle: bool,
 }
 
 /// The number an operation's top is named by: one more for each top made.
@@ -74,6 +77,8 @@ struct Slot {
     conn: AtomicU64,
     serial: AtomicU64,
     at: AtomicU64,
+    /// Whether the keep is idle: changed by its keeper alone, read with the other fields.
+    idle: AtomicBool,
 }
 
 impl Keepers {
@@ -113,12 +118,19 @@ impl Keepers {
             slot.conn.store(conn as u64, Ordering::Relaxed);
             slot.serial.store(serial, Ordering::Relaxed);
             slot.at.store(owner as u64, Ordering::Relaxed);
+            slot.idle.store(false, Ordering::Relaxed);
             slot.word.store(word + 2, Ordering::Release);
             self.next.store(at + 1, Ordering::Relaxed);
             return Some(at);
         }
         self.missed.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    /// Records that the keep at `slot` is idle, or active again, by the one that recorded it. One
+    /// field changes alone, so a reader reads it whole with the entry's others.
+    pub(super) fn set_idle(&self, slot: usize, idle: bool) {
+        self.slots[slot].idle.store(idle, Ordering::Relaxed);
     }
 
     /// Clears the entry `slot` holds, by the one that recorded it.
@@ -146,9 +158,10 @@ impl Keepers {
                     CHECKPOINT => Some(Keeper::Checkpoint),
                     _ => None,
                 };
-                let (frame, pid) = (
+                let (frame, pid, idle) = (
                     slot.frame.load(Ordering::Relaxed) as u32,
                     slot.pid.load(Ordering::Relaxed),
+                    slot.idle.load(Ordering::Relaxed),
                 );
                 // The fields read before the word is read again: one changed by a writer after its
                 // claim shows the word changed.
@@ -156,7 +169,12 @@ impl Keepers {
                 if slot.word.load(Ordering::Relaxed) != before {
                     continue;
                 }
-                out.extend(keeper.map(|keeper| Entry { frame, pid, keeper }));
+                out.extend(keeper.map(|keeper| Entry {
+                    frame,
+                    pid,
+                    keeper,
+                    idle,
+                }));
                 break;
             }
         }

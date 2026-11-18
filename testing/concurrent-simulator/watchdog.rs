@@ -1,7 +1,8 @@
 //! Atoll mode's watchdog (SHORT-HOLD1): a thread that, once one of the simulator's steps has not
 //! returned in two minutes, prints the park report of every Atoll database the run opened to
-//! stderr, and again every two minutes while the step still runs; and the census of taken frames
-//! the run checks at its end.
+//! stderr, and again every two minutes while the step still runs, with a line for each fiber: its
+//! connection as the pool's registry of keepers names it, its statement's SQL and what its last
+//! step returned (SHORT-HOLD1b); and the census of taken frames the run checks at its end.
 //!
 //! The report is read while the stepping thread waits. A wait on memory parks at the operation's
 //! top holding no Step and no change gate (Atoll's `park.rs` asserts both at every park), and no
@@ -9,7 +10,7 @@
 //! parked thread holds: it reads the buffer pool's atomics and takes the shortage queue's mutex
 //! alone, as any of its callers does, and is built whole before it is printed.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -38,6 +39,18 @@ struct Shared {
     /// stepping thread takes to forget them before it drops them: the last reference to a
     /// database always goes on the stepping thread.
     databases: Mutex<Vec<Weak<Database>>>,
+    /// The fiber whose step is under way, plus one: 0 for none, or a step of no fiber's.
+    fiber: AtomicUsize,
+    /// What each fiber's last step was, by fiber, written by the stepping thread after the step.
+    fibers: Mutex<Vec<Option<FiberLine>>>,
+}
+
+/// A fiber's last step: its connection as the registry of keepers names it, its statement's SQL
+/// and what the step returned.
+struct FiberLine {
+    connection: Option<usize>,
+    sql: String,
+    returned: String,
 }
 
 /// A step under way, for as long as it lives.
@@ -58,6 +71,8 @@ impl Watchdog {
             steps: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             databases: Mutex::new(Vec::new()),
+            fiber: AtomicUsize::new(0),
+            fibers: Mutex::new(Vec::new()),
         });
         let watched = shared.clone();
         let thread = std::thread::Builder::new()
@@ -70,12 +85,35 @@ impl Watchdog {
         }
     }
 
-    /// A step begins: it is watched until the returned value drops.
-    pub(crate) fn watch(&self) -> Watched {
+    /// A step begins, of `fiber`'s if it is one: it is watched until the returned value drops.
+    pub(crate) fn watch(&self, fiber: Option<usize>) -> Watched {
         self.shared.steps.fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .fiber
+            .store(fiber.map_or(0, |f| f + 1), Ordering::Release);
         let at = self.shared.start.elapsed().as_millis() as u64;
         self.shared.began.store(at + 1, Ordering::Release);
         Watched(self.shared.clone())
+    }
+
+    /// Fiber `fiber` stepped its statement, of SQL `sql`, on the connection the registry of keepers
+    /// names `connection`, and the step returned `returned`.
+    pub(crate) fn stepped(
+        &self,
+        fiber: usize,
+        connection: Option<usize>,
+        sql: &str,
+        returned: String,
+    ) {
+        let mut fibers = self.shared.fibers();
+        if fibers.len() <= fiber {
+            fibers.resize_with(fiber + 1, || None);
+        }
+        fibers[fiber] = Some(FiberLine {
+            connection,
+            sql: sql.to_string(),
+            returned,
+        });
     }
 
     /// The run opened `db`, or opened it again through the database registry.
@@ -156,6 +194,10 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn fibers(&self) -> std::sync::MutexGuard<'_, Vec<Option<FiberLine>>> {
+        self.fibers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The report of every open database, built before anything is printed.
     fn report(&self, step: u64, running: Duration) -> String {
         let mut out = format!(
@@ -172,6 +214,24 @@ impl Shared {
                 None => "closed\n".to_string(),
             };
             out.push_str(&format!("database {i}:\n{report}"));
+        }
+        drop(databases);
+        let under_way = self.fiber.load(Ordering::Acquire).checked_sub(1);
+        out.push_str(&format!(
+            "fibers, the step under way {}:\n",
+            under_way.map_or("of none".to_string(), |f| format!("fiber {f}'s"))
+        ));
+        for (i, line) in self.fibers().iter().enumerate() {
+            match line {
+                Some(line) => out.push_str(&format!(
+                    "  fiber {i}: connection {}, last step returned {}, sql {:?}\n",
+                    line.connection
+                        .map_or("not in Atoll mode".to_string(), |c| format!("{c:#x}")),
+                    line.returned,
+                    line.sql
+                )),
+                None => out.push_str(&format!("  fiber {i}: no step yet\n")),
+            }
         }
         out
     }

@@ -132,9 +132,18 @@ pub enum CacheError {
     Pinned { pgno: usize },
     #[error("Page cache is full")]
     Full,
+    /// Atoll's buffer pool cannot serve a claim: every frame it waits behind is kept by a statement
+    /// suspended between its steps, and stays so past the connection's busy timeout. The words
+    /// name the class wanted, the batches and the keeps by count. A boxed `str`: a second `String`
+    /// variant would make the enum 32 bytes, and every page read of the pager pays for that.
+    #[error("{0}")]
+    TooSmall(Box<str>),
     #[error("key already exists")]
     KeyExists,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<CacheError>() == 24);
 
 #[derive(Debug, PartialEq)]
 pub enum CacheResizeResult {

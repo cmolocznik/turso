@@ -178,6 +178,23 @@ impl FrameHeader {
         self.record.load(Ordering::Acquire) & (RECORD_HELD | RECORD_GROUP) != 0
     }
 
+    /// Whether the frame's load's group keeps it.
+    pub fn grouped(&self) -> bool {
+        self.record.load(Ordering::Acquire) & RECORD_GROUP != 0
+    }
+
+    /// Whether the frame's load's group keeps it and its record holds no request: a frame whose
+    /// keeps a drain may revoke (SHORT-HOLD1b).
+    pub fn grouped_alone(&self) -> bool {
+        self.record.load(Ordering::Acquire) & (RECORD_HELD | RECORD_GROUP) == RECORD_GROUP
+    }
+
+    /// Whether a claim passed over the frame for its record or its group: read by a keep whose
+    /// change left the frame revocable, which then tells the pool's supply (SHORT-HOLD1b).
+    pub fn record_waited(&self) -> bool {
+        self.record.load(Ordering::Acquire) & RECORD_WAITED != 0
+    }
+
     /// The load's group keeps the frame from here ([`super::group`]): by the loader, under its
     /// exclusive latch, before it publishes the load. A frame claimed for a load holds no request
     /// and no group, and no claim marks a frame that holds neither.
@@ -241,8 +258,9 @@ impl FrameHeader {
     }
 
     /// The record's request retired, or was never handed over: the record is free, and what was
-    /// marked on it while it held the request, unless the load's group still keeps the frame,
-    /// whose release then lets it go.
+    /// marked on it while it held the request. If the load's group still keeps the frame, whose
+    /// release then lets it go, whether a claim passed over it: the group's keeps may be ones a
+    /// drain revokes, which the record held back until now (SHORT-HOLD1b).
     pub fn retire_record(&self) -> Retired {
         self.let_go(
             RECORD_HELD,
@@ -263,18 +281,23 @@ impl FrameHeader {
     }
 
     /// Clears `mine`, which the word holds: with `other` still keeping the frame, only that, and
-    /// nothing found; otherwise the whole word, and whether the frame was freed meanwhile and a
-    /// claim passed over it. A lost compare-and-swap is another party's change, looked at again.
+    /// for a request's retirement whether a claim passed over it, its mark kept; otherwise the
+    /// whole word, and whether the frame was freed meanwhile and a claim passed over it. A lost
+    /// compare-and-swap is another party's change, looked at again.
     fn let_go(&self, mine: u8, other: u8, missing: &'static str) -> Retired {
         let mut was = self.record.load(Ordering::Acquire);
         loop {
             assert!(was & mine != 0, "{missing}: {was:#x}");
             let (now, found) = if was & other != 0 {
+                // Still kept by the other. A request retired from a frame its group keeps: the
+                // group's keeps may be ones a drain revokes, which the request held back until
+                // now (SHORT-HOLD1b), so a claim that passed it over is told; the mark stays for
+                // the group's let-go. A group's let-go from a frame a request holds frees nothing.
                 (
                     was & !mine,
                     Retired {
                         freed: false,
-                        waited: false,
+                        waited: mine == RECORD_HELD && was & RECORD_WAITED != 0,
                     },
                 )
             } else {

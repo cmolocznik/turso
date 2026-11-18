@@ -7,6 +7,7 @@
 //! as any caller holding nothing does. The frame is kept for the claim it was reserved for, which
 //! takes it when the operation runs again; the gate passes on when the operation ends.
 
+use super::group::Keep;
 #[cfg(any(test, feature = "simulator"))]
 use super::keepers::{Keeper, Serial};
 use super::supply::{Handoff, Supply};
@@ -129,8 +130,24 @@ pub(crate) struct Conn {
 pub(crate) struct ConnOf {
     /// Its transactions' operations' places in the queue: read alone by a newcomer that came
     /// short, which then has nothing of its connection's to revoke when it is 0.
-    live: std::sync::atomic::AtomicUsize,
+    live: std::sync::atomic::AtomicU32,
+    /// Its busy timeout in whole milliseconds, rounded up, [`UNBOUNDED_MS`] for none: how long a
+    /// claim of any of its transactions' operations waits behind sturdy idle keeps alone before it
+    /// ends in the shortage error (SHORT-HOLD1b, A3). Relaxed: a setting, read at each such look.
+    busy: std::sync::atomic::AtomicU32,
 }
+
+/// 8 bytes, so a connection's `Arc` of it is the allocator's same 32-byte chunk it was before the
+/// busy timeout came here.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ConnOf>() == 8);
+
+/// [`ConnOf`]'s busy timeout that never passes.
+const UNBOUNDED_MS: u32 = u32::MAX;
+
+/// A busy timeout that never passes: the PostgreSQL frontend's waits park until what is in the way
+/// ends.
+pub(crate) const UNBOUNDED: u64 = u64::MAX;
 
 impl Conn {
     /// The first transaction's identity of a connection.
@@ -149,6 +166,27 @@ impl Conn {
     /// Whether any of its operations holds a place in a shortage queue.
     pub(crate) fn queued(&self) -> bool {
         self.live.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Sets its connection's busy timeout, in nanoseconds: [`UNBOUNDED`] for none. Every
+    /// transaction of the connection reads it. Kept in whole milliseconds, rounded up, so a bound
+    /// of a nanosecond still waits.
+    pub(crate) fn set_busy(&self, nanos: u64) {
+        let ms = if nanos == UNBOUNDED {
+            UNBOUNDED_MS
+        } else {
+            u32::try_from(nanos.div_ceil(1_000_000))
+                .map_or(UNBOUNDED_MS - 1, |ms| ms.min(UNBOUNDED_MS - 1))
+        };
+        self.of.busy.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Its connection's busy timeout, in nanoseconds: [`UNBOUNDED`] for none.
+    fn busy(&self) -> u64 {
+        match self.of.busy.load(std::sync::atomic::Ordering::Relaxed) {
+            UNBOUNDED_MS => UNBOUNDED,
+            ms => u64::from(ms) * 1_000_000,
+        }
     }
 
     /// Whether any operation of its connection's holds a place in a shortage queue.
@@ -768,7 +806,14 @@ pub(crate) struct Owner {
     /// The number the registry of keepers names it by.
     #[cfg(any(test, feature = "simulator"))]
     serial: Serial,
+    /// The calls whose entry found its keep revoked, for a test.
+    #[cfg(test)]
+    revocations: u64,
 }
+
+// Beside its keeps' (below): the base's size, which the keep states leave as it was.
+#[cfg(all(target_pointer_width = "64", not(any(test, feature = "simulator"))))]
+const _: () = assert!(std::mem::size_of::<Owner>() == 48);
 
 /// What an operation's top keeps between its calls (ASYNC1 D2e §2.2b): at most one reference in a
 /// load's group and one metadata page, each for the page a call of the operation last loaded or
@@ -778,14 +823,24 @@ pub(crate) struct Owner {
 /// or a gate wait, and when the operation ends.
 #[derive(Default)]
 struct Keeps {
+    /// The reference in a load's group, or the operation's mark (SHORT-HOLD1b): the revoked keep
+    /// left in place, holding no reference, once a drain revoked it, or in place of a sturdy keep
+    /// let go. With either, or a sturdy keep, the operation's next keep is sturdy, whatever its
+    /// page: from its first revocation every keep of the operation is sturdy, to its end (the
+    /// mark carried on, the auditor's #6341), so it is revoked at most once.
     pool: Option<Kept>,
     meta: Option<MetaRef>,
 }
 
+// The owner is moved out of its top and back at every call ([`Owner::call_in`]): the keep states
+// add nothing to it, nor to its keeps (SHORT-HOLD1b, the auditor's #6325; the base's sizes).
+#[cfg(all(target_pointer_width = "64", not(any(test, feature = "simulator"))))]
+const _: () = assert!(std::mem::size_of::<Keeps>() == 32);
+
 impl Keeps {
-    /// Lets go everything kept. Each slot is dropped only when it holds a page, so an empty one
-    /// costs its test alone: every operation's end comes here.
-    fn let_go(&mut self) {
+    /// Lets go everything kept, a revocation's mark too: every operation's end comes here. Each
+    /// slot is dropped only when it holds something, so an empty one costs its test alone.
+    fn clear(&mut self) {
         if let Some(kept) = self.pool.take() {
             drop(kept);
         }
@@ -794,20 +849,183 @@ impl Keeps {
         }
     }
 
+    /// Lets go the pages kept, at a shortage or a gate wait, or for an operation that queues
+    /// again: the operation's mark stays, and a sturdy keep leaves one.
+    fn let_go(&mut self) {
+        drop(self.take_keep());
+        if let Some(meta) = self.meta.take() {
+            drop(meta);
+        }
+    }
+
+    /// Takes the reference kept in a load's group, leaving the operation's mark in place, and
+    /// leaving one in place of a sturdy keep: the operation's later keeps stay sturdy.
+    fn take_keep(&mut self) -> Option<Kept> {
+        let state = self.pool.as_ref()?.state;
+        if state.is_revoked() {
+            return None;
+        }
+        let taken = self.pool.take()?;
+        if state.keep() == Keep::Sturdy {
+            self.pool = Some(taken.mark());
+        }
+        Some(taken)
+    }
+
+    /// The reference kept in a load's group: none for a revocation's mark.
+    fn kept(&self) -> Option<&Kept> {
+        self.pool.as_ref().filter(|k| !k.state.is_revoked())
+    }
+
     fn empty(&self) -> bool {
         self.pool.is_none() && self.meta.is_none()
+    }
+
+    /// The kind of keep the operation takes next, of whatever page (SHORT-HOLD1b): sturdy once a
+    /// drain revoked a keep of it. A keep is taken only with the slot empty or holding the mark
+    /// (`let_go_kept` before a load, `take_keep` before a join), and a sturdy keep taken leaves
+    /// the mark, so the mark alone says it.
+    fn kind(&self) -> Keep {
+        match &self.pool {
+            Some(k) if k.state.is_revoked() => Keep::Sturdy,
+            _ => Keep::Ordinary,
+        }
+    }
+
+    /// Keeps `kept`, the reference just added for its page, of the kind [`kind`](Self::kind)
+    /// said, in place of the operation's mark if one is there. What it replaces is returned, to
+    /// be let go after the borrow.
+    fn keep(&mut self, kept: Kept) -> Option<Kept> {
+        self.pool.replace(kept)
     }
 }
 
 /// A reference in a load's group (ASYNC1 D2e §2.2b): the frame the load reads `pid` into, kept
-/// while the reference lives. Released exactly once, by its drop.
+/// while the reference lives. Released exactly once, by its drop, unless a drain revoked it
+/// (SHORT-HOLD1b): its group's generation then differs from its state's, and it releases nothing.
 pub(super) struct Kept {
     pool: Arc<BufferPool>,
     frame: u32,
     pid: PageId,
+    state: KeepState,
     /// Its slot in the pool's registry of keepers, if the registry had a free one.
     #[cfg(any(test, feature = "simulator"))]
     entry: Option<usize>,
+}
+
+/// The frame a revocation's mark names: none, so a mark is never taken for a keep of the frame a
+/// fix finds (`keep_joined`). A pool's frames are numbered far below it.
+const MARK_FRAME: u32 = u32::MAX;
+
+impl Kept {
+    /// At its owner's IO return: idle from here, so a drain may revoke it unless it is sturdy.
+    fn go_idle(&mut self) {
+        let word = self.pool.group(self.frame).idle(self.state.at());
+        self.state = self.state.idle(true);
+        #[cfg(any(test, feature = "simulator"))]
+        if let Some(slot) = self.entry {
+            self.pool.keepers.set_idle(slot, true);
+        }
+        self.pool.tell_revocable(self.frame, word);
+    }
+
+    /// The operation's mark in place of this sturdy keep, let go: no reference, its kind carried
+    /// on to the operation's next keep.
+    fn mark(&self) -> Kept {
+        Kept {
+            pool: self.pool.clone(),
+            frame: MARK_FRAME,
+            pid: self.pid,
+            state: KeepState::new(0, Keep::Sturdy).revoked(),
+            #[cfg(any(test, feature = "simulator"))]
+            entry: None,
+        }
+    }
+
+    /// Found revoked at its owner's call's entry: from here the revocation's mark, holding no
+    /// reference, out of the registry of keepers.
+    fn mark_revoked(&mut self) {
+        self.state = self.state.revoked();
+        self.frame = MARK_FRAME;
+        #[cfg(any(test, feature = "simulator"))]
+        if let Some(slot) = self.entry.take() {
+            self.pool.keepers.remove(slot);
+        }
+    }
+
+    /// At its owner's next call: active again, its kind kept, the operation running with its
+    /// page; false if a drain revoked it, the operation then loading its page again.
+    fn wake(&mut self) -> bool {
+        let state = self.state;
+        crate::turso_assert!(
+            state.is_idle(),
+            "an owner's call entered with its keep active"
+        );
+        if !self.pool.group(self.frame).wake(state.at(), state.keep()) {
+            return false;
+        }
+        self.state = state.idle(false);
+        #[cfg(any(test, feature = "simulator"))]
+        if let Some(slot) = self.entry {
+            self.pool.keepers.set_idle(slot, false);
+        }
+        true
+    }
+}
+
+/// A keep's generation, the one of the frame's group word its reference was added at, with its
+/// kind, whether it is idle (its owner returned IO and has not been called again) and whether a
+/// drain revoked it (the keep is then the revocation's mark), in one word: the generation takes
+/// 27 bits ([`super::group`]), so a kept page is no larger than before the keep states.
+#[derive(Clone, Copy)]
+struct KeepState(u32);
+
+impl KeepState {
+    const REVOKED: u32 = 1 << 29;
+    const IDLE: u32 = 1 << 30;
+    const STURDY: u32 = 1 << 31;
+
+    fn new(at: u32, keep: Keep) -> Self {
+        const _: () = assert!(super::group::LAST_GENERATION < KeepState::REVOKED);
+        let sturdy = if keep == Keep::Sturdy {
+            Self::STURDY
+        } else {
+            0
+        };
+        Self(at | sturdy)
+    }
+
+    fn at(self) -> u32 {
+        self.0 & !(Self::REVOKED | Self::IDLE | Self::STURDY)
+    }
+
+    fn keep(self) -> Keep {
+        if self.0 & Self::STURDY != 0 {
+            Keep::Sturdy
+        } else {
+            Keep::Ordinary
+        }
+    }
+
+    fn is_idle(self) -> bool {
+        self.0 & Self::IDLE != 0
+    }
+
+    fn is_revoked(self) -> bool {
+        self.0 & Self::REVOKED != 0
+    }
+
+    fn revoked(self) -> Self {
+        Self(self.0 | Self::REVOKED)
+    }
+
+    fn idle(self, idle: bool) -> Self {
+        Self(if idle {
+            self.0 | Self::IDLE
+        } else {
+            self.0 & !Self::IDLE
+        })
+    }
 }
 
 impl Drop for Kept {
@@ -817,9 +1035,24 @@ impl Drop for Kept {
         if let Some(slot) = self.entry {
             self.pool.keepers.remove(slot);
         }
-        self.pool.release_kept(self.frame, self.pid);
+        let state = self.state;
+        if state.is_revoked() {
+            return;
+        }
+        self.pool.release_kept(
+            self.frame,
+            self.pid,
+            state.at(),
+            state.is_idle(),
+            state.keep(),
+        );
     }
 }
+
+/// An owner's keep as a test sees it ([`Owner::keep_seen`]): (frame, generation, idle, sturdy), and
+/// the page whose keep a drain revoked.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(crate) type KeepSeen = (Option<(u32, u32, bool, bool)>, Option<PageId>);
 
 /// An operation's place in the shortage queue (DESIGN.md 9.1.3, *Tenure*): one demand per tenure.
 /// A phase-B step that comes short again ends the tenure and queues anew (*Ending*). What
@@ -832,6 +1065,9 @@ struct Tenure {
     demand: Option<(SizeClass, Purpose)>,
     /// The pages the step held when it came short, published once phase A is done.
     held: Vec<u64>,
+    /// Since when phase A's claim has found every frame it waits behind kept by sturdy idle keeps
+    /// alone, and the timer that wakes it at its connection's busy timeout (SHORT-HOLD1b, A3).
+    stuck: Option<(std::time::Instant, Option<crate::timer::Timed>)>,
 }
 
 /// What a claim inside an operation that found no frame records for its top: the pool and its
@@ -877,6 +1113,8 @@ impl Owner {
             serves_owed: false,
             #[cfg(any(test, feature = "simulator"))]
             serial: Serial::default(),
+            #[cfg(test)]
+            revocations: 0,
         }
     }
 
@@ -894,6 +1132,9 @@ impl Owner {
         &mut self,
         op: impl FnOnce() -> Result<IOResult<T>>,
     ) -> Result<IOResult<T>> {
+        if self.keeps.pool.is_some() {
+            self.wake_kept();
+        }
         if let Some(t) = self.tenure.as_deref() {
             if !t.pool.shortage.enter(t.place) {
                 // Revoked for a newcomer of its connection, or cancelled with its transaction:
@@ -908,12 +1149,85 @@ impl Owner {
         out
     }
 
+    /// The entry of a call with a keep: the keep its last call's IO return left idle goes active,
+    /// or is found revoked by a drain (SHORT-HOLD1b), the operation then loading its page again
+    /// and keeping it sturdy. A revoked keep becomes the revocation's mark: it holds nothing, and
+    /// its drop releases nothing. A mark found here is left as it is.
+    fn wake_kept(&mut self) {
+        let Some(kept) = self.keeps.pool.as_mut() else {
+            return;
+        };
+        if kept.state.is_revoked() || kept.wake() {
+            return;
+        }
+        kept.mark_revoked();
+        #[cfg(test)]
+        {
+            self.revocations += 1;
+        }
+    }
+
+    /// A call's entry alone, its keep going active or found revoked, for a test that races it.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn enter_for_test(&mut self) {
+        self.wake_kept();
+    }
+
+    /// An IO return alone, its keep going idle, for a test whose call entered by
+    /// [`enter_for_test`](Self::enter_for_test).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn return_io_for_test(&mut self) {
+        self.idle_kept();
+    }
+
+    /// Whether the owner's tenure holds the shortage gate, at the queue's head with its turn
+    /// finished, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn holds_gate(&self) -> bool {
+        self.tenure
+            .as_ref()
+            .is_some_and(|t| t.pool.shortage.holds_gate(t.place))
+    }
+
+    /// The calls whose entry found the owner's keep revoked, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn revocations(&self) -> u64 {
+        self.revocations
+    }
+
+    /// The owner's keep, for a test: its frame, its generation, whether it is idle and whether it
+    /// is sturdy; and the page whose keep a drain revoked, if its mark is set.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn keep_seen(&self) -> KeepSeen {
+        (
+            self.keeps.kept().map(|k| {
+                let s = k.state;
+                (k.frame, s.at(), s.is_idle(), s.keep() == Keep::Sturdy)
+            }),
+            self.keeps
+                .pool
+                .as_ref()
+                .filter(|k| k.state.is_revoked())
+                .map(|k| k.pid),
+        )
+    }
+
     fn run<T>(&mut self, op: impl FnOnce() -> Result<IOResult<T>>) -> Result<IOResult<T>> {
         if let Some(t) = self.tenure.as_deref_mut() {
             // The operation runs again only at its turn, with its demand's frame reserved and
             // its publication's barrier passed, however early it is called.
-            if let Some(wait) = t.advance()? {
-                return Ok(IOResult::IO(IOCompletions(wait)));
+            let busy = self.conn.as_deref().map_or(0, Conn::busy);
+            match t.advance(busy) {
+                Ok(Some(wait)) => {
+                    // Woken at this call's entry, the keep goes idle again with the wait.
+                    self.idle_kept();
+                    return Ok(IOResult::IO(IOCompletions(wait)));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.end();
+                    return Err(e);
+                }
             }
         }
         let out = {
@@ -945,7 +1259,10 @@ impl Owner {
                         self.keeps.let_go();
                         self.reserve(short)
                     }
-                    None => Ok(IOResult::IO(c)),
+                    None => {
+                        self.idle_kept();
+                        Ok(IOResult::IO(c))
+                    }
                 }
             }
             done => {
@@ -953,6 +1270,17 @@ impl Owner {
                 debug_assert!(GATE.with(|g| g.borrow().is_none()));
                 self.end();
                 done
+            }
+        }
+    }
+
+    /// An IO return that keeps a page, the operation not touching it again before the next call's
+    /// entry: the keep goes idle (SHORT-HOLD1b). Every other return lets the keeps go or ends the
+    /// operation, so a call that is done pays nothing here.
+    fn idle_kept(&mut self) {
+        if let Some(kept) = self.keeps.pool.as_mut() {
+            if !kept.state.is_revoked() {
+                kept.go_idle();
             }
         }
     }
@@ -973,7 +1301,7 @@ impl Owner {
                 self.tenure.as_ref().is_some_and(|t| t.demand.is_none()),
                 "an operation ran before its demand was reserved"
             );
-            self.end();
+            self.end_tenure();
         }
         let queue = &short.pool.shortage;
         let turn = notify::remote_wait();
@@ -1002,14 +1330,28 @@ impl Owner {
             },
             None => queue.join(turn, self.conn.clone()),
         };
+        let busy = self.busy();
         let t = self.tenure.insert(Box::new(Tenure {
             pool: short.pool.clone(),
             place,
             demand: Some((short.class, short.purpose)),
             held: short.held,
+            stuck: None,
         }));
-        let wait = t.advance()?.unwrap_or_else(Completion::new_yield);
-        Ok(IOResult::IO(IOCompletions(wait)))
+        match t.advance(busy) {
+            Ok(wait) => Ok(IOResult::IO(IOCompletions(
+                wait.unwrap_or_else(Completion::new_yield),
+            ))),
+            Err(e) => {
+                self.end();
+                Err(e)
+            }
+        }
+    }
+
+    /// The busy timeout of the owner's connection, in nanoseconds: 0 for an owner of none.
+    fn busy(&self) -> u64 {
+        self.conn.as_deref().map_or(0, Conn::busy)
     }
 
     /// Ends the tenure, if any: the unused frame given back, the set retired, the place left, the
@@ -1017,6 +1359,18 @@ impl Owner {
     /// unfinished (a cursor parked at its statement's reset). A tenure revoked or cancelled
     /// meanwhile was let go there.
     pub(crate) fn end(&mut self) {
+        self.keeps.clear();
+        if let Some(t) = self.tenure.take() {
+            if let Some(released) = t.pool.shortage.end(t.place) {
+                released.let_go(&t.pool);
+            }
+        }
+    }
+
+    /// [`end`](Self::end) for an operation that goes on and queues again: a revocation's mark
+    /// among its keeps stays. Its own copy of the tenure's end, so `end`, every operation's, is
+    /// compiled as the base's was (the cost a call, #6325).
+    fn end_tenure(&mut self) {
         self.keeps.let_go();
         if let Some(t) = self.tenure.take() {
             if let Some(released) = t.pool.shortage.end(t.place) {
@@ -1045,7 +1399,7 @@ impl Owner {
     /// The frame whose load's group the owner holds a reference in, for a test.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(crate) fn kept_frame(&self) -> Option<u32> {
-        self.keeps.pool.as_ref().map(|k| k.frame)
+        self.keeps.kept().map(|k| k.frame)
     }
 
     /// The number the registry of keepers names the owner by, for a test.
@@ -1105,7 +1459,7 @@ impl Tenure {
     /// and protecting nothing of the pool (phase A), looking again at each call until it has it,
     /// and only then keeps the pages the step held resident (phase B): the demand's run may need
     /// the frame of a page the step held, which the step then reads in again.
-    fn advance(&mut self) -> Result<Option<Completion>> {
+    fn advance(&mut self, busy: u64) -> Result<Option<Completion>> {
         let queue = &self.pool.shortage;
         if !queue.holds_gate(self.place) {
             let s = queue.slots.lock();
@@ -1123,9 +1477,11 @@ impl Tenure {
             let frame = match queue.want(self.place, class, purpose) {
                 Some(frame) => frame,
                 None => {
+                    let mut stuck = None;
                     let claimed = {
                         let _installed = Installed(OWNER.with(|o| o.replace(std::ptr::null_mut())));
-                        self.pool.claim(class, purpose, &[])
+                        self.pool
+                            .claim_noting(class, purpose, &[], Some(&mut stuck))
                     };
                     match claimed? {
                         IOResult::Done(found) => {
@@ -1143,12 +1499,17 @@ impl Tenure {
                                 Some(frame) => frame,
                                 // Its own wait: the frame handed to it wakes it, whatever the
                                 // claim's wait was (the auditor's P2-S6-3).
-                                None => return Ok(Some(queue.wait(self.place, under))),
+                                None => {
+                                    let grant = queue.wait(self.place, under);
+                                    self.wait_out(stuck, busy, &grant, class, purpose)?;
+                                    return Ok(Some(grant));
+                                }
                             }
                         }
                     }
                 }
             };
+            self.stuck = None;
             // A handed frame keeps its quiet stamp: a read goes into it only once every step that
             // could still read what it held has ended (DESIGN.md 9.1.3, phase A). One wait per
             // place, registered once, finished by the epochs or by the place's end.
@@ -1182,6 +1543,47 @@ impl Tenure {
             queue.published(self.place, barrier);
         }
         Ok(queue.barrier(self.place))
+    }
+
+    /// Phase A's claim of `class` for `purpose` found every frame it waits behind kept by sturdy
+    /// idle keeps alone (`stuck`), which no step under way lets go, only their owners' next calls
+    /// (SHORT-HOLD1b, A3): it waits for up to its connection's busy timeout of `busy` nanoseconds,
+    /// looking again at each let-go and woken by the timer at its end through `grant`, and then
+    /// ends in the shortage error. With a timeout of 0, at once.
+    fn wait_out(
+        &mut self,
+        stuck: Option<super::Stuck>,
+        busy: u64,
+        grant: &Completion,
+        class: SizeClass,
+        purpose: Purpose,
+    ) -> Result<()> {
+        let Some(stuck) = stuck else {
+            self.stuck = None;
+            return Ok(());
+        };
+        let now = std::time::Instant::now();
+        let (since, timed) = self.stuck.get_or_insert((now, None));
+        let Some(deadline) = (busy != UNBOUNDED)
+            .then(|| since.checked_add(std::time::Duration::from_nanos(busy)))
+            .flatten()
+        else {
+            return Ok(());
+        };
+        if now < deadline {
+            if !timed
+                .as_ref()
+                .is_some_and(|timed| timed.is_for(deadline, grant))
+            {
+                *timed = None;
+                *timed = crate::timer::complete_at(deadline, grant.clone());
+            }
+            if timed.is_some() {
+                return Ok(());
+            }
+        }
+        self.stuck = None;
+        Err(stuck.error(class, purpose))
     }
 }
 
@@ -1287,9 +1689,11 @@ crate::thread::thread_local! {
     pub(crate) static OWED_WAITED_ON_RUNNING: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Whether the claim running on this thread runs for an owner, which keeps the page it loads.
-pub(super) fn keeping() -> bool {
-    owned()
+/// The kind of keep the owner running on this thread takes of the page its loader is about to read
+/// in: sturdy once a drain revoked a keep of its operation (SHORT-HOLD1b). `None` outside any
+/// owner's call, where nothing keeps the page.
+pub(super) fn keeping() -> Option<Keep> {
+    running_keeps(|k| k.kind())
 }
 
 /// Runs `f` on the running owner's keeps, while its call runs: `None` outside any owner's call.
@@ -1309,56 +1713,62 @@ fn running_keeps<R>(f: impl FnOnce(&mut Keeps) -> R) -> Option<R> {
 /// located and its frame claimed, right before its own load takes the reference's place, so it
 /// keeps one at most; and by a loader whose page another frame holds.
 pub(super) fn let_go_kept() {
-    drop(running_keeps(|k| k.pool.take()));
+    drop(running_keeps(Keeps::take_keep));
 }
 
-/// The running owner's reference in the group its loader just opened for `pid` in `frame`, its
-/// slot empty since its miss.
-pub(super) fn keep_loaded(pool: &Arc<BufferPool>, frame: u32, pid: PageId) {
-    #[cfg(any(test, feature = "simulator"))]
-    let keeper = running_keeper();
-    let old = running_keeps(|k| {
-        k.pool.replace(Kept {
-            pool: pool.clone(),
-            frame,
-            pid,
-            #[cfg(any(test, feature = "simulator"))]
-            entry: keeper.and_then(|keeper| pool.keepers.add(frame, pid.raw(), keeper)),
-        })
-    });
-    crate::turso_assert!(old.flatten().is_none(), "a loader kept two loads' pages");
+/// The running owner's reference, of kind `keep`, in the group its loader just opened for `pid`
+/// in `frame` at generation `at`, its slot empty since its miss.
+pub(super) fn keep_loaded(pool: &Arc<BufferPool>, frame: u32, pid: PageId, at: u32, keep: Keep) {
+    let kept = kept(pool, frame, pid, at, keep);
+    let old = running_keeps(|k| k.keep(kept)).flatten();
+    crate::turso_assert!(
+        old.as_ref().is_none_or(|k| k.state.is_revoked()),
+        "a loader kept two loads' pages"
+    );
 }
 
 /// A fix of the running owner found `pid` loading in `frame`: it keeps the page in that load's
-/// group, `join` adding its reference, unless it holds that reference already. Another it holds
-/// is let go first. A refused join keeps nothing.
+/// group, `join` adding its reference of the kind it is given and saying the generation it added
+/// it at, unless the owner holds that reference already. Another it holds is let go first. A
+/// refused join keeps nothing.
 pub(super) fn keep_joined(
     pool: &Arc<BufferPool>,
     frame: u32,
     pid: PageId,
-    join: impl FnOnce() -> bool,
+    join: impl FnOnce(Keep) -> Option<u32>,
 ) {
     // The same load: a frame its group keeps is neither freed nor loaded again meanwhile.
+    // A mark names `MARK_FRAME`, so it is never taken for the same load.
     let held = running_keeps(|k| match &k.pool {
         Some(kept) if kept.frame == frame && kept.pid == pid => Ok(()),
-        _ => Err(k.pool.take()),
+        _ => Err((k.take_keep(), k.kind())),
     });
-    let Some(Err(other)) = held else {
+    let Some(Err((other, keep))) = held else {
         return;
     };
     drop(other);
-    if join() {
+    if let Some(at) = join(keep) {
+        let kept = kept(pool, frame, pid, at, keep);
+        let old = running_keeps(|k| k.keep(kept)).flatten();
+        crate::turso_assert!(
+            old.as_ref().is_none_or(|k| k.state.is_revoked()),
+            "a joiner kept two loads' pages"
+        );
+    }
+}
+
+/// The running owner's reference of kind `keep` in the group of `pid`'s load into `frame`, added
+/// at generation `at`, active as its call runs.
+fn kept(pool: &Arc<BufferPool>, frame: u32, pid: PageId, at: u32, keep: Keep) -> Kept {
+    #[cfg(any(test, feature = "simulator"))]
+    let keeper = running_keeper();
+    Kept {
+        pool: pool.clone(),
+        frame,
+        pid,
+        state: KeepState::new(at, keep),
         #[cfg(any(test, feature = "simulator"))]
-        let keeper = running_keeper();
-        running_keeps(|k| {
-            k.pool = Some(Kept {
-                pool: pool.clone(),
-                frame,
-                pid,
-                #[cfg(any(test, feature = "simulator"))]
-                entry: keeper.and_then(|keeper| pool.keepers.add(frame, pid.raw(), keeper)),
-            })
-        });
+        entry: keeper.and_then(|keeper| pool.keepers.add(frame, pid.raw(), keeper)),
     }
 }
 
@@ -1388,7 +1798,7 @@ fn running_keeper() -> Option<Keeper> {
 /// The page the running owner keeps in a load's group, and its frame's hint (the frame plus one),
 /// while its call runs: the page its last call waited for (ASYNC1 D2e §2.2b).
 pub(crate) fn kept_page() -> Option<(PageId, u32)> {
-    running_keeps(|k| k.pool.as_ref().map(|kept| (kept.pid, kept.frame + 1))).flatten()
+    running_keeps(|k| k.kept().map(|kept| (kept.pid, kept.frame + 1))).flatten()
 }
 
 /// The running owner keeps the metadata page `frame` its call found loading, in place of any
@@ -1865,13 +2275,14 @@ mod tests {
             place: tail,
             demand: Some((class, super::Purpose::New)),
             held: vec![pid.raw()],
+            stuck: None,
         };
         // Before the old head lets go, the next is not admitted: it waits for its turn and
         // publishes nothing the old head's release could clear.
-        let held_back = matches!(next.advance(), Ok(Some(_)));
+        let held_back = matches!(next.advance(0), Ok(Some(_)));
         releasing.let_go(&pool);
         // Its turn finished after the old `R` and set are let go: admitted now, it publishes.
-        let admitted = next.advance().is_ok();
+        let admitted = next.advance(0).is_ok();
         let protected_after_old_release = pool.protected(frame);
         if let Some(released) = q.end(tail) {
             released.let_go(&pool);

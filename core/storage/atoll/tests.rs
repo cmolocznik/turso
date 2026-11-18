@@ -1999,7 +1999,7 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("buffer/cell.rs", "current_with", "Completion::new_yield", 1, "change: the cell changed during its read"),
     ("buffer/lend.rs", "provide", "Completion::new_yield", 1, "change: a batch changed hands, or drains for another"),
     ("buffer/mod.rs", "cut_run", "Completion::new_yield", 2, "change: an outgoing frame freed or reused while read, at the walk and at the late look"),
-    ("buffer/mod.rs", "claim", "look_again", 3, "change: work of the claim's own started, a latch it found changed, a horizon reached"),
+    ("buffer/mod.rs", "claim_noting", "look_again", 3, "change: work of the claim's own started, a latch it found changed, a horizon reached"),
     ("buffer/mod.rs", "free_page", "Completion::new_yield", 1, "change: its own write landed (settle_writes)"),
     ("buffer/mod.rs", "look_again", "Completion::new_yield", 1, "the helper itself"),
     ("buffer/mod.rs", "wait_for_resident_latch", "Completion::new_yield", 3, "change: the latch free at the look, the frame no longer resident, the hold changed before the mark"),

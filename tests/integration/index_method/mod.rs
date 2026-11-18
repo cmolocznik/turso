@@ -1,5 +1,6 @@
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 mod json;
+mod path_trie;
 
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
 use turso_core::ConnectOpts;

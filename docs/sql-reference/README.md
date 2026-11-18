@@ -22,6 +22,7 @@ sql-reference/
 │   ├── json.mdx
 │   ├── vector.mdx              # Turso-specific vector search
 │   ├── fts.mdx                 # Turso-specific full-text search
+│   ├── path.mdx                # Turso-specific path patterns and incremental sync
 │   └── ...
 ├── pragmas.mdx                 # All supported PRAGMAs (includes CDC, encryption)
 ├── extensions.mdx              # UUID, regexp, vector, time, CSV, percentile

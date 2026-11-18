@@ -159,6 +159,16 @@ Once an FTS index exists, use the `search()` function to query it:
 SELECT * FROM articles WHERE search(articles, 'database performance');
 ```
 
+### Paths with `USING path_trie`
+
+The `path_trie` index method indexes slash-separated paths with a sequence number, for the [`path_sync`](/docs/sql-reference/functions/path) function: rows whose path matches a set of glob patterns, and optionally only those changed since a sequence number.
+
+```sql
+CREATE INDEX files_by_path ON files USING path_trie (path, seq);
+
+SELECT path FROM files WHERE path_sync(path, seq, '["src/**"]', 4120);
+```
+
 ## Examples
 
 ### Index for a Common Lookup Pattern

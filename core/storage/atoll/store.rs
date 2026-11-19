@@ -1112,7 +1112,7 @@ impl PageStore {
             locked.release_unchanged();
             return Ok(IOResult::Done(false));
         }
-        set_map(&mut locked, Tree::Map, number, FREE, ALLOCATED);
+        set_map(&mut locked, Tree::Map, number, FREE, ALLOCATED, height);
         locked.commit(&self.meta);
         Ok(IOResult::Done(true))
     }
@@ -1180,7 +1180,7 @@ impl PageStore {
             }
             // Marked before the entry is free, so no allocation takes the number between.
             self.unreusable[class.index()].set(number);
-            set_map(&mut locked, Tree::Map, number, entry, FREE);
+            set_map(&mut locked, Tree::Map, number, entry, FREE, height);
             let epoch = self.epoch();
             locked.commit(&self.meta);
             {
@@ -1401,7 +1401,7 @@ impl PageStore {
             };
             crate::race::point("store.copy_slot_claimed");
             let marked = self.edit_slot(class, slot, &mut state.pages, |locked| {
-                set_space(locked, class, slot, true)
+                set_space(locked, class, slot, true, self.height(Tree::Space, class))
             })?;
             Ok(match marked {
                 IOResult::Done(()) => IOResult::Done(slot),
@@ -1732,7 +1732,7 @@ impl PageStore {
         let freed = self.edit_slot(class, slot, pages, |locked| {
             // Marked unerased before it is free, so no taker finds it between.
             self.unerased[class.index()].set(slot);
-            set_space(locked, class, slot, false);
+            set_space(locked, class, slot, false, self.height(Tree::Space, class));
         })?;
         if let IOResult::IO(io) = freed {
             return Ok(IOResult::IO(io));
@@ -2369,6 +2369,12 @@ impl<'a> Locked<'a> {
                 }
             }
         }
+        // The group is kept for the cut whole: a cut begun between two of its latches would
+        // otherwise keep the later pages as they stood and read the earlier ones after the
+        // group's change (MAP-COUNT1).
+        for hold in holds[..len].iter().flatten() {
+            hold.keep_for_cut();
+        }
         Ok(Self { holds, len })
     }
 
@@ -2432,8 +2438,8 @@ impl<'a> Locked<'a> {
 }
 
 /// Sets `number`'s page-table entry from `from` to `to` as it stands, counting it in or out of use
-/// above.
-fn set_map(locked: &mut Locked<'_>, tree: Tree, number: u64, from: u64, to: u64) {
+/// above. The group reaches the tree's root at its height `published` (MAP-HEIGHT1).
+fn set_map(locked: &mut Locked<'_>, tree: Tree, number: u64, from: u64, to: u64, published: u8) {
     let class = locked.ids().next().expect("a group latches a page").class;
     let height = locked
         .ids()
@@ -2441,6 +2447,10 @@ fn set_map(locked: &mut Locked<'_>, tree: Tree, number: u64, from: u64, to: u64)
         .map(|id| id.level + 1)
         .max()
         .unwrap_or(1);
+    assert_eq!(
+        height, published,
+        "a change of the {tree:?} tree of {class:?} latched {height} levels of {published}"
+    );
     let path = radix::path(tree, class, height, number);
     radix::set_map_entry(locked.page_of(path[0]), number, to);
     let delta = (to != FREE) as i64 - (from != FREE) as i64;
@@ -2455,14 +2465,19 @@ fn set_map(locked: &mut Locked<'_>, tree: Tree, number: u64, from: u64, to: u64)
     }
 }
 
-/// Marks `slot` in use or free as it stands, counting it above.
-fn set_space(locked: &mut Locked<'_>, class: SizeClass, slot: u64, used: bool) {
+/// Marks `slot` in use or free as it stands, counting it above. The group reaches the free
+/// space's root at its height `published` (MAP-HEIGHT1).
+fn set_space(locked: &mut Locked<'_>, class: SizeClass, slot: u64, used: bool, published: u8) {
     let height = locked
         .ids()
         .filter(|id| id.tree == Tree::Space && id.class == class)
         .map(|id| id.level + 1)
         .max()
         .unwrap_or(1);
+    assert_eq!(
+        height, published,
+        "a change of the free space of {class:?} latched {height} levels of {published}"
+    );
     let path = radix::path(Tree::Space, class, height, slot);
     let leaf = locked.page_of(path[0]);
     let was = radix::space_bit(leaf, slot);
@@ -2605,7 +2620,14 @@ impl PageStore {
     pub fn plant_entry(self: &Arc<Self>, pid: PageId, entry: u64) -> Result<IOResult<()>> {
         self.plant(Tree::Map, pid.class(), pid.number(), |locked, ids| {
             let from = radix::map_entry(locked.page_of(ids[0]), pid.number());
-            set_map(locked, Tree::Map, pid.number(), from, entry);
+            set_map(
+                locked,
+                Tree::Map,
+                pid.number(),
+                from,
+                entry,
+                self.height(Tree::Map, pid.class()),
+            );
         })
     }
 
@@ -2617,7 +2639,7 @@ impl PageStore {
         used: bool,
     ) -> Result<IOResult<()>> {
         self.plant(Tree::Space, class, slot, |locked, _| {
-            set_space(locked, class, slot, used)
+            set_space(locked, class, slot, used, self.height(Tree::Space, class))
         })
     }
 

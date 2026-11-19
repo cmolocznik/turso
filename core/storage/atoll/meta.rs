@@ -497,6 +497,13 @@ impl<'a> MetaHold<'a> {
         self.frame.changed(cache);
     }
 
+    /// Keeps the page as it stands for the cut in effect, unless it is kept already: called by a
+    /// group once all its pages are latched and before any is changed, so that a cut begun while
+    /// the group was latching keeps every page of it, not only those latched after it began.
+    pub fn keep_for_cut(&self) {
+        self.frame.keep_cut();
+    }
+
     /// Runs `f` on the page as it stood at the cut in effect, kept when the hold was taken: what
     /// that checkpoint writes of it. `None` with no cut in effect.
     pub fn with_cut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {

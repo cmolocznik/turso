@@ -643,6 +643,21 @@ mod tests {
         ),
         (
             "store/tests.rs",
+            "a_cut_begun_between_a_map_groups_latches_keeps_its_leaf_and_parent_alike",
+            "child",
+        ),
+        (
+            "store/tests.rs",
+            "a_cut_begun_between_a_space_groups_latches_keeps_its_leaf_and_parent_alike",
+            "child",
+        ),
+        (
+            "store/tests.rs",
+            "a_map_change_whose_group_misses_a_level_stops_at_the_change",
+            "child",
+        ),
+        (
+            "store/tests.rs",
             "a_swap_copy_landing_in_a_marked_slot_ends_the_process",
             "child",
         ),

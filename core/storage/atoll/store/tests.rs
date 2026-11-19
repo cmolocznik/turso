@@ -2314,6 +2314,220 @@ fn a_copy_past_the_cuts_free_space_frees_its_old_slot_in_the_grown_tree() {
     assert!(owed, "the old slot's free does not wait for the checkpoint");
 }
 
+/// MAP-COUNT1: a cut begun while a page-table group is half latched (its leaf latched, its parent
+/// not yet) keeps the leaf and the parent alike. The group latches in id order, the leaf first:
+/// begun at the parent's latch, before its keep, the cut used to keep the parent as it stood and
+/// read the leaf after the group's change, so its copies counted one allocation in the leaf and
+/// not above it (the auditor's capture: 473 in the leaf's image of checkpoint 49, 472 in its
+/// parent's).
+#[test]
+fn a_cut_begun_between_a_map_groups_latches_keeps_its_leaf_and_parent_alike() {
+    // In a child: a failure unwinds through the database, which ends the process.
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_cut_begun_between_a_map_groups_latches_keeps_its_leaf_and_parent_alike"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Db::open_on(io);
+            let class = class(4);
+            let store = db.store().clone();
+            let mut grown = false;
+            for _ in 0..100_000 {
+                drive(&db.io, || store.allocate(class)).unwrap();
+                if store.height(Tree::Map, class) >= 2 {
+                    grown = true;
+                    break;
+                }
+            }
+            assert!(grown, "the page table of class 4 never grew to two levels");
+            let n = store.meta().in_charge() + 1;
+            let begun = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let (store, begun) = (store.clone(), begun.clone());
+                crate::race::at("meta.lock_before_keep", move || {
+                    // The group's first page, its leaf: the cut begins at the next, its parent.
+                    crate::race::at("meta.lock_before_keep", move || {
+                        store.begin_cut(n);
+                        begun.store(true, std::sync::atomic::Ordering::SeqCst);
+                    });
+                });
+            }
+            let pid = drive(&db.io, || store.allocate(class)).unwrap();
+            assert!(
+                begun.load(std::sync::atomic::Ordering::SeqCst),
+                "the allocation latched fewer than two metadata pages"
+            );
+            let height = store.height(Tree::Map, class);
+            let path = radix::path(Tree::Map, class, height, pid.number());
+            let (leaf, parent) = (path[0], path[1]);
+            let child = radix::child(Tree::Map, parent.level, pid.number());
+            let frame = drive(&db.io, || store.meta().get(leaf)).unwrap();
+            let in_leaf_at_cut = frame
+                .read_cut(
+                    n,
+                    |live| radix::map_entry(live, pid.number()),
+                    |cut| radix::map_entry(cut, pid.number()),
+                )
+                .unwrap()
+                != FREE;
+            drop(frame);
+            let above_at_cut = cut_count(&db, n, parent, child).unwrap();
+            let frame = drive(&db.io, || store.meta().get(parent)).unwrap();
+            let above_live = frame.read(|b| radix::used_below(b, child)).unwrap();
+            drop(frame);
+            assert_eq!(
+        (in_leaf_at_cut, above_at_cut),
+        (in_leaf_at_cut, above_live - u64::from(!in_leaf_at_cut)),
+        "(the allocation in the leaf as the cut keeps it, the parent's count as the cut keeps it): \
+         the leaf and its parent kept a change apart"
+    );
+        },
+    );
+}
+
+/// MAP-HEIGHT1: a change of the page table through a group that latched its leaf and not the
+/// level above, with the table two levels high, stops the process at the change, before a count
+/// above the leaf is left behind (mutant: the assertion gone, the change made and nothing said).
+#[test]
+fn a_map_change_whose_group_misses_a_level_stops_at_the_change() {
+    let test = concat!(
+        module_path!(),
+        "::a_map_change_whose_group_misses_a_level_stops_at_the_change"
+    );
+    let ended = crate::child_test::in_child(test, || {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Db::open_on(io);
+        let class = class(4);
+        let store = db.store().clone();
+        while store.height(Tree::Map, class) < 2 {
+            drive(&db.io, || store.allocate(class)).unwrap();
+        }
+        let number = store.numbers[class.index()].load(std::sync::atomic::Ordering::Relaxed);
+        let leaf = radix::path(Tree::Map, class, 2, number)[0];
+        let frames = drive(&db.io, || store.meta().get_all(&[leaf])).unwrap();
+        let mut locked = Locked::new(&frames).expect("the leaf's latch is free");
+        set_map(&mut locked, Tree::Map, number, FREE, ALLOCATED, 2);
+        locked.commit(store.meta());
+        eprintln!("MAP-HEIGHT1: the change went through");
+    });
+    if let Some(ended) = ended {
+        assert!(
+            ended.code != Some(0)
+                && ended
+                    .stderr
+                    .contains("a change of the Map tree of SizeClass(4) latched 1 levels of 2"),
+            "the child ended {:?}: {}",
+            ended.code,
+            ended.stderr
+        );
+    }
+}
+
+/// MAP-COUNT1, the cut's side: a cut begun before a page-table group latches reads the leaf
+/// before the group and the parent after its commit, and finds both as they stood at the cut: the
+/// group's latches keep each page before it changes, so the cut's two reads are of one moment.
+#[test]
+fn a_cut_begun_before_a_map_group_reads_its_leaf_before_and_its_parent_after_alike() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Db::open_on(io);
+    let class = class(4);
+    let store = db.store().clone();
+    while store.height(Tree::Map, class) < 2 {
+        drive(&db.io, || store.allocate(class)).unwrap();
+    }
+    let n = store.meta().in_charge() + 1;
+    store.begin_cut(n);
+    let next = store.numbers[class.index()].load(std::sync::atomic::Ordering::Relaxed);
+    let height = store.height(Tree::Map, class);
+    let path = radix::path(Tree::Map, class, height, next);
+    let (leaf, parent) = (path[0], path[1]);
+    let child = radix::child(Tree::Map, parent.level, next);
+    let frame = drive(&db.io, || store.meta().get(leaf)).unwrap();
+    let in_leaf_before = frame
+        .read_cut(
+            n,
+            |l| radix::map_entry(l, next),
+            |c| radix::map_entry(c, next),
+        )
+        .unwrap();
+    drop(frame);
+    let above_before = cut_count(&db, n, parent, child).unwrap();
+    let pid = drive(&db.io, || store.allocate(class)).unwrap();
+    assert_eq!(pid.number(), next, "the allocation took the next number");
+    let frame = drive(&db.io, || store.meta().get(leaf)).unwrap();
+    let in_leaf_after = frame
+        .read_cut(
+            n,
+            |l| radix::map_entry(l, next),
+            |c| radix::map_entry(c, next),
+        )
+        .unwrap();
+    drop(frame);
+    let above_after = cut_count(&db, n, parent, child).unwrap();
+    assert_eq!(
+        (in_leaf_after, above_after),
+        (in_leaf_before, above_before),
+        "(the leaf's entry, the parent's count) the cut read after the group against before it"
+    );
+    assert_eq!(in_leaf_before, FREE, "the number was free at the cut");
+}
+
+/// MAP-COUNT1's mirror in the free space: a cut begun between the latches of a slot's leaf and its
+/// parent keeps both alike, the slot's bit and the count above it as of one moment.
+#[test]
+fn a_cut_begun_between_a_space_groups_latches_keeps_its_leaf_and_parent_alike() {
+    // In a child: a failure unwinds through the database, which ends the process.
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_cut_begun_between_a_space_groups_latches_keeps_its_leaf_and_parent_alike"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Db::open_on(io);
+            let class = class(0);
+            let store = db.store().clone();
+            while store.height(Tree::Space, class) < 2 {
+                drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+            }
+            let slot = radix::SPACE_BITS + 3;
+            let n = store.meta().in_charge() + 1;
+            let begun = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let (store, begun) = (store.clone(), begun.clone());
+                crate::race::at("meta.lock_before_keep", move || {
+                    crate::race::at("meta.lock_before_keep", move || {
+                        store.begin_cut(n);
+                        begun.store(true, std::sync::atomic::Ordering::SeqCst);
+                    });
+                });
+            }
+            drive(&db.io, || store.plant_slot(class, slot, true)).unwrap();
+            assert!(
+                begun.load(std::sync::atomic::Ordering::SeqCst),
+                "the slot's edit latched fewer than two metadata pages"
+            );
+            let height = store.height(Tree::Space, class);
+            let path = radix::path(Tree::Space, class, height, slot);
+            let (leaf, parent) = (path[0], path[1]);
+            let child = radix::child(Tree::Space, parent.level, slot);
+            let bit_at_cut = cut_bit(&db, n, leaf, slot).unwrap();
+            let above_at_cut = cut_count(&db, n, parent, child).unwrap();
+            let frame = drive(&db.io, || store.meta().get(parent)).unwrap();
+            let above_live = frame.read(|b| radix::used_below(b, child)).unwrap();
+            drop(frame);
+            assert_eq!(
+        (bit_at_cut, above_at_cut),
+        (bit_at_cut, above_live - u64::from(!bit_at_cut)),
+        "(the slot's bit as the cut keeps it, the parent's count as the cut keeps it): the leaf and \
+         its parent kept a change apart"
+    );
+        },
+    );
+}
+
 /// A checkpoint whose copy's slot lies past the free space its cut found writes a free space that
 /// reaches it: here every slot of the one leaf is in use, so the checkpoint's copies go to the
 /// second, and once reopened the free space is two levels high and names every unit it named

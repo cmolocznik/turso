@@ -1278,7 +1278,17 @@ impl Whopper {
                     // In-process whopper has no worker process to respawn,
                     // so Corrupt/CheckpointFailed surface as fatal here.
                     crate::error_handling::ErrorAction::Respawn
-                    | crate::error_handling::ErrorAction::Fatal => return Err(error.into()),
+                    | crate::error_handling::ErrorAction::Fatal => {
+                        // The statement that met it, named, so a single run's failure says which.
+                        eprintln!(
+                            "fatal at step {} on fiber {fiber_idx} (in a transaction: {in_tx}, \
+                             autocommit: {}): {error}; the operation: {}",
+                            self.current_step,
+                            ctx.fiber.connection.get_auto_commit(),
+                            completed_op.sql()
+                        );
+                        return Err(error.into());
+                    }
                 }
             }
         }

@@ -61,6 +61,11 @@ pub enum Taken {
     Holders(Vec<(u16, Ts)>),
     /// The take was cleared from the word by another, for a victim: it is no longer pending.
     Lost,
+    /// Held, every holder drained, and the horizon not yet over `ts`, the newest commit in any
+    /// slot's commit log, which every holder published before letting the gate go: the caller
+    /// waits for the horizon to cover it
+    /// ([`Transactions::wait_covered`](super::Transactions::wait_covered)) and takes again (GATE1).
+    Covering(Ts),
 }
 
 pub(super) struct Gate {

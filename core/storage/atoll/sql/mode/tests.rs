@@ -11406,6 +11406,7 @@ mod in_frames {
                         "mode.rs:end_served",
                         "mode.rs:end_unbegun",
                         "mode.rs:give_up",
+                        "mode.rs:holding_a_transaction",
                         "mode.rs:is_open",
                         "mode.rs:left_in_it",
                         "mode.rs:open_savepoint",

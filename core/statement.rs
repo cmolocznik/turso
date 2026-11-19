@@ -516,6 +516,32 @@ impl Statement {
         }
     }
 
+    /// A statement reset, its abort run, with its connection in autocommit and no statement of it
+    /// active leaves no Atoll transaction: one left open would keep the write gate from every
+    /// other connection until this one closes (GATE1). It takes the cells' locks, so it runs where
+    /// debug assertions are on.
+    #[inline]
+    fn check_idle_holds_no_atoll_txn(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let conn = &self.program.connection;
+            if let Some(atoll) = conn
+                .atoll()
+                .filter(|_| conn.n_active_root_statements.load(Ordering::SeqCst) as i32 == 0)
+            {
+                if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                    if let Some(cell) = atoll.holding_a_transaction(&self.state.atoll_txn) {
+                        crate::turso_assert!(
+                            false,
+                            "a connection in autocommit with no statement active holds an Atoll transaction",
+                            { "cell": cell, "sql": self.program.sql.as_str() }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A statement that came back Busy to its caller at its Transaction instruction, before its
     /// write began, has not begun (ONE-TXN rule 2). A writer's registration is let go, and its
     /// next step registers again. One that waited for Atoll's write gate holds nothing: its take
@@ -814,40 +840,11 @@ impl Statement {
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
-        const MAX_SCHEMA_RETRY: usize = 50;
-        for attempt in 0..MAX_SCHEMA_RETRY + 1 {
-            // Only reprepare if we still need to update schema
-            if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
-                break;
+        if matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
+            match self.retry_on_schema::<POLLED>(res, waker) {
+                SchemaRetry::Stepped(stepped) => res = stepped,
+                SchemaRetry::Return(out) => return out,
             }
-            if attempt == MAX_SCHEMA_RETRY {
-                self.give_up_on_schema();
-                break;
-            }
-            // In a write transaction, reprepare may not help (e.g. cross-process
-            // schema change where the in-memory schema hasn't been refreshed from
-            // disk). Allow a few retries for the in-process case where reprepare
-            // *can* resolve the issue, but bail early to avoid burning 50 attempts.
-            if attempt >= 2
-                && !self.program.connection.get_auto_commit()
-                && matches!(
-                    self.program.connection.get_tx_state(),
-                    TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
-                )
-            {
-                break;
-            }
-            tracing::debug!("reprepare: attempt={}", attempt);
-            if let Err(err) = self
-                .rollback_autocommit_txn()
-                .and_then(|()| self.reprepare())
-            {
-                self.release_active_root_if_counted(true);
-                return Err(err);
-            }
-            res = self
-                .program
-                .step::<POLLED>(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
         // Atoll mode (DESIGN.md §17, §3.2): a sole autocommit statement that met a conflict, which
@@ -1017,16 +1014,88 @@ impl Statement {
         res.map_err(|err| (*err).into_structured_constraint())
     }
 
+    /// A step that met a schema-cookie mismatch: rolls the attempt back, reprepares and steps
+    /// again, up to MAX_SCHEMA_RETRY times. What the last step came to, or what the statement
+    /// returns at once. Out of line, so that an ordinary step pays nothing for it.
+    #[cold]
+    #[inline(never)]
+    fn retry_on_schema<const POLLED: bool>(
+        &mut self,
+        mut res: std::result::Result<StepResult, Box<LimboError>>,
+        waker: Option<&Waker>,
+    ) -> SchemaRetry {
+        const MAX_SCHEMA_RETRY: usize = 50;
+        for attempt in 0..MAX_SCHEMA_RETRY + 1 {
+            // Only reprepare if we still need to update schema
+            if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
+                break;
+            }
+            if attempt == MAX_SCHEMA_RETRY {
+                if let Err(err) = self.give_up_on_schema() {
+                    self.release_active_root_if_counted(true);
+                    return SchemaRetry::Return(Err(err));
+                }
+                break;
+            }
+            // In a write transaction, reprepare may not help (e.g. cross-process
+            // schema change where the in-memory schema hasn't been refreshed from
+            // disk). Allow a few retries for the in-process case where reprepare
+            // *can* resolve the issue, but bail early to avoid burning 50 attempts.
+            if attempt >= 2
+                && !self.program.connection.get_auto_commit()
+                && matches!(
+                    self.program.connection.get_tx_state(),
+                    TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
+                )
+            {
+                break;
+            }
+            tracing::debug!("reprepare: attempt={}", attempt);
+            if let Err(err) = self
+                .rollback_autocommit_txn()
+                .and_then(|()| self.reprepare())
+            {
+                self.release_active_root_if_counted(true);
+                return SchemaRetry::Return(Err(err));
+            }
+            #[cfg(test)]
+            REPREPARES.with(|n| n.set(n.get() + 1));
+            // In Atoll mode a snapshot below the commit that published the schema the connection
+            // now holds would mismatch again: the reprepared statement waits for the horizon to
+            // cover it before it begins, holding nothing (GATE1).
+            if let Some(c) = self
+                .program
+                .connection
+                .atoll()
+                .and_then(|atoll| atoll.schema_cover_wait())
+            {
+                crate::race::point("statement.schema_cover_wait");
+                self.busy = true;
+                self.state
+                    .set_pending_io(crate::types::IOCompletions(c), waker);
+                return SchemaRetry::Return(Ok(StepResult::IO));
+            }
+            res = self
+                .program
+                .step::<POLLED>(&mut self.state, &self.pager, self.query_mode, waker);
+        }
+        SchemaRetry::Stepped(res)
+    }
+
     /// A statement that gives up on its schema returns with its lent transaction ended: no other
     /// statement and no ROLLBACK of its connection can end it (ASYNC1 E1b).
     #[cold]
     #[inline(never)]
-    fn give_up_on_schema(&mut self) {
+    fn give_up_on_schema(&mut self) -> Result<()> {
         if self.state.atoll_lease {
             let conn = self.program.connection.clone();
             let main_pager = conn.pager.load().clone();
             self.rollback_txn_state_for_retry(&conn, &main_pager);
+            return Ok(());
         }
+        // The last attempt's own transaction ends with the statement, as each retry's did: kept,
+        // it would hold the write gate on a connection its host takes for idle (GATE-LEAK1).
+        self.rollback_autocommit_txn()
     }
 
     #[inline]
@@ -2156,6 +2225,7 @@ impl Statement {
             self.release_active_root_if_counted(statement_failed);
         }
         self.cleanup_orphaned_seq_inner_tx();
+        self.check_idle_holds_no_atoll_txn();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;
@@ -3031,4 +3101,17 @@ mod tests {
         );
         holder.execute("ROLLBACK").unwrap();
     }
+}
+
+/// What a schema retry came to: the last step's result for the rest of the step to handle, or
+/// what the statement returns at once.
+enum SchemaRetry {
+    Stepped(std::result::Result<StepResult, Box<LimboError>>),
+    Return(Result<StepResult>),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The schema retries' reprepares on this thread, for a test that counts them (GATE1).
+    pub(crate) static REPREPARES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }

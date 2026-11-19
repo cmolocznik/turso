@@ -404,6 +404,24 @@ impl Pages {
                                 if seen.contains(&root) { "seen by" } else { "not seen by" },
                                 hex(&stored[..stored.len().min(48)]),
                             ));
+                            // What decided it, for an entry its snapshot does not see (GATE1).
+                            if !seen.contains(&root) {
+                                if let Some(v) = stored
+                                    .get(..crate::storage::atoll::txn::versioned::HEADER)
+                                    .and_then(
+                                        crate::storage::atoll::txn::versioned::Version::decode,
+                                    )
+                                {
+                                    let words =
+                                        db.atoll().transactions().visibility_words(txn, v.slot);
+                                    self.findings.add(format!(
+                                        "tree {}'s entry (slot {}, start {}): {words}",
+                                        root.raw(),
+                                        v.slot,
+                                        v.ts
+                                    ));
+                                }
+                            }
                         }
                         roots.insert(root);
                         *at = ListAt::Next;

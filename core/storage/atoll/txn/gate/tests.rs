@@ -371,6 +371,8 @@ fn writers_and_exclusive_takers_all_finish(threads: usize, rounds: usize) -> usi
                             Taken::Done => break,
                             Taken::Behind { .. } | Taken::Holders(_) => park(&c, &waits),
                             Taken::Lost => panic!("a take lost with no victim"),
+                            // Drained; the horizon covers the last holder's commit on its own.
+                            Taken::Covering(_) => crate::thread::yield_now(),
                         }
                     }
                     if !t.snapped() {

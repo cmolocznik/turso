@@ -964,7 +964,7 @@ impl Transactions {
     pub fn take_exclusive(&self, txn: &mut Txn, c: &Completion) -> Result<Taken> {
         self.refuse_if_failed()?;
         let (word, shared) = match txn.hold {
-            Hold::Exclusive { .. } => return Ok(Taken::Done),
+            Hold::Exclusive { .. } => return Ok(self.snapshot_once_covered(txn)),
             Hold::Pending { word, shared } => (word, shared),
             hold => {
                 let shared = hold == Hold::Shared;
@@ -998,16 +998,65 @@ impl Transactions {
         }
         txn.hold = Hold::Exclusive { word, shared };
         if !txn.snapped {
-            self.take_snapshot(txn);
+            return Ok(self.snapshot_once_covered(txn));
         } else if txn.snapshot < self.gate.schema() {
             return Err(LimboError::SchemaConflict);
         }
         Ok(Taken::Done)
     }
 
+    /// The snapshot of `txn`, which holds the gate exclusive with every holder drained, once the
+    /// horizon covers the newest commit in any slot's log ([`newest_commit`](Self::newest_commit)),
+    /// which every holder pushed before letting the gate go: only holders draw, so with the gate
+    /// on the horizon already covers it, which the assertion holds; a test's hold of the horizon
+    /// is what the wait is for (GATE1). Done with a snapshot taken already.
+    fn snapshot_once_covered(&self, txn: &mut Txn) -> Taken {
+        if txn.snapped {
+            return Taken::Done;
+        }
+        let newest = self.newest_commit();
+        if self.horizon.at() < newest {
+            #[cfg(all(test, not(atoll_loom)))]
+            let held = self.horizon.held_for_test();
+            #[cfg(not(all(test, not(atoll_loom))))]
+            let held = false;
+            assert!(
+                held || !self.gated.load(std::sync::atomic::Ordering::Acquire),
+                "an exclusive taker, every holder drained, found the horizon {} below the last \
+                 commit in any slot's log, {newest}",
+                self.horizon.at()
+            );
+            crate::race::point("txn.exclusive_covering");
+            if self.wait_covered(newest).is_some() {
+                return Taken::Covering(newest);
+            }
+        }
+        self.take_snapshot(txn);
+        Taken::Done
+    }
+
+    /// The newest commit timestamp in any slot's commit log: for an exclusive taker with every
+    /// holder drained, each having pushed its pair before letting the gate go, the newest commit
+    /// a holder published. A slot with no commit since the database opened gives its log's base,
+    /// below every snapshot. A walk of the slots, on a schema change's or a check's take alone.
+    fn newest_commit(&self) -> Ts {
+        self.slots
+            .iter()
+            .map(|log| match log.len.load(Ordering::Acquire) {
+                0 => log.base,
+                n => log.pair(n - 1).1,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Hands back `txn`'s exclusive hold, its schema write refused before it wrote anything,
     /// waking whoever waits behind it; a shared hold it had before stays.
     pub fn hand_back_exclusive(&self, txn: &mut Txn) {
+        crate::turso_assert!(
+            !txn.wrote(),
+            "a transaction that wrote under the write gate hands its exclusive hold back"
+        );
         if let Hold::Exclusive { word, shared } = txn.hold {
             self.gate.release_exclusive(word, None);
             txn.hold = if shared { Hold::Shared } else { Hold::None };
@@ -1376,6 +1425,30 @@ impl Transactions {
             self.release(txn.slot);
         }
         Ok(IOResult::Done(()))
+    }
+
+    /// What decides whether `txn`'s snapshot sees a version of `slot`'s, in words, for a finding
+    /// that says a committed-looking version is not seen: the snapshot, the horizon, the newest
+    /// commit of any slot, the schema's timestamp, and the slot's commit log as the snapshot reads
+    /// it.
+    pub fn visibility_words(&self, txn: &Txn, slot: u16) -> String {
+        let log = &self.slots[slot as usize];
+        let n = log.len.load(Ordering::Acquire);
+        let (newest_start, newest_commit) = match n {
+            0 => (log.base, 0),
+            n => log.pair(n - 1),
+        };
+        format!(
+            "the check's snapshot {}, the horizon {}, the newest commit of any slot {}, the \
+             schema's {}; slot {slot}: the last start committed by that snapshot {}, its newest \
+             commit (start {newest_start}, commit {newest_commit}) of {n} since its base {}",
+            txn.snapshot,
+            self.horizon.at(),
+            self.newest_commit(),
+            self.gate.schema(),
+            log.last_at(txn.snapshot),
+            log.base,
+        )
     }
 
     /// `None` once every snapshot taken from now on sees the commit at `ts`, the horizon covering

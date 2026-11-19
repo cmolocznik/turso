@@ -352,6 +352,429 @@ fn a_tree_the_catalog_names_and_the_dropped_list_holds_is_found_with_both_sides(
     );
 }
 
+/// A list entry the check's snapshot does not see is found with what decided it (GATE1): the
+/// check's snapshot, the horizon, the newest commit of any slot and the schema's, and the entry's
+/// slot's commit log as that snapshot reads it. The entry is a dropped table's, copied under a
+/// named tree's root with its start moved past every commit of its slot.
+#[test]
+fn a_dropped_list_entry_the_check_does_not_see_is_found_with_what_decided_it() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_dropped_list_entry_the_check_does_not_see_is_found_with_what_decided_it"
+        ),
+        || {
+            use crate::storage::atoll::txn::versioned::{Version, HEADER};
+            let (db, conn) = used("/db/integrity-dropped-unseen");
+            let adb = atoll(&db);
+            conn.execute("CREATE TABLE u(x)").unwrap();
+            conn.execute("INSERT INTO u VALUES (1)").unwrap();
+            let gone = entry_of(&conn, adb, "u").root;
+            let reader = db.connect(ConnectOpts::new()).unwrap();
+            reader.execute("BEGIN").unwrap();
+            assert_eq!(rows(&reader, "SELECT count(*) FROM u").len(), 1);
+            conn.execute("DROP TABLE u").unwrap();
+            let list = adb.dropped().tree();
+            let mut stored = {
+                let mut cursor = crate::storage::atoll::btree::Cursor::new();
+                let key = gone.raw().to_be_bytes();
+                let found = drive(adb.io(), || {
+                    list.seek(&mut cursor, &key, crate::storage::atoll::btree::Seek::Ge)
+                })
+                .unwrap();
+                assert!(
+                    found && cursor.key() == Some(&key[..]),
+                    "u's root on the dropped list"
+                );
+                cursor.value().unwrap().to_vec()
+            };
+            let mut version = Version::decode(&stored[..HEADER]).expect("a version header");
+            version.ts += 1 << 40;
+            stored[..HEADER].copy_from_slice(&version.encode());
+            let root = entry_of(&conn, adb, "t").root;
+            let mut put = crate::storage::atoll::btree::Put::with_entry(
+                &root.raw().to_be_bytes(),
+                stored,
+                HEADER,
+                crate::storage::atoll::btree::Mode::Insert,
+            );
+            drive(adb.io(), || list.put(&mut put)).unwrap();
+            found(
+                &conn,
+                &[
+                    "the list's entry is not seen by that snapshot".to_string(),
+                    format!(
+                        "tree {}'s entry (slot {}, start {}): the check's snapshot ",
+                        root.raw(),
+                        version.slot,
+                        version.ts
+                    ),
+                    ", the horizon ".to_string(),
+                    ", the newest commit of any slot ".to_string(),
+                    format!(
+                        "; slot {}: the last start committed by that snapshot ",
+                        version.slot
+                    ),
+                ],
+            );
+            reader.execute("ROLLBACK").unwrap();
+        },
+    );
+}
+
+/// HAND-BACK1 (the hunt's fast seed 11): a schema statement refused with BusySnapshot inside a
+/// transaction that already holds the write gate exclusive, having written under it, keeps the
+/// hold: another connection's check meanwhile is Busy, not a walk of the transaction's uncommitted
+/// drop. A: BEGIN and a read (its snapshot); B: a committed write to t; A: DROP INDEX of another
+/// table's index (the gate taken, its entry on the Dropped list); A: CREATE INDEX on t, refused.
+#[test]
+fn a_schema_write_refused_in_a_transaction_that_holds_the_gate_keeps_it() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_schema_write_refused_in_a_transaction_that_holds_the_gate_keeps_it"
+        ),
+        || {
+            let (db, a) = used("/db/hand-back");
+            a.execute("CREATE TABLE u(x)").unwrap();
+            a.execute("CREATE INDEX u_x ON u(x)").unwrap();
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            let c = db.connect(ConnectOpts::new()).unwrap();
+            a.execute("BEGIN").unwrap();
+            assert_eq!(rows(&a, "SELECT count(*) FROM t").len(), 1);
+            b.execute("INSERT INTO t(v) VALUES ('after the snapshot')")
+                .unwrap();
+            a.execute("DROP INDEX u_x").unwrap();
+            let refused = a
+                .execute("CREATE INDEX t_again ON t(substr(v, 1, 4))")
+                .map_err(|e| e.to_string());
+            let checked = c
+                .prepare("PRAGMA integrity_check")
+                .and_then(|mut s| s.run_collect_rows())
+                .map_err(|e| e.to_string());
+            let _ = a.execute("ROLLBACK");
+            let after = integrity(&c);
+            assert!(
+                matches!(&refused, Err(e) if e.contains("snapshot")),
+                "the CREATE INDEX was not refused for its stale snapshot: {refused:?}"
+            );
+            assert!(
+                matches!(&checked, Err(e) if e.contains("busy") || e.contains("Busy")),
+                "a check beside a transaction holding the gate with an uncommitted DROP INDEX \
+                 did not wait for it: {checked:?}"
+            );
+            assert_eq!(after, ok(), "the check after the ROLLBACK");
+        },
+    );
+}
+
+/// HAND-BACK1's state: A in a transaction that dropped u's index under the gate, its CREATE INDEX
+/// on t refused for a stale snapshot; B and C other connections.
+fn a_refused_schema_write_beside_its_drop(
+    path: &str,
+) -> (
+    Arc<Database>,
+    Arc<Connection>,
+    Arc<Connection>,
+    Result<(), String>,
+) {
+    let (db, a) = used(path);
+    a.execute("CREATE TABLE u(x)").unwrap();
+    a.execute("INSERT INTO u VALUES (1), (2)").unwrap();
+    a.execute("CREATE INDEX u_x ON u(x)").unwrap();
+    let b = db.connect(ConnectOpts::new()).unwrap();
+    let c = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&a, "SELECT count(*) FROM t").len(), 1);
+    b.execute("INSERT INTO t(v) VALUES ('after the snapshot')")
+        .unwrap();
+    a.execute("DROP INDEX u_x").unwrap();
+    let refused = a
+        .execute("CREATE INDEX t_again ON t(substr(v, 1, 4))")
+        .map_err(|e| e.to_string());
+    (db, a, c, refused)
+}
+
+/// What the catalog names and what the dropped list holds, in words.
+fn schema_and_list(db: &Arc<Database>, conn: &Arc<Connection>) -> String {
+    format!(
+        "catalog {:?}; dropped {}",
+        rows(
+            conn,
+            "SELECT type, name FROM sqlite_schema WHERE name LIKE 'u%' ORDER BY name"
+        ),
+        dropped_keys(db).len()
+    )
+}
+
+/// HAND-BACK1, the other face: another connection's schema statement beside A's uncommitted DROP
+/// INDEX waits for A (Busy), whether A then rolls back or commits.
+#[test]
+fn a_schema_statement_beside_a_refused_transactions_drop_waits() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_schema_statement_beside_a_refused_transactions_drop_waits"
+        ),
+        || {
+            for end in ["ROLLBACK", "COMMIT"] {
+                let (db, a, c, refused) =
+                    a_refused_schema_write_beside_its_drop(&format!("/db/hand-back-ddl-{end}"));
+                let drop_table = c.execute("DROP TABLE u").map_err(|e| e.to_string());
+                let create = c
+                    .execute("CREATE TABLE beside(x)")
+                    .map_err(|e| e.to_string());
+                let ended = a.execute(end).map_err(|e| e.to_string());
+                let after = schema_and_list(&db, &c);
+                let check = integrity(&c);
+                eprintln!(
+                    "HAND-BACK1 {end}: refused {refused:?}; C's DROP TABLE {drop_table:?}; C's \
+                     CREATE TABLE {create:?}; A's {end} {ended:?}; after {after}; check {check:?}"
+                );
+                let busy = |r: &Result<(), String>| matches!(r, Err(e) if e.to_lowercase().contains("busy"));
+                assert!(
+                    busy(&drop_table) && busy(&create),
+                    "{end}: another connection's DDL beside A's uncommitted DROP INDEX: DROP \
+                     TABLE {drop_table:?}, CREATE TABLE {create:?}"
+                );
+                assert_eq!(check, ok(), "{end}: the check after A's {end}");
+            }
+        },
+    );
+}
+
+/// HAND-BACK1 (c): A, refused with BusySnapshot on one statement, keeps what it wrote before:
+/// its COMMIT commits the DROP INDEX, its ROLLBACK takes it back; the gate is free after either.
+#[test]
+fn a_transaction_refused_one_schema_statement_commits_or_rolls_back_the_rest() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_transaction_refused_one_schema_statement_commits_or_rolls_back_the_rest"
+        ),
+        || {
+            for (end, index_left) in [("COMMIT", 0), ("ROLLBACK", 1)] {
+                let (db, a, c, refused) =
+                    a_refused_schema_write_beside_its_drop(&format!("/db/hand-back-end-{end}"));
+                let ended = a.execute(end).map_err(|e| e.to_string());
+                let index = rows(&c, "SELECT count(*) FROM sqlite_schema WHERE name = 'u_x'");
+                let free = c
+                    .execute("CREATE TABLE gate_free(x)")
+                    .map_err(|e| e.to_string());
+                eprintln!(
+                    "HAND-BACK1 end {end}: refused {refused:?}; ended {ended:?}; u_x {index:?}; \
+                     another DDL after {free:?}; {}",
+                    schema_and_list(&db, &c)
+                );
+                assert_eq!(ended, Ok(()), "A's {end} after its refused CREATE INDEX");
+                assert_eq!(
+                    index,
+                    vec![vec![Value::from_i64(index_left)]],
+                    "u_x after A's {end}"
+                );
+                assert_eq!(free, Ok(()), "the gate after A's {end}");
+                assert_eq!(integrity(&c), ok(), "the check after A's {end}");
+            }
+        },
+    );
+}
+
+/// HAND-BACK1 (#6540): a transaction that wrote only rows under a shared hold is refused its first
+/// schema statement for a stale snapshot before its exclusive take (the check ahead of the take):
+/// it keeps its shared hold alone, so another writer goes beside it, and its ROLLBACK undoes its
+/// row.
+#[test]
+fn a_row_writer_refused_its_first_schema_statement_keeps_only_its_shared_hold() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_row_writer_refused_its_first_schema_statement_keeps_only_its_shared_hold"
+        ),
+        || {
+            let (db, a) = used("/db/hand-back-rows");
+            a.execute("CREATE TABLE u(x)").unwrap();
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            let c = db.connect(ConnectOpts::new()).unwrap();
+            a.execute("BEGIN").unwrap();
+            assert_eq!(rows(&a, "SELECT count(*) FROM t").len(), 1);
+            b.execute("INSERT INTO t(v) VALUES ('after the snapshot')")
+                .unwrap();
+            a.execute("INSERT INTO u VALUES (1)").unwrap();
+            let refused = a
+                .execute("CREATE INDEX t_again ON t(substr(v, 1, 4))")
+                .map_err(|e| e.to_string());
+            let beside = c
+                .execute("INSERT INTO u VALUES (2)")
+                .map_err(|e| e.to_string());
+            let ended = a.execute("ROLLBACK").map_err(|e| e.to_string());
+            let after = c
+                .execute("INSERT INTO u VALUES (3)")
+                .map_err(|e| e.to_string());
+            assert!(
+                matches!(&refused, Err(e) if e.contains("snapshot")),
+                "the CREATE INDEX was not refused for its stale snapshot: {refused:?}"
+            );
+            assert_eq!(
+                (beside, ended, after),
+                (Ok(()), Ok(()), Ok(())),
+                "another writer beside the refused row writer, A's ROLLBACK, the writer again"
+            );
+            assert_eq!(
+                rows(&c, "SELECT x FROM u ORDER BY x"),
+                vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]]
+            );
+            assert_eq!(integrity(&c), ok());
+        },
+    );
+}
+
+/// HAND-BACK1 (#6544): an exclusive take MADE and then refused. A wrote a row under its shared
+/// hold; its CREATE INDEX on t passes the stale check ahead of the take and waits for B, another
+/// shared holder, to drain; B's commit (a row of t) makes A's read stale; A's take is made and the
+/// check after it refuses. A has written, so it keeps the exclusive hold until it ends: C's INSERT
+/// is Busy meanwhile and goes after A's ROLLBACK.
+#[test]
+fn an_exclusive_take_made_and_refused_by_a_row_writer_keeps_the_hold_until_it_ends() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_exclusive_take_made_and_refused_by_a_row_writer_keeps_the_hold_until_it_ends"
+        ),
+        || {
+            let (db, a) = used("/db/hand-back-drain");
+            a.execute("CREATE TABLE u(x)").unwrap();
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            let c = db.connect(ConnectOpts::new()).unwrap();
+            a.execute("PRAGMA busy_timeout = 60000").unwrap();
+            a.execute("BEGIN").unwrap();
+            assert_eq!(rows(&a, "SELECT count(*) FROM t").len(), 1);
+            a.execute("INSERT INTO u VALUES (1)").unwrap();
+            b.execute("BEGIN").unwrap();
+            b.execute("INSERT INTO t(v) VALUES ('in the drain')")
+                .unwrap();
+            let mut create = a
+                .prepare("CREATE INDEX t_again ON t(substr(v, 1, 4))")
+                .unwrap();
+            let mut waited = 0;
+            let first = loop {
+                match create.step() {
+                    Ok(crate::StepResult::IO) if waited < 3 => {
+                        waited += 1;
+                        create._io().step().unwrap();
+                    }
+                    Ok(crate::StepResult::Yield) => {}
+                    other => break other.map(|r| format!("{r:?}")).map_err(|e| e.to_string()),
+                }
+            };
+            assert_eq!(
+                (waited, first),
+                (3, Ok("IO".to_string())),
+                "A's CREATE INDEX did not wait in the drain for B"
+            );
+            b.execute("COMMIT").unwrap();
+            let refused = loop {
+                match create.step() {
+                    Ok(crate::StepResult::IO) => create._io().step().unwrap(),
+                    Ok(crate::StepResult::Yield) => {}
+                    Ok(crate::StepResult::Done) => break Ok(()),
+                    Ok(other) => break Err(format!("{other:?}")),
+                    Err(e) => break Err(e.to_string()),
+                }
+            };
+            drop(create);
+            let beside = c
+                .execute("INSERT INTO u VALUES (2)")
+                .map_err(|e| e.to_string());
+            let ended = a.execute("ROLLBACK").map_err(|e| e.to_string());
+            let after = c
+                .execute("INSERT INTO u VALUES (3)")
+                .map_err(|e| e.to_string());
+            assert!(
+                matches!(&refused, Err(e) if e.contains("snapshot")),
+                "A's CREATE INDEX after the drain was not refused for its stale snapshot: \
+                 {refused:?}"
+            );
+            assert!(
+                matches!(&beside, Err(e) if e.to_lowercase().contains("busy")),
+                "a writer beside A, which made its exclusive take and wrote before: {beside:?}"
+            );
+            assert_eq!(
+                (ended, after),
+                (Ok(()), Ok(())),
+                "A's ROLLBACK, then C's INSERT"
+            );
+            assert_eq!(rows(&c, "SELECT x FROM u"), vec![vec![Value::from_i64(3)]]);
+            assert_eq!(integrity(&c), ok());
+        },
+    );
+}
+
+/// GATE1 (#6551): a statement parked in the schema retry's wait (below a published DROP INDEX, the
+/// horizon held) and then dropped holds nothing: once the horizon goes, the drop commits, the
+/// connection runs another statement and closes, and a check finds nothing.
+#[test]
+fn a_statement_dropped_at_the_schema_retrys_wait_holds_nothing() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_statement_dropped_at_the_schema_retrys_wait_holds_nothing"
+        ),
+        || {
+            let (db, conn) = used("/db/hg-dropped-at-wait");
+            let other = db.connect(ConnectOpts::new()).unwrap();
+            let txns = atoll(&db).atoll().transactions();
+            let cookie = || {
+                atoll(&db)
+                    .header()
+                    .committed_at(super::super::header::Field::SchemaCookie)
+            };
+            let before = cookie();
+            txns.hold_horizon(true);
+            let dropper = std::thread::spawn(move || {
+                other.execute("DROP INDEX t_v").map_err(|e| e.to_string())
+            });
+            let mut published = false;
+            for _ in 0..10_000_000 {
+                if cookie() > before {
+                    published = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(published, "the drop's commit was never published");
+            let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+            let parked = loop {
+                match stmt.step() {
+                    Ok(crate::StepResult::Yield) => {}
+                    other => break other.map(|r| format!("{r:?}")).map_err(|e| e.to_string()),
+                }
+            };
+            assert_eq!(
+                parked,
+                Ok("IO".to_string()),
+                "the statement did not park at the wait"
+            );
+            assert!(
+                stmt.pending_io_for_test().is_some(),
+                "the parked statement holds no completion"
+            );
+            // Dropped at the wait: its reset runs the idle check (no transaction left in the
+            // connection's cells), and nothing it held keeps the horizon or the drop waiting.
+            drop(stmt);
+            txns.hold_horizon(false);
+            let next = conn.execute("INSERT INTO t(v) VALUES ('after the drop of the parked one')");
+            assert_eq!(dropper.join().unwrap(), Ok(()), "the drop");
+            conn.close().unwrap();
+            let reader = db.connect(ConnectOpts::new()).unwrap();
+            assert_eq!(
+                (next.map_err(|e| e.to_string()), integrity(&reader)),
+                (Ok(()), ok()),
+                "the connection's next statement, then a check"
+            );
+        },
+    );
+}
+
 /// A page a tree reaches, freed behind its back once written back, is found as reached and free.
 #[test]
 fn a_freed_page_a_tree_reaches_is_found() {
@@ -3217,6 +3640,491 @@ fn a_drop_rolled_back_leaves_nothing_a_check_finds() {
         other.execute("ROLLBACK").unwrap();
         assert_eq!(integrity(&conn), ok(), "{sql} rolled back");
     }
+}
+
+/// HORIZON-GATE1 (#6487-#6490), the capture's road: a check whose snapshot, taken once it holds
+/// the gate, is the horizon, and the horizon not yet over a DROP INDEX committed just before. The
+/// catalog at that snapshot still names the index's tree, the list holds the drop's committed
+/// entry, and the snapshot does not see it: the capture's words, with nothing left behind.
+#[test]
+fn a_check_whose_snapshot_lags_a_committed_drop_finds_nothing() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_check_whose_snapshot_lags_a_committed_drop_finds_nothing"
+        ),
+        || {
+            let (db, conn) = used("/db/integrity-horizon-lag");
+            let other = db.connect(ConnectOpts::new()).unwrap();
+            let txns = atoll(&db).atoll().transactions();
+            txns.hold_horizon(true);
+            // The drop publishes its commit and lets the gate go, then waits for the horizon to cover it:
+            // on a thread of its own, which the check runs beside.
+            let dropper = std::thread::spawn(move || {
+                other.execute("DROP INDEX t_v").map_err(|e| e.to_string())
+            });
+            // The drop's entry on the list, read raw, says its put landed; the check then runs once the
+            // drop has let the gate go, Busy until then.
+            let before = dropped_keys(&db).len();
+            let mut landed = false;
+            for _ in 0..1_000_000 {
+                if dropped_keys(&db).len() > before {
+                    landed = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // The check's snapshot is taken as it takes the gate; its own full checkpoint, which waits
+            // for the horizon, comes after: the horizon is let go there.
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let (db, released) = (db.clone(), released.clone());
+                crate::race::at("integrity.host_checkpoint", move || {
+                    atoll(&db).atoll().transactions().hold_horizon(false);
+                    released.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            // Mended, the take waits for the horizon before its snapshot: let go there too.
+            {
+                let (db, released) = (Arc::downgrade(&db), released.clone());
+                crate::race::at("txn.exclusive_covering", move || {
+                    let db = db.upgrade().expect("the database is open at the take");
+                    atoll(&db).atoll().transactions().hold_horizon(false);
+                    released.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            let mut checked = Err("never ran".to_string());
+            for _ in 0..100_000 {
+                checked = conn
+                    .prepare("PRAGMA integrity_check")
+                    .and_then(|mut s| s.run_collect_rows())
+                    .map_err(|e| e.to_string());
+                if !matches!(&checked, Err(e) if e.contains("busy") || e.contains("Busy")) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(landed, "the drop's entry never reached the list");
+            if !released.load(std::sync::atomic::Ordering::SeqCst) {
+                txns.hold_horizon(false);
+            }
+            let drop_result = dropper.join().unwrap();
+            let after = integrity(&conn);
+            assert_eq!(
+        (drop_result, format!("{checked:?}"), after),
+        (Ok(()), format!("{:?}", Ok::<_, String>(ok())), ok()),
+        "(the drop, the check run while the drop's commit waited on the horizon, the check after)"
+    );
+        },
+    );
+}
+
+thread_local! {
+    /// The reprepares the last `a_writer_below_a_committed_drop` counted for its statement.
+    static LAST_REPREPARES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// HORIZON-GATE1's writers (#6489 item 2): DROP INDEX t_v committed on its own thread with the
+/// horizon held, so a fresh writer on another connection takes the gate with a snapshot below the
+/// drop's commit, which still names t_v; the horizon is let go at that writer's commit. What the
+/// writer's statement came to, and the integrity check once both have ended.
+fn a_writer_below_a_committed_drop(
+    path: &str,
+    sql: &'static str,
+) -> (Result<(), String>, Vec<Vec<Value>>) {
+    let (db, conn) = used(path);
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let txns = atoll(&db).atoll().transactions();
+    let cookie = || {
+        atoll(&db)
+            .header()
+            .committed_at(super::super::header::Field::SchemaCookie)
+    };
+    let before = cookie();
+    txns.hold_horizon(true);
+    let dropper =
+        std::thread::spawn(move || other.execute("DROP INDEX t_v").map_err(|e| e.to_string()));
+    // The drop's commit published (its schema cookie with it), the horizon still below it.
+    let mut published = false;
+    for _ in 0..10_000_000 {
+        if cookie() > before {
+            published = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(published, "the drop's commit was never published");
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        // The database held weakly: a hook the writer never reached is dropped at the thread's end.
+        let (db, released) = (Arc::downgrade(&db), released.clone());
+        crate::race::at("txn.before_reserved_at", move || {
+            let db = db
+                .upgrade()
+                .expect("the database is open at the writer's commit");
+            atoll(&db).atoll().transactions().hold_horizon(false);
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    {
+        let (db, released) = (Arc::downgrade(&db), released.clone());
+        crate::race::at("txn.exclusive_covering", move || {
+            let db = db.upgrade().expect("the database is open at the take");
+            atoll(&db).atoll().transactions().hold_horizon(false);
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    {
+        let (db, released) = (Arc::downgrade(&db), released.clone());
+        crate::race::at("statement.schema_cover_wait", move || {
+            let db = db.upgrade().expect("the database is open at the wait");
+            atoll(&db).atoll().transactions().hold_horizon(false);
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    crate::statement::REPREPARES.with(|n| n.set(0));
+    let mut out = Err("never ran".to_string());
+    for _ in 0..100_000 {
+        out = conn.execute(sql).map_err(|e| e.to_string());
+        if !matches!(&out, Err(e) if e.to_lowercase().contains("busy")) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if !released.load(std::sync::atomic::Ordering::SeqCst) {
+        txns.hold_horizon(false);
+    }
+    let reprepares = crate::statement::REPREPARES.with(|n| n.get());
+    eprintln!("HG {sql}: the writer's statement came to {out:?} after {reprepares} reprepares");
+    LAST_REPREPARES.with(|n| n.set(reprepares));
+    assert_eq!(dropper.join().unwrap(), Ok(()), "the drop");
+    eprintln!("HG {sql}: the drop joined");
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let check = reader
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut s| s.run_collect_rows());
+    eprintln!("HG {sql}: the check after came to {check:?}");
+    (out, check.unwrap_or_default())
+}
+
+#[test]
+fn a_writer_below_a_committed_drop_dropping_the_index_again() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_writer_below_a_committed_drop_dropping_the_index_again"
+        ),
+        || {
+            let (out, check) =
+                a_writer_below_a_committed_drop("/db/hg-drop-again", "DROP INDEX t_v");
+            assert_eq!(
+                (out, check),
+                (Err("No such index: t_v".to_string()), ok()),
+                "(a second DROP INDEX below the drop's commit, the check after)"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_writer_below_a_committed_drop_dropping_its_table() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_writer_below_a_committed_drop_dropping_its_table"
+        ),
+        || {
+            let (out, check) = a_writer_below_a_committed_drop("/db/hg-drop-table", "DROP TABLE t");
+            assert_eq!(
+                (out, check),
+                (Ok(()), ok()),
+                "(DROP TABLE of the index's table below the drop's commit, the check after)"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_writer_below_a_committed_drop_inserting_into_its_table() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_writer_below_a_committed_drop_inserting_into_its_table"
+        ),
+        || {
+            let (out, check) = a_writer_below_a_committed_drop(
+                "/db/hg-insert",
+                "INSERT INTO t(v) VALUES ('below the drop')",
+            );
+            assert_eq!(
+                (out, check, LAST_REPREPARES.with(|n| n.get())),
+                (Ok(()), ok(), 1),
+                "(an INSERT below the drop's commit, the check after, its reprepares)"
+            );
+        },
+    );
+}
+
+/// GATE1 (#6549): a reader begun below a published DROP INDEX, its snapshot below the drop's
+/// commit, waits once for the horizon to cover the commit that published the schema it holds, and
+/// reads after one reprepare.
+#[test]
+fn a_reader_below_a_committed_drop_reads_after_one_reprepare() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_reader_below_a_committed_drop_reads_after_one_reprepare"
+        ),
+        || {
+            let (out, check) =
+                a_writer_below_a_committed_drop("/db/hg-select", "SELECT count(*) FROM t");
+            assert_eq!(
+                (out, check, LAST_REPREPARES.with(|n| n.get())),
+                (Ok(()), ok(), 1),
+                "(a SELECT below the drop's commit, the check after, its reprepares)"
+            );
+        },
+    );
+}
+
+/// The keys on the Dropped list, read raw.
+fn dropped_keys(db: &Database) -> Vec<Vec<u8>> {
+    let adb = atoll(db);
+    let list = adb.dropped().tree();
+    let mut out = Vec::new();
+    let mut cursor = crate::storage::atoll::btree::Cursor::new();
+    let mut from: Vec<u8> = Vec::new();
+    loop {
+        let found = drive(adb.io(), || {
+            list.seek(&mut cursor, &from, crate::storage::atoll::btree::Seek::Gt)
+        })
+        .unwrap();
+        if !found {
+            return out;
+        }
+        from = cursor.key().unwrap().to_vec();
+        out.push(from.clone());
+    }
+}
+
+/// The CREATE INDEX of a name another connection dropped, with nothing held back: does the
+/// connection's own schema let it through once the drop has committed?
+#[test]
+fn a_create_index_of_a_name_another_connection_dropped_goes() {
+    let (db, conn) = used("/db/create-after-drop");
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    other.execute("DROP INDEX t_v").unwrap();
+    let out = conn
+        .execute("CREATE INDEX t_v ON t(substr(v, 1, 8))")
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        out,
+        Ok(()),
+        "CREATE INDEX of the dropped name, after the drop committed"
+    );
+}
+
+/// The capture's road with the gate on and no hook (#6504 item 2 (b)): a check inside an explicit
+/// transaction whose snapshot was taken by a read before another connection's statement put a
+/// tree on the Dropped list and committed. Wanted: SchemaConflict, or "ok".
+fn a_check_inside_an_old_read_after(path: &str, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    let (db, conn) = used(path);
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(rows(&conn, "SELECT count(*) FROM t").len(), 1);
+    other.execute(sql).unwrap();
+    let checked = conn
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut s| s.run_collect_rows())
+        .map_err(|e| e.to_string());
+    let _ = conn.execute("ROLLBACK");
+    eprintln!("OLD-READ {sql}: {checked:?}");
+    checked
+}
+
+fn no_finding(checked: &Result<Vec<Vec<Value>>, String>) -> bool {
+    match checked {
+        Ok(rows) => *rows == ok(),
+        Err(e) => e.contains("conflict") || e.contains("Conflict") || e.contains("schema"),
+    }
+}
+
+#[test]
+fn a_check_inside_an_old_read_after_a_drop_index() {
+    let checked = a_check_inside_an_old_read_after("/db/old-read-drop-index", "DROP INDEX t_v");
+    assert!(no_finding(&checked), "{checked:?}");
+}
+
+#[test]
+fn a_check_inside_an_old_read_after_a_drop_table() {
+    let checked = a_check_inside_an_old_read_after("/db/old-read-drop-table", "DROP TABLE t");
+    assert!(no_finding(&checked), "{checked:?}");
+}
+
+#[test]
+fn a_check_inside_an_old_read_after_a_delete_of_every_row() {
+    let checked = a_check_inside_an_old_read_after("/db/old-read-delete", "DELETE FROM t");
+    assert!(no_finding(&checked), "{checked:?}");
+}
+
+/// The Clear: a DELETE of every row of a table with no index replaces its tree under the same
+/// name, its old root on the Dropped list.
+#[test]
+fn a_check_inside_an_old_read_after_a_clear() {
+    let (db, conn) = used("/db/old-read-clear");
+    conn.execute("CREATE TABLE plain(x)").unwrap();
+    conn.execute("INSERT INTO plain SELECT value FROM generate_series(1, 50)")
+        .unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(rows(&conn, "SELECT count(*) FROM plain").len(), 1);
+    other.execute("DELETE FROM plain").unwrap();
+    let checked = conn
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut s| s.run_collect_rows())
+        .map_err(|e| e.to_string());
+    let _ = conn.execute("ROLLBACK");
+    eprintln!("OLD-READ clear: {checked:?}");
+    assert!(no_finding(&checked), "{checked:?}");
+}
+
+#[test]
+fn a_check_inside_an_old_read_after_a_reindex() {
+    let checked = a_check_inside_an_old_read_after("/db/old-read-reindex", "REINDEX t_v");
+    assert!(no_finding(&checked), "{checked:?}");
+}
+
+/// GATE-LEAK1 (#6495-#6498): a statement that meets a schema-cookie mismatch at each of its 51
+/// attempts gives up with "Database schema changed". Its connection, back in autocommit and idle,
+/// must hold nothing: another connection's INSERT goes. The mismatches are forced on this thread
+/// (the only road found in one process is a snapshot held behind the horizon).
+fn a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(path: &str, sql: &str) {
+    let (db, conn) = used(path);
+    conn.execute("CREATE TABLE u(x)").unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    crate::vdbe::execute::FORCED_SCHEMA_MISMATCHES.with(|n| n.set(51));
+    let out = conn.execute(sql).map_err(|e| e.to_string());
+    crate::vdbe::execute::FORCED_SCHEMA_MISMATCHES.with(|n| n.set(0));
+    let insert = other
+        .execute("INSERT INTO t(v) VALUES ('after the give-up')")
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        (out, insert),
+        (Err("Database schema changed".to_string()), Ok(())),
+        "({sql} forced through every retry, another connection's INSERT after it)"
+    );
+}
+
+#[test]
+fn a_drop_table_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_drop_table_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-drop-table",
+                "DROP TABLE u",
+            );
+        },
+    );
+}
+
+#[test]
+fn a_drop_index_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_drop_index_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-drop-index",
+                "DROP INDEX t_v",
+            );
+        },
+    );
+}
+
+#[test]
+fn a_create_table_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_create_table_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-create-table",
+                "CREATE TABLE w(x)",
+            );
+        },
+    );
+}
+
+#[test]
+fn a_create_index_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_create_index_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-create-index",
+                "CREATE INDEX t_id ON t(id)",
+            );
+        },
+    );
+}
+
+#[test]
+fn an_alter_table_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_alter_table_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-alter",
+                "ALTER TABLE t ADD COLUMN extra",
+            );
+        },
+    );
+}
+
+#[test]
+fn an_integrity_check_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_integrity_check_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-check",
+                "PRAGMA integrity_check",
+            );
+        },
+    );
+}
+
+#[test]
+fn an_insert_that_gives_up_on_the_schema_leaves_the_gate_free() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::an_insert_that_gives_up_on_the_schema_leaves_the_gate_free"
+        ),
+        || {
+            a_statement_that_gives_up_on_the_schema_leaves_the_gate_free(
+                "/db/gl-insert",
+                "INSERT INTO t(v) VALUES ('given up')",
+            );
+        },
+    );
 }
 
 /// DROPPED-LIST1, #6434 items 2 and 3: an autocommit DROP INDEX stepped in frames and abandoned

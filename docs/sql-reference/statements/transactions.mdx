@@ -92,6 +92,8 @@ A few failures cannot be undone statement-by-statement (for example running out 
 
 A deadlock also rolls back the whole transaction. With the Atoll storage engine, transactions on different connections can each wait for a row or for the write lock that another one holds, so that none of them can go on. One of them is then chosen and rolled back, and its statement fails with `database is deadlocked: this transaction was rolled back to break a cycle of waits`; the others go on. Run the rolled-back transaction again. A wait that is not part of such a cycle ends with busy once the busy timeout passes.
 
+With the Atoll storage engine, a schema statement (such as `CREATE INDEX`) inside a transaction fails with `snapshot is stale` when another connection has committed a change to a table it reads since the transaction began. Only that statement is refused: the transaction keeps what it did before and any write lock it already held (a transaction that changed the schema earlier keeps other schema changes waiting until it ends), and `COMMIT` commits its earlier changes while `ROLLBACK` undoes them. Run the transaction again to make the refused change.
+
 ## One Write Statement at a Time
 
 A connection runs one write statement at a time. A write statement is the connection's writer from the moment it starts until it finishes, fails, or is reset or finalized. That includes the time it spends waiting: for another connection's lock, for I/O, or between the rows of a `RETURNING` clause.

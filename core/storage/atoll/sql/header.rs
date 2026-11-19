@@ -137,6 +137,11 @@ impl Header {
         self.committed[field.index()].lock().1
     }
 
+    /// The commit timestamp of `field`'s newest published value; 0 for none since the open.
+    pub fn committed_at(&self, field: Field) -> Ts {
+        self.committed[field.index()].lock().0
+    }
+
     /// Publishes `value` of `field`, which the commit at `ts` wrote: it stands unless a newer
     /// commit's value already does.
     pub fn publish(&self, field: Field, ts: Ts, value: u32) {

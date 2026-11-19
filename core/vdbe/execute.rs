@@ -5250,7 +5250,7 @@ pub fn op_transaction_inner(
                 );
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
-                        if header_schema_cookie != *schema_cookie {
+                        if header_schema_cookie != *schema_cookie || forced_schema_mismatch() {
                             tracing::debug!(
                                 "schema changed, force reprepare: {} != {}",
                                 header_schema_cookie,
@@ -21739,6 +21739,31 @@ pub fn op_fk_guard_row(
     return_if_io!(state, atoll_cursor(state, *cursor_id)?.unseen_hit());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Schema-cookie checks on this thread still to report a mismatch, for a test that sends a
+    /// statement through its retries to the give-up (GATE-LEAK1).
+    pub(crate) static FORCED_SCHEMA_MISMATCHES: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Whether this schema-cookie check is one a test forces to mismatch; never in a build without tests.
+#[inline(always)]
+fn forced_schema_mismatch() -> bool {
+    #[cfg(test)]
+    {
+        FORCED_SCHEMA_MISMATCHES.with(|n| {
+            let left = n.get();
+            n.set(left.saturating_sub(1));
+            left > 0
+        })
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

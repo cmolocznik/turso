@@ -1656,6 +1656,39 @@ impl ConnTxn {
         self.transactions.own()
     }
 
+    /// Which cell holds a transaction, the connection's own or the one lent to `statement`, if
+    /// one does: for the check that a connection in autocommit with no statement active holds
+    /// none (GATE1). The view a schema reparse's pin holds is the reparse's, which ends it after
+    /// its reads, and is not counted.
+    #[turso_macros::atoll_entry]
+    pub fn holding_a_transaction(&self, statement: &StatementTxn) -> Option<&'static str> {
+        let own = &self.transactions.own().cell;
+        if !own.pinned() && own.observe().is_some() {
+            return Some("the connection's own");
+        }
+        (statement.holds_lent()
+            && self
+                .txn_of(TxnOf::Statement(statement))
+                .cell
+                .observe()
+                .is_some())
+        .then_some("the statement's lent one")
+    }
+
+    /// For a statement that met a schema-cookie mismatch, rolled its attempt back and reprepared:
+    /// `None` once the horizon covers the commit that published the schema cookie the connection
+    /// now holds, so a snapshot taken now sees that schema; until then, the completion to wait on
+    /// before the reprepared statement begins (GATE1). The header publishes the cookie with its
+    /// commit before the schema reaches any connection.
+    #[turso_macros::atoll_entry]
+    pub fn schema_cover_wait(&self) -> Option<crate::io::Completion> {
+        let ts = self
+            .db
+            .header()
+            .committed_at(super::header::Field::SchemaCookie);
+        self.db.atoll().transactions().wait_covered(ts)
+    }
+
     /// A statement's first run in Atoll mode: from then its name resolves to the connection's own
     /// transaction until it is lent one.
     #[turso_macros::atoll_entry]
@@ -2389,7 +2422,12 @@ impl ConnTxn {
                 Taken::Done => {
                     wait.lock().over()?;
                     if checks && done!(self.read_since_snapshot(sql_txn, txn, reads, read)) {
-                        txns.hand_back_exclusive(txn);
+                        // A transaction that wrote under the hold keeps it: its writes are
+                        // uncommitted until it ends, and no other taker may come beside them
+                        // (HAND-BACK1). One that wrote nothing gives it back.
+                        if !txn.wrote() {
+                            txns.hand_back_exclusive(txn);
+                        }
                         return Err(LimboError::BusySnapshot);
                     }
                 }
@@ -2415,6 +2453,7 @@ impl ConnTxn {
                     })?;
                     return wait.wait(&self.waits, c);
                 }
+                Taken::Covering(ts) => return Self::wait_until_covered(taking, txns, ts),
                 Taken::Holders(holders) => {
                     *taking = Some(c.clone());
                     let take = txn.pending_take().ok_or_else(|| {
@@ -2440,6 +2479,24 @@ impl ConnTxn {
             txns.take_snapshot(txn);
         }
         Ok(IOResult::Done(began))
+    }
+
+    /// An exclusive take held and drained, whose snapshot waits for the horizon to catch up with
+    /// what the last holder published, which cannot wait on this take (GATE1): `taking` let go, the
+    /// completion to wait on. Covered meanwhile, the take is stepped again and takes its snapshot. Out
+    /// of line, so that a begin that takes at once pays nothing for it.
+    #[cold]
+    #[inline(never)]
+    fn wait_until_covered<G>(
+        taking: G,
+        txns: &crate::storage::atoll::txn::Transactions,
+        ts: crate::storage::atoll::txn::Ts,
+    ) -> Result<IOResult<bool>> {
+        drop(taking);
+        Ok(IOResult::IO(IOCompletions(
+            txns.wait_covered(ts)
+                .unwrap_or_else(crate::io::Completion::new_yield),
+        )))
     }
 
     /// Whether a commit raised the stamp of a tree `reads` names past `txn`'s snapshot: the tree

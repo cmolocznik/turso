@@ -106,6 +106,12 @@ impl Horizon {
         self.held.store(self.at(), Ordering::SeqCst);
     }
 
+    /// Whether a test holds the horizon.
+    #[cfg(all(test, not(atoll_loom)))]
+    pub(super) fn held_for_test(&self) -> bool {
+        self.held.load(Ordering::SeqCst) != u64::MAX
+    }
+
     /// Lets a test's hold go: the horizon rises, and the commits waiting look again.
     #[cfg(all(test, not(atoll_loom)))]
     pub(super) fn let_go(&self, clock: &Clock) {

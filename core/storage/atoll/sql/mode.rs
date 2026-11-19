@@ -33,7 +33,6 @@ use super::AtollDb;
 use crate::io::FileSyncType;
 use crate::io::{Completion, OpenFlags, IO};
 use crate::storage::atoll::btree::{Mode, Near, Outcome};
-use crate::storage::atoll::buffer::MIN_DB_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::{drive, drive_for, drive_or_io};
@@ -123,14 +122,25 @@ fn holds_anything(io: &Arc<dyn IO>, path: &str) -> Result<bool> {
     }
 }
 
+/// The pool's budget for a database opened without a configuration: a ceiling, since the pool's
+/// memory is taken a batch at a time as pages are used (DEFAULT-CACHE1, #6364).
+pub(in crate::storage::atoll) const DEFAULT_BUDGET: usize = 256 << 20;
+
 /// The configuration an Atoll database opens with: the caller's, or for one opened without the
-/// option, Turso's default page cache, 2000 KiB (`cache_size` −2000), raised to the smallest
-/// budget a database takes, the pool with its log's ring (R26).
+/// option, [`DEFAULT_BUDGET`].
 #[turso_macros::atoll_entry]
 pub fn config_for(option: Option<&AtollConfig>) -> AtollConfig {
     option
         .cloned()
-        .unwrap_or_else(|| AtollConfig::with_budget(MIN_DB_BUDGET.max(2_048_000)))
+        .unwrap_or_else(|| AtollConfig::with_budget(DEFAULT_BUDGET))
+}
+
+/// The smallest configuration a database opens with: the pool of
+/// [`MIN_DB_BUDGET`](crate::storage::atoll::buffer::MIN_DB_BUDGET), with its log's ring, where
+/// every claim of a class that holds no batch drains another's. For tests that work the pool hard.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(in crate::storage::atoll) fn smallest_config() -> AtollConfig {
+    AtollConfig::with_budget(crate::storage::atoll::buffer::MIN_DB_BUDGET)
 }
 
 fn refused() -> LimboError {

@@ -7307,6 +7307,57 @@ fn a_page_owed_in_its_swap_copy_alone_read_in_after_the_cut_still_owes_the_cut_i
     );
 }
 
+/// A page owed to the cut, evicted to its swap copy so its batch holds no frame, and read back in
+/// while the walk passes an empty batch, still owes the cut its copy (DEFAULT-CACHE1): the walk
+/// passes a batch with no frame taken over whole, and the page's swap copy is listed by the shards'
+/// runs, as before the walk could pass a batch (mutant: a passed batch's grains never walked again
+/// by anything, the shards' pages not listed).
+#[test]
+fn a_page_read_back_in_while_the_walk_passes_an_empty_batch_still_owes_the_cut_its_copy() {
+    use crate::race;
+    use std::{cell::Cell, rc::Rc};
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-passed-batch", MIN_KEEPING_BUDGET);
+    const N: u64 = 1;
+    let pid = owed_page(&io, &pool, 1);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    let evicted = pool.evict_clean(pid);
+    let read_in = Rc::new(Cell::new(false));
+    {
+        // The pool held weakly: an action the walk never reached is dropped at the thread's end,
+        // where the pool must not be.
+        let (io, pool, read_in) = (io.clone(), Arc::downgrade(&pool), read_in.clone());
+        race::at("buffer.cut_run_passed_a_batch", move || {
+            let pool = pool.upgrade().expect("the pool is open during its cut");
+            // Evicted before the cut already: read in again here, from its swap copy.
+            read_back_in(&io, &pool, pid);
+            read_in.set(true);
+        });
+    }
+    let mut scan = CutScan::default();
+    let ended = finish_cut(&pool, N, &mut scan);
+    let passed = !race::pending("buffer.cut_run_passed_a_batch");
+    let listed = scan.owed.contains(&pid);
+    let (kept, imaged) = first_change_and_image(&io, &pool, pid, N);
+    pool.end_cut(N);
+    drop(pool);
+    assert!(evicted, "the page was not evicted");
+    assert!(passed, "the walk passed no empty batch");
+    assert!(
+        read_in.get(),
+        "the page was not read in while the walk passed"
+    );
+    assert!(ended, "the cut waited with no holder");
+    assert!(listed, "the cut did not find the page owed");
+    assert!(kept, "the change found no room for its copy");
+    assert_eq!(
+        imaged,
+        ("kept", Some(1)),
+        "the checkpoint's image of a page read back in while the walk passed an empty batch"
+    );
+}
+
 /// A page the walk marks and that is evicted and read in again before its run lists it, the run
 /// not yet returned, still owes the cut its copy: its swap copy landed before the shards are
 /// listed, so the cut marks it again once they are (mutant: the swapped pages not marked again).
@@ -7579,13 +7630,21 @@ fn a_cut_walks_the_frames_a_run_at_a_time() {
     }
     let mut scan = CutScan::default();
     let (mut runs, mut most) = (0usize, 0u32);
+    // The frames a run looks at: those of batches with a frame taken, a batch with none being
+    // passed over whole.
+    let walked = |from: u32, to: u32| {
+        (from..to.min(grains))
+            .filter(|&g| !pool.memory.holds_no_frame(g / memory::GRAINS))
+            .count() as u32
+    };
+    let in_use = walked(0, grains);
     loop {
         let before = scan.next;
         let done = match pool.cut_run(1, &mut scan) {
             IOResult::Done(done) => done,
             IOResult::IO(_) => panic!("a cut with no holder waited"),
         };
-        most = most.max(scan.next - before);
+        most = most.max(walked(before, scan.next));
         runs += 1;
         if done {
             break;
@@ -7597,13 +7656,13 @@ fn a_cut_walks_the_frames_a_run_at_a_time() {
     stored.sort();
     drop(pool);
     assert!(
-        grains as usize > 2 * CUT_RUN,
-        "{grains} frames: a walk of one run"
+        in_use as usize > 2 * CUT_RUN,
+        "{in_use} frames in batches in use: a walk of one run"
     );
     assert_eq!(most as usize, CUT_RUN, "a run looked at {most} frames");
     assert!(
-        runs > (grains as usize).div_ceil(CUT_RUN),
-        "{runs} runs over {grains} frames"
+        runs > (in_use as usize).div_ceil(CUT_RUN),
+        "{runs} runs over {in_use} frames in batches in use"
     );
     assert_eq!(owed, stored, "what the cut found owed");
 }
@@ -11036,7 +11095,7 @@ mod group {
     }
 
     /// The checkpoint's demand behind sturdy idle keeps alone (SHORT-HOLD1b, the designer's #6344),
-    /// at the default cache, eight owners each revoked once and suspended at their reloaded pages
+    /// at the smallest cache, eight owners each revoked once and suspended at their reloaded pages
     /// ([`eight_sturdy`]), no read at the backend: the demand's claims are the demand's
     /// (`upkeep::claim`), which run as no owner's and note no end of the road, so it waits, not
     /// ending in the shortage error; the owner in its drain's way ends its operation, letting its
@@ -11297,14 +11356,14 @@ mod group {
         );
     }
 
-    /// A pool of the default configuration (`config_for(None)`: MIN_DB_BUDGET, 11 batches of 2 MiB,
+    /// A pool of the smallest configuration (`smallest_config()`: MIN_DB_BUDGET, 11 batches of 2 MiB,
     /// the log's ring and the image bank lent at open, 8 a cache claim can drain), over a source
     /// whose reads the test lands. Eight owners, each reading a page of its own class into a batch
     /// of its own, are each revoked once, by a statement of class 4 draining that batch, and
     /// suspended at their reload: eight sturdy idle keeps, one in each batch. Returns the pool, its
     /// reads and the eight owners with their pages.
     fn eight_sturdy(base: &str) -> (Arc<BufferPool>, PendingReads, Vec<(Owner, PageId)>) {
-        let config = crate::storage::atoll::sql::mode::config_for(None);
+        let config = crate::storage::atoll::sql::mode::smallest_config();
         let mut buffer = config.buffer.clone();
         buffer.lent_at_open = LentAtOpen {
             ring: crate::storage::atoll::log::ring_chunks(&config.log),
@@ -11369,16 +11428,16 @@ mod group {
         (pool, reads, owners)
     }
 
-    /// The default configuration's end of the road (SHORT-HOLD1b, A3, the auditor's #6311): eight
+    /// The smallest configuration's end of the road (SHORT-HOLD1b, A3, the auditor's #6311): eight
     /// sturdy idle keeps, one in each batch a cache claim can drain, and a ninth claim that needs a
     /// batch: it waits its busy timeout, 200 ms, and ends in `TooSmall`, its words naming the
     /// class wanted, the batch and the sturdy keep.
     #[test]
-    fn at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small() {
+    fn at_the_smallest_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small() {
         crate::storage::atoll::testing::cleanly(
             concat!(
                 module_path!(),
-                "::at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small"
+                "::at_the_smallest_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small"
             ),
             || {
                 let (pool, reads, owners) = eight_sturdy("/db/default-eight");
@@ -11401,7 +11460,7 @@ mod group {
                 assert_eq!(
                     (batches, lent),
                     (11, 3),
-                    "the default pool: (batches, lent at open)"
+                    "the smallest pool: (batches, lent at open)"
                 );
                 assert!(
                     matches!(&outcome, Driven::Failed(LimboError::CacheError(
@@ -11420,16 +11479,16 @@ mod group {
         );
     }
 
-    /// [`at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small`] with the owner in
+    /// [`at_the_smallest_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small`] with the owner in
     /// the ninth claim's way run to its operation's end while the claim waits: its keep, sturdy to
     /// that end (the mark carried on, the auditor's #6341), is released there, which frees the
     /// frame and tells the claim; the claim gets its frame.
     #[test]
-    fn at_the_default_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame() {
+    fn at_the_smallest_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame() {
         crate::storage::atoll::testing::cleanly(
             concat!(
                 module_path!(),
-                "::at_the_default_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame"
+                "::at_the_smallest_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame"
             ),
             || {
                 let (pool, reads, mut owners) = eight_sturdy("/db/default-eight-ended");

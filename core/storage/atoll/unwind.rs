@@ -687,6 +687,11 @@ mod tests {
             "child",
         ),
         (
+            "sql/mode/tests.rs",
+            "a_close_and_an_open_leave_no_page_allocated_and_never_used_at_the_default_budget",
+            "child",
+        ),
+        (
             "tests.rs",
             "a_number_taken_before_a_cut_and_freed_during_its_checkpoint_is_free_after_a_recovery",
             "child",
@@ -1185,12 +1190,12 @@ mod tests {
         ),
         (
             "buffer/tests.rs",
-            "at_the_default_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small",
+            "at_the_smallest_cache_eight_sturdy_keeps_end_a_ninth_claim_in_too_small",
             "child",
         ),
         (
             "buffer/tests.rs",
-            "at_the_default_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame",
+            "at_the_smallest_cache_one_of_eight_sturdy_keepers_ended_gives_the_ninth_claim_its_frame",
             "child",
         ),
         (

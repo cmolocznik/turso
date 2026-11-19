@@ -77,6 +77,10 @@ struct Args {
     /// encryption or the FTS profiles, which Atoll mode refuses or does not run
     #[arg(long)]
     atoll: bool,
+    /// With --atoll: the configuration of a database opened without one, its default budget,
+    /// instead of Atoll's small configuration (DEFAULT-CACHE1)
+    #[arg(long, requires = "atoll")]
+    atoll_default_cache: bool,
     /// Enable Elle consistency checking with specified model (uses only Elle workloads)
     #[arg(long, value_enum)]
     elle: Option<ElleModel>,
@@ -636,6 +640,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)
         .with_atoll(args.atoll)
+        .with_atoll_default_cache(args.atoll_default_cache)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)

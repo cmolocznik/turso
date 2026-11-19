@@ -260,22 +260,29 @@ impl<K: Ord + Clone, V: Clone> MergableMap<K, V> {
 }
 
 /// Opens the simulator's database: in Atoll mode through [`Database::open`], with Atoll's small
-/// configuration (Atoll's DESIGN.md §17); else as a file, as SQLite lays it out.
+/// configuration (Atoll's DESIGN.md §17), or with the configuration of a database opened without one
+/// when `atoll_default_cache` (DEFAULT-CACHE1); else as a file, as SQLite lays it out.
 fn open_database(
     io: Arc<dyn IO>,
     path: &str,
     db_opts: DatabaseOpts,
     encryption_opts: Option<EncryptionOpts>,
     atoll: bool,
+    atoll_default_cache: bool,
 ) -> turso_core::Result<Arc<Database>> {
     if atoll {
+        let config = if atoll_default_cache {
+            turso_core::storage::atoll::sql::mode::config_for(None)
+        } else {
+            turso_core::storage::atoll::db::AtollConfig::small()
+        };
         return Database::open(
             io,
             path,
             turso_core::OpenOptions::new(Arc::new(SqliteDialect))
                 .flags(OpenFlags::default())
                 .db_opts(db_opts)
-                .atoll(turso_core::storage::atoll::db::AtollConfig::small()),
+                .atoll(config),
         );
     }
     Database::open_file_with_flags(
@@ -322,6 +329,9 @@ pub struct WhopperOpts {
     pub enable_encryption: bool,
     /// Open the database in Atoll mode (Atoll's DESIGN.md §17), with Atoll's small configuration.
     pub atoll: bool,
+    /// In Atoll mode, the configuration of a database opened without one (its default budget)
+    /// instead of the small one.
+    pub atoll_default_cache: bool,
     /// Elle tables to create: vec of (table_name, create_sql).
     pub elle_tables: Vec<(String, String)>,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
@@ -406,6 +416,7 @@ impl Default for WhopperOpts {
             experimental_mvcc_passive_checkpoint: false,
             enable_encryption: false,
             atoll: false,
+            atoll_default_cache: false,
             elle_tables: vec![],
             workloads: vec![],
             properties: vec![],
@@ -545,6 +556,11 @@ impl WhopperOpts {
 
     pub fn with_atoll(mut self, atoll: bool) -> Self {
         self.atoll = atoll;
+        self
+    }
+
+    pub fn with_atoll_default_cache(mut self, default_cache: bool) -> Self {
+        self.atoll_default_cache = default_cache;
         self
     }
 
@@ -732,6 +748,8 @@ pub struct Whopper {
     encryption_opts: Option<EncryptionOpts>,
     /// Whether the database opens in Atoll mode.
     atoll: bool,
+    /// Whether, in Atoll mode, it opens with the default configuration rather than the small one.
+    atoll_default_cache: bool,
     max_connections: usize,
     workloads: Vec<(u32, Box<dyn Workload>)>,
     properties: Vec<std::sync::Mutex<Box<dyn Property>>>,
@@ -830,6 +848,7 @@ impl Whopper {
                 db_opts,
                 encryption_opts.clone(),
                 opts.atoll,
+                opts.atoll_default_cache,
             ) {
                 Ok(db) => db,
                 Err(e) => {
@@ -916,6 +935,7 @@ impl Whopper {
             wal_path,
             encryption_opts,
             atoll: opts.atoll,
+            atoll_default_cache: opts.atoll_default_cache,
             max_connections: opts.max_connections,
             workloads: opts.workloads,
             properties: opts
@@ -1836,6 +1856,7 @@ impl Whopper {
             db_opts,
             self.encryption_opts.clone(),
             self.atoll,
+            self.atoll_default_cache,
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
         if let Some(watchdog) = &self.watchdog {

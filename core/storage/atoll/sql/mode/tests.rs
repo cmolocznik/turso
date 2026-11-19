@@ -216,6 +216,140 @@ fn first_light_creates_writes_reads_rolls_back_and_reopens() {
 
 /// A database opened without the option, over a file Atoll's control file holds, opens in Atoll
 /// mode; one with the option over a SQLite file is refused, and the file is left as it is.
+/// A full checkpoint of an empty database walks the pool in as many runs at the default budget as
+/// at the smallest (DEFAULT-CACHE1, #6465): the walk passes a batch with no frame taken over whole,
+/// so its cost follows the frames in use and not the memory the pool was given.
+#[test]
+fn a_checkpoint_of_an_empty_database_walks_as_many_runs_at_the_default_budget_as_at_the_smallest() {
+    let runs = |config: crate::storage::atoll::db::AtollConfig, path: &str| {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_with(&io, path, config);
+        let adb = db.atoll.as_ref().unwrap();
+        let before = adb.atoll().pool().cut_runs_for_test();
+        crate::storage::atoll::sql::mode::full_checkpoint(adb).unwrap();
+        adb.atoll().pool().cut_runs_for_test() - before
+    };
+    let smallest = runs(
+        crate::storage::atoll::sql::mode::smallest_config(),
+        "/db/cut-runs-smallest",
+    );
+    let default = runs(
+        crate::storage::atoll::sql::mode::config_for(None),
+        "/db/cut-runs-default",
+    );
+    assert_eq!(
+        default, smallest,
+        "the walk's runs of a full checkpoint at the default budget and at the smallest"
+    );
+}
+
+/// DEFAULT-CACHE1's second measure, not a check (#6465 (a)): the pool filled with clean resident
+/// pages of one table, at the budget `ATOLL_MEASURE_BUDGET` names, one row changed, and the full
+/// checkpoint after it, alone in [`measured_checkpoint`] for callgrind's toggle. Checkpoints are
+/// stepped by writers, on this thread.
+#[test]
+#[ignore]
+fn measure_a_checkpoint_of_one_change_in_a_full_pool() {
+    let which = std::env::var("ATOLL_MEASURE_BUDGET").unwrap_or_else(|_| "floor".to_string());
+    let mut config = match which.as_str() {
+        "default" => crate::storage::atoll::sql::mode::config_for(None),
+        _ => crate::storage::atoll::sql::mode::smallest_config(),
+    };
+    config.checkpointing = crate::storage::atoll::checkpoint::Checkpointing::Writers;
+    let rows = (config.buffer.budget / 4096) as i64;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_with(&io, "/db/measure-full", config);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+        .unwrap();
+    conn.execute(format!(
+        "INSERT INTO t SELECT value, zeroblob(3000) FROM generate_series(1, {rows})"
+    ))
+    .unwrap();
+    let adb = db.atoll.as_ref().unwrap();
+    crate::storage::atoll::sql::mode::full_checkpoint(adb).unwrap();
+    rows_count(&conn);
+    conn.execute("UPDATE t SET b = zeroblob(3001) WHERE a = 1")
+        .unwrap();
+    measured_checkpoint(adb);
+    eprintln!(
+        "MEASURE-FULL {which}: {rows} rows, {} batches",
+        adb.atoll().pool().batches_for_test()
+    );
+}
+
+fn rows_count(conn: &Arc<Connection>) {
+    let _ = rows(conn, "SELECT count(b) FROM t");
+}
+
+#[inline(never)]
+fn measured_checkpoint(db: &crate::storage::atoll::sql::AtollDb) {
+    crate::storage::atoll::sql::mode::full_checkpoint(db).unwrap();
+}
+
+/// DEFAULT-CACHE1's measure, not a check: an empty database opened on files at the budget
+/// `ATOLL_MEASURE_BUDGET` names ("floor" or "default"), with this process's resident memory before
+/// and after the open, a table made and a full checkpoint, and the bytes its files take on disk
+/// then. Run alone, under callgrind for the open's instructions.
+#[test]
+#[ignore]
+fn measure_an_empty_database_at_a_budget() {
+    let which = std::env::var("ATOLL_MEASURE_BUDGET").unwrap_or_else(|_| "floor".to_string());
+    let config = match which.as_str() {
+        "default" => crate::storage::atoll::sql::mode::config_for(None),
+        _ => crate::storage::atoll::sql::mode::smallest_config(),
+    };
+    let resident = || {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        statm
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * 4096
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("measure").to_str().unwrap().to_string();
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let before = resident();
+    let db = open_with(&io, &path, config);
+    let opened = resident();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    crate::storage::atoll::sql::mode::full_checkpoint(db.atoll.as_ref().unwrap()).unwrap();
+    let checkpointed = resident();
+    let mut disk = 0u64;
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        use std::os::unix::fs::MetadataExt;
+        disk += entry.unwrap().metadata().unwrap().blocks() * 512;
+    }
+    eprintln!(
+        "MEASURE {which}: resident before {before}, after the open {opened}, after a table and a \
+         full checkpoint {checkpointed}; on disk {disk} bytes"
+    );
+    drop((conn, db));
+}
+
+/// PRAGMA cache_size in Atoll mode (DEFAULT-CACHE1): it reads and sets the connection's setting as
+/// Turso keeps it, and the pool keeps the budget it opened with.
+#[test]
+fn cache_size_in_atoll_mode_leaves_the_pool_as_it_opened() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/cache-size");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let pool = || db.atoll.as_ref().unwrap().atoll().pool().batches_for_test();
+    let before = (pool(), rows(&conn, "PRAGMA cache_size"));
+    conn.execute("PRAGMA cache_size = -1000000").unwrap();
+    let after = (pool(), rows(&conn, "PRAGMA cache_size"));
+    eprintln!("CACHE_SIZE before {before:?} after {after:?}");
+    assert_eq!(
+        before.0, after.0,
+        "the pool's batches after PRAGMA cache_size"
+    );
+}
+
 #[test]
 fn an_atoll_database_is_detected_and_a_sqlite_one_refused() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -233,6 +367,14 @@ fn an_atoll_database_is_detected_and_a_sqlite_one_refused() {
     )
     .unwrap();
     assert!(db.atoll.is_some(), "detected without the option");
+    // Opened without a configuration, it takes the default budget, the opener's and not the file's
+    // (DEFAULT-CACHE1): 256 MiB, 128 batches of 2 MiB.
+    let batches = db.atoll.as_ref().unwrap().atoll().pool().batches_for_test();
+    assert_eq!(
+        (batches as usize) << 21,
+        crate::storage::atoll::sql::mode::DEFAULT_BUDGET,
+        "the budget of a database opened without a configuration, in batches of 2 MiB"
+    );
     let conn = db.connect(ConnectOpts::new()).unwrap();
     assert!(names(&conn).is_empty());
     drop(conn);
@@ -16883,30 +17025,65 @@ fn a_dropped_connection_ends_the_group_its_transaction_still_has() {
 }
 
 /// VALUE-LOST1 through SQL, at four sizes of value stored out of line: rows written one autocommit
-/// insert each while the checkpoint thread runs under the default page cache, a clean close, an
+/// insert each while the checkpoint thread runs under the smallest page cache, a clean close, an
 /// open, and every row read back. Before the fix a value whose page a settle found no frame for was
 /// left out of every later checkpoint's map, and the open's replay gave the page to another row.
 #[test]
 fn values_of_60000_bytes_read_back_after_a_close_and_an_open() {
-    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-60000", 60_000, 6_000);
+    let lost = rows_lost_after_a_close_and_an_open(
+        "/db/value-lost-60000",
+        60_000,
+        6_000,
+        crate::storage::atoll::sql::mode::smallest_config(),
+    );
     assert_eq!(lost, Vec::<i64>::new(), "rows lost");
 }
 
 #[test]
 fn values_of_20000_bytes_read_back_after_a_close_and_an_open() {
-    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-20000", 20_000, 6_000);
+    let lost = rows_lost_after_a_close_and_an_open(
+        "/db/value-lost-20000",
+        20_000,
+        6_000,
+        crate::storage::atoll::sql::mode::smallest_config(),
+    );
     assert_eq!(lost, Vec::<i64>::new(), "rows lost");
 }
 
 #[test]
 fn values_of_6000_bytes_read_back_after_a_close_and_an_open() {
-    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-6000", 6_000, 120_000);
+    let lost = rows_lost_after_a_close_and_an_open(
+        "/db/value-lost-6000",
+        6_000,
+        120_000,
+        crate::storage::atoll::sql::mode::smallest_config(),
+    );
+    assert_eq!(lost, Vec::<i64>::new(), "rows lost");
+}
+
+/// Values of 1,500 bytes at the default budget (DEFAULT-CACHE1): far fewer checkpoints, each reaching
+/// more pages. One size, the lightest in memory; it still takes about 1.3 GB resident, so it is left
+/// out of the library's lanes and run alone (#6465).
+#[test]
+#[ignore = "about 1.3 GB resident: run alone, on its own line of the gate (#6465)"]
+fn values_of_1500_bytes_read_back_after_a_close_and_an_open_at_the_default_budget() {
+    let lost = rows_lost_after_a_close_and_an_open(
+        "/db/value-lost-default-1500",
+        1_500,
+        80_000,
+        crate::storage::atoll::sql::mode::config_for(None),
+    );
     assert_eq!(lost, Vec::<i64>::new(), "rows lost");
 }
 
 #[test]
 fn values_of_1500_bytes_read_back_after_a_close_and_an_open() {
-    let lost = rows_lost_after_a_close_and_an_open("/db/value-lost-1500", 1_500, 80_000);
+    let lost = rows_lost_after_a_close_and_an_open(
+        "/db/value-lost-1500",
+        1_500,
+        80_000,
+        crate::storage::atoll::sql::mode::smallest_config(),
+    );
     assert_eq!(lost, Vec::<i64>::new(), "rows lost");
 }
 
@@ -16925,50 +17102,66 @@ fn a_close_and_an_open_leave_no_page_allocated_and_never_used() {
             module_path!(),
             "::a_close_and_an_open_leave_no_page_allocated_and_never_used"
         ),
-        || {
-            let rounds: i64 = std::env::var("VALUE_LEAK_ROUNDS")
-                .ok()
-                .and_then(|r| r.parse().ok())
-                .unwrap_or(LEAK_ROUNDS);
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let path = "/db/value-leak";
-            let config = crate::storage::atoll::sql::mode::config_for(None);
-            let mut first_bad = None;
-            for round in 0..=rounds {
-                let db = open_with(&io, path, config.clone());
-                let conn = db.connect(ConnectOpts::new()).unwrap();
-                let check = conn
-                    .prepare("PRAGMA integrity_check")
-                    .unwrap()
-                    .run_collect_rows()
-                    .map_err(|e| e.to_string());
-                if check != Ok(vec![vec![Value::build_text("ok")]]) {
-                    first_bad = Some((round, check));
-                    conn.close().unwrap();
-                    break;
-                }
-                if round < rounds {
-                    if round == 0 {
-                        conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB)")
-                            .unwrap();
-                    }
-                    let mut insert = conn
-                        .prepare("INSERT INTO t VALUES (?1, zeroblob(60000))")
-                        .unwrap();
-                    for k in round * LEAK_ROWS + 1..=(round + 1) * LEAK_ROWS {
-                        insert.reset().unwrap();
-                        insert
-                            .bind_at(1.try_into().unwrap(), Value::from_i64(k))
-                            .unwrap();
-                        insert.run_ignore_rows().unwrap();
-                    }
-                    drop(insert);
-                }
-                conn.close().unwrap();
-            }
-            assert_eq!(first_bad, None, "integrity_check after a close and an open");
-        },
+        || no_page_allocated_and_never_used(crate::storage::atoll::sql::mode::smallest_config()),
     );
+}
+
+/// [`a_close_and_an_open_leave_no_page_allocated_and_never_used`] at the default budget
+/// (DEFAULT-CACHE1).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_close_and_an_open_leave_no_page_allocated_and_never_used_at_the_default_budget() {
+    crate::storage::atoll::testing::cleanly(
+        concat!(
+            module_path!(),
+            "::a_close_and_an_open_leave_no_page_allocated_and_never_used_at_the_default_budget"
+        ),
+        || no_page_allocated_and_never_used(crate::storage::atoll::sql::mode::config_for(None)),
+    );
+}
+
+/// The rounds of [`a_close_and_an_open_leave_no_page_allocated_and_never_used`] with `config`.
+fn no_page_allocated_and_never_used(config: crate::storage::atoll::db::AtollConfig) {
+    let rounds: i64 = std::env::var("VALUE_LEAK_ROUNDS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(LEAK_ROUNDS);
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = &format!("/db/value-leak-{}", config.buffer.budget);
+    let mut first_bad = None;
+    for round in 0..=rounds {
+        let db = open_with(&io, path, config.clone());
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let check = conn
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .run_collect_rows()
+            .map_err(|e| e.to_string());
+        if check != Ok(vec![vec![Value::build_text("ok")]]) {
+            first_bad = Some((round, check));
+            conn.close().unwrap();
+            break;
+        }
+        if round < rounds {
+            if round == 0 {
+                conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB)")
+                    .unwrap();
+            }
+            let mut insert = conn
+                .prepare("INSERT INTO t VALUES (?1, zeroblob(60000))")
+                .unwrap();
+            for k in round * LEAK_ROWS + 1..=(round + 1) * LEAK_ROWS {
+                insert.reset().unwrap();
+                insert
+                    .bind_at(1.try_into().unwrap(), Value::from_i64(k))
+                    .unwrap();
+                insert.run_ignore_rows().unwrap();
+            }
+            drop(insert);
+        }
+        conn.close().unwrap();
+    }
+    assert_eq!(first_bad, None, "integrity_check after a close and an open");
 }
 
 /// The rows a round of [`a_close_and_an_open_leave_no_page_allocated_and_never_used`] writes.
@@ -16977,11 +17170,15 @@ const LEAK_ROWS: i64 = 300;
 const LEAK_ROUNDS: i64 = 10;
 
 /// Writes `rows` rows of `size` bytes, one autocommit insert each, into a database at `path` in
-/// memory with the default configuration, closes it, opens it again, and reads every row: the keys
-/// of the rows that did not read back as written.
-fn rows_lost_after_a_close_and_an_open(path: &str, size: usize, rows: i64) -> Vec<i64> {
+/// memory with `config`, closes it, opens it again, and reads every row: the keys of the rows that
+/// did not read back as written.
+fn rows_lost_after_a_close_and_an_open(
+    path: &str,
+    size: usize,
+    rows: i64,
+    config: crate::storage::atoll::db::AtollConfig,
+) -> Vec<i64> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let config = crate::storage::atoll::sql::mode::config_for(None);
     let value = |k: i64| {
         let mut v = vec![0u8; size];
         v[..8].copy_from_slice(&k.to_be_bytes());

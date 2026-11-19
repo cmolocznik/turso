@@ -1265,6 +1265,12 @@ impl Memory {
         LendWord(self.lend[batch as usize].load(Ordering::SeqCst))
     }
 
+    /// Whether no frame of `batch` is taken or promised, so none holds a page: a checkpoint's walk
+    /// of the pool passes it over whole.
+    pub fn holds_no_frame(&self, batch: u32) -> bool {
+        self.state(batch).taken() == 0
+    }
+
     /// Whether `batch` is a lend batch or waits as one ([`LENT`] or [`LENDING`]).
     pub fn is_lend_batch(&self, batch: u32) -> bool {
         matches!(self.state(batch).owner(), LENT | LENDING)

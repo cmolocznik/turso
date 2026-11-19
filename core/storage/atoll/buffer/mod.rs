@@ -90,7 +90,8 @@ pub const MIN_KEEPING_BUDGET: usize = MIN_BUDGET + COPY_BATCHES * memory::BATCH;
 
 /// The smallest budget a database takes whose log's ring fits one batch, as every ring of
 /// chunks up to 256 KiB with the default writes in flight does, with the default image bank:
-/// [`min_budget_beside`] of that ring and bank, 22 MiB.
+/// [`min_budget_beside`] of that ring and bank, 22 MiB. Tests open databases at it.
+#[cfg(test)]
 pub const MIN_DB_BUDGET: usize = MIN_KEEPING_BUDGET + memory::BATCH + 2 * memory::BATCH;
 
 /// The smallest budget a database takes (DESIGN.md 9.1.1, Minimum budget): the core, the log's
@@ -667,6 +668,9 @@ pub struct BufferPool {
     /// The pages that checkpoint found owed and has neither imaged nor kept: one read in again is
     /// pending.
     cut_owed: Mutex<HashSet<PageId>>,
+    /// The checkpoint walk's runs of the pool so far, each a call of `cut_run` that walked frames.
+    #[cfg(test)]
+    cut_runs: std::sync::atomic::AtomicU64,
     temp: Arc<TempPages>,
     /// The operations waiting for memory (DESIGN.md 9.1.3, *A shortage never waits under a
     /// hold*).
@@ -782,6 +786,8 @@ impl BufferPool {
             room: KeptRoom::new(kept_bytes, supply.clone(), store.io().clone()),
             relief: SetOnce::default(),
             cut_owed: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            cut_runs: std::sync::atomic::AtomicU64::new(0),
             temp: Arc::new(TempPages::new(
                 store.counted().clone(),
                 store.base(),
@@ -836,6 +842,18 @@ impl BufferPool {
             Some(e) => Err(LimboError::CompletionError(e)),
             None => Ok(()),
         }
+    }
+
+    /// The checkpoint walk's runs of the pool so far.
+    #[cfg(test)]
+    pub fn cut_runs_for_test(&self) -> u64 {
+        self.cut_runs.load(Ordering::Relaxed)
+    }
+
+    /// Batches the pool's budget makes.
+    #[cfg(test)]
+    pub fn batches_for_test(&self) -> u32 {
+        self.memory.batches
     }
 
     /// Bytes each size class holds.
@@ -3466,11 +3484,25 @@ impl BufferPool {
         self.memory.cutting.store(n, Ordering::SeqCst);
         let grains = self.memory.grains();
         if scan.next < grains {
+            #[cfg(test)]
+            self.cut_runs.fetch_add(1, Ordering::Relaxed);
             let from = scan.owed.len();
-            let end = grains.min(scan.next.saturating_add(CUT_RUN as u32));
+            let mut end = grains.min(scan.next.saturating_add(CUT_RUN as u32));
             let stopped = loop {
-                if scan.next == end {
+                if scan.next >= end {
                     break None;
+                }
+                // A batch with no frame taken holds no page: passed over whole, and its grains do
+                // not count against the run, so the walk's units follow the frames in use and not
+                // the pool's size. A batch taken after the walk passes it holds only pages read in
+                // or made after the cut began, pending or not owed to this cut.
+                if scan.next % memory::GRAINS == 0
+                    && self.memory.holds_no_frame(scan.next / memory::GRAINS)
+                {
+                    crate::race::point("buffer.cut_run_passed_a_batch");
+                    scan.next += memory::GRAINS;
+                    end = grains.min(end.saturating_add(memory::GRAINS));
+                    continue;
                 }
                 let h = self.header(scan.next);
                 if h.status() == RESIDENT {

@@ -1181,6 +1181,11 @@ impl TursoConnection {
         self.connection.set_applies_replicated_commits(applies);
     }
 
+    /// See `turso_core::Connection::last_commit_ts`.
+    pub fn last_commit_ts(&self) -> Option<u64> {
+        self.connection.last_commit_ts()
+    }
+
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
     }

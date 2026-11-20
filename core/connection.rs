@@ -658,6 +658,9 @@ pub struct Connection {
     /// database, whose commits its database's log replicator neither admits
     /// nor receives.
     pub(super) applies_replicated_commits: AtomicBool,
+    /// The commit timestamp of the last MVCC transaction this connection committed to a logical
+    /// log; 0 before any.
+    pub(super) last_commit_ts: AtomicU64,
     #[cfg(feature = "conn_raw_api")]
     pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
@@ -3253,6 +3256,21 @@ impl Connection {
 
     pub fn applies_replicated_commits(&self) -> bool {
         self.applies_replicated_commits.load(Ordering::Acquire)
+    }
+
+    /// The commit timestamp of the last transaction this connection committed to an MVCC logical
+    /// log, in the clock of the database it committed to, as a follower's applier records where
+    /// each replicated entry ended. A transaction that wrote nothing, and so no frame, leaves it
+    /// as it was. `None` before the first.
+    pub fn last_commit_ts(&self) -> Option<u64> {
+        match self.last_commit_ts.load(Ordering::Acquire) {
+            0 => None,
+            ts => Some(ts),
+        }
+    }
+
+    pub(crate) fn set_last_commit_ts(&self, ts: u64) {
+        self.last_commit_ts.store(ts, Ordering::Release);
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC

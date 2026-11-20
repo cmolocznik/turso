@@ -103,6 +103,10 @@ async fn a_full_log_replicator_paces_the_writer_without_blocking_the_runtime() {
         .unwrap();
     assert_eq!(ids(&conn).await, [1, 3]);
     assert_eq!(replicator.frames.lock().unwrap().len(), 2);
+    let applied = applier
+        .last_commit_ts()
+        .expect("the applier's commit has a timestamp");
+    assert!(applied > replicator.frames.lock().unwrap()[1].commit_ts);
 }
 
 #[tokio::test]

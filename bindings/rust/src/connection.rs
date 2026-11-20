@@ -108,6 +108,14 @@ impl Connection {
         }
     }
 
+    /// The commit timestamp of the last transaction this connection committed
+    /// to its MVCC logical log, as a follower's applier records where each
+    /// replicated entry ended (`turso_core::Connection::last_commit_ts`).
+    /// `None` before the first. Embedded only.
+    pub fn last_commit_ts(&self) -> Option<u64> {
+        self.inner.as_ref().and_then(|conn| conn.last_commit_ts())
+    }
+
     pub(crate) async fn maybe_handle_dangling_tx(&self) -> Result<()> {
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {

@@ -3080,6 +3080,7 @@ impl Database {
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
             applies_replicated_commits: AtomicBool::new(false),
+            last_commit_ts: AtomicU64::new(0),
             #[cfg(feature = "conn_raw_api")]
             mvcc_log_metadata: RwLock::new(HashMap::default()),
             capture_data_changes: RwLock::new(None),

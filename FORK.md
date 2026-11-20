@@ -1903,6 +1903,29 @@ each, whose cut keeps the newest back. The log's files stay under 64 KB, and ope
 dropping its log, the database replays the rolled segments' portable frames and holds all 60
 rows. Without the roll, the files held every frame and the test fails.
 
+### A connection reports the commit timestamp of its last frame
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`Connection::last_commit_ts` in `core/connection.rs`, set at `CommitState::FinalizeCommit` in
+`core/mvcc/database/mod.rs`; `Connection::last_commit_ts` in the Rust binding and the SDK kit.
+Why: a follower applies each replicated entry on its applier connection, whose frames do not
+reach its log replicator. To give checkpoints cuts at entry ends, it records each entry's end:
+the commit timestamp its last commit got in the follower's own database (Codex: "give the serial
+applier a local commit receipt").
+What: every MVCC commit that writes a frame sets its connection's last commit timestamp to its
+own, also when a group-commit leader wrote the frame. A transaction that wrote nothing never takes a
+place in the log and leaves it as it was. `None` before the first.
+Limits: the timestamp is in the clock of the database the connection last committed to, so a
+connection that commits to attached MVCC databases mixes clocks.
+Tests: in `tests/integration/mvcc_log_replicator.rs`:
+- A connection's last commit timestamp is its frame's. An applier's is past the leader's last.
+  A read-only transaction leaves it as it was, and a checkpoint cut there covers exactly that
+  commit.
+- In the eight concurrent writers' test, the timestamps the writers report are exactly the
+  frames' timestamps.
+- Through the binding, the applier's commit has one.
+Each is seen failing without it: the timestamp never set (two tests), and the newest commit's set
+in place of the connection's own (the concurrent test).
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

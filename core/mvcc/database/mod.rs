@@ -3902,6 +3902,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
+                // Every transaction that gets here wrote a frame: one that wrote nothing finished
+                // before taking a place in the log.
+                self.connection.set_last_commit_ts(*end_ts);
                 let tx_header = *tx_unlocked.header.read();
                 if tx_unlocked.header_dirty.load(Ordering::Acquire)
                     && self.connection.db.mvcc_log_dropped_on_open()

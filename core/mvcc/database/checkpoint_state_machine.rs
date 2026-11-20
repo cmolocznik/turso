@@ -2098,6 +2098,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
+    /// The snapshot this checkpoint writes through: the newest commit it may write
+    /// (`MvStore::checkpoint_snapshot_ts`), lowered to the cut the database's log replicator
+    /// gives ([`crate::mvcc::log_replicator::LogReplicator::checkpoint_cut`]).
+    fn snapshot_at_cut(&self) -> u64 {
+        let newest = self.mvstore.checkpoint_snapshot_ts();
+        match self.database.log_replicator() {
+            Some(replicator) => replicator.checkpoint_cut(newest).min(newest),
+            None => newest,
+        }
+    }
+
     /// Takes a passive checkpoint's snapshot.
     fn sample_passive_snapshot(&mut self) {
         // The offset first: every frame before it is a commit the snapshot covers or one
@@ -2110,7 +2121,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             self.truncate_goal = self.truncate_goal.or(Some(hold.writing));
             self.pass_began_with = Some(hold);
         }
-        self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+        self.snapshot_ts = self.snapshot_at_cut();
         self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
         // Checkpoint state machines can be created before they are run.
         // Resample after serializing so already-durable index deletes are not replayed.
@@ -2786,7 +2797,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Sample the snapshot only after the stop-the-world lock: no concurrent
                 // commits can land between snapshot_ts and collection on this path.
                 self.snapshot_log_offset = self.mvstore.storage.logical_log_offset();
-                self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+                self.snapshot_ts = self.snapshot_at_cut();
                 self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing with other checkpoints so already-durable

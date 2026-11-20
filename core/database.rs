@@ -86,6 +86,11 @@ pub struct DatabaseOpts {
     /// write the conversion and keep the current mode.
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    /// Open an MVCC database from its file alone: its logical log is dropped,
+    /// not replayed, and the database holds what its last checkpoint wrote.
+    /// A database replicated through its log (`Database::set_log_replicator`)
+    /// opens this way, and the replication replays the rest.
+    pub drop_mvcc_log_on_open: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -138,6 +143,12 @@ impl DatabaseOpts {
 
     pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
         self.enable_experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
+    /// See [`Self::drop_mvcc_log_on_open`].
+    pub fn with_mvcc_log_dropped_on_open(mut self, drop: bool) -> Self {
+        self.drop_mvcc_log_on_open = drop;
         self
     }
 
@@ -3979,6 +3990,21 @@ impl Database {
         self.opts.enable_experimental_mvcc_passive_checkpoint
     }
 
+    /// Whether this database opened from its file alone, its MVCC logical log
+    /// dropped ([`DatabaseOpts::drop_mvcc_log_on_open`]).
+    pub fn mvcc_log_dropped_on_open(&self) -> bool {
+        self.opts.drop_mvcc_log_on_open
+    }
+
+    /// The newest commit timestamp whose rows the database file holds: what
+    /// the last checkpoint covered, or, just after the database opens, what
+    /// the file held when it opened. `None` unless in MVCC mode.
+    pub fn mvcc_checkpointed_through(&self) -> Option<u64> {
+        let store = self.mv_store.load();
+        let store = store.as_ref()?;
+        Some(store.checkpointed_through())
+    }
+
     /// Whether a connection needs key material its opener holds: an encryption key or an external
     /// page codec.
     pub(crate) fn needs_key_material(&self) -> bool {
@@ -4025,13 +4051,15 @@ impl Database {
     }
 
     /// Installs `replicator` to receive each committed transaction's
-    /// logical-log frame, and to say whether the database takes commits
-    /// (`mvcc::log_replicator`). It is installed once, before the database's
-    /// first commit.
+    /// logical-log frame, to say whether the database takes commits, and to
+    /// give the cut each checkpoint writes through (`mvcc::log_replicator`).
+    /// It is installed once, before the database's first commit.
     ///
     /// # Errors
     ///
-    /// If one is installed already; if the database is not in MVCC mode, which
+    /// If one is installed already; if the database was not opened with
+    /// passive checkpoints and its logical log dropped on open
+    /// ([`DatabaseOpts::drop_mvcc_log_on_open`]); if it is not in MVCC mode, which
     /// has no logical log; or if the build lacks `conn_raw_api`, without which
     /// a frame carries no portable metadata to name its tables.
     pub fn set_log_replicator(
@@ -4047,6 +4075,13 @@ impl Database {
         if !self.mvcc_enabled() {
             return Err(LimboError::InvalidArgument(
                 "a log replicator replicates the MVCC logical log, and this database is not in MVCC mode"
+                    .to_string(),
+            ));
+        }
+        if !self.experimental_mvcc_passive_checkpoint_enabled() || !self.mvcc_log_dropped_on_open()
+        {
+            return Err(LimboError::InvalidArgument(
+                "a log replicator needs passive checkpoints and a logical log dropped on open: a checkpoint writes only through the replicator's cut, beside writers, and the database reopens from its file"
                     .to_string(),
             ));
         }

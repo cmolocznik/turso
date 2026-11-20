@@ -1787,6 +1787,58 @@ Tests: `mvcc_log_replicator` in `tests/integration` (six), and `test_log_replica
   first write's frame, and, in the binding, the replicator not installed, `mvcc` not passed, and
   the applier flag not passed through.
 
+### A checkpoint writes through the log replicator's cut, and the database reopens from its file
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`LogReplicator::checkpoint_cut` in `core/mvcc/log_replicator.rs`; `snapshot_at_cut` in
+`core/mvcc/database/checkpoint_state_machine.rs`; `DatabaseOpts::drop_mvcc_log_on_open`,
+`Database::mvcc_checkpointed_through` and the refusal in `Database::set_log_replicator` in
+`core/database.rs`; the dropped log in `maybe_recover_logical_log` and the completion of an
+interrupted checkpoint in `core/mvcc/database/mod.rs`. In the Rust binding,
+`Builder::with_log_replicator` turns on passive checkpoints and the dropped log, and
+`Database::mvcc_checkpointed_through` reports the file's cut; the SDK maps the feature name
+`mvcc_log_dropped_on_open` to `DatabaseOpts::with_mvcc_log_dropped_on_open`.
+Why: in atoll-forge's decision 76 (its `FORGE.md` §6), a checkpoint is a Raft snapshot. Each node
+checkpoints a database only through a cut: the end of a committed Raft entry, with every earlier
+frame at or below its timestamp and every later one above. The node records the cut's timestamp
+with its Raft index first. A node that restarts, or a leader that is deposed, opens each database
+from its file alone, and Raft replays from the cut's index, so frames no quorum took are gone. A
+design that rewound in place was rejected first. It capped checkpoints at a restart record and
+stopped recovery at a recorded frame. Codex found it loses data: garbage collection drops the
+version a capped checkpoint needs, under blocking checkpoints, and frames kept in the log name new
+tables by ids a restart rebuilds differently.
+What: a checkpoint asks the database's replicator for the cut it writes through, giving the newest
+commit it could write (`checkpoint_snapshot_ts`: every commit at or below it is committed and its
+frame written). It writes every commit at or below the cut and none above, and publishes the cut as
+the file's boundary. The default cut is the newest. A database opened with `drop_mvcc_log_on_open`
+reads its boundary from the file, empties every file of its logical log without reading it, and
+starts its clock after the boundary. So a torn or corrupt log opens, and so does an interrupted
+checkpoint whose log header is torn. A replicator is installed only on a database with passive
+checkpoints and its log dropped on open. Under passive checkpoints, garbage collection keeps a
+superseded version until a checkpoint has written its overwrite or delete. So a row overwritten
+above the cut keeps the version the cut needs.
+Limits: page 1 still takes the live header, not the cut's (next entry). The cut must be one no frame
+written after it, in log order, is at or below: frames are in group-commit order, not timestamp
+order, and choosing such a cut is the replicator's work. A replicator that never moves its cut keeps
+the log growing, and a log with portable changes does not roll yet. Embedded only.
+Not done: the forge's replicator that picks cuts; `ivf_crash`'s kill rounds over a dropped log.
+Tests: in `tests/integration/mvcc_log_replicator.rs`, whose replicated databases now open with
+passive checkpoints and the log dropped:
+- A checkpoint at a cut below a later commit writes the commit at the cut and not the later one,
+  while the running database sees both. The database reopens with the first alone, reports the cut,
+  keeps no frame, goes on above the cut, and opens even with its log header torn.
+- A database never checkpointed reopens empty, without even its tables, with its log header torn
+  and its WAL empty.
+- A row overwritten above the cut, through two checkpoints at the cut and garbage collection
+  after each, reopens with its value at the cut. Once the cut passes the overwrite, the next
+  checkpoint writes it.
+- A replicator is refused on an MVCC database with neither option, with passive checkpoints alone,
+  and with the dropped log alone.
+- Through the binding, `test_log_replicator`'s third test: a database reopens at its replicator's
+  cut.
+Each part is seen failing without it: the cut ignored (two tests), the log replayed, the log's files
+kept, the header read when dropped, the torn header failing an interrupted checkpoint's completion,
+the refusal gone, either option not required, and, in the binding, either option not passed.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

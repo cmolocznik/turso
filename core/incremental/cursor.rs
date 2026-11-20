@@ -293,6 +293,7 @@ mod tests {
                 enable_without_rowid: false,
                 enable_mvcc: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
+                drop_mvcc_log_on_open: false,
                 unsafe_testing: false,
             },
             None,

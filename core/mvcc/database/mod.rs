@@ -82,8 +82,8 @@ use super::persistent_storage::logical_log::{
     parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
 };
 use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, LogChainReader, ParsedOp, StreamingLogicalLogReader,
-    StreamingResult, LOG_HDR_SIZE,
+    HeaderReadResult, IndexOpKind, LogChainReader, ParsedOp, RecoveredLog,
+    StreamingLogicalLogReader, StreamingResult, LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
@@ -6821,6 +6821,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// The least `durable_at_begin` over the active and preparing transactions (`u64::MAX` when
     /// none): a version committed at or below it is B-tree-equivalent for every live reader. A
     /// reader that begins after this is sampled sees a durable maximum at least as large.
+    /// The newest commit timestamp whose rows the database file holds (`durable_txid_max`).
+    pub(crate) fn checkpointed_through(&self) -> u64 {
+        self.durable_txid_max.load(Ordering::SeqCst)
+    }
+
     /// Advance `durable_txid_max` to `txid`, whose rows a reader reaches once its WAL mark is at or
     /// past `at`. A repeat of the current value keeps its earlier, smaller position.
     pub(crate) fn publish_durable_bound(&self, txid: u64, at: WalPos) {
@@ -10282,6 +10287,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             // the WAL and write a fresh header in RetryHeader, as for an
                             // interrupted checkpoint, with no header to reuse.
                         }
+                        HeaderReadResult::Invalid if connection.db.mvcc_log_dropped_on_open() => {
+                            // The log is dropped once the checkpoint completes, so a torn header
+                            // loses nothing: complete it as for a log that is gone.
+                        }
                         HeaderReadResult::Invalid => {
                             // Present but undecodable: a torn header write / genuine
                             // corruption, not a clean truncation — fail closed.
@@ -10663,9 +10672,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let reader = Box::new(LogChainReader::new(self.storage.log_files(), enc_ctx));
                     let preserved_tvfs =
                         Self::capture_table_valued_functions(&connection.schema.read());
-                    *st = RecoverLogicalLogState::ReadHeader {
-                        reader,
-                        preserved_tvfs,
+                    *st = if connection.db.mvcc_log_dropped_on_open() {
+                        // A log that is dropped is not read, so a torn or corrupt one opens.
+                        RecoverLogicalLogState::ReadTxTs {
+                            reader,
+                            preserved_tvfs,
+                            header_present: false,
+                            txts_st: ReadPersistentTxTsMaxState::default(),
+                        }
+                    } else {
+                        RecoverLogicalLogState::ReadHeader {
+                            reader,
+                            preserved_tvfs,
+                        }
                     };
                 }
                 RecoverLogicalLogState::ReadHeader { reader, .. } => {
@@ -10721,6 +10740,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.publish_durable_bound(persistent_tx_ts_max, WalPos::ORIGIN);
                     self.clock.reset(persistent_tx_ts_max + 1);
 
+                    if connection.db.mvcc_log_dropped_on_open() {
+                        // The database opens from its file alone: every file of the log is
+                        // emptied, its frames neither replayed nor kept for a later open.
+                        self.storage
+                            .restore_after_recovery(RecoveredLog::default())?;
+                        let c = self.storage.reset_to_fresh_header()?;
+                        *st = RecoverLogicalLogState::Done;
+                        if c.succeeded() {
+                            return Ok(IOResult::Done(false));
+                        }
+                        io_yield_one!(c);
+                    }
                     reader.plan(persistent_tx_ts_max)?;
                     if !header_present || !reader.has_frames()? {
                         self.storage.restore_after_recovery(reader.recovered())?;

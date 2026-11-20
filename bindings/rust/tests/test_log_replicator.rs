@@ -3,7 +3,8 @@
 //! writer wait without blocking the runtime, until a task of the
 //! replicator's own makes room, as one waiting on a Raft quorum does. A commit
 //! it refuses fails, and the connection that applies replicated commits is
-//! not asked.
+//! not asked. A checkpoint writes through the replicator's cut, where the
+//! database reopens.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -115,4 +116,73 @@ async fn a_log_replicator_needs_mvcc() {
         built.is_err(),
         "a log replicator was installed on a WAL database"
     );
+}
+
+/// Keeps each frame and gives checkpoints `cut`, when set.
+#[derive(Default)]
+struct Cutting {
+    frames: Mutex<Vec<ReplicatedFrame>>,
+    cut: Mutex<Option<u64>>,
+}
+
+impl LogReplicator for Cutting {
+    fn takes_commits(&self) -> bool {
+        true
+    }
+
+    fn replicate(&self, frame: ReplicatedFrame) -> Completion {
+        self.frames.lock().unwrap().push(frame);
+        Completion::new_yield()
+    }
+
+    fn checkpoint_cut(&self, newest: u64) -> u64 {
+        self.cut.lock().unwrap().unwrap_or(newest)
+    }
+}
+
+async fn replicated(path: &std::path::Path, replicator: Arc<Cutting>) -> turso::Database {
+    Builder::new_local(path.to_str().unwrap())
+        .with_mvcc(true)
+        .with_log_replicator(replicator)
+        .build()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_database_with_a_log_replicator_reopens_at_its_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let replicator = Arc::new(Cutting::default());
+    let db = replicated(&path, replicator.clone()).await;
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("INSERT INTO things VALUES (1, 'at the cut')", ())
+        .await
+        .unwrap();
+    let cut = replicator.frames.lock().unwrap().last().unwrap().commit_ts;
+    conn.execute("INSERT INTO things VALUES (2, 'after the cut')", ())
+        .await
+        .unwrap();
+    *replicator.cut.lock().unwrap() = Some(cut);
+    let mut checkpoint = conn
+        .query("PRAGMA wal_checkpoint(PASSIVE)", ())
+        .await
+        .unwrap();
+    while checkpoint.next().await.unwrap().is_some() {}
+    drop(checkpoint);
+    assert_eq!(db.mvcc_checkpointed_through().unwrap(), Some(cut));
+    assert_eq!(ids(&conn).await, [1, 2]);
+    drop(conn);
+    drop(db);
+
+    let db = replicated(&path, Arc::new(Cutting::default())).await;
+    let conn = db.connect().unwrap();
+    assert_eq!(ids(&conn).await, [1]);
+    assert_eq!(db.mvcc_checkpointed_through().unwrap(), Some(cut));
 }

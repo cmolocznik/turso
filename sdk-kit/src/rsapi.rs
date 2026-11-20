@@ -401,6 +401,7 @@ impl TursoDatabaseConfig {
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
+                "mvcc_log_dropped_on_open" => opts.with_mvcc_log_dropped_on_open(true),
                 "mvcc" => opts.with_mvcc(true),
                 // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
                 _ => opts,

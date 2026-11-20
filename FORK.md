@@ -1631,6 +1631,60 @@ unit suite, 4,218 tests, and the 163 of `index_method::` in `tests/integration` 
   indexed table, as `toy_vector_sparse_ivf` does, and `CREATE INDEX` filled them from the table's
   rows.
 
+### `path_trie`: writers of different rows commit side by side
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`core/index_method/path_trie.rs`; user docs `docs/sql-reference/functions/path.mdx`. It replaces
+the prefix tree of the entry above.
+Why: atoll-forge's writers run in `BEGIN CONCURRENT` under MVCC, and the index serialized them
+twice over. Every insert and delete replaced one counter entry, and every insert raised the
+sequence number of each directory entry above its row, so two writers under one top-level
+directory rewrote the same entries. A review by Codex found two more faults, both reproduced here
+by tests that fail on the prefix tree. Two writers adding one path to an empty index both
+committed: no counter entry existed yet to conflict on, and a key-only backing index is not
+conflict-checked at commit, which only unique indexes are. A class that matches `/` (`a[!x]b`
+matches `a/b`) was taken as one component, so the walk never reached `a/b`.
+What: each row has entries of its own, and no two rows share one, in two key-only B-trees:
+- `by_path` holds (path, seq, rowid), one entry per row. A query without `since` reads the range of
+  each pattern's literal directory, or the one path a pattern of exact names names.
+- `by_directory` holds (directory, direct child, seq, rest of the path, rowid), one entry for each
+  directory above the row down to `depth` levels below the root (`WITH (depth = n)`, 0 to 64,
+  default 2). This is a closure table cut off at that depth. A query with `since` reads, for each
+  pattern, its literal directory's entries above `since`, or, for a deeper literal directory, the
+  entries of the directory `depth` levels down that holds it. A pattern whose rest is one component
+  with no class reads only the direct children.
+Every candidate is checked against the whole pattern, and rows two patterns both reach are given
+once. Inserts and deletes write and remove a row's entries without reading any. Two rows may have
+one path: a UNIQUE index on the column keeps paths unique, and refuses a second writer of a path
+even while both transactions are open. An index made by the prefix tree must be dropped and made
+again: its backing stores have other names, and the error opening one says so.
+Cost: on this repository's 4,671 tracked paths in 628 directories, 18,479 entries at depth 2 against
+10,598, and at most 884,057 bytes of path text against 171,336. A change of a row's path or
+sequence number rewrites all of its entries. Storing only rowids in `by_directory`, and reading a
+candidate's path from its row, would cut the text; not done.
+Not done: `ivf_crash`'s kill rounds, a run in Atoll mode, and a cost run.
+Tests: `index_method::path_trie` in `tests/integration` (eighteen, two under `io_memory_yield`) and
+`index_method::path_trie::tests` in `turso_core` (five).
+- Writers of different paths under one directory, inserting and updating in `BEGIN CONCURRENT`,
+  both commit, and the index holds the table's rows after. The prefix tree failed it with a write
+  conflict.
+- A writer that deletes a directory's last file and one that adds a file there both commit, and
+  every query gives the added file. The prefix tree refused the second writer.
+- Two rows may have one path; with a UNIQUE index on the path, a second concurrent writer of one
+  path is refused.
+- Globs that cross a `/` without `**` (`a[!x]b`, `a[^x]b`, `a[.-0]b`, `[!q]/*`, `{a,b/c}/x.rs`,
+  `a{/x,}/b`) and others give the same rows as a plain scan. The prefix tree missed `a/b`.
+- The random history of 600 inserts, updates, moves and deletes gives the same rows as a plain scan
+  under WAL, under MVCC, over an IO that finishes nothing until stepped, and at depths 0, 1, 3 and
+  6. A depth that is no whole number from 0 to 64, or another option, is refused.
+- What a query reads still follows what it returns (`io_memory_yield`): a table eight times as
+  large reads about as many pages for one changed file or one directory.
+- The plan reads every row the whole patterns match, for 23 globs, 27 paths, five depths and three
+  values of `since`.
+- Each part is seen failing without it: a class read as unable to cross `/`, a deep pattern reading
+  direct-child entries, the root's entry marked direct, rows given twice, `since` not checked on
+  `by_path` ranges, a prefix range that never ends (the read-cost test), a delete that leaves its
+  directory entries, and no direct-children range.
+
 ### A commit replicator receives each commit before it is visible
 2026-11-20, on branch `commit-replicator` (from `path-trie`; not yet on `atoll`), in the commit that
 adds this entry. `core/storage/commit_replicator.rs` (`CommitReplicator`, `ReplicatedCommit`,

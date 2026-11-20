@@ -33,7 +33,7 @@ Returns 1 if `path` matches any glob in `patterns` and, unless `since` is NULL, 
 |--------|---------|
 | `*` | Any run of characters within one path component. It does not match `/`. |
 | `?` | Any one character other than `/`. |
-| `[abc]`, `[a-z]`, `[!abc]` | One character in, or not in, the class. |
+| `[abc]`, `[a-z]`, `[!abc]` | One character in, or not in, the class. Unlike `*` and `?`, a class may match `/`: `a[!x]b` matches `a/b`. |
 | `{a,b}` | Either alternative. |
 | `**` as a whole component | Any number of directories: `src/**` is everything under `src`, `**/*.rs` is every `.rs` file, `a/**/b` is `a/b`, `a/x/b`, `a/x/y/b`. |
 
@@ -50,29 +50,30 @@ WHERE path_sync(path, seq, '["src/**", "Cargo.toml", "crates/*/Cargo.toml"]', NU
 
 ```sql
 CREATE INDEX files_by_path ON files USING path_trie (path, seq);
+CREATE INDEX files_by_path ON files USING path_trie (path, seq) WITH (depth = 3);
 ```
 
-The index takes exactly two columns: the path and the sequence number. A query whose `WHERE` clause holds `path_sync` on those two columns reads the index, with or without other terms beside it:
+The index takes exactly two columns: the path and the sequence number. Its one option, `depth`, from 0 to 64 and 2 if it is not given, is how many levels of directories below the root it keeps changes for (below). A query whose `WHERE` clause holds `path_sync` on those two columns reads the index, with or without other terms beside it:
 
 ```sql
 SELECT path, kind FROM files
 WHERE path_sync(path, seq, ?1, ?2) AND kind <> 0;
 ```
 
-Two rows of the table cannot have the same path while the index exists.
+Two rows may have the same path. To keep paths unique, add a `UNIQUE` index on the path column too.
 
 ### What a query reads
 
-The index is a tree of directories. Each directory holds the highest sequence number of anything beneath it.
+A pattern's literal directory is the run of its first components that hold no glob syntax: `src/net` for `src/net/**/*.rs`, the root for `*.toml`. Every row a query reads is checked against the whole pattern.
 
-- A query follows the patterns down the tree. It does not read a directory no pattern can match.
-- With `since`, it does not read a directory in which nothing is newer than `since`.
+- Without `since`, a query reads the rows under each pattern's literal directory, by path, or the one row of a pattern that names a path.
+- With `since`, it reads the changes newer than `since` under each pattern's literal directory. The index keeps those for every directory down to `depth` levels below the root. For a pattern whose literal directory is deeper, it reads the changes of the directory `depth` levels down that holds it. A pattern that can match only a file of its literal directory, such as `*.toml`, reads only that directory's own files.
 
 So a query for one directory, or for what changed since the last sequence number, reads about the same number of pages in a table of a thousand rows as in one of a million.
 
 ### Keeping a copy in step
 
-Give every write a sequence number higher than the last. Keep a deleted file's row, marked as deleted, with the sequence number of its deletion: the copy then learns of the deletion like any other change.
+Give every write a sequence number higher than the last. Keep a deleted file's row, marked as deleted, with the sequence number of its deletion: the copy then learns of the deletion like any other change. When several transactions write at once, their sequence numbers can commit out of order: a copy must not take a number as the point it is up to until every write numbered at or below it has committed.
 
 ```sql
 -- The first time: everything under the patterns.
@@ -84,7 +85,7 @@ SELECT path, kind FROM files WHERE path_sync(path, seq, ?patterns, 4120);
 
 ### Writes
 
-A write to the indexed table also writes the entries of the directories above the row's path, and replaces one entry that every write shares. Two transactions that write the indexed table at once therefore conflict, and the second is refused: write the table from one transaction at a time.
+A row has entries of its own: one by its path, and one for each directory above it down to `depth` levels below the root. No two rows share an entry, so under MVCC, transactions in `BEGIN CONCURRENT` that write different rows commit side by side.
 
 ---
 

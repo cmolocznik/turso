@@ -139,6 +139,39 @@ fn path_sync_gives_the_same_rows_with_and_without_the_index(tmp_db: TempDatabase
     the_index_agrees_with_a_plain_scan(&plain, &indexed, 600);
 }
 
+/// The same random history and queries with the index keeping entries for fewer or more
+/// levels below the root: the rows it gives do not depend on how deep it keeps them.
+#[turso_macros::test(mvcc)]
+fn path_sync_gives_the_same_rows_at_every_depth(tmp_db: TempDatabase) {
+    for depth in [0, 1, 3, 6] {
+        let builder = TempDatabase::builder()
+            .with_opts(tmp_db.db_opts)
+            .with_flags(tmp_db.db_flags)
+            .with_init_sql(TABLE);
+        let plain_db = builder.clone().build();
+        let index_db = builder.build();
+        let plain = plain_db.connect_limbo();
+        let indexed = index_db.connect_limbo();
+        indexed
+            .execute(format!("{INDEX} WITH (depth = {depth})"))
+            .unwrap();
+        the_index_agrees_with_a_plain_scan(&plain, &indexed, 300);
+    }
+}
+
+#[turso_macros::test]
+fn a_depth_that_is_no_small_whole_number_is_refused(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(TABLE).unwrap();
+    for option in ["depth = -1", "depth = 65", "depth = 'two'", "levels = 2"] {
+        assert!(
+            conn.execute(format!("{INDEX} WITH ({option})")).is_err(),
+            "{option}"
+        );
+    }
+    conn.execute(format!("{INDEX} WITH (depth = 64)")).unwrap();
+}
+
 /// With an IO that finishes nothing until it is stepped, and a cache of a few small pages, the
 /// index's reads and writes are interrupted and entered again at every B-tree operation.
 #[cfg(feature = "io_memory_yield")]
@@ -232,16 +265,26 @@ fn a_change_deep_in_a_directory_is_found_from_the_top(tmp_db: TempDatabase) {
     );
 }
 
-#[turso_macros::test]
-fn two_rows_cannot_have_one_path(tmp_db: TempDatabase) {
+/// Two rows may have one path: the index is an index, and keeping paths unique is a UNIQUE
+/// index's work (below).
+#[turso_macros::test(mvcc)]
+fn two_rows_may_have_one_path(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     conn.execute(TABLE).unwrap();
     conn.execute(INDEX).unwrap();
     conn.execute("INSERT INTO files VALUES ('a/x.rs', 1, 1)")
         .unwrap();
-    assert!(conn
-        .execute("INSERT INTO files VALUES ('a/x.rs', 1, 2)")
-        .is_err());
+    conn.execute("INSERT INTO files VALUES ('a/x.rs', 1, 2)")
+        .unwrap();
+    assert_eq!(
+        matching(&conn, "[\"**\"]", None),
+        vec!["a/x.rs".to_string(), "a/x.rs".to_string()]
+    );
+    assert_eq!(
+        matching(&conn, "[\"a/x.rs\"]", Some(1)),
+        vec!["a/x.rs".to_string()]
+    );
+    conn.execute("DELETE FROM files WHERE seq = 1").unwrap();
     assert_eq!(
         matching(&conn, "[\"**\"]", None),
         vec!["a/x.rs".to_string()]
@@ -257,16 +300,64 @@ fn two_rows_cannot_have_one_path(tmp_db: TempDatabase) {
     );
 }
 
-/// The index is written by one transaction at a time. Here a second transaction removes the
-/// last file it can see in a directory while the first, not yet committed, adds another file
-/// there: were both to commit, the directory would be gone with a file still in it.
-#[test]
-fn a_second_writer_at_once_is_refused_under_mvcc() {
-    let tmp_db = TempDatabase::builder()
-        .with_db_name("path-trie-two-writers.db")
+fn mvcc_index_db(name: &str) -> TempDatabase {
+    TempDatabase::builder()
+        .with_db_name(name)
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
-        .build();
+        .build()
+}
+
+/// The paths of the rows in the table, read without the index.
+fn plain_paths(conn: &Arc<turso_core::Connection>) -> Vec<String> {
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT path FROM files ORDER BY path");
+    rows.into_iter().map(|(path,)| path).collect()
+}
+
+/// Writers of different paths under one directory, each in a concurrent transaction, commit
+/// side by side: the index keeps no entry that two rows share.
+#[test]
+fn writers_of_different_paths_commit_side_by_side_under_mvcc() {
+    let tmp_db = mvcc_index_db("path-trie-side-by-side.db");
+    let first = tmp_db.connect_limbo();
+    let second = tmp_db.connect_limbo();
+    first.execute(TABLE).unwrap();
+    first.execute(INDEX).unwrap();
+    first
+        .execute("INSERT INTO files VALUES ('a/b/x.rs', 1, 1), ('a/c/y.rs', 1, 1)")
+        .unwrap();
+
+    first.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO files VALUES ('a/b/z.rs', 1, 2)")
+        .unwrap();
+    second
+        .execute("INSERT INTO files VALUES ('a/b/w.rs', 1, 3)")
+        .unwrap();
+    first
+        .execute("UPDATE files SET seq = 2 WHERE path = 'a/b/x.rs'")
+        .unwrap();
+    second
+        .execute("UPDATE files SET seq = 3 WHERE path = 'a/c/y.rs'")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    second.execute("COMMIT").unwrap();
+
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(matching(&reader, "[\"**\"]", None), plain_paths(&reader));
+    assert_eq!(
+        matching(&reader, "[\"a/**\"]", Some(1)),
+        vec!["a/b/w.rs", "a/b/x.rs", "a/b/z.rs", "a/c/y.rs"]
+    );
+    assert_eq!(matching(&reader, "[\"a/b/*\"]", Some(2)), vec!["a/b/w.rs"]);
+}
+
+/// A writer that removes the last file of a directory and one that adds a file there commit
+/// side by side, and the index holds exactly the table's rows after.
+#[test]
+fn emptying_a_directory_beside_a_writer_that_fills_it() {
+    let tmp_db = mvcc_index_db("path-trie-empty-and-fill.db");
     let first = tmp_db.connect_limbo();
     let second = tmp_db.connect_limbo();
     first.execute(TABLE).unwrap();
@@ -278,23 +369,124 @@ fn a_second_writer_at_once_is_refused_under_mvcc() {
     first.execute("BEGIN CONCURRENT").unwrap();
     second.execute("BEGIN CONCURRENT").unwrap();
     first
-        .execute("INSERT INTO files VALUES ('a/y.rs', 1, 1)")
+        .execute("INSERT INTO files VALUES ('a/y.rs', 1, 2)")
+        .unwrap();
+    second
+        .execute("DELETE FROM files WHERE path = 'a/x.rs'")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    second.execute("COMMIT").unwrap();
+
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(plain_paths(&reader), vec!["a/y.rs"]);
+    for since in [None, Some(0), Some(1)] {
+        assert_eq!(
+            matching(&reader, "[\"**\"]", since),
+            vec!["a/y.rs"],
+            "{since:?}"
+        );
+        assert_eq!(
+            matching(&reader, "[\"a/*\"]", since),
+            vec!["a/y.rs"],
+            "{since:?}"
+        );
+    }
+}
+
+/// Keeping paths unique is a UNIQUE index's work, and it refuses a second writer of one path
+/// even when both transactions are open at once.
+#[test]
+fn a_unique_index_on_the_path_refuses_a_second_writer_of_it() {
+    let tmp_db = mvcc_index_db("path-trie-unique.db");
+    let first = tmp_db.connect_limbo();
+    let second = tmp_db.connect_limbo();
+    first.execute(TABLE).unwrap();
+    first
+        .execute("CREATE UNIQUE INDEX files_path ON files (path)")
+        .unwrap();
+    first.execute(INDEX).unwrap();
+
+    first.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    first
+        .execute("INSERT INTO files VALUES ('a/x.rs', 1, 1)")
         .unwrap();
     let second_wrote = second
-        .execute("DELETE FROM files WHERE path = 'a/x.rs'")
+        .execute("INSERT INTO files VALUES ('a/x.rs', 1, 2)")
         .is_ok();
     first.execute("COMMIT").unwrap();
     let second_committed = second_wrote && second.execute("COMMIT").is_ok();
-    assert!(!second_committed, "both writers committed");
+    assert!(!second_committed, "both writers of one path committed");
     if !second_wrote {
         let _ = second.execute("ROLLBACK");
     }
-
     let reader = tmp_db.connect_limbo();
-    let rows: Vec<(String,)> = reader.exec_rows("SELECT path FROM files ORDER BY path");
-    let scanned: Vec<String> = rows.into_iter().map(|(path,)| path).collect();
-    assert_eq!(scanned, vec!["a/x.rs".to_string(), "a/y.rs".to_string()]);
-    assert_eq!(matching(&reader, "[\"**\"]", None), scanned);
+    assert_eq!(matching(&reader, "[\"**\"]", None), vec!["a/x.rs"]);
+}
+
+/// Paths a glob reaches only by crossing a `/` with something other than `**`: a class may
+/// match `/` (`[!x]`, `[^x]`, a range that holds it), and an alternation may hold one.
+const CROSSING_PATHS: &[&str] = &[
+    "a/b",
+    "ab",
+    "axb",
+    "a/x/b",
+    "a.b",
+    "a0b",
+    "a/x.rs",
+    "b/c/x.rs",
+    "crates/a/Cargo.toml",
+    "crates/a/b/Cargo.toml",
+    "docs/api/v1/index.md",
+    "Cargo.toml",
+    "x/y",
+    "/x",
+    "a//b",
+];
+const CROSSING_GLOBS: &[&str] = &[
+    "a[!x]b",
+    "a[^x]b",
+    "a[.-0]b",
+    "[!q]/*",
+    "{a,b/c}/x.rs",
+    "a{/x,}/b",
+    "crates/*/Cargo.toml",
+    "docs/{guide,api/v1}/*.md",
+    "*.toml",
+    "*",
+    "a?b",
+    "**/b",
+    "a/**",
+];
+
+#[turso_macros::test(mvcc)]
+fn a_glob_that_crosses_a_separator_finds_the_same_rows_with_and_without_the_index(
+    tmp_db: TempDatabase,
+) {
+    let builder = TempDatabase::builder()
+        .with_opts(tmp_db.db_opts)
+        .with_flags(tmp_db.db_flags)
+        .with_init_sql(TABLE);
+    let plain_db = builder.clone().build();
+    let index_db = builder.build();
+    let plain = plain_db.connect_limbo();
+    let indexed = index_db.connect_limbo();
+    indexed.execute(INDEX).unwrap();
+    for (seq, path) in CROSSING_PATHS.iter().enumerate() {
+        let insert = format!("INSERT INTO files VALUES ('{path}', 1, {})", seq + 1);
+        plain.execute(&insert).unwrap();
+        indexed.execute(&insert).unwrap();
+    }
+    for glob in CROSSING_GLOBS {
+        let patterns = format!("[\"{glob}\"]");
+        for since in [None, Some(0), Some(5)] {
+            assert_eq!(
+                matching(&indexed, &patterns, since),
+                matching(&plain, &patterns, since),
+                "{glob} since {since:?}"
+            );
+        }
+    }
 }
 
 #[turso_macros::test]

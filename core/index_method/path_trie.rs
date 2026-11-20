@@ -1,27 +1,33 @@
 //! An index over slash-separated paths that answers one question fast: which rows have a path
 //! matching any of a set of glob patterns, and, optionally, a sequence number above a given one.
 //!
-//! > CREATE INDEX files_by_path ON files USING path_trie (path, seq)
+//! > CREATE INDEX files_by_path ON files USING path_trie (path, seq) WITH (depth = 2)
 //! > SELECT * FROM files WHERE path_sync(path, seq, '["src/**", "*.toml"]', 41)
 //!
-//! It is a prefix tree keyed by path component. A directory's entry holds the highest sequence
-//! number of anything beneath it, so a query with a minimum sequence number never reads a
-//! directory in which nothing is newer. CephFS's `rctime` and the birth transaction ids of btrfs
-//! and ZFS serve incremental sends the same way.
+//! Each row has entries of its own and shares none with another row, so writers of different
+//! rows never write the same entry: under MVCC they commit side by side. There is no directory
+//! entry, counter or running maximum to keep up to date.
 //!
-//! The tree is kept in two key-only B-trees:
+//! The entries are in two key-only B-trees:
 //!
-//! - `names`: (directory, name, is a directory, sequence number, child). It gives a directory's
-//!   entries by name.
-//! - `changes`: (directory, sequence number newest first, name, is a directory, child). It gives a
-//!   directory's entries by how recently they changed.
+//! - `by_path`: (path, sequence number, rowid), one per row. A query with no minimum sequence
+//!   number reads the range of a pattern's literal directory, or the one path a pattern names.
+//! - `by_directory`: (directory, direct child, sequence number, rest of the path, rowid), one for
+//!   every directory above the row down to `depth` levels below the root: the root, then each
+//!   directory in turn. The entry for the row's own directory is marked a direct child. A query
+//!   with a minimum sequence number reads, for each pattern, the entries of its literal directory
+//!   above that number, or those of the directory `depth` levels down that holds it; a pattern
+//!   that can match only a direct child reads only those.
 //!
-//! A file's child is the rowid of its table row. A directory's child is the directory's id; the
-//! root's is 0.
+//! The rows `by_directory` holds under one directory are a closure table's: every pair of a
+//! directory and a row below it, here cut off `depth` levels down. A pattern's literal part is
+//! as many of its first components as hold no glob character; every candidate is then checked
+//! against the whole pattern, so a class or an alternation that can match a `/` is never cut
+//! short. Two rows may have one path: keeping paths unique is a UNIQUE index's work.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
-use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use turso_parser::ast::{self, SortOrder};
 
 use crate::json::jsonb::ElementType;
@@ -47,6 +53,11 @@ use crate::{
 
 /// The SQL function the index serves.
 pub const PATH_SYNC_FUNCTION_NAME: &str = "path_sync";
+
+/// How many levels below the root `by_directory` keeps entries for, unless the index says.
+const DEFAULT_DEPTH: usize = 2;
+/// The most levels an index may ask for.
+const MOST_DEPTH: usize = 64;
 
 /// `path_sync(path, seq, patterns, since)` for one row, without the index: whether `path` matches
 /// any glob in the JSON array `patterns` and, unless `since` is NULL, `seq` is an integer above
@@ -84,6 +95,7 @@ impl IndexMethod for PathTrieIndexMethod {
                 configuration.columns.len()
             )));
         };
+        let depth = depth_of(configuration)?;
         let pattern = format!(
             "SELECT * FROM {} WHERE {PATH_SYNC_FUNCTION_NAME}({}, {}, ?, ?)",
             configuration.table_name, path.name, seq.name
@@ -91,7 +103,33 @@ impl IndexMethod for PathTrieIndexMethod {
         Ok(Arc::new(PathTrieAttachment {
             configuration: configuration.clone(),
             patterns: parse_patterns(&[&pattern])?,
+            depth,
         }))
+    }
+}
+
+/// The index's `depth` option: the default when it is not given.
+fn depth_of(configuration: &IndexMethodConfiguration) -> Result<usize> {
+    if let Some(other) = configuration
+        .parameters
+        .keys()
+        .find(|name| *name != "depth")
+    {
+        return Err(LimboError::ParseError(format!(
+            "{PATH_TRIE_INDEX_METHOD_NAME} index has no option {other}: it takes only depth"
+        )));
+    }
+    match configuration.parameters.get("depth") {
+        None => Ok(DEFAULT_DEPTH),
+        Some(Value::Numeric(Numeric::Integer(depth)))
+            if usize::try_from(*depth).is_ok_and(|depth| depth <= MOST_DEPTH) =>
+        {
+            Ok(*depth as usize)
+        }
+        Some(other) => Err(LimboError::ParseError(format!(
+            "{PATH_TRIE_INDEX_METHOD_NAME} index: depth must be an integer from 0 to \
+             {MOST_DEPTH}, not {other:?}"
+        ))),
     }
 }
 
@@ -99,6 +137,7 @@ impl IndexMethod for PathTrieIndexMethod {
 pub struct PathTrieAttachment {
     configuration: IndexMethodConfiguration,
     patterns: Vec<ast::Select>,
+    depth: usize,
 }
 
 impl IndexMethodAttachment for PathTrieAttachment {
@@ -117,7 +156,10 @@ impl IndexMethodAttachment for PathTrieAttachment {
     }
 
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
-        Ok(Box::new(PathTrieCursor::new(self.configuration.clone())))
+        Ok(Box::new(PathTrieCursor::new(
+            self.configuration.clone(),
+            self.depth,
+        )))
     }
 
     fn backing_schema(&self) -> BackingSchema {
@@ -132,28 +174,25 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
     let table = BackingTable::new(
         format!("path_trie_{}", configuration.index_name),
         vec![
-            BackingColumn::new("dir", Type::Integer),
-            BackingColumn::new("name", Type::Text),
-            BackingColumn::new("is_dir", Type::Integer),
+            BackingColumn::new("path", Type::Text),
             BackingColumn::new("seq", Type::Integer),
-            BackingColumn::new("child", Type::Integer),
+            BackingColumn::new("row", Type::Integer),
+            BackingColumn::new("dir", Type::Text),
+            BackingColumn::new("direct", Type::Integer),
+            BackingColumn::new("rest", Type::Text),
         ],
     );
-    let five_keys = || vec![key_info(), key_info(), key_info(), key_info(), key_info()];
-    let columns = |names: [&str; 5]| names.iter().map(|name| (*name).to_string()).collect();
-    let names = BackingIndex::on_backing_table(
-        &table,
-        format!("{}_names", table.table_name()),
-        columns(["dir", "name", "is_dir", "seq", "child"]),
-        five_keys(),
-    );
-    let changes = BackingIndex::on_backing_table(
-        &table,
-        format!("{}_changes", table.table_name()),
-        columns(["dir", "seq", "name", "is_dir", "child"]),
-        five_keys(),
-    );
-    BackingSchema::new(vec![table], vec![names, changes])
+    let index = |suffix: &str, names: &[&str]| {
+        BackingIndex::on_backing_table(
+            &table,
+            format!("{}_{suffix}", table.table_name()),
+            names.iter().map(|name| (*name).to_string()).collect(),
+            names.iter().map(|_| key_info()).collect(),
+        )
+    };
+    let by_path = index("by_path", &["path", "seq", "row"]);
+    let by_directory = index("by_directory", &["dir", "direct", "seq", "rest", "row"]);
+    BackingSchema::new(vec![table], vec![by_path, by_directory])
 }
 
 fn key_info() -> KeyInfo {
@@ -166,32 +205,31 @@ fn key_info() -> KeyInfo {
 
 pub struct PathTrieCursor {
     schema: BackingSchema,
-    names: Option<Box<dyn CursorTrait>>,
-    changes: Option<Box<dyn CursorTrait>>,
+    depth: usize,
+    by_path: Option<Box<dyn CursorTrait>>,
+    by_directory: Option<Box<dyn CursorTrait>>,
     /// An open of its cursors is under way: entered again, it goes on with the cursors it made.
     opening: bool,
     pending_store_ops: VecDeque<BackingStoreOp>,
-    insert: InsertState,
-    delete: DeleteState,
-    writes: Writes,
-    walk: Option<Walk>,
-    /// `query_start` made `walk` and has not yet given its first answer.
-    walk_starting: bool,
+    /// The entries an insert or a delete has decided to write, until they are written.
+    writes: Option<Writes>,
+    query: Option<Query>,
+    /// `query_start` made `query` and has not yet given its first answer.
+    query_starting: bool,
 }
 
 impl PathTrieCursor {
-    pub fn new(configuration: IndexMethodConfiguration) -> Self {
+    pub fn new(configuration: IndexMethodConfiguration, depth: usize) -> Self {
         Self {
             schema: backing_schema(&configuration),
-            names: None,
-            changes: None,
+            depth,
+            by_path: None,
+            by_directory: None,
             opening: false,
             pending_store_ops: VecDeque::new(),
-            insert: InsertState::Idle,
-            delete: DeleteState::Idle,
-            writes: Writes::default(),
-            walk: None,
-            walk_starting: false,
+            writes: None,
+            query: None,
+            query_starting: false,
         }
     }
 
@@ -213,23 +251,51 @@ impl PathTrieCursor {
 
     fn open_cursors_inner(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if !self.opening {
-            self.names = Some(open_store_cursor(context, &self.schema.indexes[0])?);
-            self.changes = Some(open_store_cursor(context, &self.schema.indexes[1])?);
+            self.by_path = Some(open_store_cursor(context, &self.schema.indexes[0])?);
+            self.by_directory = Some(open_store_cursor(context, &self.schema.indexes[1])?);
             self.opening = true;
         }
-        for cursor in [&mut self.names, &mut self.changes].into_iter().flatten() {
+        for cursor in [&mut self.by_path, &mut self.by_directory]
+            .into_iter()
+            .flatten()
+        {
             return_if_io!(cursor.finish_open());
         }
         Ok(IOResult::Done(()))
     }
 
-    fn advance_walk(&mut self) -> IOResultOr<bool> {
-        let (Some(names), Some(changes), Some(walk)) =
-            (&mut self.names, &mut self.changes, &mut self.walk)
+    /// Writes the entries `decide` gives for the row in `values`, deciding once: entered again
+    /// after a wait for IO, it goes on with what it decided.
+    fn write(
+        &mut self,
+        values: &[Register],
+        decide: fn(&IndexedRow, usize) -> Result<Writes>,
+    ) -> IOResultOr<()> {
+        let (Some(by_path), Some(by_directory)) = (&mut self.by_path, &mut self.by_directory)
         else {
             return Err(not_open());
         };
-        walk.advance(names.as_mut(), changes.as_mut())
+        if self.writes.is_none() {
+            let Some(row) = IndexedRow::from_registers(values)? else {
+                return Ok(IOResult::Done(()));
+            };
+            self.writes = Some(decide(&row, self.depth)?);
+        }
+        let writes = self.writes.as_mut().expect("decided above");
+        let out = writes.drain(by_path.as_mut(), by_directory.as_mut());
+        if !matches!(out, Ok(IOResult::IO(_))) {
+            self.writes = None;
+        }
+        out
+    }
+
+    fn advance_query(&mut self) -> IOResultOr<bool> {
+        let (Some(by_path), Some(by_directory), Some(query)) =
+            (&mut self.by_path, &mut self.by_directory, &mut self.query)
+        else {
+            return Err(not_open());
+        };
+        query.advance(by_path.as_mut(), by_directory.as_mut())
     }
 }
 
@@ -240,7 +306,11 @@ fn open_store_cursor(
     context
         .backing_store(index)?
         .ok_or_else(|| {
-            LimboError::InternalError(format!("backing store {} not found", index.name))
+            LimboError::InternalError(format!(
+                "backing store {} not found: an index made by an earlier {PATH_TRIE_INDEX_METHOD_NAME} \
+                 must be dropped and made again",
+                index.name
+            ))
         })?
         .open_cursor()
 }
@@ -277,253 +347,45 @@ impl IndexMethodCursor for PathTrieCursor {
     }
 
     fn close(&mut self, _context: &IndexMethodContext) {
-        self.names = None;
-        self.changes = None;
+        self.by_path = None;
+        self.by_directory = None;
         self.opening = false;
     }
 
-    /// Adds the row's file entry, makes the directories on its path that do not exist yet, and
-    /// raises the sequence number of every directory above it that holds a lower one.
-    ///
-    /// It reads first and writes after: each state below reads, and queues what to write in
-    /// `writes`, and the last state writes the queue. Its first read is of the counter.
+    /// Adds the row's entries. It reads nothing: no other row's entry is touched.
     fn insert(&mut self, values: &[Register]) -> IOResultOr<()> {
-        let (Some(names), Some(changes)) = (&mut self.names, &mut self.changes) else {
-            return Err(not_open());
-        };
-        loop {
-            match &mut self.insert {
-                InsertState::Idle => {
-                    self.writes.clear();
-                    let Some(row) = IndexedRow::from_registers(values)? else {
-                        return Ok(IOResult::Done(()));
-                    };
-                    self.insert = InsertState::Counter {
-                        finder: Finder::at(directory_prefix(COUNTER)?),
-                        row,
-                    };
-                }
-                InsertState::Counter { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let InsertState::Counter { row, .. } =
-                        std::mem::replace(&mut self.insert, InsertState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    let counter = self.writes.take_counter(found)?;
-                    self.insert = InsertState::below(row, 0, ROOT, counter)?;
-                }
-                InsertState::Descend { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let InsertState::Descend {
-                        row,
-                        depth,
-                        dir,
-                        mut counter,
-                        ..
-                    } = std::mem::replace(&mut self.insert, InsertState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    let name = &row.components[depth];
-                    self.insert = match found.filter(|e| e.is_directory_named(dir, name)) {
-                        Some(entry) => {
-                            if entry.seq < row.seq {
-                                self.writes.replace(&entry, &entry.with_seq(row.seq))?;
-                            }
-                            InsertState::below(row, depth + 1, entry.child, counter)?
-                        }
-                        // This directory and those below it do not exist: none of them can
-                        // hold the file yet.
-                        None => {
-                            let mut parent = dir;
-                            for name in &row.components[depth..row.components.len() - 1] {
-                                self.writes.add(&Entry {
-                                    dir: parent,
-                                    name: name.clone(),
-                                    is_dir: true,
-                                    seq: row.seq,
-                                    child: counter.next_id,
-                                })?;
-                                parent = counter.next_id;
-                                counter.next_id += 1;
-                            }
-                            self.writes.add(&row.file_entry(parent))?;
-                            self.writes.put_counter(counter)?;
-                            InsertState::Write
-                        }
-                    };
-                }
-                InsertState::Leaf { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let InsertState::Leaf {
-                        row, dir, counter, ..
-                    } = std::mem::replace(&mut self.insert, InsertState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    if found.is_some_and(|e| e.is_file_named(dir, row.file_name())) {
-                        return Err(Box::new(LimboError::Constraint(format!(
-                            "{PATH_TRIE_INDEX_METHOD_NAME}: two rows have the path {}",
-                            row.components.join("/")
-                        ))));
-                    }
-                    self.writes.add(&row.file_entry(dir))?;
-                    self.writes.put_counter(counter)?;
-                    self.insert = InsertState::Write;
-                }
-                InsertState::Write => {
-                    return_if_io!(self.writes.drain(names.as_mut(), changes.as_mut()));
-                    self.insert = InsertState::Idle;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.write(values, Writes::inserting)
     }
 
-    /// Removes the row's file entry, and every directory above it that is left empty. Like
-    /// `insert`, it reads first and writes after.
-    ///
-    /// It leaves the sequence numbers of the directories above as they are: a number that is too
-    /// high costs a query a visit, and never an answer.
+    /// Removes the row's entries, as `insert` made them from the same values.
     fn delete(&mut self, values: &[Register]) -> IOResultOr<()> {
-        let (Some(names), Some(changes)) = (&mut self.names, &mut self.changes) else {
-            return Err(not_open());
-        };
-        loop {
-            match &mut self.delete {
-                DeleteState::Idle => {
-                    self.writes.clear();
-                    let Some(row) = IndexedRow::from_registers(values)? else {
-                        return Ok(IOResult::Done(()));
-                    };
-                    self.delete = DeleteState::Counter {
-                        finder: Finder::at(directory_prefix(COUNTER)?),
-                        row,
-                    };
-                }
-                DeleteState::Counter { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let DeleteState::Counter { row, .. } =
-                        std::mem::replace(&mut self.delete, DeleteState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    let counter = self.writes.take_counter(found)?;
-                    self.writes.put_counter(counter)?;
-                    self.delete = DeleteState::below(row, Vec::new(), ROOT)?;
-                }
-                DeleteState::Descend { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let DeleteState::Descend {
-                        row,
-                        mut above,
-                        dir,
-                        ..
-                    } = std::mem::replace(&mut self.delete, DeleteState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    let name = &row.components[above.len()];
-                    let Some(entry) = found.filter(|e| e.is_directory_named(dir, name)) else {
-                        return Err(corrupt("a directory of an indexed path is missing"));
-                    };
-                    let child = entry.child;
-                    above.push(entry);
-                    self.delete = DeleteState::below(row, above, child)?;
-                }
-                DeleteState::Leaf { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let DeleteState::Leaf {
-                        row, above, dir, ..
-                    } = std::mem::replace(&mut self.delete, DeleteState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    let Some(entry) = found
-                        .filter(|e| e.is_file_named(dir, row.file_name()) && e.child == row.rowid)
-                    else {
-                        return Err(corrupt("an indexed row has no file entry"));
-                    };
-                    self.writes.remove(&entry)?;
-                    self.delete = DeleteState::Emptied {
-                        finder: Finder::at(directory_prefix(dir)?),
-                        above,
-                        removed: entry,
-                        saw_removed: false,
-                    };
-                }
-                DeleteState::Emptied { finder, .. } => {
-                    let found = return_if_io!(finder.step(names.as_mut(), Tree::Names));
-                    let DeleteState::Emptied {
-                        mut finder,
-                        mut above,
-                        removed,
-                        saw_removed,
-                    } = std::mem::replace(&mut self.delete, DeleteState::Idle)
-                    else {
-                        unreachable!("the state was matched above");
-                    };
-                    let other = found.filter(|e| e.dir == removed.dir);
-                    self.delete = match other {
-                        // This is the removed entry itself: look at the one after it.
-                        Some(entry) if entry == removed && !saw_removed => {
-                            finder.next();
-                            DeleteState::Emptied {
-                                finder,
-                                above,
-                                removed,
-                                saw_removed: true,
-                            }
-                        }
-                        Some(_) => DeleteState::Write,
-                        None => match above.pop() {
-                            // The directory is empty now: remove it from the one above.
-                            Some(directory) => {
-                                self.writes.remove(&directory)?;
-                                DeleteState::Emptied {
-                                    finder: Finder::at(directory_prefix(directory.dir)?),
-                                    above,
-                                    removed: directory,
-                                    saw_removed: false,
-                                }
-                            }
-                            // The root has no entry to remove.
-                            None => DeleteState::Write,
-                        },
-                    };
-                }
-                DeleteState::Write => {
-                    return_if_io!(self.writes.drain(names.as_mut(), changes.as_mut()));
-                    self.delete = DeleteState::Idle;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.write(values, Writes::deleting)
     }
 
     /// `values` holds the pattern's number (there is one pattern), then the JSON array of globs,
     /// then the minimum sequence number or NULL.
     fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool> {
-        if !self.walk_starting {
+        if !self.query_starting {
             let since = since_from_value(values[2].get_value())?;
             let patterns = PathPatterns::from_value(values[1].get_value())?;
-            self.walk = Some(Walk::new(patterns, since));
-            self.walk_starting = true;
+            self.query = Some(Query::new(patterns, since, self.depth));
+            self.query_starting = true;
         }
-        let out = self.advance_walk();
+        let out = self.advance_query();
         if !matches!(out, Ok(IOResult::IO(_))) {
-            self.walk_starting = false;
+            self.query_starting = false;
         }
         out
     }
 
     fn query_next(&mut self) -> IOResultOr<bool> {
-        self.advance_walk()
+        self.advance_query()
     }
 
     fn query_rowid(&mut self) -> IOResultOr<Option<i64>> {
-        Ok(IOResult::Done(self.walk.as_ref().and_then(|walk| walk.row)))
+        Ok(IOResult::Done(
+            self.query.as_ref().and_then(|query| query.row),
+        ))
     }
 
     fn query_column(&mut self, _: usize) -> IOResultOr<Value> {
@@ -533,26 +395,10 @@ impl IndexMethodCursor for PathTrieCursor {
     }
 }
 
-/// The root directory's id.
-const ROOT: i64 = 0;
-
-/// The directory id under which `names` keeps one entry that is not a file: the counter. Every
-/// insert and delete replaces it, so two transactions that write the index at once write the
-/// same entry, and the engine refuses the second.
-const COUNTER: i64 = -1;
-
-/// The counter's entry holds `next_id` as its sequence number and `writes` as its child.
-#[derive(Debug, Clone, Copy)]
-struct Counter {
-    /// The next unused directory id.
-    next_id: i64,
-    /// How many inserts and deletes the index has taken.
-    writes: i64,
-}
-
 /// What a row gives the index: its path, split at each `/`, its sequence number and its rowid.
 #[derive(Debug)]
 struct IndexedRow {
+    path: String,
     components: Vec<String>,
     seq: i64,
     rowid: i64,
@@ -571,25 +417,43 @@ impl IndexedRow {
             ));
         };
         Ok(Some(Self {
+            path: path.to_owned(),
             components: path.split('/').map(str::to_owned).collect(),
             seq: sequence_number(values[1].get_value()),
             rowid,
         }))
     }
 
-    fn file_name(&self) -> &str {
-        self.components
-            .last()
-            .expect("splitting a path gives at least one component")
+    /// The row's entries in `by_directory`: one for each directory above it down to `depth`
+    /// levels below the root, the root first.
+    fn directory_entries(&self, depth: usize) -> Vec<Entry> {
+        let directories = &self.components[..self.components.len() - 1];
+        let levels = directories.len().min(depth);
+        let mut dir = String::new();
+        let mut entries = Vec::with_capacity(levels + 1);
+        for level in 0..=levels {
+            if level > 0 {
+                dir.push_str(&directories[level - 1]);
+                dir.push('/');
+            }
+            entries.push(Entry {
+                path: format!("{dir}{}", self.components[level..].join("/")),
+                seq: self.seq,
+                rowid: self.rowid,
+                dir: dir.clone(),
+                direct: level == directories.len(),
+            });
+        }
+        entries
     }
 
-    fn file_entry(&self, dir: i64) -> Entry {
+    fn path_entry(&self) -> Entry {
         Entry {
-            dir,
-            name: self.file_name().to_owned(),
-            is_dir: false,
+            path: self.path.clone(),
             seq: self.seq,
-            child: self.rowid,
+            rowid: self.rowid,
+            dir: String::new(),
+            direct: false,
         }
     }
 }
@@ -610,166 +474,30 @@ fn since_from_value(value: &Value) -> Result<Option<i64>> {
     }
 }
 
-#[derive(Debug)]
-enum InsertState {
-    Idle,
-    /// Reading the counter, which every write replaces.
-    Counter {
-        row: IndexedRow,
-        finder: Finder,
-    },
-    /// Looking for the directory `row.components[depth]` in `dir`.
-    Descend {
-        row: IndexedRow,
-        depth: usize,
-        dir: i64,
-        counter: Counter,
-        finder: Finder,
-    },
-    /// Every directory exists: looking for a file of the same name in `dir`.
-    Leaf {
-        row: IndexedRow,
-        dir: i64,
-        counter: Counter,
-        finder: Finder,
-    },
-    Write,
-}
-
-impl InsertState {
-    /// The state that goes on from directory `dir`, which holds `row.components[depth]`.
-    fn below(row: IndexedRow, depth: usize, dir: i64, counter: Counter) -> Result<Self> {
-        let name = &row.components[depth];
-        if depth + 1 == row.components.len() {
-            Ok(Self::Leaf {
-                finder: Finder::at(entry_prefix(dir, name, false)?),
-                row,
-                dir,
-                counter,
-            })
-        } else {
-            Ok(Self::Descend {
-                finder: Finder::at(entry_prefix(dir, name, true)?),
-                row,
-                depth,
-                dir,
-                counter,
-            })
-        }
-    }
-}
-
-#[derive(Debug)]
-enum DeleteState {
-    Idle,
-    /// Reading the counter, which every write replaces.
-    Counter {
-        row: IndexedRow,
-        finder: Finder,
-    },
-    /// Looking for the directory `row.components[above.len()]` in `dir`. `above` holds the
-    /// entries of the directories passed so far, the root's child first.
-    Descend {
-        row: IndexedRow,
-        above: Vec<Entry>,
-        dir: i64,
-        finder: Finder,
-    },
-    /// Looking for the row's file entry in `dir`.
-    Leaf {
-        row: IndexedRow,
-        above: Vec<Entry>,
-        dir: i64,
-        finder: Finder,
-    },
-    /// `removed` is queued for removal from its directory: looking for any other entry there.
-    /// With none, the directory's own entry, the last of `above`, is removed too.
-    Emptied {
-        above: Vec<Entry>,
-        removed: Entry,
-        saw_removed: bool,
-        finder: Finder,
-    },
-    Write,
-}
-
-impl DeleteState {
-    /// The state that goes on from directory `dir`, which holds `row.components[above.len()]`.
-    fn below(row: IndexedRow, above: Vec<Entry>, dir: i64) -> Result<Self> {
-        let name = &row.components[above.len()];
-        if above.len() + 1 == row.components.len() {
-            Ok(Self::Leaf {
-                finder: Finder::at(entry_prefix(dir, name, false)?),
-                row,
-                above,
-                dir,
-            })
-        } else {
-            Ok(Self::Descend {
-                finder: Finder::at(entry_prefix(dir, name, true)?),
-                row,
-                above,
-                dir,
-            })
-        }
-    }
-}
-
-fn corrupt(what: &str) -> Box<LimboError> {
-    Box::new(LimboError::Corrupt(format!(
-        "{PATH_TRIE_INDEX_METHOD_NAME} index corrupted: {what}"
-    )))
-}
-
-/// A query in progress: the directories still to read, and the one being read.
-struct Walk {
+/// A query in progress: the ranges still to read, the one being read, and the rows given.
+struct Query {
     /// `None` when the patterns are NULL: no row matches.
     patterns: Option<PathPatterns>,
     since: Option<i64>,
-    pending: Vec<Directory>,
-    scan: Option<Scan>,
+    scans: VecDeque<Scan>,
+    reading: Option<(Scan, Finder)>,
+    /// Rows already given: two patterns' ranges may hold one row.
+    given: HashSet<i64>,
     /// The rowid of the row the query stands at.
     row: Option<i64>,
 }
 
-/// A directory a query reads, with its path (ending in `/`, empty for the root) and what the
-/// patterns still need below it.
-struct Directory {
-    id: i64,
-    path: String,
-    states: PatternStates,
-}
-
-struct Scan {
-    directory: Directory,
-    kind: ScanKind,
-    finder: Finder,
-}
-
-enum ScanKind {
-    /// Every entry, by name.
-    Names,
-    /// Entries newer than `since`, newest first.
-    Changes,
-    /// Only these names: every pattern still alive needs one of them here.
-    Literals { names: Vec<String>, next: usize },
-}
-
-impl Walk {
-    fn new(patterns: Option<PathPatterns>, since: Option<i64>) -> Self {
-        let pending = match &patterns {
-            Some(patterns) => vec![Directory {
-                id: ROOT,
-                path: String::new(),
-                states: patterns.start(),
-            }],
-            None => Vec::new(),
-        };
+impl Query {
+    fn new(patterns: Option<PathPatterns>, since: Option<i64>, depth: usize) -> Self {
+        let scans = patterns
+            .as_ref()
+            .map_or_else(VecDeque::new, |patterns| plan(patterns, since, depth));
         Self {
             patterns,
             since,
-            pending,
-            scan: None,
+            scans,
+            reading: None,
+            given: HashSet::new(),
             row: None,
         }
     }
@@ -777,179 +505,194 @@ impl Walk {
     /// Moves to the next matching row. Returns whether there is one.
     fn advance(
         &mut self,
-        names: &mut dyn CursorTrait,
-        changes: &mut dyn CursorTrait,
+        by_path: &mut dyn CursorTrait,
+        by_directory: &mut dyn CursorTrait,
     ) -> IOResultOr<bool> {
         let Some(patterns) = &self.patterns else {
             return Ok(IOResult::Done(false));
         };
         loop {
-            let Some(scan) = &mut self.scan else {
-                let Some(directory) = self.pending.pop() else {
+            let Some((scan, finder)) = &mut self.reading else {
+                let Some(scan) = self.scans.pop_front() else {
                     self.row = None;
                     return Ok(IOResult::Done(false));
                 };
-                self.scan = Some(Scan::of(directory, patterns, self.since)?);
+                let finder = Finder::at(scan.start()?);
+                self.reading = Some((scan, finder));
                 continue;
             };
-            let entry = match scan.kind {
-                ScanKind::Changes => return_if_io!(scan.finder.step(changes, Tree::Changes)),
-                ScanKind::Names | ScanKind::Literals { .. } => {
-                    return_if_io!(scan.finder.step(names, Tree::Names))
-                }
+            let tree = scan.tree();
+            let cursor: &mut dyn CursorTrait = match tree {
+                Tree::ByPath => &mut *by_path,
+                Tree::ByDirectory => &mut *by_directory,
             };
+            let entry = return_if_io!(finder.step(cursor, tree));
             // The read is done. Nothing below waits for IO, so each entry is handled once.
-            let entry = entry.filter(|e| e.dir == scan.directory.id);
-            let entry = match &mut scan.kind {
-                ScanKind::Names => entry,
-                // `changes` holds the newest first: the first entry that is not newer than
-                // `since` ends the directory.
-                ScanKind::Changes => entry.filter(|e| self.since.is_none_or(|s| e.seq > s)),
-                ScanKind::Literals { names, next } => {
-                    match entry.filter(|e| e.name == names[*next]) {
-                        Some(entry) => Some(entry),
-                        None if *next + 1 < names.len() => {
-                            *next += 1;
-                            scan.finder =
-                                Finder::at(name_prefix(scan.directory.id, &names[*next])?);
-                            continue;
-                        }
-                        None => None,
-                    }
-                }
-            };
-            let Some(entry) = entry else {
-                self.scan = None;
+            let Some(entry) = entry.filter(|entry| scan.holds(entry)) else {
+                self.reading = None;
                 continue;
             };
-            scan.finder.next();
-            if self.since.is_some_and(|since| entry.seq <= since) {
+            finder.next();
+            if self.since.is_some_and(|since| entry.seq <= since)
+                || !patterns.matches(&entry.path)
+                || !self.given.insert(entry.rowid)
+            {
                 continue;
             }
-            let next = patterns.advance(&scan.directory.states, &entry.name);
-            if entry.is_dir {
-                let states = patterns.unfinished(next);
-                if !states.is_empty() {
-                    self.pending.push(Directory {
-                        id: entry.child,
-                        path: format!("{}{}/", scan.directory.path, entry.name),
-                        states,
-                    });
-                }
-            } else if patterns.may_finish(&next) {
-                let path = format!("{}{}", scan.directory.path, entry.name);
-                if patterns.matches(&path) {
-                    self.row = Some(entry.child);
-                    return Ok(IOResult::Done(true));
-                }
-            }
+            self.row = Some(entry.rowid);
+            return Ok(IOResult::Done(true));
         }
     }
+}
+
+/// A range of one B-tree that a query reads.
+#[derive(Debug, PartialEq, Eq)]
+enum Scan {
+    /// The rows of exactly this path, in `by_path`.
+    Path(String),
+    /// The rows whose path starts with this, in `by_path`: a directory's path and `/`, or
+    /// nothing for every row.
+    Below(String),
+    /// The entries of `dir` in `by_directory` of one kind, newer than `above`.
+    Directory {
+        dir: String,
+        direct: bool,
+        above: i64,
+    },
 }
 
 impl Scan {
-    fn of(directory: Directory, patterns: &PathPatterns, since: Option<i64>) -> Result<Self> {
-        let (kind, key) = if since.is_some() {
-            (ScanKind::Changes, directory_prefix(directory.id)?)
-        } else if let Some(names) = patterns.only_literals(&directory.states) {
-            let key = name_prefix(directory.id, &names[0])?;
-            (ScanKind::Literals { names, next: 0 }, key)
-        } else {
-            (ScanKind::Names, directory_prefix(directory.id)?)
-        };
-        Ok(Self {
-            directory,
-            kind,
-            finder: Finder::at(key),
-        })
-    }
-}
-
-/// One entry of a directory: a file or a directory in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
-    dir: i64,
-    name: String,
-    is_dir: bool,
-    /// A file's sequence number, or the highest one beneath a directory.
-    seq: i64,
-    /// A file's rowid, or a directory's id.
-    child: i64,
-}
-
-impl Entry {
-    fn is_directory_named(&self, dir: i64, name: &str) -> bool {
-        self.dir == dir && self.is_dir && self.name == name
-    }
-
-    fn is_file_named(&self, dir: i64, name: &str) -> bool {
-        self.dir == dir && !self.is_dir && self.name == name
-    }
-
-    fn with_seq(&self, seq: i64) -> Self {
-        Self {
-            seq,
-            ..self.clone()
+    fn tree(&self) -> Tree {
+        match self {
+            Self::Path(_) | Self::Below(_) => Tree::ByPath,
+            Self::Directory { .. } => Tree::ByDirectory,
         }
     }
+
+    /// The key the range starts at.
+    fn start(&self) -> Result<ImmutableRecord> {
+        match self {
+            Self::Path(path) | Self::Below(path) => {
+                ImmutableRecord::from_values(&[Value::build_text(path.clone())], 1)
+            }
+            Self::Directory { dir, direct, above } => ImmutableRecord::from_values(
+                &[
+                    Value::build_text(dir.clone()),
+                    Value::from_i64(i64::from(*direct)),
+                    Value::from_i64(above.saturating_add(1)),
+                ],
+                3,
+            ),
+        }
+    }
+
+    /// Whether `entry`, read in the range's B-tree at or after its start, is still in it.
+    fn holds(&self, entry: &Entry) -> bool {
+        match self {
+            Self::Path(path) => entry.path == *path,
+            Self::Below(prefix) => entry.path.starts_with(prefix.as_str()),
+            Self::Directory { dir, direct, above } => {
+                entry.dir == *dir && entry.direct == *direct && entry.seq > *above
+            }
+        }
+    }
+}
+
+/// The ranges that hold every row the patterns may match, newer than `since` if it is set.
+fn plan(patterns: &PathPatterns, since: Option<i64>, depth: usize) -> VecDeque<Scan> {
+    let mut scans = VecDeque::new();
+    for components in &patterns.components {
+        let literals: Vec<&str> = components
+            .iter()
+            .map_while(|component| match component {
+                Component::Literal(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if literals.len() == components.len() {
+            scans.push_back(Scan::Path(literals.join("/")));
+            continue;
+        }
+        let rest = &components[literals.len()..];
+        let only_direct_children = matches!(
+            rest,
+            [Component::Glob {
+                crosses_separator: false
+            }]
+        );
+        match since {
+            None => scans.push_back(Scan::Below(directory_path(&literals))),
+            // No sequence number is above the largest.
+            Some(i64::MAX) => {}
+            Some(above) if literals.len() <= depth => {
+                let dir = directory_path(&literals);
+                scans.push_back(Scan::Directory {
+                    dir: dir.clone(),
+                    direct: true,
+                    above,
+                });
+                if !only_direct_children {
+                    scans.push_back(Scan::Directory {
+                        dir,
+                        direct: false,
+                        above,
+                    });
+                }
+            }
+            // Every row under a directory deeper than `depth` is below, and no direct child,
+            // of the directory `depth` levels down that holds it.
+            Some(above) => scans.push_back(Scan::Directory {
+                dir: directory_path(&literals[..depth]),
+                direct: false,
+                above,
+            }),
+        }
+    }
+    scans
+}
+
+/// The path of the directory these names lead to, each followed by `/`: empty for the root.
+fn directory_path(names: &[&str]) -> String {
+    names.iter().map(|name| format!("{name}/")).collect()
+}
+
+/// An entry of either B-tree. A `by_path` entry has no directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    path: String,
+    seq: i64,
+    rowid: i64,
+    dir: String,
+    direct: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tree {
-    Names,
-    Changes,
+    ByPath,
+    ByDirectory,
 }
 
-fn names_key(entry: &Entry) -> Result<ImmutableRecord> {
+fn by_path_key(entry: &Entry) -> Result<ImmutableRecord> {
     ImmutableRecord::from_values(
         &[
-            Value::from_i64(entry.dir),
-            Value::build_text(entry.name.clone()),
-            Value::from_i64(i64::from(entry.is_dir)),
+            Value::build_text(entry.path.clone()),
             Value::from_i64(entry.seq),
-            Value::from_i64(entry.child),
-        ],
-        5,
-    )
-}
-
-/// `changes` sorts a directory's entries newest first: it keys them by the bitwise complement of
-/// the sequence number, which reverses the order of every `i64`.
-fn changes_key(entry: &Entry) -> Result<ImmutableRecord> {
-    ImmutableRecord::from_values(
-        &[
-            Value::from_i64(entry.dir),
-            Value::from_i64(!entry.seq),
-            Value::build_text(entry.name.clone()),
-            Value::from_i64(i64::from(entry.is_dir)),
-            Value::from_i64(entry.child),
-        ],
-        5,
-    )
-}
-
-/// The key every entry of directory `dir` starts with, in either tree.
-fn directory_prefix(dir: i64) -> Result<ImmutableRecord> {
-    ImmutableRecord::from_values(&[Value::from_i64(dir)], 1)
-}
-
-/// The key the entries called `name` in `dir` start with, in `names`.
-fn name_prefix(dir: i64, name: &str) -> Result<ImmutableRecord> {
-    ImmutableRecord::from_values(
-        &[Value::from_i64(dir), Value::build_text(name.to_owned())],
-        2,
-    )
-}
-
-/// The key the file or the directory called `name` in `dir` starts with, in `names`.
-fn entry_prefix(dir: i64, name: &str, is_dir: bool) -> Result<ImmutableRecord> {
-    ImmutableRecord::from_values(
-        &[
-            Value::from_i64(dir),
-            Value::build_text(name.to_owned()),
-            Value::from_i64(i64::from(is_dir)),
+            Value::from_i64(entry.rowid),
         ],
         3,
+    )
+}
+
+fn by_directory_key(entry: &Entry) -> Result<ImmutableRecord> {
+    ImmutableRecord::from_values(
+        &[
+            Value::build_text(entry.dir.clone()),
+            Value::from_i64(i64::from(entry.direct)),
+            Value::from_i64(entry.seq),
+            Value::build_text(entry.path[entry.dir.len()..].to_owned()),
+            Value::from_i64(entry.rowid),
+        ],
+        5,
     )
 }
 
@@ -967,20 +710,23 @@ fn parse_entry(tree: Tree, record: &ImmutableRecord) -> Result<Entry> {
         ))),
     };
     match tree {
-        Tree::Names => Ok(Entry {
-            dir: integer(0)?,
-            name: text(1)?,
-            is_dir: integer(2)? != 0,
-            seq: integer(3)?,
-            child: integer(4)?,
+        Tree::ByPath => Ok(Entry {
+            path: text(0)?,
+            seq: integer(1)?,
+            rowid: integer(2)?,
+            dir: String::new(),
+            direct: false,
         }),
-        Tree::Changes => Ok(Entry {
-            dir: integer(0)?,
-            seq: !integer(1)?,
-            name: text(2)?,
-            is_dir: integer(3)? != 0,
-            child: integer(4)?,
-        }),
+        Tree::ByDirectory => {
+            let dir = text(0)?;
+            Ok(Entry {
+                path: format!("{dir}{}", text(3)?),
+                seq: integer(2)?,
+                rowid: integer(4)?,
+                direct: integer(1)? != 0,
+                dir,
+            })
+        }
     }
 }
 
@@ -1071,74 +817,42 @@ enum WritePhase {
 }
 
 impl Writes {
-    fn clear(&mut self) {
-        self.ops.clear();
-        self.phase = WritePhase::Seek;
+    /// The row's entries, to add.
+    fn inserting(row: &IndexedRow, depth: usize) -> Result<Self> {
+        Self::of(row, depth, WriteOp::Insert)
     }
 
-    fn push(&mut self, op: WriteOp) {
-        self.ops.push_back(op);
+    /// The row's entries, to remove.
+    fn deleting(row: &IndexedRow, depth: usize) -> Result<Self> {
+        Self::of(row, depth, WriteOp::Delete)
     }
 
-    fn add(&mut self, entry: &Entry) -> Result<()> {
-        self.push(WriteOp::Insert(Tree::Names, names_key(entry)?));
-        self.push(WriteOp::Insert(Tree::Changes, changes_key(entry)?));
-        Ok(())
-    }
-
-    fn remove(&mut self, entry: &Entry) -> Result<()> {
-        self.push(WriteOp::Delete(Tree::Names, names_key(entry)?));
-        self.push(WriteOp::Delete(Tree::Changes, changes_key(entry)?));
-        Ok(())
-    }
-
-    fn replace(&mut self, old: &Entry, new: &Entry) -> Result<()> {
-        self.remove(old)?;
-        self.add(new)
-    }
-
-    /// Queues the removal of the counter's entry, which `found` is unless the index has taken
-    /// no write yet, and gives the counter it held.
-    fn take_counter(&mut self, found: Option<Entry>) -> Result<Counter> {
-        match found.filter(|entry| entry.dir == COUNTER) {
-            Some(entry) => {
-                self.push(WriteOp::Delete(Tree::Names, names_key(&entry)?));
-                Ok(Counter {
-                    next_id: entry.seq,
-                    writes: entry.child,
-                })
-            }
-            None => Ok(Counter {
-                next_id: ROOT + 1,
-                writes: 0,
-            }),
+    fn of(
+        row: &IndexedRow,
+        depth: usize,
+        op: fn(Tree, ImmutableRecord) -> WriteOp,
+    ) -> Result<Self> {
+        let mut ops = VecDeque::from([op(Tree::ByPath, by_path_key(&row.path_entry())?)]);
+        for entry in row.directory_entries(depth) {
+            ops.push_back(op(Tree::ByDirectory, by_directory_key(&entry)?));
         }
-    }
-
-    /// Queues the counter's entry as it is after this write.
-    fn put_counter(&mut self, counter: Counter) -> Result<()> {
-        let entry = Entry {
-            dir: COUNTER,
-            name: String::new(),
-            is_dir: false,
-            seq: counter.next_id,
-            child: counter.writes + 1,
-        };
-        self.push(WriteOp::Insert(Tree::Names, names_key(&entry)?));
-        Ok(())
+        Ok(Self {
+            ops,
+            phase: WritePhase::Seek,
+        })
     }
 
     fn drain(
         &mut self,
-        names: &mut dyn CursorTrait,
-        changes: &mut dyn CursorTrait,
+        by_path: &mut dyn CursorTrait,
+        by_directory: &mut dyn CursorTrait,
     ) -> IOResultOr<()> {
         while let Some(op) = self.ops.front() {
             let (WriteOp::Insert(tree, key) | WriteOp::Delete(tree, key)) = op;
             let is_delete = matches!(op, WriteOp::Delete(..));
             let cursor: &mut dyn CursorTrait = match tree {
-                Tree::Names => &mut *names,
-                Tree::Changes => &mut *changes,
+                Tree::ByPath => &mut *by_path,
+                Tree::ByDirectory => &mut *by_directory,
             };
             match self.phase {
                 WritePhase::Seek => {
@@ -1182,29 +896,35 @@ impl Writes {
     }
 }
 
+fn corrupt(what: &str) -> Box<LimboError> {
+    Box::new(LimboError::Corrupt(format!(
+        "{PATH_TRIE_INDEX_METHOD_NAME} index corrupted: {what}"
+    )))
+}
+
 /// A set of glob patterns over slash-separated paths, with `globset`'s rules and a literal
 /// separator: `*` and `?` do not match `/`, and `**` as a whole component matches any number
-/// of directories.
+/// of directories. A class may still match `/`: `[!x]` does.
 pub struct PathPatterns {
     /// Decides whether a whole path matches.
     whole: GlobSet,
-    /// Each pattern split at `/`, for deciding which directories are worth reading.
+    /// Each pattern split at `/`, for deciding which ranges hold the rows it may match.
     components: Vec<Vec<Component>>,
 }
 
 /// What a pattern needs of one path component.
+#[derive(Debug)]
 enum Component {
     Literal(String),
-    Glob(GlobMatcher),
+    /// A glob of one component. One with a class may match a `/`, and so span components.
+    Glob {
+        crosses_separator: bool,
+    },
     /// `**`: any number of directories, none included.
     AnyDirectories,
     /// The pattern from here on is not split: anything below might match, and `whole` decides.
     Anything,
 }
-
-/// For each pattern still alive, how many of its components the path so far has matched: pairs
-/// of pattern and component number, sorted, each once.
-type PatternStates = Vec<(usize, usize)>;
 
 impl PathPatterns {
     /// Reads a JSON array of glob strings. NULL gives `None`.
@@ -1258,85 +978,6 @@ impl PathPatterns {
     pub fn matches(&self, path: &str) -> bool {
         self.whole.is_match(path)
     }
-
-    /// The states before any component is matched.
-    fn start(&self) -> PatternStates {
-        let mut states = Vec::new();
-        for pattern in 0..self.components.len() {
-            self.reach(pattern, 0, &mut states);
-        }
-        normalized(states)
-    }
-
-    /// The states after one more component, `name`, is matched.
-    fn advance(&self, states: &PatternStates, name: &str) -> PatternStates {
-        let mut next = Vec::new();
-        for &(pattern, matched) in states {
-            match self.components[pattern].get(matched) {
-                None => {}
-                Some(Component::Literal(literal)) => {
-                    if literal == name {
-                        self.reach(pattern, matched + 1, &mut next);
-                    }
-                }
-                Some(Component::Glob(glob)) => {
-                    if glob.is_match(name) {
-                        self.reach(pattern, matched + 1, &mut next);
-                    }
-                }
-                Some(Component::AnyDirectories | Component::Anything) => {
-                    self.reach(pattern, matched, &mut next);
-                }
-            }
-        }
-        normalized(next)
-    }
-
-    /// Adds the state, and those it reaches by letting `**` match no directory.
-    fn reach(&self, pattern: usize, mut matched: usize, states: &mut PatternStates) {
-        states.push((pattern, matched));
-        while let Some(Component::AnyDirectories) = self.components[pattern].get(matched) {
-            matched += 1;
-            states.push((pattern, matched));
-        }
-    }
-
-    /// Whether a file reached with these states might match. It may say yes for a file that does
-    /// not match, and never no for one that does: `matches` decides.
-    fn may_finish(&self, states: &PatternStates) -> bool {
-        states.iter().any(|&(pattern, matched)| {
-            matches!(
-                self.components[pattern].get(matched),
-                None | Some(Component::AnyDirectories | Component::Anything)
-            )
-        })
-    }
-
-    /// The states that still need a component: those a directory is worth reading for.
-    fn unfinished(&self, mut states: PatternStates) -> PatternStates {
-        states.retain(|&(pattern, matched)| matched < self.components[pattern].len());
-        states
-    }
-
-    /// The names the states need next, if each of them needs one exact name.
-    fn only_literals(&self, states: &PatternStates) -> Option<Vec<String>> {
-        let mut names = Vec::with_capacity(states.len());
-        for &(pattern, matched) in states {
-            match self.components[pattern].get(matched) {
-                Some(Component::Literal(name)) => names.push(name.clone()),
-                _ => return None,
-            }
-        }
-        names.sort_unstable();
-        names.dedup();
-        (!names.is_empty()).then_some(names)
-    }
-}
-
-fn normalized(mut states: PatternStates) -> PatternStates {
-    states.sort_unstable();
-    states.dedup();
-    states
 }
 
 fn path_glob(glob: &str) -> std::result::Result<globset::Glob, globset::Error> {
@@ -1376,6 +1017,7 @@ fn component(part: &str) -> Option<Component> {
     }
     let mut name = String::with_capacity(part.len());
     let mut exact = true;
+    let mut class = false;
     let mut after_star = false;
     let mut chars = part.chars();
     while let Some(c) = chars.next() {
@@ -1386,13 +1028,16 @@ fn component(part: &str) -> Option<Component> {
             '*' if after_star => return None,
             '*' | '?' | ']' => exact = false,
             '[' => {
-                let mut class = chars.clone();
-                match (class.next(), class.next()) {
+                let mut one = chars.clone();
+                match (one.next(), one.next()) {
                     (Some(only), Some(']')) if only != '!' && only != '^' => {
                         name.push(only);
-                        chars = class;
+                        chars = one;
                     }
-                    _ => exact = false,
+                    _ => {
+                        exact = false;
+                        class = true;
+                    }
                 }
             }
             c => name.push(c),
@@ -1402,9 +1047,9 @@ fn component(part: &str) -> Option<Component> {
     if exact {
         Some(Component::Literal(name))
     } else {
-        path_glob(part)
-            .ok()
-            .map(|glob| Component::Glob(glob.compile_matcher()))
+        path_glob(part).ok().map(|_| Component::Glob {
+            crosses_separator: class,
+        })
     }
 }
 
@@ -1416,117 +1061,194 @@ mod tests {
         PathPatterns::new(&globs.iter().map(|g| (*g).to_owned()).collect::<Vec<_>>()).unwrap()
     }
 
-    /// Whether the split patterns would let a walk reach `path` as a file.
-    fn reachable(patterns: &PathPatterns, path: &str) -> bool {
-        let components: Vec<&str> = path.split('/').collect();
-        let (file, directories) = components.split_last().unwrap();
-        let mut states = patterns.start();
-        for directory in directories {
-            states = patterns.unfinished(patterns.advance(&states, directory));
-            if states.is_empty() {
-                return false;
-            }
+    fn row(path: &str, seq: i64) -> IndexedRow {
+        IndexedRow {
+            path: path.to_owned(),
+            components: path.split('/').map(str::to_owned).collect(),
+            seq,
+            rowid: 7,
         }
-        patterns.may_finish(&patterns.advance(&states, file))
     }
 
+    /// Whether the planned ranges hold one of the row's entries that the query reads.
+    fn covered(scans: &VecDeque<Scan>, row: &IndexedRow, depth: usize) -> bool {
+        let path_entry = row.path_entry();
+        let directory_entries = row.directory_entries(depth);
+        scans.iter().any(|scan| match scan.tree() {
+            Tree::ByPath => scan.holds(&path_entry),
+            Tree::ByDirectory => directory_entries.iter().any(|entry| scan.holds(entry)),
+        })
+    }
+
+    const GLOBS: &[&str] = &[
+        "crates/foo/**",
+        "**/*.toml",
+        "*.toml",
+        "crates/*/Cargo.toml",
+        "Cargo.lock",
+        "a/**/b",
+        "**",
+        "docs/{guide,api/v1}/*.md",
+        "src/[a-c]?.rs",
+        "we\\*ird/*",
+        "x**y/z",
+        "",
+        "a//b",
+        "app/[[]id[]]/page.tsx",
+        "q[?]/[*].rs",
+        "[{]lit[}]",
+        "back\\\\slash/\\*",
+        "[!a]/x",
+        "a[!x]b",
+        "a[.-0]b",
+        "a{/x,}/b",
+        "deep/er/than/two/*.txt",
+        "deep/er/**",
+    ];
+    const PATHS: &[&str] = &[
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/foo/src/lib.rs",
+        "crates/foo/Cargo.toml",
+        "crates/bar/Cargo.toml",
+        "crates/bar/src/Cargo.toml",
+        "a/b",
+        "a/x/y/b",
+        "a/b/c",
+        "a/x/b",
+        "docs/guide/intro.md",
+        "docs/api/v1/index.md",
+        "src/ab.rs",
+        "src/zz.rs",
+        "we*ird/file",
+        "xy/z",
+        "x/q/y/z",
+        "",
+        "a//b",
+        "deep/er/than/two/pattern.txt",
+        "deep/er/than/any/pattern.txt",
+        "app/[id]/page.tsx",
+        "q?/*.rs",
+        "{lit}",
+        "back\\slash/*",
+        "b/x",
+        "/x",
+    ];
+
+    /// Every row a pattern matches is in a range its plan reads, at every depth, with and
+    /// without a minimum sequence number below the row's.
     #[test]
-    fn the_split_patterns_reach_every_path_the_whole_patterns_match() {
-        let globs = [
-            "crates/foo/**",
-            "**/*.toml",
-            "crates/*/Cargo.toml",
-            "Cargo.lock",
-            "a/**/b",
-            "**",
-            "docs/{guide,api/v1}/*.md",
-            "src/[a-c]?.rs",
-            "we\\*ird/*",
-            "x**y/z",
-            "",
-            "a//b",
-            "app/[[]id[]]/page.tsx",
-            "q[?]/[*].rs",
-            "[{]lit[}]",
-            "back\\\\slash/\\*",
-            "[!a]/x",
-        ];
-        let paths = [
-            "Cargo.lock",
-            "Cargo.toml",
-            "crates/foo/src/lib.rs",
-            "crates/foo/Cargo.toml",
-            "crates/bar/Cargo.toml",
-            "crates/bar/src/Cargo.toml",
-            "a/b",
-            "a/x/y/b",
-            "a/b/c",
-            "docs/guide/intro.md",
-            "docs/api/v1/index.md",
-            "src/ab.rs",
-            "src/zz.rs",
-            "we*ird/file",
-            "xy/z",
-            "x/q/y/z",
-            "",
-            "a//b",
-            "deep/er/than/any/pattern.txt",
-            "app/[id]/page.tsx",
-            "q?/*.rs",
-            "{lit}",
-            "back\\slash/*",
-            "b/x",
-        ];
-        for glob in globs {
-            let one = patterns(&[glob]);
-            for path in paths {
-                if one.matches(path) {
-                    assert!(reachable(&one, path), "{glob:?} matches {path:?}");
+    fn the_plan_reads_every_row_the_whole_patterns_match() {
+        for depth in [0, 1, 2, 3, 6] {
+            for glob in GLOBS {
+                let one = patterns(&[glob]);
+                for path in PATHS {
+                    if !one.matches(path) {
+                        continue;
+                    }
+                    let row = row(path, 5);
+                    for since in [None, Some(4), Some(i64::MIN)] {
+                        let scans = plan(&one, since, depth);
+                        assert!(
+                            covered(&scans, &row, depth),
+                            "{glob:?} matches {path:?}, depth {depth}, since {since:?}: {scans:?}"
+                        );
+                    }
                 }
             }
         }
-        let all = patterns(&globs);
-        for path in paths {
-            if all.matches(path) {
-                assert!(reachable(&all, path), "the set matches {path:?}");
-            }
-        }
     }
 
     #[test]
-    fn a_pattern_of_exact_names_prunes_everything_else() {
-        let one = patterns(&["crates/foo/**", "Cargo.lock"]);
-        let root = one.start();
-        assert_eq!(
-            one.only_literals(&root),
-            Some(vec!["Cargo.lock".to_owned(), "crates".to_owned()])
-        );
-        assert!(one.unfinished(one.advance(&root, "docs")).is_empty());
-        let crates = one.unfinished(one.advance(&root, "crates"));
-        assert!(one.unfinished(one.advance(&crates, "bar")).is_empty());
-        assert!(!one.unfinished(one.advance(&crates, "foo")).is_empty());
+    fn a_row_newer_than_nothing_the_query_asks_for_is_in_no_range() {
+        let one = patterns(&["**"]);
+        assert!(plan(&one, Some(i64::MAX), 2).is_empty());
+        let scans = plan(&one, Some(5), 2);
+        assert!(!covered(&scans, &row("a/b/c.rs", 5), 2));
+        assert!(covered(&scans, &row("a/b/c.rs", 6), 2));
     }
 
     #[test]
-    fn a_name_written_with_escapes_is_still_one_exact_name() {
+    fn a_pattern_of_exact_names_reads_one_path() {
         let one = patterns(&["app/[[]id[]]/page.tsx", "we\\*ird/[?]"]);
         assert!(one.matches("app/[id]/page.tsx"));
         assert!(one.matches("we*ird/?"));
-        let root = one.start();
         assert_eq!(
-            one.only_literals(&root),
-            Some(vec!["app".to_owned(), "we*ird".to_owned()])
+            plan(&one, None, 2),
+            VecDeque::from([
+                Scan::Path("app/[id]/page.tsx".to_owned()),
+                Scan::Path("we*ird/?".to_owned()),
+            ])
         );
-        let app = one.unfinished(one.advance(&root, "app"));
-        assert_eq!(one.only_literals(&app), Some(vec!["[id]".to_owned()]));
-        assert!(one.unfinished(one.advance(&app, "id")).is_empty());
+    }
+
+    /// `*.toml` can match only a file of the root: it reads the root's direct children. A class
+    /// may match `/`, so `a[!x]b` reads everything below the root.
+    #[test]
+    fn only_a_pattern_that_cannot_cross_a_separator_reads_direct_children_alone() {
+        let direct = |dir: &str| Scan::Directory {
+            dir: dir.to_owned(),
+            direct: true,
+            above: 1,
+        };
+        let below = |dir: &str| Scan::Directory {
+            dir: dir.to_owned(),
+            direct: false,
+            above: 1,
+        };
+        assert_eq!(
+            plan(&patterns(&["*.toml"]), Some(1), 2),
+            VecDeque::from([direct("")])
+        );
+        assert_eq!(
+            plan(&patterns(&["a[!x]b"]), Some(1), 2),
+            VecDeque::from([direct(""), below("")])
+        );
+        assert_eq!(
+            plan(&patterns(&["crates/*/Cargo.toml"]), Some(1), 2),
+            VecDeque::from([direct("crates/"), below("crates/")])
+        );
+        // Deeper than the index keeps: the directory two levels down, below it.
+        assert_eq!(
+            plan(&patterns(&["a/b/c/*.rs"]), Some(1), 2),
+            VecDeque::from([below("a/b/")])
+        );
     }
 
     #[test]
-    fn a_star_does_not_cross_a_separator() {
-        let one = patterns(&["crates/*/Cargo.toml"]);
-        assert!(one.matches("crates/a/Cargo.toml"));
-        assert!(!one.matches("crates/a/b/Cargo.toml"));
-        assert!(!reachable(&one, "crates/a/b/Cargo.toml"));
+    fn a_row_has_an_entry_for_each_directory_down_to_the_depth() {
+        let entries = |path: &str, depth| {
+            row(path, 1)
+                .directory_entries(depth)
+                .into_iter()
+                .map(|entry| (entry.dir, entry.direct, entry.path))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            entries("a/b/c.rs", 2),
+            vec![
+                (String::new(), false, "a/b/c.rs".to_owned()),
+                ("a/".to_owned(), false, "a/b/c.rs".to_owned()),
+                ("a/b/".to_owned(), true, "a/b/c.rs".to_owned()),
+            ]
+        );
+        assert_eq!(
+            entries("a/b/c/d.rs", 1),
+            vec![
+                (String::new(), false, "a/b/c/d.rs".to_owned()),
+                ("a/".to_owned(), false, "a/b/c/d.rs".to_owned()),
+            ]
+        );
+        assert_eq!(
+            entries("x.rs", 2),
+            vec![(String::new(), true, "x.rs".to_owned())]
+        );
+        assert_eq!(
+            entries("/x", 2),
+            vec![
+                (String::new(), false, "/x".to_owned()),
+                ("/".to_owned(), true, "/x".to_owned()),
+            ]
+        );
     }
 }

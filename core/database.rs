@@ -3992,6 +3992,32 @@ impl Database {
         self.opts.enable_without_rowid
     }
 
+    /// Installs `replicator` to receive every commit of this database before
+    /// it becomes visible (`storage::commit_replicator`). It is installed once,
+    /// before the database's first write.
+    ///
+    /// # Errors
+    ///
+    /// If one is installed already, or the database is in MVCC mode, whose
+    /// commits go through the logical log and not the WAL commit it replicates.
+    pub fn set_commit_replicator(
+        &self,
+        replicator: Arc<dyn crate::storage::commit_replicator::CommitReplicator>,
+    ) -> Result<()> {
+        if self.mvcc_enabled() {
+            return Err(LimboError::InvalidArgument(
+                "a commit replicator replicates WAL commits, and this database is in MVCC mode"
+                    .to_string(),
+            ));
+        }
+        if !self.pager_state.set_commit_replicator(replicator) {
+            return Err(LimboError::InvalidArgument(
+                "this database has a commit replicator already".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()

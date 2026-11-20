@@ -4,6 +4,7 @@ use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
+use crate::storage::commit_replicator::{CommitReplicator, ReplicatedCommit, ReplicatedPage};
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames, ReadChanges};
 use crate::storage::{
@@ -1238,6 +1239,10 @@ enum CommitState {
     WaitBatchedReads { db_size: u32 },
     /// Collect pages (now all available) and prepare WAL frames.
     PrepareFrames { db_size: u32 },
+    /// Wait for the database's commit replicator to take the commit's pages,
+    /// before any of its frames is written. Entered only with a replicator
+    /// installed; its completion is `CommitInfo::replication`.
+    WaitReplicated,
     /// All frames prepared, writes are in flight
     WaitWrites,
     /// Wait for the WAL fsync that makes the commit durable. Every commit
@@ -1248,6 +1253,7 @@ enum CommitState {
     /// them; otherwise the commit finishes here, since frames written through
     /// `write_frame_raw` published themselves when they were appended.
     WaitSync,
+
     /// Finalize the WAL commit by publishing the prepared frames.
     /// After this state, the write transaction is durable.
     /// If autocheckpoint is enabled and the autocheckpoint threshold is reached, checkpoint will be attempted.
@@ -1346,6 +1352,10 @@ struct CommitInfo {
     page_sources: Vec<PageSource>,
     page_source_cursor: usize,
     prepared_frames: Vec<PreparedFrames>,
+    /// The database's size in pages after the commit, once its last frames are prepared.
+    db_size: Option<u32>,
+    /// The replicator's completion for this commit, once handed to it.
+    replication: Option<Completion>,
 }
 
 /// Represents a dirty page that will be committed to the log.
@@ -1366,6 +1376,8 @@ impl CommitInfo {
         self.page_sources.clear();
         self.prepared_frames.clear();
         self.page_source_cursor = 0;
+        self.db_size = None;
+        self.replication = None;
     }
 
     /// Clear and reserve space for n pages in each vector.
@@ -1581,6 +1593,8 @@ pub struct SharedPagerState {
     /// What `PRAGMA secure_delete` last set, for every connection to the database: a checkpoint
     /// writes the pages of other connections' deletes.
     secure_delete: AtomicU8,
+    /// Receives every connection's commits before they become visible.
+    commit_replicator: crate::sync::OnceLock<Arc<dyn CommitReplicator>>,
 }
 
 /// What a freed page keeps. The bytes a delete frees inside a page are zeroed whatever this says.
@@ -1628,7 +1642,18 @@ impl SharedPagerState {
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
             secure_delete: AtomicU8::new(SecureDelete::Off.code() as u8),
+            commit_replicator: crate::sync::OnceLock::new(),
         }
+    }
+
+    /// Installs the database's commit replicator. Returns false if one is
+    /// installed already.
+    pub fn set_commit_replicator(&self, replicator: Arc<dyn CommitReplicator>) -> bool {
+        self.commit_replicator.set(replicator).is_ok()
+    }
+
+    fn commit_replicator(&self) -> Option<&Arc<dyn CommitReplicator>> {
+        self.commit_replicator.get()
     }
 
     pub(crate) fn initialized(&self) -> bool {
@@ -1674,6 +1699,10 @@ pub struct Pager {
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    /// With a commit replicator installed: each page the current write
+    /// transaction dirtied, as it found the page. Cleared when a write
+    /// transaction begins, however the one before it ended.
+    before_images: RwLock<HashMap<u32, Arc<[u8]>>>,
     /// Counts every `add_dirty` call, monotonically: the dirty-page set
     /// itself cannot tell whether a page was dirtied in a time window,
     /// because spills shrink it.
@@ -1987,6 +2016,7 @@ impl Pager {
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            before_images: RwLock::new(HashMap::new()),
             pages_dirtied_count: AtomicU64::new(0),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
@@ -1999,6 +2029,8 @@ impl Pager {
                 prepared_frames: Vec::new(),
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
+                db_size: None,
+                replication: None,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -3446,6 +3478,7 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        self.before_images.write().clear();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -4012,6 +4045,13 @@ impl Pager {
             { "page_id": page.get().id() }
         );
         self.subjournal_page_if_required(page)?;
+        if self.shared.commit_replicator().is_some() {
+            let number = page.get().id() as u32;
+            self.before_images
+                .write()
+                .entry(number)
+                .or_insert_with(|| Arc::from(page.get_contents().as_ptr()));
+        }
         self.pages_dirtied_count.fetch_add(1, Ordering::Relaxed);
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id() as u32);
@@ -4756,6 +4796,7 @@ impl Pager {
                 CommitState::PrepareFrames { db_size } => {
                     let page_sz = self.get_page_size_unchecked();
                     let mut commit_info = self.commit_info.write();
+                    commit_info.db_size = Some(db_size);
                     let mut cache = self.page_cache.write();
 
                     'inner: loop {
@@ -4814,17 +4855,17 @@ impl Pager {
                         );
                         return Ok(IOResult::Done(()));
                     }
-                    // Submit all WAL writes
-                    let wal_file = wal.wal_file()?;
-                    let mut batch = WriteBatch::new(wal_file);
-                    for prepared in &commit_info.prepared_frames {
-                        batch.writev(prepared.offset, &prepared.bufs);
+                    match self.shared.commit_replicator() {
+                        // The replicator takes the commit before its frames are
+                        // written, so a commit it fails leaves nothing a crash
+                        // could recover.
+                        Some(replicator) => {
+                            let commit = self.replicated_commit(&commit_info);
+                            commit_info.replication = Some(replicator.replicate(commit));
+                            commit_info.state = CommitState::WaitReplicated;
+                        }
+                        None => Self::submit_prepared_frames(&mut commit_info, wal)?,
                     }
-                    let mut group = CompletionGroup::new(|_| {});
-                    batch.submit(Some(&mut group))?;
-                    commit_info.group = Some(group);
-                    commit_info.completion_group = None;
-                    commit_info.state = CommitState::WaitWrites;
                 }
                 CommitState::WaitWrites => {
                     let writes = self.commit_completion();
@@ -4903,6 +4944,23 @@ impl Pager {
                     }
                     commit_info.state = CommitState::WalCommitDone;
                 }
+                CommitState::WaitReplicated => {
+                    let replicated = self
+                        .commit_info
+                        .read()
+                        .replication
+                        .clone()
+                        .expect("a commit waiting on its replicator has its completion");
+                    if !replicated.finished() {
+                        io_yield_one!(replicated);
+                    }
+                    if let Some(error) = replicated.get_error() {
+                        // No frame of the commit was written: the caller rolls
+                        // the transaction back, and nothing of it is on disk.
+                        return Err(LimboError::CompletionError(error).into());
+                    }
+                    Self::submit_prepared_frames(&mut self.commit_info.write(), wal)?;
+                }
                 CommitState::WalCommitDone => {
                     // all I/O complete, NOW it's safe to advance WAL state
                     let mut commit_info = self.commit_info.write();
@@ -4922,6 +4980,50 @@ impl Pager {
                 CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
             }
         }
+    }
+
+    /// The commit's pages as the replicator receives them: each with the image
+    /// this transaction found and the one its frame writes.
+    fn replicated_commit(&self, commit_info: &CommitInfo) -> ReplicatedCommit {
+        let before_images = self.before_images.read();
+        let pages = commit_info
+            .prepared_frames
+            .iter()
+            .flat_map(|prepared| &prepared.metadata)
+            .map(|(page, _, _)| {
+                let number = page.get().id() as u32;
+                let before = before_images.get(&number).cloned().unwrap_or_else(|| {
+                    panic!("page {number} was committed without the image it had before")
+                });
+                ReplicatedPage {
+                    number,
+                    before,
+                    after: Arc::from(page.get_contents().as_ptr()),
+                }
+            })
+            .collect();
+        ReplicatedCommit {
+            db_size: commit_info
+                .db_size
+                .expect("a commit with prepared frames knows its database size"),
+            pages,
+        }
+    }
+
+    /// Submits the writes of the commit's prepared frames, which the commit
+    /// then waits for.
+    fn submit_prepared_frames(commit_info: &mut CommitInfo, wal: &Arc<dyn Wal>) -> Result<()> {
+        let wal_file = wal.wal_file()?;
+        let mut batch = WriteBatch::new(wal_file);
+        for prepared in &commit_info.prepared_frames {
+            batch.writev(prepared.offset, &prepared.bufs);
+        }
+        let mut group = CompletionGroup::new(|_| {});
+        batch.submit(Some(&mut group))?;
+        commit_info.group = Some(group);
+        commit_info.completion_group = None;
+        commit_info.state = CommitState::WaitWrites;
+        Ok(())
     }
 
     /// Prepare collected pages as WAL frames without submitting I/O.

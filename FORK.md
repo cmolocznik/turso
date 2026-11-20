@@ -1631,6 +1631,48 @@ unit suite, 4,218 tests, and the 163 of `index_method::` in `tests/integration` 
   indexed table, as `toy_vector_sparse_ivf` does, and `CREATE INDEX` filled them from the table's
   rows.
 
+### A commit replicator receives each commit before it is visible
+2026-11-20, on branch `commit-replicator` (from `path-trie`; not yet on `atoll`), in the commit that
+adds this entry. `core/storage/commit_replicator.rs` (`CommitReplicator`, `ReplicatedCommit`,
+`ReplicatedPage`), `Database::set_commit_replicator` in `core/database.rs`, and the commit state
+`WaitReplicated` in `core/storage/pager.rs`.
+Why: atoll-forge replicates its databases through Raft as dqlite replicates SQLite's WAL. Each
+commit's pages go into the Raft log, and a commit becomes visible on the leader only once a quorum
+holds it (atoll-forge's `FORGE.md` §6, decision 73). That needs the commit's pages before they are
+published, and each page's image before the transaction, so that an entry can carry a page as its
+change.
+What: a database with a replicator installed keeps the image of each page a write transaction
+dirties, as the transaction found it, copied at the page's first `add_dirty`. A page the
+transaction adds is zeros, as it is allocated. Once the commit's frames are prepared, and before any
+is written, the replicator receives the commit's pages, before and after, and the database's size,
+and the commit waits on the completion it returns (`WaitReplicated`). If that completion succeeds,
+the frames are written, synced and published as before. If it fails, the commit fails with its
+error, and the caller rolls the transaction back: no reader saw it, and no frame of it is in the
+WAL for a crash to recover. The writer holds the
+write lock throughout, so commits reach the replicator one at a time, in the order they commit.
+Frames inserted with `wal_insert_frame`, as a follower applies a commit, publish themselves and
+never reach it. A follower reads a page's image with `try_wal_watermark_read_page` and writes a
+commit with `wal_insert_begin`, `wal_insert_frame` and `wal_insert_end`.
+Limits: `set_commit_replicator` refuses an MVCC database, whose commits go through the logical
+log. Page 1 of a new database is written to the database file when the database is first
+initialized, outside any commit, so every replica writes its own, the same one.
+Not done: `ivf_crash`'s kill rounds, a run in Atoll mode, and a cost run.
+Tests: `wal::test_commit_replicator` in `tests/integration` (four).
+- A follower given each commit's pages holds the leader's database, the same `dbhash`. The
+  workload covers overflow pages, a transaction spilled through a 16-page cache, a savepoint rolled
+  back inside a commit, a rolled-back transaction and a dropped index. Every page's image before
+  matches the follower's.
+- A reader does not see a commit its replicator holds, and does once the replicator lets it through.
+- A commit its replicator fails is rolled back, and the commits after it replicate.
+- A crash just after a commit its replicator failed leaves no trace of it: a copy of the database
+  and its WAL, taken then, opens without it. The first version called the replicator after the
+  commit's frames were written and synced, and this test found the failed commit in the copy.
+- A database takes one replicator.
+- Each part is seen failing without it. With the replicator never called, the three tests that
+  replicate fail. With a page's image taken at every `add_dirty` instead of the first, or with
+  the clear when a write transaction begins removed, the follower's images before no longer match.
+  With the replicator's error ignored, the failed commit stays.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

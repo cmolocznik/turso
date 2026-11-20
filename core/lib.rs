@@ -174,6 +174,7 @@ pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
+    commit_replicator::{CommitReplicator, ReplicatedCommit, ReplicatedPage},
     database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},

@@ -179,6 +179,7 @@ pub struct Builder {
     vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
+    commit_replicator: Option<Arc<dyn turso_core::CommitReplicator>>,
 }
 
 impl Builder {
@@ -199,6 +200,7 @@ impl Builder {
             vfs: IoBackend::Default,
             encryption_opts: None,
             io: None,
+            commit_replicator: None,
         }
     }
 
@@ -278,6 +280,19 @@ impl Builder {
         self
     }
 
+    /// Gives every commit of the database to `replicator` before the commit
+    /// becomes visible, and fails the commit if the replicator fails it
+    /// (`turso_core::CommitReplicator`). It is installed before the database's
+    /// first write. Embedded only: a serverless database's commits happen on
+    /// its server.
+    pub fn with_commit_replicator(
+        mut self,
+        replicator: Arc<dyn turso_core::CommitReplicator>,
+    ) -> Self {
+        self.commit_replicator = Some(replicator);
+        self
+    }
+
     /// Open the database without write access.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -323,6 +338,7 @@ impl Builder {
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         let features = self.build_features_string();
+        let commit_replicator = self.commit_replicator;
         let db =
             turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
@@ -348,6 +364,11 @@ impl Builder {
                 .await
                 .map_err(TursoError::from)?;
         }
+        if let Some(replicator) = commit_replicator {
+            db.db_core()?
+                .set_commit_replicator(replicator)
+                .map_err(TursoError::from)?;
+        }
         Ok(Database { inner: db })
     }
 }
@@ -371,6 +392,14 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
         Ok(Connection::create(conn, None))
+    }
+
+    /// The embedded engine's database: for its raw WAL API, through which a
+    /// follower applies the commits a leader's replicator received
+    /// (`wal_insert_begin`, `wal_insert_frame`, `wal_insert_end`). Embedded
+    /// only: a serverless database has no engine in the process.
+    pub fn core(&self) -> Result<Arc<turso_core::Database>> {
+        Ok(self.inner.db_core()?)
     }
 }
 

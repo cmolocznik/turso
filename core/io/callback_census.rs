@@ -301,18 +301,18 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "records how many header bytes were read",
     ),
     ("storage/pager.rs", "checkpoint_inner", "new_trunc", "logs"),
-    (
-        "storage/pager.rs",
-        "commit_wal_inner",
-        "new",
-        "nothing (a group)",
-    ),
     ("storage/pager.rs", "initialize", "new", "nothing (a group)"),
     (
         "storage/pager.rs",
         "subjournal_page_if_required",
         "new_write",
         "records the page in the savepoint and advances its offset",
+    ),
+    (
+        "storage/pager.rs",
+        "submit_prepared_frames",
+        "new",
+        "nothing (a group)",
     ),
     (
         "storage/pager.rs",

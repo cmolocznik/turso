@@ -1533,16 +1533,9 @@ async fn append_decoded_mvcc_frame_to_txns_file<Ctx>(
     recovery_payload: &[u8],
     op_count: u32,
 ) -> Result<(usize, usize)> {
-    let mut payload_bytes = BytesMut::from(portable_payload);
     let mut txns = 0usize;
     let mut ops = 0usize;
-    while let Some(portable_txn) =
-        take_proto_message_from_bytes::<PortableLogicalTxn>(&mut payload_bytes)?
-    {
-        let txn = decode_recovery_ops_to_logical_txn(portable_txn, recovery_payload, op_count)?;
-        if txn.ops.is_empty() {
-            continue;
-        }
+    for txn in decode_mvcc_frame_txns(portable_payload, recovery_payload, op_count)? {
         ops += txn.ops.len();
         txns += 1;
         append_file_bytes(
@@ -1553,12 +1546,31 @@ async fn append_decoded_mvcc_frame_to_txns_file<Ctx>(
         )
         .await?;
     }
+    Ok((txns, ops))
+}
+
+/// The transactions of a frame that change something a reader replays.
+pub(crate) fn decode_mvcc_frame_txns(
+    portable_payload: &[u8],
+    recovery_payload: &[u8],
+    op_count: u32,
+) -> Result<Vec<LogicalTxnData>> {
+    let mut payload_bytes = BytesMut::from(portable_payload);
+    let mut txns = Vec::new();
+    while let Some(portable_txn) =
+        take_proto_message_from_bytes::<PortableLogicalTxn>(&mut payload_bytes)?
+    {
+        let txn = decode_recovery_ops_to_logical_txn(portable_txn, recovery_payload, op_count)?;
+        if !txn.ops.is_empty() {
+            txns.push(txn);
+        }
+    }
     if !payload_bytes.is_empty() {
         return Err(Error::DatabaseSyncEngineError(
             "MVCC logical-log portable payload has trailing partial protobuf message".to_string(),
         ));
     }
-    Ok((txns, ops))
+    Ok(txns)
 }
 
 pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
@@ -1641,132 +1653,26 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
         }
 
         while pos < range_body.len() {
-            let frame_start = pos;
-            if range_body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
-                return Err(Error::DatabaseSyncEngineError(
-                    "truncated MVCC logical-log transaction frame".to_string(),
-                ));
-            }
-            let frame_magic = read_u32_le(range_body, pos)?;
-            let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
-            if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
-                return Err(Error::DatabaseSyncEngineError(format!(
-                    "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
-                )));
-            }
-            let header_size = if has_extension_header {
-                if range_body.len() - pos < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "truncated MVCC logical-log transaction frame".to_string(),
-                    ));
-                }
-                MVCC_TX_EXT_HEADER_SIZE
-            } else {
-                MVCC_TX_HEADER_SIZE
-            };
-            let payload_size =
-                usize::try_from(read_u64_le(range_body, pos + 4)?).map_err(|_| {
-                    Error::DatabaseSyncEngineError(
-                        "MVCC logical-log recovery payload size overflows usize".to_string(),
-                    )
-                })?;
-            let op_count = read_u32_le(range_body, pos + 12)?;
-            let (extension_size, extension_record_count) = if has_extension_header {
-                let extension_size =
-                    usize::try_from(read_u64_le(range_body, pos + 24)?).map_err(|_| {
-                        Error::DatabaseSyncEngineError(
-                            "MVCC logical-log extension size overflows usize".to_string(),
-                        )
-                    })?;
-                let extension_record_count = read_u32_le(range_body, pos + 32)?;
-                let frame_flags = read_u32_le(range_body, pos + 36)?;
-                if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                    return Err(Error::DatabaseSyncEngineError(format!(
-                        "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
-                    )));
-                }
-                if extension_size == 0 && extension_record_count != 0 {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "MVCC logical-log frame has extension record count without extension block"
-                            .to_string(),
-                    ));
-                }
-                if extension_size > 0 && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0 {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "MVCC logical-log frame has extension block without extension flag"
-                            .to_string(),
-                    ));
-                }
-                (extension_size, extension_record_count)
-            } else {
-                (0, 0)
-            };
-
-            let extension_start = pos.checked_add(header_size).ok_or_else(|| {
-                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
-            })?;
-            let recovery_start = extension_start.checked_add(extension_size).ok_or_else(|| {
-                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
-            })?;
-            let trailer_start = recovery_start.checked_add(payload_size).ok_or_else(|| {
-                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
-            })?;
-            let frame_end = trailer_start
-                .checked_add(MVCC_TX_TRAILER_SIZE)
-                .ok_or_else(|| {
-                    Error::DatabaseSyncEngineError(
-                        "MVCC logical-log frame offset overflow".to_string(),
-                    )
-                })?;
-            if frame_end > range_body.len() {
-                return Err(Error::DatabaseSyncEngineError(
-                    "truncated MVCC logical-log transaction frame".to_string(),
-                ));
-            }
-            if read_u32_le(range_body, trailer_start + 4)? != MVCC_TX_END_MAGIC {
-                return Err(Error::DatabaseSyncEngineError(
-                    "invalid MVCC logical-log transaction trailer magic".to_string(),
-                ));
-            }
-            if let Some(prev_crc) = running_crc {
-                let expected_crc =
-                    crc32c::crc32c_append(prev_crc, &range_body[frame_start..trailer_start]);
-                let stored_crc = read_u32_le(range_body, trailer_start)?;
-                if expected_crc != stored_crc {
-                    return Err(Error::DatabaseSyncEngineError(format!(
-                        "MVCC logical-log transaction checksum mismatch at range offset {frame_start}"
-                    )));
-                }
-                running_crc = Some(stored_crc);
-            }
-
-            if extension_size == 0 {
-                pos = frame_end;
+            let frame = parse_mvcc_frame(range_body, pos, running_crc)?;
+            running_crc = Some(frame.crc);
+            pos = frame.end;
+            let Some(changes) = frame.changes else {
                 continue;
-            }
-            let extension_block = &range_body[extension_start..recovery_start];
-            let recovery_payload = &range_body[recovery_start..trailer_start];
-            let portable_payload = find_mvcc_extension_payload(
-                extension_block,
-                extension_record_count,
-                MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
-            )?;
-            if portable_payload.is_empty() {
-                pos = frame_end;
+            };
+            if changes.portable_payload.is_empty() {
                 continue;
             }
             let (frame_txns, frame_ops) = append_decoded_mvcc_frame_to_txns_file(
                 coro,
                 txns_file,
                 &mut txns_offset,
-                &portable_payload,
-                recovery_payload,
-                op_count,
+                &changes.portable_payload,
+                changes.recovery_payload,
+                changes.op_count,
             )
             .await?;
             txns += frame_txns;
             ops += frame_ops;
-            pos = frame_end;
         }
         previous_range_boundary = Some((range.generation, range.end_offset));
     }
@@ -1778,6 +1684,148 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     }
     sync_file(coro, txns_file).await?;
     Ok((txns, ops))
+}
+
+/// One transaction frame of an MVCC logical log.
+pub(crate) struct MvccFrame<'a> {
+    /// Where the frame ends, in the bytes it was read from.
+    pub(crate) end: usize,
+    /// The CRC its trailer holds, which the next frame's continues.
+    pub(crate) crc: u32,
+    /// What the frame changed, if it has an extension block: a frame without
+    /// one was written by a database that kept no portable changes.
+    pub(crate) changes: Option<MvccFrameChanges<'a>>,
+}
+
+pub(crate) struct MvccFrameChanges<'a> {
+    /// The portable changes: which table each of the recovery ops' table ids
+    /// names. Empty when the transaction changed nothing a reader replays.
+    pub(crate) portable_payload: Vec<u8>,
+    pub(crate) recovery_payload: &'a [u8],
+    pub(crate) op_count: u32,
+}
+
+/// Reads the frame at `pos` in `body`, checking that its CRC continues
+/// `running_crc` when that is known.
+pub(crate) fn parse_mvcc_frame(
+    body: &[u8],
+    pos: usize,
+    running_crc: Option<u32>,
+) -> Result<MvccFrame<'_>> {
+    let frame_start = pos;
+    if body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+        return Err(Error::DatabaseSyncEngineError(
+            "truncated MVCC logical-log transaction frame".to_string(),
+        ));
+    }
+    let frame_magic = read_u32_le(body, pos)?;
+    let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
+    if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
+        )));
+    }
+    let header_size = if has_extension_header {
+        if body.len() - pos < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+            return Err(Error::DatabaseSyncEngineError(
+                "truncated MVCC logical-log transaction frame".to_string(),
+            ));
+        }
+        MVCC_TX_EXT_HEADER_SIZE
+    } else {
+        MVCC_TX_HEADER_SIZE
+    };
+    let payload_size = usize::try_from(read_u64_le(body, pos + 4)?).map_err(|_| {
+        Error::DatabaseSyncEngineError(
+            "MVCC logical-log recovery payload size overflows usize".to_string(),
+        )
+    })?;
+    let op_count = read_u32_le(body, pos + 12)?;
+    let (extension_size, extension_record_count) = if has_extension_header {
+        let extension_size = usize::try_from(read_u64_le(body, pos + 24)?).map_err(|_| {
+            Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension size overflows usize".to_string(),
+            )
+        })?;
+        let extension_record_count = read_u32_le(body, pos + 32)?;
+        let frame_flags = read_u32_le(body, pos + 36)?;
+        if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
+            )));
+        }
+        if extension_size == 0 && extension_record_count != 0 {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log frame has extension record count without extension block"
+                    .to_string(),
+            ));
+        }
+        if extension_size > 0 && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log frame has extension block without extension flag".to_string(),
+            ));
+        }
+        (extension_size, extension_record_count)
+    } else {
+        (0, 0)
+    };
+
+    let extension_start = pos.checked_add(header_size).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+    })?;
+    let recovery_start = extension_start.checked_add(extension_size).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+    })?;
+    let trailer_start = recovery_start.checked_add(payload_size).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+    })?;
+    let frame_end = trailer_start
+        .checked_add(MVCC_TX_TRAILER_SIZE)
+        .ok_or_else(|| {
+            Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+        })?;
+    if frame_end > body.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "truncated MVCC logical-log transaction frame".to_string(),
+        ));
+    }
+    if read_u32_le(body, trailer_start + 4)? != MVCC_TX_END_MAGIC {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC logical-log transaction trailer magic".to_string(),
+        ));
+    }
+    let stored_crc = read_u32_le(body, trailer_start)?;
+    if let Some(prev_crc) = running_crc {
+        let expected_crc = crc32c::crc32c_append(prev_crc, &body[frame_start..trailer_start]);
+        if expected_crc != stored_crc {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "MVCC logical-log transaction checksum mismatch at range offset {frame_start}"
+            )));
+        }
+    }
+
+    if extension_size == 0 {
+        return Ok(MvccFrame {
+            end: frame_end,
+            crc: stored_crc,
+            changes: None,
+        });
+    }
+    let extension_block = &body[extension_start..recovery_start];
+    let portable_payload = find_mvcc_extension_payload(
+        extension_block,
+        extension_record_count,
+        MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
+    )?;
+    Ok(MvccFrame {
+        end: frame_end,
+        crc: stored_crc,
+        changes: Some(MvccFrameChanges {
+            portable_payload,
+            recovery_payload: &body[recovery_start..trailer_start],
+            op_count,
+        }),
+    })
 }
 
 /// Bootstrap multiple DB files from latest generation from remote

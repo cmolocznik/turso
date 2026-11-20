@@ -1946,6 +1946,38 @@ refused. The files are then cut back to what was synced and reopened: on the cod
 was gone.
 Not done: `mvcc_rolling`'s kill rounds.
 
+### Another database's replicated MVCC frames apply row by row
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`ReplicatedLogApplier` in `sync/engine/src/replicated_log.rs`; `parse_mvcc_frame` and
+`decode_mvcc_frame_txns`, taken out of `decode_raw_mvcc_logical_log_to_file`, in
+`sync/engine/src/database_sync_operations.rs`. Embedded only: a Rust API of the sync engine.
+Why: atoll-forge's followers apply the frames the leader's log replicator receives (its decision
+76). A frame names its tables by the leader's table ids, which another database does not share.
+Its portable changes name each table, which is how this engine replays the log a sync client
+pulls.
+What: the applier takes frames as a log replicator receives them and applies their transactions,
+in order, as one transaction of its database. It runs on a connection that applies replicated
+commits, so the database's own log replicator neither refuses the commits nor receives their
+frames. Rows are replayed through SQL by table name and keep their rowids, and the database's own
+writes keep its indexes, index methods' included: a frame's index operations and internal tables
+are left out, as in a sync pull. It returns the transaction's commit timestamp, or `None` if
+nothing was committed. A frame must be one whole frame with portable changes, and its CRC must
+continue from the CRC it says comes before it. Otherwise nothing of the call is applied.
+Tests: in `replicated_log.rs`:
+- A follower that applies a leader's frames, in two calls, holds its rows. This covers inserts,
+  updates, deletes, `user_version`, a table without a primary key, a unique column, and an index
+  and a `path_trie` index that find them.
+- A call whose second frame's CRC does not continue applies nothing, not even its first frame.
+- Two frames sent as one are refused, and so is a frame of a log that keeps no portable changes.
+Each is seen failing without its part:
+- the CRC unchecked;
+- committing on an error;
+- the length unchecked;
+- a frame with no portable changes taken as empty;
+- rowids not kept;
+- a commit reported for frames that committed nothing;
+- the connection not marked as the applier.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

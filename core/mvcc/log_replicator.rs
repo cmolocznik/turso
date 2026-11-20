@@ -18,7 +18,8 @@
 //! follower's database takes no commits of its own. A connection that applies
 //! commits replicated from another database
 //! (`Connection::set_applies_replicated_commits`) is not asked, and its frames
-//! do not reach the replicator.
+//! do not reach the replicator. The sync engine's `ReplicatedLogApplier`
+//! applies another database's frames on such a connection, row by row.
 //!
 //! A checkpoint writes the database file only through a cut the replicator
 //! gives ([`LogReplicator::checkpoint_cut`]), so that the file holds exactly

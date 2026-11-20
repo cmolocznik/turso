@@ -256,6 +256,45 @@ mod tests {
         assert_eq!(applier.apply(&[]).unwrap(), None);
     }
 
+    /// A table keyed by other than the rowid: the follower's rowids need not
+    /// be the leader's, so each delete and update reaches it by the row's
+    /// key, whether the row was still in the log or already checkpointed.
+    #[test]
+    fn a_follower_finds_rows_keyed_by_other_than_the_rowid_by_their_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (leader, recorder) = open(&dir, "leader.db", true);
+        let (follower, _) = open(&dir, "follower.db", false);
+        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        for sql in [
+            "CREATE TABLE keyed (id TEXT PRIMARY KEY, v TEXT)",
+            "INSERT INTO keyed VALUES ('a', 'one'), ('b', 'two'), ('c', 'three')",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut applier = ReplicatedLogApplier::new(&follower).unwrap();
+        applier.apply(&frames(&recorder)).unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for sql in [
+            "INSERT INTO keyed VALUES ('d', 'four'), ('e', 'five')",
+            "UPDATE keyed SET v = 'TWO' WHERE id = 'b'",
+            "DELETE FROM keyed WHERE id = 'c'",
+            "DELETE FROM keyed WHERE id = 'e'",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        applier.apply(&frames(&recorder)).unwrap();
+        let all = "SELECT id, v FROM keyed ORDER BY id";
+        assert_eq!(rows(&follower, all), rows(&leader, all));
+        assert_eq!(
+            rows(&follower, all),
+            vec![
+                vec![Value::build_text("a"), Value::build_text("one")],
+                vec![Value::build_text("b"), Value::build_text("TWO")],
+                vec![Value::build_text("d"), Value::build_text("four")],
+            ]
+        );
+    }
+
     #[test]
     fn frames_with_one_whose_crc_does_not_continue_apply_nothing() {
         let dir = tempfile::tempdir().unwrap();

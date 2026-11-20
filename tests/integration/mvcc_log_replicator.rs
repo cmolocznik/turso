@@ -464,6 +464,67 @@ fn a_row_overwritten_above_the_cut_reopens_overwritten_once_the_cut_passes() {
     );
 }
 
+fn pragma(conn: &Arc<turso_core::Connection>, name: &str) -> i64 {
+    match &limbo_exec_rows(conn, &format!("PRAGMA {name}"))[..] {
+        [row] => match &row[..] {
+            [rusqlite::types::Value::Integer(value)] => *value,
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Page 1 is written as of the cut too: a `user_version` set and a table made
+/// above it reopen as they were at the cut, the schema cookie with them, until
+/// the cut passes them.
+fn page_one_reopens_as(cut_passes_them: bool) -> (i64, i64, i64) {
+    let name = format!("log_replicator_page_one_{cut_passes_them}.db");
+    let (db, recorder) = leader(&name);
+    let path = db.path.clone();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO things VALUES (1, 'at the cut')")
+        .unwrap();
+    recorder.cut_at(Some(recorder.last_commit_ts()));
+    let cookie_at_cut = pragma(&conn, "schema_version");
+    conn.execute("PRAGMA user_version = 7").unwrap();
+    conn.execute("CREATE TABLE later (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    if cut_passes_them {
+        recorder.cut_at(None);
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    }
+    let cookie_now = pragma(&conn, "schema_version");
+    assert!(cookie_now > cookie_at_cut);
+    drop(conn);
+    drop(db);
+    let db = open_replicated(&path, &Arc::new(Recorder::default()));
+    let conn = db.connect_limbo();
+    let later = limbo_exec_rows(&conn, "SELECT name FROM sqlite_schema WHERE name = 'later'");
+    let cookie = pragma(&conn, "schema_version");
+    let expected_cookie = if cut_passes_them {
+        cookie_now
+    } else {
+        cookie_at_cut
+    };
+    assert_eq!(cookie, expected_cookie, "page 1's schema cookie");
+    (pragma(&conn, "user_version"), later.len() as i64, cookie)
+}
+
+#[test]
+fn page_one_reopens_as_it_was_at_the_cut() {
+    let (user_version, later_tables, _) = page_one_reopens_as(false);
+    assert_eq!((user_version, later_tables), (0, 0));
+}
+
+#[test]
+fn page_one_reopens_as_the_commits_left_it_once_the_cut_passes_them() {
+    let (user_version, later_tables, _) = page_one_reopens_as(true);
+    assert_eq!((user_version, later_tables), (7, 1));
+}
+
 /// A log replicator is installed only on a database whose checkpoints run
 /// beside writers and whose log is dropped on open.
 #[test]

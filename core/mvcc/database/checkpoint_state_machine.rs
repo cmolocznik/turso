@@ -2361,6 +2361,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
         self.mvstore
             .publish_durable_bound(self.durable_txid_max_new, materialized_at);
+        self.mvstore
+            .forget_headers_through(self.durable_txid_max_new);
         self.state = CheckpointState::CheckpointWal;
         self.lock_states.pager_read_tx = false;
         self.lock_states.pager_write_tx = false;
@@ -3539,18 +3541,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             })?;
                         checkpoint_header.schema_cookie =
                             self.database.schema.lock().schema_version.into();
+                        // A database opened from its file alone holds in its file exactly what the
+                        // commits at or below the cut wrote, page 1 too: the newest header one of
+                        // them wrote, or, with none since the file's boundary, page 1 as it is.
+                        let at_cut = self.database.mvcc_log_dropped_on_open();
+                        let header_at_cut = if at_cut {
+                            self.mvstore.header_at_cut(self.snapshot_ts)
+                        } else {
+                            Some(checkpoint_header)
+                        };
                         let staged_header = self.pager.io.block(|| {
                             self.pager.with_header_mut(|header| {
                                 // Keep pager-maintained fields (for example database_size/change_counter)
                                 // intact, and apply only MVCC header mutations that are authored via
                                 // SetCookie/PRAGMA paths.
-                                header.schema_cookie = checkpoint_header.schema_cookie;
-                                header.user_version = checkpoint_header.user_version;
-                                header.application_id = checkpoint_header.application_id;
-                                header.vacuum_mode_largest_root_page =
-                                    checkpoint_header.vacuum_mode_largest_root_page;
-                                header.incremental_vacuum_enabled =
-                                    checkpoint_header.incremental_vacuum_enabled;
+                                if let Some(authored) = &header_at_cut {
+                                    header.schema_cookie = authored.schema_cookie;
+                                    header.user_version = authored.user_version;
+                                    header.application_id = authored.application_id;
+                                    header.vacuum_mode_largest_root_page =
+                                        authored.vacuum_mode_largest_root_page;
+                                    header.incremental_vacuum_enabled =
+                                        authored.incremental_vacuum_enabled;
+                                }
                                 *header
                             })
                         })?;

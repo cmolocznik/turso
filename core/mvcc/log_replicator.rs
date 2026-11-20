@@ -61,7 +61,7 @@ pub trait LogReplicator: Send + Sync {
     /// [`Self::replicate`], or committed by a connection that applies
     /// replicated commits. Every commit after it has a later timestamp. The
     /// checkpoint writes every commit at or below the cut and none above it,
-    /// and the database's next open starts from that.
+    /// with page 1 as of the cut, and the database's next open starts from that.
     /// So the cut must be a timestamp no frame written after it, in log order, is
     /// at or below. A cut above `newest` counts as `newest`, and one at or below
     /// the last checkpoint's moves nothing. The default writes them all.

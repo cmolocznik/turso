@@ -19,6 +19,12 @@
 //! commits replicated from another database
 //! (`Connection::set_applies_replicated_commits`) is not asked, and its frames
 //! do not reach the replicator.
+//!
+//! A checkpoint writes the database file only through a cut the replicator
+//! gives ([`LogReplicator::checkpoint_cut`]), so that the file holds exactly
+//! what the replication had reached there. The database reopens from its file
+//! alone (`DatabaseOpts::drop_mvcc_log_on_open`), its logical log dropped, and
+//! the replication replays what came after the cut.
 
 use std::sync::Arc;
 
@@ -48,4 +54,18 @@ pub trait LogReplicator: Send + Sync {
     /// failed one fails the commit, whose frame is in the log, as an I/O error
     /// after the write would.
     fn replicate(&self, frame: ReplicatedFrame) -> Completion;
+
+    /// The newest commit timestamp a checkpoint may write to the database
+    /// file, given `newest`, the newest it could. Every commit at or below
+    /// `newest` is committed and its frame written: given to
+    /// [`Self::replicate`], or committed by a connection that applies
+    /// replicated commits. Every commit after it has a later timestamp. The
+    /// checkpoint writes every commit at or below the cut and none above it,
+    /// and the database's next open starts from that.
+    /// So the cut must be a timestamp no frame written after it, in log order, is
+    /// at or below. A cut above `newest` counts as `newest`, and one at or below
+    /// the last checkpoint's moves nothing. The default writes them all.
+    fn checkpoint_cut(&self, newest: u64) -> u64 {
+        newest
+    }
 }

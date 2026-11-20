@@ -305,10 +305,12 @@ impl Builder {
     }
 
     /// Gives `replicator` each committed transaction's MVCC logical-log frame
-    /// once it is written, and lets it refuse commits
-    /// (`turso_core::LogReplicator`). It needs [`Self::with_mvcc`], and is
-    /// installed before the database's first commit. Embedded only: a
-    /// serverless database's log is on its server.
+    /// once it is written, lets it refuse commits, and lets it give the cut each
+    /// checkpoint writes through (`turso_core::LogReplicator`). It needs
+    /// [`Self::with_mvcc`], and is installed before the database's first commit.
+    /// The database then checkpoints beside its writers, and opens from its
+    /// file alone, its logical log dropped: the replication replays the rest.
+    /// Embedded only: a serverless database's log is on its server.
     pub fn with_log_replicator(mut self, replicator: Arc<dyn turso_core::LogReplicator>) -> Self {
         self.log_replicator = Some(replicator);
         self
@@ -346,8 +348,11 @@ impl Builder {
         if self.enable_without_rowid {
             features.push("without_rowid");
         }
-        if self.enable_mvcc_passive_checkpoint {
+        if self.enable_mvcc_passive_checkpoint || self.log_replicator.is_some() {
             features.push("mvcc_passive_checkpoint");
+        }
+        if self.log_replicator.is_some() {
+            features.push("mvcc_log_dropped_on_open");
         }
         if self.enable_mvcc {
             features.push("mvcc");
@@ -418,6 +423,13 @@ impl Debug for Database {
 }
 
 impl Database {
+    /// The newest commit timestamp whose rows the database file holds: what
+    /// the last checkpoint wrote, or, just after the database opens, what the
+    /// file held. `None` unless in MVCC mode. Embedded only.
+    pub fn mvcc_checkpointed_through(&self) -> Result<Option<u64>> {
+        Ok(self.inner.db_core()?.mvcc_checkpointed_through())
+    }
+
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;

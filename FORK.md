@@ -1926,6 +1926,26 @@ Tests: in `tests/integration/mvcc_log_replicator.rs`:
 Each is seen failing without it: the timestamp never set (two tests), and the newest commit's set
 in place of the connection's own (the concurrent test).
 
+### An MVCC checkpoint refused its backfill truncated the log before its WAL commit was synced
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`CheckpointState::SyncRefusedWal` in `core/mvcc/database/checkpoint_state_machine.rs`.
+Why: Codex found it, reviewing atoll-forge's checkpoints as Raft snapshots, whose Raft entries
+are dropped only once a checkpoint past them is durable. A passive checkpoint writes its rows to
+the WAL in a pager commit, which under `synchronous=NORMAL` issues no fsync. The WAL backfill owes
+that fsync (issue #7952's fix), but beside a reader of the database file it returns Busy before
+issuing it. The checkpoint then went on to truncate the logical log and sync that truncation. A
+power loss kept the truncated log and lost the unsynced WAL tail. A row a `synchronous=FULL`
+commit had made durable in the log was gone, and the boundary published as durable was not.
+What: when the backfill is refused, the checkpoint fsyncs the WAL before it truncates the logical
+log, except under `synchronous=OFF`.
+Test: `an_mvcc_checkpoint_refused_its_backfill_syncs_the_wal_before_truncating_the_log` in
+`tests/integration/checkpoint_crash_atomicity.rs`, on `UnreliableIo`. A `synchronous=FULL` commit
+leaves no write of its log unsynced. A reader holds the database file, and a passive checkpoint
+under `NORMAL` runs; the test checks that the database file is unchanged, so the backfill was
+refused. The files are then cut back to what was synced and reopened: on the code before, the row
+was gone.
+Not done: `mvcc_rolling`'s kill rounds.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

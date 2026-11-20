@@ -218,6 +218,11 @@ pub enum CheckpointState {
     /// This ensures durability: if we crash after WAL truncation but before DB fsync,
     /// the data would be lost.
     SyncDbFile,
+    /// Passive, beside a reader that refused the WAL backfill: fsync the WAL, which holds this
+    /// checkpoint's commit, before truncating the logical log. The backfill owes that fsync under
+    /// `synchronous=NORMAL`, whose pager commit does not issue one, but a refused backfill returns
+    /// before it.
+    SyncRefusedWal,
     TruncateLogicalLog,
     FsyncLogicalLog,
     /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
@@ -3694,10 +3699,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .unwrap_or((0, 0));
                         self.checkpoint_result =
                             Some(CheckpointResult::new(max_frame, nbackfills, 0));
-                        self.state = CheckpointState::TruncateLogicalLog;
+                        self.state = CheckpointState::SyncRefusedWal;
                         Ok(TransitionResult::Continue)
                     }
                     Err(e) => Err(*e),
+                }
+            }
+
+            CheckpointState::SyncRefusedWal => {
+                self.state = CheckpointState::TruncateLogicalLog;
+                if self.sync_mode == SyncMode::Off {
+                    return Ok(TransitionResult::Continue);
+                }
+                let Some(wal) = &self.pager.wal else {
+                    return Ok(TransitionResult::Continue);
+                };
+                let c = wal.sync(self.pager.get_sync_type())?;
+                if c.succeeded() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 

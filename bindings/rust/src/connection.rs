@@ -98,6 +98,16 @@ impl Connection {
         connection
     }
 
+    /// Marks this connection as the one that applies commits replicated from
+    /// another database, as a follower does its leader's: its commits are not
+    /// asked of the database's log replicator, and their frames do not reach
+    /// it (`turso_core::LogReplicator`).
+    pub fn set_applies_replicated_commits(&self, applies: bool) {
+        if let Some(conn) = &self.inner {
+            conn.set_applies_replicated_commits(applies);
+        }
+    }
+
     pub(crate) async fn maybe_handle_dangling_tx(&self) -> Result<()> {
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {

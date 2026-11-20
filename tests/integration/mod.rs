@@ -18,6 +18,7 @@ mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
 mod mvcc;
+mod mvcc_log_replicator;
 mod pragma;
 mod query_processing;
 mod query_timeout;

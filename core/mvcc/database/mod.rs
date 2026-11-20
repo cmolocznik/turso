@@ -3753,8 +3753,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     Some(batch) => (Some(batch.writing.ticket), batch.writing.tx_id),
                     None => (None, self.tx_id),
                 };
-                self.mark_log_record_written(mvcc_store, ticket, owner_tx)?;
+                // The replicator gets the frame while its transaction is still `Preparing`:
+                // marking the record written can finish an abandoned waiter's commit, and a
+                // checkpoint may cover a committed transaction only once its frame is replicated.
                 let replicating = self.replicate_written_frame();
+                self.mark_log_record_written(mvcc_store, ticket, owner_tx)?;
                 self.state = self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
                 if let Some(replicating) = replicating.filter(|c| !c.finished()) {
                     return Ok(TransitionResult::Io(IOCompletions(replicating)));

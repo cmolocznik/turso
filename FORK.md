@@ -1864,6 +1864,23 @@ is seen failing without it: page 1 from the live header, headers not kept (both 
 first through the cookie a table below the cut bumped), every header forgotten at a checkpoint,
 and the cut's own commit's header left out.
 
+### A frame reaches the log replicator while its transaction is still preparing
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`CommitState::MarkLogRecordWritten` in `core/mvcc/database/mod.rs`.
+Why: a checkpoint asks the replicator for its cut, assuming that every commit at or below the newest
+it could write has its frame with the replicator. Codex found a commit that counts as committed
+first. A group-commit leader that writes a waiter's frame after the waiter's commit was dropped
+finishes that commit itself, when it marks the record written, and only then handed the frame to
+the replicator. A checkpoint on another thread could take its snapshot in between.
+What: the leader hands the frame to the replicator before it marks the record written. The writer
+still waits on the replicator's completion after the mark, as before.
+Tests: `an_abandoned_waiter_s_frame_reaches_the_replicator_while_it_is_still_preparing` in
+`core/mvcc/database/group_commit_tests.rs`, built with `conn_raw_api`
+(`cargo test -p turso_core --features conn_raw_api`). It holds two commits in one group and drops
+the waiter's after the leader issued its write. The replicator then notes whether each frame's
+transaction is `Preparing` as the frame arrives. On the code before, the waiter's frame arrived
+after its transaction had committed.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

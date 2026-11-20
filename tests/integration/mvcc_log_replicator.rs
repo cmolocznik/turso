@@ -183,6 +183,7 @@ fn concurrent_commits_reach_the_replicator_in_log_order() {
             let db = db.clone();
             std::thread::spawn(move || {
                 let conn = db.connect_limbo();
+                let mut committed = Vec::new();
                 for i in 0..each {
                     conn.execute("BEGIN CONCURRENT").unwrap();
                     conn.execute(format!(
@@ -191,16 +192,25 @@ fn concurrent_commits_reach_the_replicator_in_log_order() {
                     ))
                     .unwrap();
                     conn.execute("COMMIT").unwrap();
+                    committed.push(conn.last_commit_ts().unwrap());
                 }
+                committed
             })
         })
         .collect();
-    for thread in threads {
-        thread.join().unwrap();
-    }
+    let mut committed: Vec<u64> = threads
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect();
     let frames = recorder.frames.lock().unwrap().clone();
     assert_eq!(frames.len(), 1 + writers * each);
     assert_frames_are_the_log(&db, &frames);
+    // Each writer's last commit timestamp is its own frame's, whichever
+    // group-commit leader wrote the frame.
+    let mut written: Vec<u64> = frames[1..].iter().map(|f| f.commit_ts).collect();
+    committed.sort_unstable();
+    written.sort_unstable();
+    assert_eq!(committed, written);
 }
 
 #[test]
@@ -586,6 +596,38 @@ fn a_replicated_log_that_every_checkpoint_keeps_a_commit_of_stays_bounded() {
         limbo_exec_rows(&db.connect_limbo(), "SELECT count(*) FROM things"),
         vec![vec![rusqlite::types::Value::Integer(60)]]
     );
+}
+
+/// A connection reports the commit timestamp of its last frame, an applier's
+/// too, which is how a follower records where each replicated entry ended: a
+/// checkpoint through it covers that commit. A transaction that wrote nothing
+/// leaves it as it was.
+#[test]
+fn a_connection_reports_the_commit_timestamp_of_its_last_frame() {
+    let (db, recorder) = leader("log_replicator_last_commit.db");
+    let conn = db.connect_limbo();
+    assert_eq!(conn.last_commit_ts(), None);
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    assert_eq!(conn.last_commit_ts(), Some(recorder.last_commit_ts()));
+
+    let applier = db.connect_limbo();
+    applier.set_applies_replicated_commits(true);
+    applier
+        .execute("INSERT INTO things VALUES (1, 'applied')")
+        .unwrap();
+    let applied = applier.last_commit_ts().unwrap();
+    assert!(applied > recorder.last_commit_ts());
+    applier.execute("BEGIN CONCURRENT").unwrap();
+    limbo_exec_rows(&applier, "SELECT count(*) FROM things");
+    applier.execute("COMMIT").unwrap();
+    assert_eq!(applier.last_commit_ts(), Some(applied), "a read moved it");
+
+    recorder.cut_at(Some(applied));
+    conn.execute("INSERT INTO things VALUES (2, 'after')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(db.db.mvcc_checkpointed_through(), Some(applied));
 }
 
 /// A log replicator is installed only on a database whose checkpoints run

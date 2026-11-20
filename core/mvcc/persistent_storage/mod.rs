@@ -193,6 +193,9 @@ pub trait DurableStorage: Send + Sync + Debug {
         self.set_header(header);
     }
 
+    /// Lets the log roll with portable changes in its frames, as a log replicator takes them.
+    fn roll_with_portable_changes(&self) {}
+
     /// Called when a checkpoint begins, before any rows are written to the B-tree.
     fn on_checkpoint_start(&self) -> Result<()> {
         Ok(())
@@ -501,6 +504,10 @@ impl DurableStorage for Storage {
 
     fn set_active_segment(&self, slot: usize, header: logical_log::LogHeader) {
         self.logical_log.write().set_active_segment(slot, header);
+    }
+
+    fn roll_with_portable_changes(&self) {
+        self.logical_log.write().roll_with_portable_changes();
     }
 }
 

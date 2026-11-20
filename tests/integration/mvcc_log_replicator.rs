@@ -525,6 +525,69 @@ fn page_one_reopens_as_the_commits_left_it_once_the_cut_passes_them() {
     assert_eq!((user_version, later_tables), (7, 1));
 }
 
+/// The bytes held by a database's logical-log files.
+fn log_files_size(db: &TempDatabase) -> u64 {
+    let base = db.path.with_extension("db-log");
+    let mut paths = vec![base.clone()];
+    for slot in 1..4 {
+        paths.push(std::path::PathBuf::from(format!(
+            "{}.{slot}",
+            base.display()
+        )));
+    }
+    paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// A replicated log rolls, though its frames carry portable changes: when
+/// every checkpoint's cut keeps a commit back, the log's files hold a few
+/// frames, not every frame ever written.
+#[test]
+fn a_replicated_log_that_every_checkpoint_keeps_a_commit_of_stays_bounded() {
+    let (db, recorder) = leader("log_replicator_rolls.db");
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    let payload = "x".repeat(4096);
+    for i in 0..60 {
+        let below = recorder.last_commit_ts();
+        conn.execute(format!("INSERT INTO things VALUES ({i}, '{payload}')"))
+            .unwrap();
+        recorder.cut_at(Some(below));
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    }
+    let size = log_files_size(&db);
+    assert!(
+        size < 64 * 1024,
+        "the log's files hold {size} bytes after 60 commits of 4 KB"
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM things"),
+        vec![vec![rusqlite::types::Value::Integer(60)]]
+    );
+
+    // Opened without dropping its log, the database replays the rolled
+    // segments' portable frames above the file's cut.
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+    let db = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_opts(
+            DatabaseOpts::new()
+                .with_mvcc(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+        .build();
+    assert_eq!(
+        limbo_exec_rows(&db.connect_limbo(), "SELECT count(*) FROM things"),
+        vec![vec![rusqlite::types::Value::Integer(60)]]
+    );
+}
+
 /// A log replicator is installed only on a database whose checkpoints run
 /// beside writers and whose log is dropped on open.
 #[test]

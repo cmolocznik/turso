@@ -6834,6 +6834,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// The least `durable_at_begin` over the active and preparing transactions (`u64::MAX` when
     /// none): a version committed at or below it is B-tree-equivalent for every live reader. A
     /// reader that begins after this is sampled sees a durable maximum at least as large.
+    /// Lets the logical log roll with portable changes in its frames, as a log replicator takes
+    /// each frame when it is written.
+    pub(crate) fn roll_replicated_log(&self) {
+        self.storage.roll_with_portable_changes();
+    }
+
     /// The newest commit timestamp whose rows the database file holds (`durable_txid_max`).
     pub(crate) fn checkpointed_through(&self) -> u64 {
         self.durable_txid_max.load(Ordering::SeqCst)

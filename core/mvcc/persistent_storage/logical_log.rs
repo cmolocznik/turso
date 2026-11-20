@@ -728,6 +728,9 @@ pub struct LogicalLog {
     /// being written when it is appended, so once the oldest segment holding a frame is of a later
     /// generation than `n`, no frame appended while `n` was being written is left in the files.
     generation: u64,
+    /// The log rolls even with portable changes in its frames: a log replicator takes them as they
+    /// are written, and nothing reads the files but recovery.
+    rolls_with_portable_changes: bool,
 }
 
 /// The path of slot `slot` of the log whose first file is `base`.
@@ -895,6 +898,7 @@ impl LogicalLog {
             max_appended_commit_ts: 0,
             ring: None,
             generation: 0,
+            rolls_with_portable_changes: false,
         }
     }
 
@@ -1064,14 +1068,20 @@ impl LogicalLog {
     }
 
     /// Whether this log rolls: it was opened over files it can roll through, and its frames carry
-    /// no portable changes, whose readers follow a single file.
+    /// no portable changes, whose readers follow a single file, unless a log replicator takes
+    /// them ([`Self::roll_with_portable_changes`]).
     fn rolls(&self) -> bool {
         self.ring.is_some()
             && self.pending_header_upgrade.is_none()
-            && self
-                .header
-                .as_ref()
-                .is_some_and(|header| header.version == LOG_VERSION_V2)
+            && self.header.as_ref().is_some_and(|header| {
+                header.version == LOG_VERSION_V2 || self.rolls_with_portable_changes
+            })
+    }
+
+    /// Lets the log roll with portable changes in its frames: a log replicator takes each frame
+    /// as it is written, so no reader follows the log's files.
+    pub(crate) fn roll_with_portable_changes(&mut self) {
+        self.rolls_with_portable_changes = true;
     }
 
     /// Seals the segment being written and goes on in `slot`'s file, at a frame boundary.

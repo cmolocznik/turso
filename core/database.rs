@@ -4090,6 +4090,9 @@ impl Database {
                 "this database has a log replicator already".to_string(),
             ));
         }
+        if let Some(store) = self.mv_store.load().as_ref() {
+            store.roll_replicated_log();
+        }
         Ok(())
     }
 

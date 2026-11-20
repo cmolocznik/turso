@@ -1819,7 +1819,8 @@ above the cut keeps the version the cut needs.
 Limits: page 1 is written as of the cut by the next entry's change. The cut must be one no frame
 written after it, in log order, is at or below: frames are in group-commit order, not timestamp
 order, and choosing such a cut is the replicator's work. A replicator that never moves its cut keeps
-the log growing, and a log with portable changes does not roll yet. Embedded only.
+the log growing; one that moves it keeps a rolling log bounded (the entry after next). Embedded
+only.
 Not done: the forge's replicator that picks cuts; `ivf_crash`'s kill rounds over a dropped log.
 Tests: in `tests/integration/mvcc_log_replicator.rs`, whose replicated databases now open with
 passive checkpoints and the log dropped:
@@ -1880,6 +1881,27 @@ Tests: `an_abandoned_waiter_s_frame_reaches_the_replicator_while_it_is_still_pre
 the waiter's after the leader issued its write. The replicator then notes whether each frame's
 transaction is `Preparing` as the frame arrives. On the code before, the waiter's frame arrived
 after its transaction had committed.
+
+### A replicated log rolls, though its frames carry portable changes
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`LogicalLog::rolls` and `roll_with_portable_changes` in `core/mvcc/persistent_storage/logical_log.rs`;
+`DurableStorage::roll_with_portable_changes` in `core/mvcc/persistent_storage/mod.rs`;
+`MvStore::roll_replicated_log`, called by `Database::set_log_replicator`.
+Why: a log whose frames carry portable changes never rolled, because the sync engine's readers
+follow its single file ("The logical log rolls under writes that never pause"). A replicated
+database's frames always carry them. Its checkpoints write through a cut that keeps the commits
+after it in the log, so under writes that never pause the log was never truncated.
+What: a log replicator takes each frame as it is written, so once one is installed the log rolls
+with portable changes too, through the segment files and checkpoints it rolls through otherwise. A
+header upgrade still pending keeps it from rolling, as before.
+Limits: the sync engine does not read a replicated database's log, whose segments its readers do
+not follow. With four files and a cut that does not move, the active segment grows, as any rolling
+log's does.
+Tests: `a_replicated_log_that_every_checkpoint_keeps_a_commit_of_stays_bounded` in
+`tests/integration/mvcc_log_replicator.rs`. It makes 60 commits of 4 KB with a checkpoint after
+each, whose cut keeps the newest back. The log's files stay under 64 KB, and opened without
+dropping its log, the database replays the rolled segments' portable frames and holds all 60
+rows. Without the roll, the files held every frame and the test fails.
 
 ## Taken upstream
 

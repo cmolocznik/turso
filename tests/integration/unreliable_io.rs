@@ -92,6 +92,8 @@ struct UnreliableIoState {
     /// simulated power-loss point.
     armed_path: Mutex<Option<String>>,
     snapshot: Mutex<Option<CrashSnapshot>>,
+    /// Every fsync of this file fails, with nothing made durable.
+    failing_sync: Mutex<Option<String>>,
 }
 
 impl UnreliableIoState {
@@ -149,6 +151,7 @@ impl UnreliableIo {
                 files: Mutex::new(HashMap::new()),
                 armed_path: Mutex::new(None),
                 snapshot: Mutex::new(None),
+                failing_sync: Mutex::new(None),
             }),
         }
     }
@@ -165,6 +168,12 @@ impl UnreliableIo {
     /// pending (unsynced) writes captures the crash snapshot.
     pub fn arm_crash_on_sync(&self, path: &str) {
         *self.state.armed_path.lock().unwrap() = Some(path.to_string());
+    }
+
+    /// From now on, every fsync of `path` fails with an I/O error.
+    #[allow(dead_code)]
+    pub fn fail_syncs_of(&self, path: &str) {
+        *self.state.failing_sync.lock().unwrap() = Some(path.to_string());
     }
 
     pub fn take_crash_snapshot(&self) -> Option<CrashSnapshot> {
@@ -315,6 +324,13 @@ impl File for UnreliableFile {
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if self.state.failing_sync.lock().unwrap().as_deref() == Some(self.path.as_str()) {
+            c.error(turso_core::CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "an injected fsync failure",
+            ));
+            return Ok(c);
+        }
         // Simulated power loss: crash while the armed file's fsync is in
         // flight, i.e. after its writes were submitted but before any of them
         // were made durable.

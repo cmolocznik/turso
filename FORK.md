@@ -1650,8 +1650,12 @@ the frames are written, synced and published as before. If it fails, the commit 
 error, and the caller rolls the transaction back: no reader saw it, and no frame of it is in the
 WAL for a crash to recover. The writer holds the
 write lock throughout, so commits reach the replicator one at a time, in the order they commit.
-Frames inserted with `wal_insert_frame`, as a follower applies a commit, publish themselves and
-never reach it. A follower reads a page's image with `try_wal_watermark_read_page` and writes a
+Once the frames are published, the replicator's `published` is called: the commit is durable on
+this database's disk too, which a replicator needs before it counts the commit applied here. A
+commit the replicator took whose frames then cannot be written or synced stops the process with a
+panic, whatever `data_sync_retry` says: the replicator holds the commit, and this database must
+not carry on without it. Frames inserted with `wal_insert_frame`, as a follower applies a commit,
+publish themselves and never reach it. A follower reads a page's image with `try_wal_watermark_read_page` and writes a
 commit with `wal_insert_begin`, `wal_insert_frame` and `wal_insert_end`.
 Limits: `set_commit_replicator` refuses an MVCC database, whose commits go through the logical
 log. Page 1 of a new database is written to the database file when the database is first
@@ -1668,6 +1672,10 @@ Tests: `wal::test_commit_replicator` in `tests/integration` (four).
   and its WAL, taken then, opens without it. The first version called the replicator after the
   commit's frames were written and synced, and this test found the failed commit in the copy.
 - A database takes one replicator.
+- The replicator is told when each commit it let through is published, and of none it failed.
+- A replicated commit whose fsync fails stops the process. Without a replicator, the same failure
+  under `data_sync_retry` fails the commit. `UnreliableIo` gains `fail_syncs_of`, an injected
+  fsync error.
 - Each part is seen failing without it. With the replicator never called, the three tests that
   replicate fail. With a page's image taken at every `add_dirty` instead of the first, or with
   the clear when a write transaction begins removed, the follower's images before no longer match.

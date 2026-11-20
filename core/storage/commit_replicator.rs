@@ -45,4 +45,10 @@ pub trait CommitReplicator: Send + Sync {
     /// completion finishes: it is published if the completion succeeds, and
     /// fails with the completion's error otherwise.
     fn replicate(&self, commit: ReplicatedCommit) -> Completion;
+
+    /// The commit last given to `replicate`, which it let through, is
+    /// written, synced and visible: durable on this database's own disk too.
+    /// A commit the replicator took that cannot then be written stops the
+    /// process instead: the replicator holds it, and so must this database.
+    fn published(&self) {}
 }

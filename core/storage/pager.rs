@@ -4874,6 +4874,12 @@ impl Pager {
                     }
                     let mut commit_info = self.commit_info.write();
                     if !writes.succeeded() {
+                        if commit_info.replication.is_some() {
+                            panic!(
+                                "a commit its replicator took could not be written to the WAL: {:?}",
+                                writes.get_error()
+                            );
+                        }
                         commit_info.completion_group = None;
                         commit_info.prepared_frames.clear();
                         return Err(LimboError::CompletionError(CompletionError::IOError(
@@ -4918,6 +4924,12 @@ impl Pager {
                         // Check for fsync error as we might need to panic on data_sync_retry=off
                         let mut commit_info = self.commit_info.write();
                         if !sync_c.succeeded() {
+                            if commit_info.replication.is_some() {
+                                panic!(
+                                    "a commit its replicator took could not be synced to the WAL: {:?}",
+                                    sync_c.get_error()
+                                );
+                            }
                             commit_info.pending_sync = None;
                             commit_info.prepared_frames.clear();
 
@@ -4969,6 +4981,11 @@ impl Pager {
                     wal.finish_append_frames_commit()?;
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
+                    if commit_info.replication.is_some() {
+                        if let Some(replicator) = self.shared.commit_replicator() {
+                            replicator.published();
+                        }
+                    }
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
                         && wal.should_checkpoint(checkpoint_threshold);

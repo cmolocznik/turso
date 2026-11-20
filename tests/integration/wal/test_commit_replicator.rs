@@ -10,6 +10,7 @@ use std::time::Duration;
 use turso_core::{CommitReplicator, Completion, CompletionError, Connection, ReplicatedCommit};
 
 use crate::common::{compute_dbhash, limbo_exec_rows, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
 
 const PAGE: usize = 4096;
 
@@ -20,6 +21,7 @@ struct Recorder {
     commits: Mutex<Vec<ReplicatedCommit>>,
     fail: Mutex<Option<usize>>,
     seen: AtomicUsize,
+    published: AtomicUsize,
     hold: Mutex<bool>,
     held: Mutex<Vec<Completion>>,
 }
@@ -39,6 +41,10 @@ impl CommitReplicator for Recorder {
             return waiting;
         }
         Completion::new_yield()
+    }
+
+    fn published(&self) {
+        self.published.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -260,6 +266,55 @@ fn a_commit_its_replicator_fails_is_not_in_what_a_crash_leaves() {
         rows(&reopened, "SELECT x FROM t"),
         [[rusqlite::types::Value::Integer(1)]]
     );
+}
+
+/// The replicator learns when each commit it let through is on this
+/// database's own disk, and of no commit it failed.
+#[test]
+fn the_replicator_is_told_when_its_commit_is_published() {
+    let (leader, recorder) = leader();
+    let conn = leader.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let let_through = recorder.commits.lock().unwrap().len();
+    assert_eq!(recorder.published.load(Ordering::SeqCst), let_through);
+    *recorder.fail.lock().unwrap() = Some(recorder.seen.load(Ordering::SeqCst));
+    assert!(conn.execute("INSERT INTO t VALUES (2)").is_err());
+    assert_eq!(recorder.published.load(Ordering::SeqCst), let_through);
+}
+
+/// A database on `io` with fsyncs that fail, retried rather than fatal, as
+/// `data_sync_retry` makes them: what a commit does then.
+fn commit_with_failing_sync(replicated: bool) -> turso_core::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let path = path.to_str().unwrap().to_string();
+    let io = Arc::new(UnreliableIo::new());
+    let db =
+        turso_core::Database::open_file(io.clone(), &path, Arc::new(turso_core::SqliteDialect))
+            .unwrap();
+    if replicated {
+        db.set_commit_replicator(Arc::new(Recorder::default()))
+            .unwrap();
+    }
+    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA data_sync_retry = 1").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    io.fail_syncs_of(&format!("{path}-wal"));
+    conn.execute("INSERT INTO t VALUES (1)")
+}
+
+#[test]
+fn without_a_replicator_a_failed_fsync_fails_the_commit() {
+    assert!(commit_with_failing_sync(false).is_err());
+}
+
+/// The replicator holds the commit, so a database that cannot write it
+/// stops instead of carrying on without it.
+#[test]
+#[should_panic(expected = "a commit its replicator took could not be synced to the WAL")]
+fn a_replicated_commit_that_cannot_be_synced_stops_the_process() {
+    let _ = commit_with_failing_sync(true);
 }
 
 #[test]

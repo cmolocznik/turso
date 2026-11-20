@@ -823,6 +823,10 @@ pub struct Database<
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
 
+    /// Receives each committed transaction's logical-log frame
+    /// (`mvcc::log_replicator`).
+    log_replicator: crate::sync::OnceLock<Arc<dyn crate::mvcc::log_replicator::LogReplicator>>,
+
     /// Optional per-database MVCC durable storage override.
     ///
     /// When set, MVCC will use this implementation for logical-log durability
@@ -1010,6 +1014,7 @@ impl Database {
             page_codec_id,
             closed: Arc::new(Closed::default()),
 
+            log_replicator: crate::sync::OnceLock::new(),
             durable_storage: None,
         };
 
@@ -3063,6 +3068,7 @@ impl Database {
             wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
+            applies_replicated_commits: AtomicBool::new(false),
             #[cfg(feature = "conn_raw_api")]
             mvcc_log_metadata: RwLock::new(HashMap::default()),
             capture_data_changes: RwLock::new(None),
@@ -4016,6 +4022,46 @@ impl Database {
             ));
         }
         Ok(())
+    }
+
+    /// Installs `replicator` to receive each committed transaction's
+    /// logical-log frame, and to say whether the database takes commits
+    /// (`mvcc::log_replicator`). It is installed once, before the database's
+    /// first commit.
+    ///
+    /// # Errors
+    ///
+    /// If one is installed already; if the database is not in MVCC mode, which
+    /// has no logical log; or if the build lacks `conn_raw_api`, without which
+    /// a frame carries no portable metadata to name its tables.
+    pub fn set_log_replicator(
+        &self,
+        replicator: Arc<dyn crate::mvcc::log_replicator::LogReplicator>,
+    ) -> Result<()> {
+        if !cfg!(feature = "conn_raw_api") {
+            return Err(LimboError::InvalidArgument(
+                "a log replicator needs the conn_raw_api feature, whose portable metadata names a frame's tables"
+                    .to_string(),
+            ));
+        }
+        if !self.mvcc_enabled() {
+            return Err(LimboError::InvalidArgument(
+                "a log replicator replicates the MVCC logical log, and this database is not in MVCC mode"
+                    .to_string(),
+            ));
+        }
+        if self.log_replicator.set(replicator).is_err() {
+            return Err(LimboError::InvalidArgument(
+                "this database has a log replicator already".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn log_replicator(
+        &self,
+    ) -> Option<&Arc<dyn crate::mvcc::log_replicator::LogReplicator>> {
+        self.log_replicator.get()
     }
 
     /// check if database is currently in MVCC mode

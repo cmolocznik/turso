@@ -2,8 +2,11 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
+use crate::io::SharedBufferData;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::log_replicator::{LogReplicator, ReplicatedFrame};
+use crate::mvcc::persistent_storage::logical_log::LogTxFrameInfo;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -538,6 +541,9 @@ pub struct LogRecord {
     /// the wrapper metadata itself is empty.
     #[cfg(feature = "conn_raw_api")]
     pub portable_changes_required: bool,
+    /// Whether the frame goes to the database's log replicator once written:
+    /// the committing connection's commits are replicated.
+    pub(crate) replicated: bool,
 }
 
 impl LogRecord {
@@ -568,6 +574,7 @@ impl LogRecord {
             portable_changes_enabled: false,
             #[cfg(feature = "conn_raw_api")]
             portable_changes_required: false,
+            replicated: false,
         })
     }
 
@@ -583,6 +590,7 @@ impl LogRecord {
             portable_changes_enabled: false,
             #[cfg(feature = "conn_raw_api")]
             portable_changes_required: false,
+            replicated: false,
         }
     }
 
@@ -1681,6 +1689,9 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     group_batch: Option<GroupBatch>,
     /// This state machine issued at least one `log_tx` (leader or exclusive).
     wrote_logical_log: bool,
+    /// The frame of the record being written, for the log replicator once
+    /// the write is confirmed.
+    replicated_frame: Option<ReplicatedFrame>,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     /// For a statement's commit (`MvStore::commit_tx_continued`), the parts the statement holds
@@ -1832,6 +1843,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pending_log_append_bytes: None,
             group_batch: None,
             wrote_logical_log: false,
+            replicated_frame: None,
             sync_mode,
             continue_beside: None,
             successor: None,
@@ -1999,6 +2011,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
         self.wrote_logical_log = true;
         Ok(())
+    }
+
+    /// Gives the database's log replicator the frame just written, if it is
+    /// one the replicator receives: the completion the writer waits on.
+    fn replicate_written_frame(&mut self) -> Option<Completion> {
+        let frame = self.replicated_frame.take()?;
+        let replicator = self.connection.db.log_replicator()?;
+        Some(replicator.replicate(frame))
+    }
+
+    /// The database's log replicator, unless this connection applies commits
+    /// replicated from another database.
+    fn log_replicator(&self) -> Option<&Arc<dyn LogReplicator>> {
+        if self.connection.applies_replicated_commits() {
+            return None;
+        }
+        self.connection.db.log_replicator()
     }
 
     fn finish_abandoned_group_waiter(
@@ -2939,16 +2968,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         mvcc_store: &Arc<MvStore<Clock, A>>,
         log_record: &mut LogRecord,
     ) -> Result<()> {
+        log_record.replicated = self.log_replicator().is_some();
         #[cfg(not(feature = "conn_raw_api"))]
         {
             let _ = mvcc_store;
-            let _ = log_record;
             Ok(())
         }
 
         #[cfg(feature = "conn_raw_api")]
         {
-            if !self.connection.portable_logical_changes_enabled() {
+            // A replicated frame names its tables, for the database that
+            // applies it.
+            if !self.connection.portable_logical_changes_enabled() && !log_record.replicated {
                 return Ok(());
             }
             log_record.portable_changes_enabled = true;
@@ -3271,6 +3302,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // Read only is not only exclusive to empty write set, we could be writing the
                 // database header here.
                 let read_only = write_set_is_empty && !header_write;
+                if !read_only {
+                    if let Some(replicator) = self.log_replicator() {
+                        if !replicator.takes_commits() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                    }
+                }
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
@@ -3661,7 +3699,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
                     return Ok(TransitionResult::Continue);
                 }
-                let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
+                let commit_ts = log_record.tx_timestamp;
+                let replicated = log_record.replicated;
+                let written = std::cell::RefCell::new(None);
+                let keep_frame = |bytes: SharedBufferData, info: LogTxFrameInfo| -> Result<()> {
+                    *written.borrow_mut() = Some((bytes, info));
+                    Ok(())
+                };
+                let keep_frame: &dyn Fn(SharedBufferData, LogTxFrameInfo) -> Result<()> =
+                    &keep_frame;
+                let (c, append_bytes) = mvcc_store
+                    .storage
+                    .log_tx(log_record, replicated.then_some(keep_frame))?;
+                self.replicated_frame = written.into_inner().map(
+                    |(bytes, info): (SharedBufferData, LogTxFrameInfo)| ReplicatedFrame {
+                        commit_ts,
+                        bytes: frame_of(&bytes),
+                        crc_before: info.start_crc32c,
+                    },
+                );
                 if let Some(batch) = self.group_batch.as_ref() {
                     self.commit_coordinator
                         .note_write_issued(batch.writing.tx_id);
@@ -3698,7 +3754,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     None => (None, self.tx_id),
                 };
                 self.mark_log_record_written(mvcc_store, ticket, owner_tx)?;
+                let replicating = self.replicate_written_frame();
                 self.state = self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
+                if let Some(replicating) = replicating.filter(|c| !c.finished()) {
+                    return Ok(TransitionResult::Io(IOCompletions(replicating)));
+                }
                 if owner_tx == self.tx_id {
                     inject_transition_yield!(self, CommitYieldPoint::LogRecordMarkedWritten);
                 }
@@ -3934,6 +3994,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
     fn is_finalized(&self) -> bool {
         self.is_finalized
+    }
+}
+
+/// A logical-log write's frame: its bytes after the room kept for the log's
+/// header, which only the first write to a log file fills.
+fn frame_of(written: &SharedBufferData) -> Arc<[u8]> {
+    let bytes = written.as_slice();
+    match written {
+        SharedBufferData::Full(_) => Arc::from(&bytes[LOG_HDR_SIZE..]),
+        SharedBufferData::View(_) => Arc::from(bytes),
     }
 }
 

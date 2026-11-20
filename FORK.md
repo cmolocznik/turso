@@ -1681,6 +1681,58 @@ Tests: `wal::test_commit_replicator` in `tests/integration` (four).
   the clear when a write transaction begins removed, the follower's images before no longer match.
   With the replicator's error ignored, the failed commit stays.
 
+### A log replicator receives each MVCC commit's frame once it is written
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`core/mvcc/log_replicator.rs` (`LogReplicator`, `ReplicatedFrame`), `Database::set_log_replicator`
+in `core/database.rs`, `Connection::set_applies_replicated_commits` in `core/connection.rs`, and the
+commit states `Initial`, `WriteLogicalLog` and `MarkLogRecordWritten` in `core/mvcc/database/mod.rs`.
+In the Rust binding, `Builder::with_mvcc`, `Builder::with_log_replicator` and
+`Connection::set_applies_replicated_commits`; the SDK maps the feature name `mvcc` to
+`DatabaseOpts::with_mvcc`.
+Why: atoll-forge replaces its WAL replication with the MVCC logical log's (its `FORGE.md` §6,
+decision 76). The commit replicator above holds each commit until a quorum has it, so commits go
+one at a time behind a Raft round trip: 56 commits a second on the leader of three. Under MVCC a
+commit appends its frame to the logical log, with group commit, and goes on. Raft gets the frames
+as they are written and batches them, and the order is kept by a durable watermark outside the
+database.
+What: a database in MVCC mode with a replicator installed gives it each transaction's frame once
+the frame's write is confirmed (`MarkLogRecordWritten`), in the order of the log: the frame's bytes,
+its commit timestamp, and the log's running CRC before it. The bytes are the frame alone, without
+the log header that a log file's first write carries. Every replicated frame carries portable
+metadata, so that the database applying it can name its tables. The writer waits on the completion
+the replicator returns only when that completion is not complete already, which is how a full
+replicator slows its writers down. As each commit with writes starts, the replicator is asked
+whether the database takes commits. One it refuses fails with `LimboError::ReadOnly` before it takes
+a timestamp, with nothing written. A connection marked as applying replicated commits, as a
+follower's applier is, is neither asked nor replicated.
+Limits: group commit writes concurrent transactions' frames in the order they reached its queue,
+which need not be their commit timestamps' order. Only transactions that depend on none of each
+other's writes are written out of timestamp order, so applying frames in log order gives the same
+rows. `set_log_replicator` needs MVCC mode and the `conn_raw_api` feature, whose portable metadata
+names the tables. Embedded only.
+Not done: `ivf_crash`'s kill rounds, a run in Atoll mode, and a cost run.
+Tests: `mvcc_log_replicator` in `tests/integration` (six), and `test_log_replicator` in
+`bindings/rust/tests` (two).
+- Each commit's frame reaches the replicator. The frames are exactly the log's last bytes, each
+  names its own commit timestamp, the CRC chain continues from frame to frame, and each row's frame
+  names its table. After a checkpoint empties the log, the next frame, written with the log's
+  header, still reaches the replicator alone.
+- Eight concurrent writers' frames, written by group commit leaders for one another, reach it in
+  log order. The first version of this test expected rising commit timestamps, and failed: the log
+  is not in timestamp order.
+- A commit the replicator refuses fails with `ReadOnly`, writes nothing to the log, and is not
+  seen. The next commit, taken, goes through.
+- A connection that applies replicated commits commits while the replicator refuses others, and
+  its frame does not reach the replicator.
+- A replicator that holds its completion makes the writer wait until it completes it.
+- A table with a `path_trie` index commits under a replicator, and its frames name the table.
+- Through the binding, a commit waits for room that a task of the replicator's own makes later,
+  on a one-thread runtime. A replicator on a WAL database is refused.
+- Each part is seen failing without it: frames never handed over, the refusal ignored, the applier
+  asked, the pacing completion ignored, portable metadata not forced on, the log header left on a
+  first write's frame, and, in the binding, the replicator not installed, `mvcc` not passed, and
+  the applier flag not passed through.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

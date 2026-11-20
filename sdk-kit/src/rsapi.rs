@@ -401,6 +401,7 @@ impl TursoDatabaseConfig {
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
+                "mvcc" => opts.with_mvcc(true),
                 // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
                 _ => opts,
             };
@@ -1173,6 +1174,12 @@ impl TursoConnection {
         map_sync_transient_error(self.sync_busy.as_ref(), error)
     }
     /// Set busy timeout for the connection
+    /// Marks this connection as the one that applies commits replicated from
+    /// another database (`turso_core::LogReplicator`).
+    pub fn set_applies_replicated_commits(&self, applies: bool) {
+        self.connection.set_applies_replicated_commits(applies);
+    }
+
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
     }

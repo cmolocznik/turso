@@ -654,6 +654,10 @@ pub struct Connection {
     /// consumers such as sync clients.
     #[cfg(feature = "conn_raw_api")]
     pub(super) portable_logical_changes_enabled: AtomicBool,
+    /// Whether this connection applies commits replicated from another
+    /// database, whose commits its database's log replicator neither admits
+    /// nor receives.
+    pub(super) applies_replicated_commits: AtomicBool,
     #[cfg(feature = "conn_raw_api")]
     pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
@@ -3236,6 +3240,19 @@ impl Connection {
     #[cfg(feature = "conn_raw_api")]
     pub fn reload_wal_after_external_restore(&self) -> Result<()> {
         self.db.reload_wal_after_external_restore()
+    }
+
+    /// Marks this connection as the one that applies commits replicated from
+    /// another database, as a follower does the leader's: its commits are not
+    /// asked of the database's log replicator, and their frames do not reach
+    /// it (`mvcc::log_replicator`).
+    pub fn set_applies_replicated_commits(&self, applies: bool) {
+        self.applies_replicated_commits
+            .store(applies, Ordering::Release);
+    }
+
+    pub fn applies_replicated_commits(&self) -> bool {
+        self.applies_replicated_commits.load(Ordering::Acquire)
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC

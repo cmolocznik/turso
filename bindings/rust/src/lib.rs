@@ -180,6 +180,8 @@ pub struct Builder {
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
     commit_replicator: Option<Arc<dyn turso_core::CommitReplicator>>,
+    enable_mvcc: bool,
+    log_replicator: Option<Arc<dyn turso_core::LogReplicator>>,
 }
 
 impl Builder {
@@ -201,6 +203,8 @@ impl Builder {
             encryption_opts: None,
             io: None,
             commit_replicator: None,
+            enable_mvcc: false,
+            log_replicator: None,
         }
     }
 
@@ -293,6 +297,23 @@ impl Builder {
         self
     }
 
+    /// Opens the database in MVCC mode, switching a database that is not in
+    /// it yet.
+    pub fn with_mvcc(mut self, enabled: bool) -> Self {
+        self.enable_mvcc = enabled;
+        self
+    }
+
+    /// Gives `replicator` each committed transaction's MVCC logical-log frame
+    /// once it is written, and lets it refuse commits
+    /// (`turso_core::LogReplicator`). It needs [`Self::with_mvcc`], and is
+    /// installed before the database's first commit. Embedded only: a
+    /// serverless database's log is on its server.
+    pub fn with_log_replicator(mut self, replicator: Arc<dyn turso_core::LogReplicator>) -> Self {
+        self.log_replicator = Some(replicator);
+        self
+    }
+
     /// Open the database without write access.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -328,6 +349,9 @@ impl Builder {
         if self.enable_mvcc_passive_checkpoint {
             features.push("mvcc_passive_checkpoint");
         }
+        if self.enable_mvcc {
+            features.push("mvcc");
+        }
         if features.is_empty() {
             return None;
         }
@@ -339,6 +363,7 @@ impl Builder {
     pub async fn build(self) -> Result<Database> {
         let features = self.build_features_string();
         let commit_replicator = self.commit_replicator;
+        let log_replicator = self.log_replicator;
         let db =
             turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
@@ -367,6 +392,11 @@ impl Builder {
         if let Some(replicator) = commit_replicator {
             db.db_core()?
                 .set_commit_replicator(replicator)
+                .map_err(TursoError::from)?;
+        }
+        if let Some(replicator) = log_replicator {
+            db.db_core()?
+                .set_log_replicator(replicator)
                 .map_err(TursoError::from)?;
         }
         Ok(Database { inner: db })

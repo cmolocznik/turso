@@ -351,3 +351,81 @@ fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// An MVCC checkpoint whose WAL backfill a reader of the database file refuses
+/// must still make the commit it wrote to the WAL durable before it truncates
+/// the logical log. Under `synchronous=NORMAL` the checkpoint's own pager commit
+/// does not fsync the WAL, and the backfill that owes that fsync returns Busy
+/// before issuing it. A power loss then keeps the truncated log and loses the
+/// WAL tail: a row a `synchronous=FULL` commit had made durable is gone.
+#[test]
+fn an_mvcc_checkpoint_refused_its_backfill_syncs_the_wal_before_truncating_the_log(
+) -> anyhow::Result<()> {
+    let db_path_sim = "mvcc-checkpoint-refused-backfill.db";
+    let io = Arc::new(UnreliableIo::new());
+    let opts = DatabaseOpts::new()
+        .with_mvcc(true)
+        .with_experimental_mvcc_passive_checkpoint(true);
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    io.mark_all_durable();
+
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("INSERT INTO t VALUES (1, 'durable')")?;
+    let log = format!("{db_path_sim}-log");
+    assert!(
+        !io.has_unsynced_writes(&log),
+        "the synchronous=FULL commit left its frame unsynced"
+    );
+    conn.execute("PRAGMA synchronous=NORMAL")?;
+
+    let reader = db.connect(ConnectOpts::new())?;
+    reader.execute("BEGIN")?;
+    query_rows(&reader, "SELECT count(*) FROM t")?;
+    let db_file_before = io.durable_files().get(db_path_sim).cloned();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
+    assert_eq!(
+        io.durable_files().get(db_path_sim).cloned(),
+        db_file_before,
+        "the reader did not refuse the backfill"
+    );
+
+    // Power loss now: only what was synced survives, the logical log with it.
+    let files = io.durable_files();
+    let dir = tempfile::TempDir::new()?;
+    let db_path = dir.path().join("recovered.db");
+    for (suffix, name) in [
+        ("", "recovered.db"),
+        ("-wal", "recovered.db-wal"),
+        ("-log", "recovered.db-log"),
+    ] {
+        if let Some(bytes) = files.get(&format!("{db_path_sim}{suffix}")) {
+            std::fs::write(dir.path().join(name), bytes)?;
+        }
+    }
+    let recovered_db = Database::open_file_with_flags(
+        Arc::new(turso_core::PlatformIO::new()?),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let recovered = recovered_db.connect(ConnectOpts::new())?;
+    assert_eq!(
+        query_rows(&recovered, "SELECT v FROM t")?,
+        vec!["durable".to_string()],
+        "a row a synchronous=FULL commit made durable was lost"
+    );
+    Ok(())
+}

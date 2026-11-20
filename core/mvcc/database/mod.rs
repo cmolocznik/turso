@@ -3900,6 +3900,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
                 let tx_header = *tx_unlocked.header.read();
+                if tx_unlocked.header_dirty.load(Ordering::Acquire)
+                    && self.connection.db.mvcc_log_dropped_on_open()
+                {
+                    mvcc_store.keep_header_above_the_file(*end_ts, tx_header);
+                }
                 {
                     // Hold the header lock across the watermark update and header
                     // publish so the guard decision and replacement are serialized.
@@ -4968,6 +4973,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// early-exit and strand readers in a reparse-WaitForDependencies
     /// deadlock.
     last_global_header_ts: AtomicU64,
+    /// The header each commit above the file's boundary wrote, by commit timestamp, in a database
+    /// opened from its file alone (`DatabaseOpts::drop_mvcc_log_on_open`): a checkpoint through a
+    /// cut writes page 1 as the commits at or below the cut left it.
+    headers_above_the_file: Mutex<std::collections::BTreeMap<u64, DatabaseHeader>>,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
     /// Per-sequence first value not guaranteed safe to read past based only on
     /// durable/current sequence state. Active allocations can lower this.
@@ -5159,6 +5168,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             last_global_header_ts: AtomicU64::new(0),
+            headers_above_the_file: Mutex::new(std::collections::BTreeMap::new()),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
@@ -6824,6 +6834,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// The newest commit timestamp whose rows the database file holds (`durable_txid_max`).
     pub(crate) fn checkpointed_through(&self) -> u64 {
         self.durable_txid_max.load(Ordering::SeqCst)
+    }
+
+    /// Keeps the header a commit at `commit_ts` wrote, for a checkpoint through a cut at or above it.
+    pub(crate) fn keep_header_above_the_file(&self, commit_ts: u64, header: DatabaseHeader) {
+        self.headers_above_the_file.lock().insert(commit_ts, header);
+    }
+
+    /// The header the newest commit at or below `cut` wrote, of those above the file's boundary:
+    /// `None` when none wrote one, and page 1 already holds the header as of the cut.
+    pub(crate) fn header_at_cut(&self, cut: u64) -> Option<DatabaseHeader> {
+        self.headers_above_the_file
+            .lock()
+            .range(..=cut)
+            .next_back()
+            .map(|(_, header)| *header)
+    }
+
+    /// Forgets the headers of commits at or below `boundary`, which the database file now holds.
+    pub(crate) fn forget_headers_through(&self, boundary: u64) {
+        let mut headers = self.headers_above_the_file.lock();
+        *headers = headers.split_off(&(boundary + 1));
     }
 
     /// Advance `durable_txid_max` to `txid`, whose rows a reader reaches once its WAL mark is at or

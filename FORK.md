@@ -1816,7 +1816,7 @@ checkpoint whose log header is torn. A replicator is installed only on a databas
 checkpoints and its log dropped on open. Under passive checkpoints, garbage collection keeps a
 superseded version until a checkpoint has written its overwrite or delete. So a row overwritten
 above the cut keeps the version the cut needs.
-Limits: page 1 still takes the live header, not the cut's (next entry). The cut must be one no frame
+Limits: page 1 is written as of the cut by the next entry's change. The cut must be one no frame
 written after it, in log order, is at or below: frames are in group-commit order, not timestamp
 order, and choosing such a cut is the replicator's work. A replicator that never moves its cut keeps
 the log growing, and a log with portable changes does not roll yet. Embedded only.
@@ -1838,6 +1838,31 @@ passive checkpoints and the log dropped:
 Each part is seen failing without it: the cut ignored (two tests), the log replayed, the log's files
 kept, the header read when dropped, the torn header failing an interrupted checkpoint's completion,
 the refusal gone, either option not required, and, in the binding, either option not passed.
+
+### A checkpoint through a cut writes page 1 as of the cut
+2026-11-20, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`headers_above_the_file`, `keep_header_above_the_file`, `header_at_cut` and
+`forget_headers_through` in `core/mvcc/database/mod.rs`, kept at `FinalizeCommit`; the page 1 a
+checkpoint stages, and the forgetting once its boundary is published, in
+`core/mvcc/database/checkpoint_state_machine.rs`.
+Why: a checkpoint staged page 1's MVCC-authored fields from the live header: the schema cookie,
+`user_version`, the application id and the two vacuum fields. Codex found that a database opened
+from its file alone, through a checkpoint at a cut, could then reopen with a `user_version` a
+migration above the cut set and no table of the migration. atoll-forge keeps its schema's version
+in `user_version`.
+What: in a database opened with `drop_mvcc_log_on_open`, each commit that writes the header (a
+`SetCookie`, as a schema change or `PRAGMA user_version` does) keeps it by its commit timestamp. A
+checkpoint writes page 1's MVCC-authored fields from the newest kept header at or below its cut.
+When none is kept, page 1 already holds the header as of the cut and keeps it. Once the checkpoint
+publishes its boundary, the headers at or below it are forgotten. The live header, which every
+transaction begins from, is unchanged. Other databases stage page 1 as before.
+Limits: a header written with no transaction (`with_header_mut` with no transaction id) is not kept.
+Tests: in `tests/integration/mvcc_log_replicator.rs`, a `user_version` set and a table made above
+the cut. A checkpoint at the cut reopens with neither, and with the schema cookie as it was at the
+cut. Once the cut passes them, the next checkpoint reopens with both and the new cookie. Each part
+is seen failing without it: page 1 from the live header, headers not kept (both tests, and the
+first through the cookie a table below the cut bumped), every header forgotten at a checkpoint,
+and the cut's own commit's header left out.
 
 ## Taken upstream
 

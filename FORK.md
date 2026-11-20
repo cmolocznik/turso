@@ -1978,6 +1978,23 @@ Each is seen failing without its part:
 - a commit reported for frames that committed nothing;
 - the connection not marked as the applier.
 
+### A replicated delete names its row's key
+2026-11-21, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`Connection::portable_logical_changes_enabled` in `core/connection.rs`.
+Why: atoll-forge's nodes stopped replaying their Raft logs at the first delete of a row keyed by
+other than its rowid, as its `actors` table's rows are keyed by an id. The applier refused the
+delete, which named only a rowid, and a follower's rowids need not be the leader's. A replicated
+frame named its tables, but the switch that adds a delete's key, and that keeps the deleted row in
+a tombstone over a checkpointed row so that the key can be read from it, was still only the
+connection's own, off.
+What: a connection whose commits a log replicator takes writes portable logical changes whether
+they are enabled or not, so its deletes carry their rows' keys and its tombstones the rows they
+delete. A connection that applies replicated commits is unchanged.
+Tests: in `replicated_log.rs`, a follower finds rows keyed by other than the rowid by their keys,
+through an update, a delete of a row still in the log and a delete of a checkpointed row. Seen
+failing without the change (the applier refuses the delete), and with only the delete's key added
+(the checkpointed row's tombstone holds no row to read its key from).
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

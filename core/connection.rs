@@ -3284,11 +3284,15 @@ impl Connection {
         let _ = enabled;
     }
 
+    /// Whether this connection's MVCC frames carry portable logical changes: when enabled, and
+    /// always when a log replicator takes its commits, since the database that applies them finds
+    /// each table by its name and each deleted row by its key.
     pub fn portable_logical_changes_enabled(&self) -> bool {
         #[cfg(feature = "conn_raw_api")]
         {
             self.portable_logical_changes_enabled
                 .load(Ordering::Acquire)
+                || (!self.applies_replicated_commits() && self.db.log_replicator().is_some())
         }
         #[cfg(not(feature = "conn_raw_api"))]
         {

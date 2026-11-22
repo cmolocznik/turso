@@ -1954,6 +1954,16 @@ Each is seen failing without its part:
 - a commit reported for frames that committed nothing;
 - the connection not marked as the applier.
 
+Changed 2026-11-22: the applier waits for its statements' IO in place. It drove the replay's
+coroutine with `db.io.step()` at each yield, a blocking caller stepping the IO in a loop of its
+own, which spins on a backend whose step does nothing. Now it runs the replay on a blocking coroutine (`Coro::blocking`): a statement that
+returns IO or a yield waits through `Statement::wait_io`,
+and a busy wait sleeps through the IO, in place (`Coro::wait_for`, which a host's coroutine still
+answers by yielding to it). A replay that yields anyway is an error. Tested: a follower on `MemoryYieldIO`, which finishes nothing until stepped, with its rows
+checkpointed into its file and opened again cold, applies updates and deletes whose reads wait.
+Seen failing without the in-place wait (the replay never finishes), with the replay yielding as
+before, and with the blocking mode ignored. A busy wait's sleep is not tested.
+
 ### A replicated delete names its row's key
 2026-11-21, on branch `commit-replicator`, in the commit that adds this entry.
 `Connection::portable_logical_changes_enabled` in `core/connection.rs`.

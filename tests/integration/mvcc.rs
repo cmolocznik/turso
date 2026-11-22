@@ -134,6 +134,13 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.upgrade_header_for_log_tx(m)
     }
 
+    fn frame_len_bound(
+        &self,
+        m: &turso_core::mvcc::database::LogRecord,
+    ) -> turso_core::Result<usize> {
+        self.inner.frame_len_bound(m)
+    }
+
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> turso_core::Result<()> {
         self.inner.advance_logical_log_offset_after_success(bytes)
     }

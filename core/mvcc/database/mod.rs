@@ -2908,6 +2908,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
         );
         self.populate_portable_changes(mvcc_store, &mut log_record)?;
+        if let Some(replicator) = self.log_replicator() {
+            // Refused before any of it is written, so the commit rolls back
+            // as one that failed validation does.
+            let limit = replicator.frame_limit();
+            if mvcc_store.storage.frame_len_bound(&log_record)? > limit {
+                return Err(LimboError::TooBig);
+            }
+        }
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
         self.state = CommitState::MarkDirtyKeys {

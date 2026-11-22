@@ -1995,6 +1995,39 @@ through an update, a delete of a row still in the log and a delete of a checkpoi
 failing without the change (the applier refuses the delete), and with only the delete's key added
 (the checkpointed row's tombstone holds no row to read its key from).
 
+### A log replicator limits a frame's size, and a commit over it fails before it is written
+2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`LogReplicator::frame_limit` in `core/mvcc/log_replicator.rs`; `LogicalLog::frame_len_bound` in
+`core/mvcc/persistent_storage/logical_log.rs` and `DurableStorage::frame_len_bound`; the end of
+the commit state `BuildLogRecord` in `core/mvcc/database/mod.rs`; `TursoError::TooBig` in
+`sdk-kit/src/rsapi.rs` and `Error::TooBig` in the Rust binding.
+Why: atoll-forge's replica carries frames in Raft entries of at most 4 MiB (its `FORGE.md`
+decision 77). A frame larger than any entry was already in the leader's log when the replica
+saw it, so the replica could only stop, and the node started again without the commit. etcd
+refuses a request over `--max-request-bytes` before it is proposed.
+What: the replicator names the largest frame it takes, any by default. Once a commit's log record
+is built, its frame's size is reckoned, and a commit whose frame would be larger fails with
+`LimboError::TooBig`, SQLite's `SQLITE_TOOBIG`, before anything of it is written: it rolls back as
+a commit that fails validation does, alone or in a transaction, beside group commit's other
+writers. A connection that applies replicated commits is not limited. The size is reckoned with
+the portable extension's end offset at its widest varint, so it is never under the frame written
+and at most nine bytes over it; in debug builds every frame written is checked to be so. The SDK
+gives the error as `TursoError::TooBig` (`TURSO_ERROR` in the C API, `Error` in Python), and the
+Rust binding as `Error::TooBig`.
+Limits: a commit within nine bytes under the limit may be refused though its frame would have
+fitted.
+Tests: in `mvcc_log_replicator` (two) and `test_log_replicator` (one).
+- A frame the size of one taken, less the nine bytes, goes through; one ten bytes larger fails as
+  too big, in autocommit and in `BEGIN CONCURRENT`, with the log and the replicator untouched and
+  its rows unseen, and the next commit goes through with the frames still the log in order.
+- Six concurrent writers, a fifth of whose commits are too large, see exactly those fail; every
+  other commit reaches the replicator, every frame under the limit, the frames the log in order,
+  and the table holds exactly the commits taken.
+- Through the binding, the error is `Error::TooBig`, and the next commit goes through.
+- Each part is seen failing without it: the check skipped, the size reckoned without the
+  extension, the trailer or the extended header, or with the end offset at its narrowest, or 100
+  bytes high, and the SDK or the binding giving the error as a plain one.
+
 ### The `trigram` index method and `code_match`
 2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
 `core/index_method/trigram/` (`mod.rs`, the method; `plan.rs`, an expression's trigram query),

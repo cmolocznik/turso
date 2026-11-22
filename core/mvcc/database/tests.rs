@@ -22265,6 +22265,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
         }
+        fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+            self.inner.frame_len_bound(m)
+        }
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)
         }
@@ -22483,6 +22486,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+            self.inner.frame_len_bound(m)
         }
         fn on_log_write_complete(&self) -> Result<Completion> {
             if self.arm.swap(false, Ordering::AcqRel) {
@@ -24761,6 +24767,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+            self.inner.frame_len_bound(m)
         }
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)

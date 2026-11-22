@@ -646,6 +646,9 @@ pub enum TursoError {
     DatabaseFull(String),
     NotAdb(String),
     Corrupt(String),
+    /// A string, blob or commit larger than a limit allows: SQLite's
+    /// `SQLITE_TOOBIG`. The C API reports it as `TURSO_ERROR`.
+    TooBig(String),
     IoError(std::io::ErrorKind, &'static str),
 }
 
@@ -685,7 +688,9 @@ impl TursoError {
             TursoError::Busy(_) => capi::c::turso_status_code_t::TURSO_BUSY,
             TursoError::BusySnapshot(_) => capi::c::turso_status_code_t::TURSO_BUSY_SNAPSHOT,
             TursoError::Interrupt(_) => capi::c::turso_status_code_t::TURSO_INTERRUPT,
-            TursoError::Error(_) => capi::c::turso_status_code_t::TURSO_ERROR,
+            TursoError::Error(_) | TursoError::TooBig(_) => {
+                capi::c::turso_status_code_t::TURSO_ERROR
+            }
             TursoError::Misuse(_) => capi::c::turso_status_code_t::TURSO_MISUSE,
             TursoError::Constraint(_) => capi::c::turso_status_code_t::TURSO_CONSTRAINT,
             TursoError::Readonly(_) => capi::c::turso_status_code_t::TURSO_READONLY,
@@ -709,7 +714,8 @@ impl Display for TursoError {
             | TursoError::Readonly(s)
             | TursoError::DatabaseFull(s)
             | TursoError::NotAdb(s)
-            | TursoError::Corrupt(s) => f.write_str(s),
+            | TursoError::Corrupt(s)
+            | TursoError::TooBig(s) => f.write_str(s),
             TursoError::IoError(kind, op) => write!(f, "I/O error ({op}): {kind}"),
         }
     }
@@ -747,6 +753,7 @@ impl From<LimboError> for TursoError {
                 TursoError::DatabaseFull(e.to_string())
             }
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
+            e @ LimboError::TooBig => TursoError::TooBig(e.to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
             // Same-connection rejections carry SQLITE_BUSY semantics, but the
             // caller must finish/reset its own statement rather than wait.

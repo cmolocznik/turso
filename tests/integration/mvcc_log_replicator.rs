@@ -1,6 +1,6 @@
 //! A log replicator receives each committed transaction's MVCC logical-log
 //! frame once it is written, in log order, naming its tables; a commit it
-//! refuses fails with nothing written; a connection that applies replicated
+//! refuses, or whose frame is over its limit, fails with nothing written; a connection that applies replicated
 //! commits is neither asked nor replicated; a replicator that is full makes
 //! the writer wait; and a checkpoint writes the database file only through the
 //! replicator's cut, which is where the database reopens, its log dropped.
@@ -14,12 +14,14 @@ use turso_core::{Completion, DatabaseOpts, LimboError, LogReplicator, Replicated
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
-/// Keeps every frame; refuses commits while `refuse` is set, holds each
-/// frame's completion while `hold` is, and gives `cut` to checkpoints when set.
+/// Keeps every frame; refuses commits while `refuse` is set, takes frames of
+/// at most `limit` bytes when set, holds each frame's completion while `hold`
+/// is, and gives `cut` to checkpoints when set.
 #[derive(Default)]
 struct Recorder {
     frames: Mutex<Vec<ReplicatedFrame>>,
     refuse: AtomicBool,
+    limit: Mutex<Option<usize>>,
     hold: AtomicBool,
     held: Mutex<Vec<Completion>>,
     cut: Mutex<Option<u64>>,
@@ -39,6 +41,10 @@ impl Recorder {
 impl LogReplicator for Recorder {
     fn takes_commits(&self) -> bool {
         !self.refuse.load(Ordering::SeqCst)
+    }
+
+    fn frame_limit(&self) -> usize {
+        self.limit.lock().unwrap().unwrap_or(usize::MAX)
     }
 
     fn replicate(&self, frame: ReplicatedFrame) -> Completion {
@@ -239,6 +245,120 @@ fn a_commit_the_replicator_refuses_fails_and_leaves_nothing() {
     let rows = limbo_exec_rows(&conn, "SELECT id FROM things");
     assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
     assert_eq!(recorder.frames.lock().unwrap().len(), 2);
+}
+
+/// A frame's size is known within the nine bytes its end offset's varint may
+/// take beyond the fewest: a frame at the limit less those goes through, one
+/// past the limit is refused before it is written, and the database goes on.
+#[test]
+fn a_commit_whose_frame_is_over_the_replicator_s_limit_fails_and_leaves_nothing() {
+    let (db, recorder) = leader("log_replicator_limit.db");
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, body BLOB)")
+        .unwrap();
+    conn.execute("INSERT INTO things VALUES (1, zeroblob(1000))")
+        .unwrap();
+    let sized = recorder.frames.lock().unwrap().last().unwrap().bytes.len();
+    *recorder.limit.lock().unwrap() = Some(sized + 9);
+
+    conn.execute("INSERT INTO things VALUES (2, zeroblob(1000))")
+        .unwrap();
+    assert_eq!(recorder.frames.lock().unwrap().len(), 3);
+    assert!(recorder.frames.lock().unwrap()[2].bytes.len() <= sized + 9);
+
+    let log_before = logical_log(&db);
+    for statement in [
+        "INSERT INTO things VALUES (3, zeroblob(1010))",
+        "BEGIN CONCURRENT",
+    ] {
+        let refused = conn.execute(statement);
+        if statement.starts_with("BEGIN") {
+            refused.unwrap();
+            conn.execute("INSERT INTO things VALUES (4, zeroblob(1010))")
+                .unwrap();
+            let refused = conn.execute("COMMIT");
+            assert!(matches!(refused, Err(LimboError::TooBig)), "{refused:?}");
+        } else {
+            assert!(matches!(refused, Err(LimboError::TooBig)), "{refused:?}");
+        }
+    }
+    assert_eq!(
+        logical_log(&db),
+        log_before,
+        "a commit over the limit wrote to the log"
+    );
+    assert_eq!(recorder.frames.lock().unwrap().len(), 3);
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM things");
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)]
+        ]
+    );
+
+    conn.execute("INSERT INTO things VALUES (5, zeroblob(1000))")
+        .unwrap();
+    let frames = recorder.frames.lock().unwrap().clone();
+    assert_eq!(frames.len(), 4);
+    assert_frames_are_the_log(&db, &frames);
+}
+
+/// Writers whose commits are over the limit now and then fail alone: every
+/// other commit reaches the replicator, the frames still the log in order.
+#[test]
+fn concurrent_commits_over_the_limit_fail_alone() {
+    let (db, recorder) = leader("log_replicator_limit_concurrent.db");
+    db.connect_limbo()
+        .execute("CREATE TABLE things (id INTEGER PRIMARY KEY, body BLOB)")
+        .unwrap();
+    *recorder.limit.lock().unwrap() = Some(4096);
+    let db = Arc::new(db);
+    let (writers, each) = (6, 20);
+    let threads: Vec<_> = (0..writers)
+        .map(|w| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let conn = db.connect_limbo();
+                let mut taken = Vec::new();
+                for i in 0..each {
+                    let id = w * each + i;
+                    let size = if i % 5 == 4 { 8192 } else { 100 };
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+                    conn.execute(format!(
+                        "INSERT INTO things VALUES ({id}, zeroblob({size}))"
+                    ))
+                    .unwrap();
+                    match conn.execute("COMMIT") {
+                        Ok(()) => taken.push(id),
+                        Err(LimboError::TooBig) => assert_eq!(size, 8192),
+                        Err(other) => panic!("{other:?}"),
+                    }
+                }
+                taken
+            })
+        })
+        .collect();
+    let mut taken: Vec<usize> = threads
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect();
+    taken.sort_unstable();
+    assert_eq!(taken.len(), writers * each * 4 / 5);
+    let frames = recorder.frames.lock().unwrap().clone();
+    assert_eq!(frames.len(), 1 + taken.len());
+    assert!(frames.iter().all(|frame| frame.bytes.len() <= 4096));
+    assert_frames_are_the_log(&db, &frames);
+    let conn = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM things ORDER BY id");
+    let ids: Vec<usize> = rows
+        .into_iter()
+        .map(|row| match row[0] {
+            rusqlite::types::Value::Integer(id) => id as usize,
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(ids, taken);
 }
 
 #[test]

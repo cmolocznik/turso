@@ -50,7 +50,9 @@ pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
         rsapi::TursoError::Busy(message) => Busy::new_err(message),
         rsapi::TursoError::BusySnapshot(message) => BusySnapshot::new_err(message),
         rsapi::TursoError::Interrupt(message) => Interrupt::new_err(message),
-        rsapi::TursoError::Error(message) => Error::new_err(message),
+        rsapi::TursoError::Error(message) | rsapi::TursoError::TooBig(message) => {
+            Error::new_err(message)
+        }
         rsapi::TursoError::Misuse(message) => Misuse::new_err(message),
         rsapi::TursoError::Constraint(message) => Constraint::new_err(message),
         rsapi::TursoError::Readonly(message) => Readonly::new_err(message),

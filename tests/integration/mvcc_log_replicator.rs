@@ -423,8 +423,13 @@ fn an_optimize_on_a_connection_that_applies_replicated_commits_is_neither_asked_
     applier.set_applies_replicated_commits(true);
     applier.set_index_merges_whole(true);
     let log = logical_log(&db).len();
+    let before = applier.last_commit_ts();
     applier.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
     assert!(logical_log(&db).len() > log, "the merge wrote nothing");
+    // Its connection reports where its steps' last commit is.
+    let merged = applier.last_commit_ts();
+    assert!(merged > before, "{merged:?} after {before:?}");
+    assert!(merged > Some(recorder.last_commit_ts()));
     assert_eq!(
         recorder.frames.lock().unwrap().len(),
         frames,

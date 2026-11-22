@@ -74,9 +74,8 @@ pub(crate) async fn run_stmt_once<'a, Ctx>(
 ) -> Result<Option<&'a turso_core::Row>> {
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                coro.yield_(SyncEngineIoResult::IO).await?;
-            }
+            StepResult::IO | StepResult::Yield => coro.wait_for(stmt, None).await?,
+            StepResult::Sleep { duration } => coro.wait_for(stmt, Some(duration)).await?,
             StepResult::Done => {
                 return Ok(None);
             }
@@ -121,9 +120,8 @@ pub(crate) async fn exec_stmt<Ctx>(
 ) -> Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                coro.yield_(SyncEngineIoResult::IO).await?;
-            }
+            StepResult::IO | StepResult::Yield => coro.wait_for(stmt, None).await?,
+            StepResult::Sleep { duration } => coro.wait_for(stmt, Some(duration)).await?,
             StepResult::Done => {
                 return Ok(());
             }

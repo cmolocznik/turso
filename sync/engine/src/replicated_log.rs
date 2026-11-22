@@ -28,7 +28,6 @@ use crate::Result;
 
 /// Applies another database's frames to one database.
 pub struct ReplicatedLogApplier {
-    db: Arc<Database>,
     replay: DatabaseReplaySession,
 }
 
@@ -38,7 +37,6 @@ impl ReplicatedLogApplier {
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_applies_replicated_commits(true);
         Ok(Self {
-            db: db.clone(),
             replay: DatabaseReplaySession {
                 conn: conn.clone(),
                 cached_delete_stmt: HashMap::new(),
@@ -71,7 +69,7 @@ impl ReplicatedLogApplier {
         let before = self.replay.conn.last_commit_ts();
         self.replay.conn.execute("BEGIN IMMEDIATE")?;
         self.replay.in_txn = true;
-        let applied = drive(&self.db, |coro| {
+        let applied = drive(|coro| {
             let replay = &mut self.replay;
             async move {
                 for frame in frames {
@@ -121,17 +119,19 @@ async fn apply_frame(
     Ok(())
 }
 
-/// Runs `task` to its end, doing its I/O on `db`'s.
-fn drive<'a, F>(db: &Arc<Database>, task: impl FnOnce(Coro<()>) -> F) -> Result<()>
+/// Runs `task` to its end on a blocking coroutine, whose statements wait for their own IO in
+/// place (`Coro::wait_for`), so nothing here steps the IO in a loop of its own, which spins on a
+/// backend whose step does nothing (DESIGN.md 22.5).
+fn drive<'a, F>(task: impl FnOnce(Coro<()>) -> F) -> Result<()>
 where
     F: std::future::Future<Output = Result<()>> + 'a,
 {
-    let mut gen = genawaiter::sync::Gen::new(|co| task(co.into()));
-    loop {
-        match gen.resume_with(Ok(())) {
-            genawaiter::GeneratorState::Yielded(..) => db.io.step()?,
-            genawaiter::GeneratorState::Complete(result) => return result,
-        }
+    let mut gen = genawaiter::sync::Gen::new(|co| task(Coro::blocking(co)));
+    match gen.resume_with(Ok(())) {
+        genawaiter::GeneratorState::Complete(result) => result,
+        genawaiter::GeneratorState::Yielded(..) => Err(Error::DatabaseSyncEngineError(
+            "a replay yielded for IO it waits for in place".to_string(),
+        )),
     }
 }
 
@@ -293,6 +293,70 @@ mod tests {
                 vec![Value::build_text("d"), Value::build_text("four")],
             ]
         );
+    }
+
+    /// Over an IO that finishes nothing until it is stepped, the frames apply: the replay's
+    /// statements wait for their own IO in place, which steps such a backend, and nothing steps
+    /// it in a loop of its own. The follower's rows are in its file, its pages read cold, so the
+    /// replay's updates and deletes wait for their reads.
+    #[test]
+    fn a_follower_on_an_io_that_finishes_nothing_until_stepped_applies_the_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let (leader, recorder) = open(&dir, "leader.db", true);
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryYieldIO::new());
+        let follower = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                "follower.db",
+                OpenFlags::default(),
+                DatabaseOpts::new()
+                    .with_mvcc(true)
+                    .with_experimental_mvcc_passive_checkpoint(true)
+                    .with_mvcc_log_dropped_on_open(true)
+                    .with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap()
+        };
+        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO things SELECT value, printf('%0200d', value) \
+             FROM generate_series(1, 3000)",
+        )
+        .unwrap();
+        // Applied on a thread, so that a replay that never waits fails the test, not hangs it.
+        let apply = |db: Arc<Database>, frames: Vec<ReplicatedFrame>| {
+            let (done, applied) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut applier = ReplicatedLogApplier::new(&db).unwrap();
+                let _ = done.send(applier.apply(&frames).map(|ts| ts.is_some()));
+            });
+            applied
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the frames never applied")
+                .unwrap()
+        };
+        let db = follower();
+        assert!(apply(db.clone(), frames(&recorder)));
+        let checkpoint = db.connect(turso_core::ConnectOpts::new()).unwrap();
+        checkpoint
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(checkpoint);
+        drop(db);
+
+        conn.execute("UPDATE things SET body = 'changed' WHERE id % 97 = 0")
+            .unwrap();
+        conn.execute("DELETE FROM things WHERE id % 89 = 0")
+            .unwrap();
+        let db = follower();
+        assert!(apply(db.clone(), frames(&recorder)));
+        let all = "SELECT id, body FROM things ORDER BY id";
+        assert_eq!(rows(&db, all), rows(&leader, all));
+        assert_eq!(rows(&db, all).len(), 3000 - 3000 / 89);
     }
 
     #[test]

@@ -10,6 +10,9 @@ use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,
     gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>,
+    /// Whether a blocking caller runs the coroutine: a statement's IO is then waited for in place,
+    /// through the statement's own wait, and never yielded to a loop that steps the IO.
+    blocking: bool,
 }
 
 impl<Ctx> Coro<Ctx> {
@@ -17,12 +20,43 @@ impl<Ctx> Coro<Ctx> {
         Self {
             ctx: Mutex::new(ctx),
             gen,
+            blocking: false,
         }
     }
     pub async fn yield_(&self, value: SyncEngineIoResult) -> Result<()> {
         let ctx = self.gen.yield_(value).await?;
         *self.ctx.lock().unwrap() = ctx;
         Ok(())
+    }
+
+    /// Waits for what `stmt`'s step returned, IO or a yield, or `sleep`, a busy wait's delay: in
+    /// place for a coroutine a blocking caller runs, through `IO::wait` on the statement's
+    /// pending completions as [`turso_core::Statement::wait_io`] does; otherwise by yielding to
+    /// the host, which drives the IO.
+    pub(crate) async fn wait_for(
+        &self,
+        stmt: &turso_core::Statement,
+        sleep: Option<std::time::Duration>,
+    ) -> Result<()> {
+        if !self.blocking {
+            return self.yield_(SyncEngineIoResult::IO).await;
+        }
+        match sleep {
+            Some(duration) => stmt._io().sleep(duration),
+            None => stmt.wait_io()?,
+        }
+        Ok(())
+    }
+}
+
+impl Coro<()> {
+    /// A coroutine a blocking caller runs: see [`Coro::wait_for`].
+    pub(crate) fn blocking(gen: genawaiter::sync::Co<SyncEngineIoResult, Result<()>>) -> Self {
+        Self {
+            gen,
+            ctx: Mutex::new(()),
+            blocking: true,
+        }
     }
 }
 
@@ -31,6 +65,7 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
         Self {
             gen: value,
             ctx: Mutex::new(()),
+            blocking: false,
         }
     }
 }

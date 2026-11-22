@@ -24,6 +24,8 @@ test_helper = ["turso_core/test_helper", "turso_sdk_kit/test_helper"]
 io_memory_yield = ["turso_core/io_memory_yield"]
 # The raw WAL API a replicator drives: read committed frames, append frames to a restore.
 conn_raw_api = ["turso_core/conn_raw_api"]
+# A prepared statement's execution metrics: rows read, b-tree seeks, sorts.
+statement_metrics = []
 sync = [
     "dep:hyper",
     "dep:tokio",

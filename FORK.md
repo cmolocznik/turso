@@ -1551,6 +1551,18 @@ with core's own semantics; nothing else changes and nothing is on by default.
 Test: `bindings/rust/tests/wal_raw_api.rs` (`cargo test -p turso --features conn_raw_api --test wal_raw_api`): twenty
 committed rows' frames read from one database and inserted into a fresh one read back whole.
 
+### A prepared statement's execution metrics through `turso::Statement` (`statement_metrics`)
+2026-11-22. `core/lib.rs`, `sdk-kit/src/rsapi.rs`, `bindings/rust/src/lib.rs`, `bindings/rust/Cargo.toml`. Core keeps
+per-statement execution metrics (`Statement::metrics` / `reset_metrics`: rows read, b-tree table and index seeks,
+sorts, ...), but `StatementMetrics` sat in the private `vdbe` module and neither the sdk-kit statement nor
+`turso::Statement` reached it. WorkReef cognition measures the rows each brain query walks, to hold every read to
+its matching set rather than the whole store. Core re-exports `StatementMetrics`; `TursoStatement` and
+`turso::Statement` gain `metrics()` (`None` once finalized) and `reset_metrics()`, the binding's behind a new
+`statement_metrics` feature that is off by default; core's semantics are unchanged.
+Test: `bindings/rust/tests/statement_metrics.rs` (`cargo test -p turso --features statement_metrics --test
+statement_metrics`): a 200-row index range reports 200 to 202 rows read and no sort, `reset_metrics` zeroes the
+counters, and an unindexed ORDER BY reports its sort over all 500 rows.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

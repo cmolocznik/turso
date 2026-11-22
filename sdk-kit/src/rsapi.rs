@@ -1609,6 +1609,21 @@ pub struct TursoExecutionResult {
 }
 
 impl TursoStatement {
+    /// The core statement's execution metrics, accumulated across its executions until
+    /// `reset_metrics`; `None` once the statement is finalized.
+    pub fn metrics(&self) -> Option<turso_core::StatementMetrics> {
+        self.handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|stmt| stmt.metrics())
+    }
+    /// Zero the core statement's execution metrics.
+    pub fn reset_metrics(&self) {
+        if let Some(stmt) = self.handle.lock().unwrap().as_mut() {
+            stmt.reset_metrics();
+        }
+    }
     /// return amount of row modifications (insert/delete operations) made by the most recent executed statement
     pub fn n_change(&self) -> i64 {
         let handle = self.handle.lock().unwrap();

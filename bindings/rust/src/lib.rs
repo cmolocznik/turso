@@ -593,6 +593,19 @@ impl Statement {
         Ok(())
     }
 
+    /// The statement's execution metrics (rows read, b-tree seeks, sorts, ...), accumulated
+    /// across its executions until `reset_metrics`; `None` once the statement is finalized.
+    #[cfg(feature = "statement_metrics")]
+    pub fn metrics(&self) -> Option<turso_core::StatementMetrics> {
+        self.inner.lock().unwrap().metrics()
+    }
+
+    /// Zero the statement's execution metrics.
+    #[cfg(feature = "statement_metrics")]
+    pub fn reset_metrics(&self) {
+        self.inner.lock().unwrap().reset_metrics();
+    }
+
     /// Returns the number of rows modified (insert/delete operations) by the most recent executed statement.
     pub fn n_change(&self) -> u64 {
         self.inner.lock().unwrap().n_change() as u64

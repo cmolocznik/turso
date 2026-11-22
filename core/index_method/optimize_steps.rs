@@ -233,8 +233,13 @@ impl OptimizeSteps {
                     }
                     if self.steps.is_none() {
                         let steps = connection.connect_beside(self.database)?;
-                        // It merges as the statement's connection was told to (decision 103).
+                        // It merges as the statement's connection was told to (decision 103),
+                        // and its commits are the log replicator's as the statement's are: one
+                        // that applies replicated commits keeps its database's indexes alone.
                         steps.set_index_merges_whole(connection.index_merges_whole());
+                        steps.set_applies_replicated_commits(
+                            connection.applies_replicated_commits(),
+                        );
                         self.steps = Some(steps);
                     }
                     self.phase = Phase::Begin(None);

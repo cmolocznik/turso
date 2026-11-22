@@ -232,7 +232,10 @@ impl OptimizeSteps {
                         continue;
                     }
                     if self.steps.is_none() {
-                        self.steps = Some(connection.connect_beside(self.database)?);
+                        let steps = connection.connect_beside(self.database)?;
+                        // It merges as the statement's connection was told to (decision 103).
+                        steps.set_index_merges_whole(connection.index_merges_whole());
+                        self.steps = Some(steps);
                     }
                     self.phase = Phase::Begin(None);
                 }

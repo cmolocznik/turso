@@ -600,7 +600,107 @@ async fn replay_stmt<Ctx>(
     Ok(())
 }
 
+/// The most values one statement of [`DatabaseReplaySession::replay_all`] binds: SQLite's
+/// `SQLITE_MAX_VARIABLE_NUMBER`, so that its statements are ones any SQLite takes.
+const MAX_BOUND_VALUES: usize = 32766;
+
+/// Inserts into one table, of records of one length, waiting to be replayed as one statement.
+struct InsertRun {
+    key: (String, usize),
+    rows: usize,
+    values: Vec<turso_core::Value>,
+}
+
 impl DatabaseReplaySession {
+    /// Replays `operations` in order, as [`Self::replay`] replays each, but each run of inserts
+    /// into one table, of records of one length, as one statement, of as many rows as it binds
+    /// values for: the rows of a statement reach an index method's statement hooks together,
+    /// so an index that writes what a statement adds as one segment, as the trigram index does,
+    /// holds the run as one, as the database the operations came from holds its statement's.
+    /// Each row is an upsert as before, its conflict resolved before the next row's.
+    pub async fn replay_all<Ctx>(
+        &mut self,
+        coro: &Coro<Ctx>,
+        operations: impl IntoIterator<Item = DatabaseTapeOperation>,
+    ) -> Result<()> {
+        let mut run: Option<InsertRun> = None;
+        for operation in operations {
+            let operation = match operation {
+                DatabaseTapeOperation::RowChange(change)
+                    if change.table_name != SQLITE_SCHEMA_TABLE
+                        && matches!(change.change, DatabaseTapeRowChangeType::Insert { .. }) =>
+                {
+                    let DatabaseTapeRowChangeType::Insert { after } = &change.change else {
+                        unreachable!("matched above");
+                    };
+                    let key = self
+                        .populate_insert_stmt(coro, &change.table_name, after.len())
+                        .await?;
+                    let info = &self.cached_insert_stmt[&key].info;
+                    if self.generator.upsert_needs_null_safe_predelete(info, after) {
+                        // Replayed alone, its row removed first.
+                        DatabaseTapeOperation::RowChange(change)
+                    } else {
+                        let DatabaseTapeRowChangeType::Insert { after } = change.change else {
+                            unreachable!("matched above");
+                        };
+                        let values = self.generator.replay_values(
+                            info,
+                            DatabaseChangeType::Insert,
+                            change.id,
+                            after,
+                            None,
+                            None,
+                        );
+                        if let Some(full) = run.take_if(|run| {
+                            run.key != key || run.values.len() + values.len() > MAX_BOUND_VALUES
+                        }) {
+                            self.replay_inserts(coro, full).await?;
+                        }
+                        let run = run.get_or_insert_with(|| InsertRun {
+                            key,
+                            rows: 0,
+                            values: Vec::new(),
+                        });
+                        run.rows += 1;
+                        run.values.extend(values);
+                        continue;
+                    }
+                }
+                operation => operation,
+            };
+            if let Some(run) = run.take() {
+                self.replay_inserts(coro, run).await?;
+            }
+            self.replay(coro, operation).await?;
+        }
+        if let Some(run) = run {
+            self.replay_inserts(coro, run).await?;
+        }
+        Ok(())
+    }
+
+    /// Replays a run of inserts as one statement: one of a single row as [`Self::replay`] does,
+    /// one of more prepared for the run.
+    async fn replay_inserts<Ctx>(&mut self, coro: &Coro<Ctx>, run: InsertRun) -> Result<()> {
+        if !self.in_txn {
+            self.conn.execute("BEGIN IMMEDIATE")?;
+            self.in_txn = true;
+        }
+        let (table, columns) = &run.key;
+        if run.rows == 1 {
+            let key = self.populate_insert_stmt(coro, table, *columns).await?;
+            let cached = self.cached_insert_stmt.get_mut(&key).unwrap();
+            return replay_stmt(coro, &mut cached.stmt, run.values).await;
+        }
+        let info = self
+            .generator
+            .upsert_rows_query(coro, table, *columns, run.rows)
+            .await?;
+        let mut stmt = self.conn.prepare(&info.query)?;
+        replay_stmt(coro, &mut stmt, run.values).await
+    }
+
     fn clear_cached_statements(&mut self) {
         self.cached_delete_stmt.clear();
         self.cached_insert_stmt.clear();

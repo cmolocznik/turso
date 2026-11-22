@@ -1995,6 +1995,57 @@ through an update, a delete of a row still in the log and a delete of a checkpoi
 failing without the change (the applier refuses the delete), and with only the delete's key added
 (the checkpointed row's tombstone holds no row to read its key from).
 
+### The `trigram` index method and `code_match`
+2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`core/index_method/trigram/` (`mod.rs`, the method; `plan.rs`, an expression's trigram query),
+registered in `core/index_method/mod.rs` and `core/ext/mod.rs`; the scalar function `code_match` in
+`core/function.rs`, the SQLite dialect, the expression translator, `core/translate/schema.rs` and
+`core/vdbe/execute.rs`. User docs: `docs/sql-reference/functions/code.mdx`.
+Why: atoll-forge searches the code of a repository's main branch by regular expression, as Google
+Code Search and zoekt do. `fts` keeps every visible segment in memory while a query runs, because
+Tantivy reads through synchronous callbacks, so an index of a repository's code would be read whole
+by every search.
+What: `code_match(text, pattern)` is 1 where the regular expression (the `regex` crate's syntax)
+matches somewhere in `text`, 0 where it does not, NULL where either is not text. `CREATE INDEX ..
+USING trigram (text)` serves it as Code Search does (Russ Cox, "Regular Expression Matching with a
+Trigram Index", 2012): each text's trigrams, three bytes of its UTF-8, go into a list per trigram;
+the expression becomes a query over trigrams that every text it matches satisfies, a port of
+codesearch's `index/regexp.go` (BSD-3-Clause, The Go Authors) to `regex-syntax`'s HIR; the index
+reads the lists the query names, runs the expression on each text they admit, and returns exactly
+the rows `code_match` is 1 for. The lists are in immutable segments, as Lucene keeps its postings:
+each statement that adds texts writes one when it ends, its texts numbered from 0, and each
+trigram's numbers 128 to a row, each after the first as the varint of its distance from the one
+before. A query seeks, in each segment, only its trigrams' rows. A removed text is a tombstone of
+its identity (the segment it was added in, and its rowid), so no segment is written again. Five
+key-only B-trees on a table of the method's own: segments, postings, each segment's texts, each
+text's identity by rowid, and tombstones. Segment ids come from the database's IO random source,
+as `fts`'s do. Writers of different statements write no entry in common: under MVCC they commit
+side by side.
+Not done: merging segments, so a query seeks in every segment; `ivf_crash`'s kill rounds; a run in
+Atoll mode; a cost run.
+Tests: `index_method::trigram` in `tests/integration` (ten, two of them under `io_memory_yield`)
+and `index_method::trigram` in `turso_core` (six). `turso_core`'s unit suite passes with it but for
+`io::step_census`, which fails without it too: `sync/engine/src/replicated_log.rs`'s `drive` steps
+the IO in a loop of its own (the entry "Another database's replicated MVCC frames apply row by
+row"); the 182 of `index_method::` in `tests/integration` pass. Of 19 mutants of the method and its
+planner, 18 fail a test; the other, leaving out a concatenation's union of prefixes when its first
+side can be empty, changes no query, as such a side's prefixes always hold the empty string.
+- The same rows as a plain scan: a table with the index and one without take the same 400 random
+  inserts of one text and of many in a statement, rewrites, deletions, and a row a statement adds
+  twice (the second replacing the first), and 18 expressions of every kind (classes,
+  alternations, repetitions, anchors, `(?i)`, `(?m)`, `(?s)`, none with a trigram, none matching)
+  give the same rows from both, under WAL, under MVCC, and (`io_memory_yield`) over an IO that
+  finishes nothing until stepped, with a 12-page cache.
+- What a query reads (`io_memory_yield`): in eight segments of 400 texts and of 3,200, a query for
+  a word one text holds waited for IO 30 and 62 times, and one every text matches 117 and 888.
+- Writers adding, rewriting and removing texts in concurrent transactions commit side by side.
+- A row that is not text is in no list and leaves none behind, removed or given a text.
+- A segment's candidates: an AND of trigrams is the texts holding all of them, an OR those holding
+  any, and a query naming none every text.
+- The planner gives every query of codesearch's own table (`index/regexp_test.go`), a class of
+  more than 100 characters is any character, `c[ab]+c` admits `cabc`, and on 3,000 random
+  expressions every text one matches, of more than 20,000, satisfies its query.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

@@ -10846,6 +10846,13 @@ pub fn op_function(
                 )
                 .into());
             }
+            ScalarFunc::CodeMatch => {
+                let result = crate::index_method::trigram::code_match(
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                )?;
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::Instr => {
                 let reg_value = &state.registers[*start_reg];
                 let pattern_value = &state.registers[*start_reg + 1];

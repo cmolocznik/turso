@@ -437,6 +437,7 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::OctetLength
         | ScalarFunc::Instr
         | ScalarFunc::PathSync
+        | ScalarFunc::CodeMatch
         | ScalarFunc::Unicode
         | ScalarFunc::Sign
         | ScalarFunc::Random

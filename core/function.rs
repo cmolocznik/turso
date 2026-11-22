@@ -902,6 +902,9 @@ pub enum ScalarFunc {
     /// path_sync(path, seq, patterns, since): whether a path matches any of a JSON array of
     /// globs and, unless since is NULL, seq is above since. A path_trie index serves it.
     PathSync,
+    /// code_match(text, pattern): whether a regular expression matches somewhere in a text. A
+    /// trigram index serves it.
+    CodeMatch,
     Like,
     Abs,
     Upper,
@@ -1038,6 +1041,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Iif => true,
             ScalarFunc::Instr => true,
             ScalarFunc::PathSync => true,
+            ScalarFunc::CodeMatch => true,
             ScalarFunc::Like => true,
             ScalarFunc::Abs => true,
             ScalarFunc::Upper => true,
@@ -1198,6 +1202,7 @@ impl Display for ScalarFunc {
             Self::Iif => "iif",
             Self::Instr => "instr",
             Self::PathSync => "path_sync",
+            Self::CodeMatch => "code_match",
             Self::Like => "like",
             Self::Abs => "abs",
             Self::Upper => "upper",
@@ -1376,6 +1381,7 @@ impl ScalarFunc {
             | Self::GetByte
             | Self::TimeDiff => &[2],
             Self::PathSync => &[4],
+            Self::CodeMatch => &[2],
             // 3-arg
             Self::Iif | Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)

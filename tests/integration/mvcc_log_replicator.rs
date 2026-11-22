@@ -396,6 +396,53 @@ fn a_connection_that_applies_replicated_commits_is_neither_asked_nor_replicated(
     assert!(matches!(refused, Err(LimboError::ReadOnly)), "{refused:?}");
 }
 
+/// An `OPTIMIZE INDEX` on a connection that applies replicated commits merges, in its steps, on
+/// a database that takes no commits of its own, and none of its steps reaches the replicator: a
+/// follower keeps its indexes alone, the applier leaving the leader's index operations out
+/// (atoll-forge's decision 103). On any other connection the same merge is refused.
+#[test]
+fn an_optimize_on_a_connection_that_applies_replicated_commits_is_neither_asked_nor_replicated() {
+    let (db, recorder) = leader("log_replicator_optimize.db");
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_by_trigram ON docs USING trigram (text)")
+        .unwrap();
+    for i in 0..3 {
+        conn.execute(format!("INSERT INTO docs VALUES ({i}, 'text number {i}')"))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM docs WHERE id = 1").unwrap();
+    recorder.refuse.store(true, Ordering::SeqCst);
+    let frames = recorder.frames.lock().unwrap().len();
+    conn.set_index_merges_whole(true);
+    let refused = conn.execute("OPTIMIZE INDEX docs_by_trigram");
+    assert!(matches!(refused, Err(LimboError::ReadOnly)), "{refused:?}");
+
+    let applier = db.connect_limbo();
+    applier.set_applies_replicated_commits(true);
+    applier.set_index_merges_whole(true);
+    let log = logical_log(&db).len();
+    applier.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    assert!(logical_log(&db).len() > log, "the merge wrote nothing");
+    assert_eq!(
+        recorder.frames.lock().unwrap().len(),
+        frames,
+        "a step of the merge was replicated"
+    );
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE code_match(text, 'number') ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(0)],
+            vec![rusqlite::types::Value::Integer(2)]
+        ]
+    );
+}
+
 #[test]
 fn a_full_replicator_makes_the_writer_wait() {
     let (db, recorder) = leader("log_replicator_full.db");

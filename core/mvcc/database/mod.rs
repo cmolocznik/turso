@@ -6901,7 +6901,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    #[cfg(test)]
+    /// The checkpoint boundary transaction `tx_id`'s read reaches (`Transaction::durable_at_begin`).
     pub(crate) fn durable_at_begin_of(&self, tx_id: TxID) -> Option<u64> {
         self.txs.get(&tx_id).map(|tx| tx.value().durable_at_begin)
     }

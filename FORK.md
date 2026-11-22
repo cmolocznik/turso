@@ -2055,6 +2055,37 @@ Tests: in `mvcc_log_replicator` (one).
   stops as the replicator refuses them, before a write is refused as read-only. Each part is seen
   failing without it: the answer without a replicator reversed, and the replicator not asked.
 
+### A database's file is copied as one read sees it, with the cut it holds
+2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`Connection::copy_file` and `FileCopy` in `core/file_copy.rs`; `MvStore::durable_at_begin_of` in
+`core/mvcc/database/mod.rs`, no longer for tests alone.
+Why: atoll-forge cuts each node's Raft log as etcd does (its `FORGE.md` decision 102). A follower
+the log no longer reaches is sent the leader's database files, as etcd streams its backend's
+database from a bbolt read transaction (`Tx.WriteTo`). Each file must be copied consistently while
+writers and checkpoints go on, and the copy must say the cut it is at, so the follower knows where
+in the Raft log to go on from.
+What: `Connection::copy_file` begins a transaction and reads, which pins the pages the file is at
+and, under MVCC, the checkpoint boundary they hold (`durable_at_begin`). It then reads every page
+through the pager, as `sqlite_dbpage` does, and hands each to the caller with its offset, in order.
+The page the lock byte falls on goes as zeros, as SQLite never writes it. The transaction is then
+rolled back. Under MVCC the copy is the B-tree as that checkpoint left it, with its boundary in its
+own metadata table and none of the logical log, so a database opened from it with its log dropped
+on open holds exactly the commits at or below `FileCopy::through`. The boundary is the one the read
+pinned, not the latest: a checkpoint may publish a later one while the copy runs, and the copy
+does not hold it.
+Limits: the copy goes through the page cache. A connection in a transaction is refused, since the
+copy's read must be its own. Embedded only.
+Tests: in `mvcc_log_replicator` (three).
+- A copy at a cut below later commits names the cut. A database opened from it holds exactly the
+  commits through the cut and passes `integrity_check`, while the running database keeps them all;
+  a connection in a transaction is refused.
+- Six copies taken while a writer commits and checkpoints every 25 commits each hold one cut, and
+  not all the same one: exactly the rows committed at or below it, and `integrity_check` passes.
+- A checkpoint that passes the copy's cut while the copy runs, after its first page, changes neither
+  its pages nor the cut it names.
+Each part is seen failing without it: the transaction (pages from different reads), the read that
+pins it, and the pinned boundary, which the live one fails.
+
 ### The `trigram` index method and `code_match`
 2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
 `core/index_method/trigram/` (`mod.rs`, the method; `plan.rs`, an expression's trigram query),

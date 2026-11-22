@@ -783,3 +783,179 @@ fn a_log_replicator_needs_passive_checkpoints_and_its_log_dropped_on_open() {
         );
     }
 }
+
+/// Copies `conn`'s database file as one read sees it into the file at `to`.
+fn copy_file_to(conn: &Arc<turso_core::Connection>, to: &Path) -> turso_core::FileCopy {
+    let mut bytes = Vec::new();
+    let copy = conn
+        .copy_file(&mut |offset, page| {
+            let offset = offset as usize;
+            assert_eq!(offset, bytes.len(), "pages are handed over in order");
+            bytes.extend_from_slice(page);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(bytes.len() as u64, copy.pages * copy.page_size as u64);
+    std::fs::write(to, bytes).unwrap();
+    copy
+}
+
+fn integrity(conn: &Arc<turso_core::Connection>) -> String {
+    match &limbo_exec_rows(conn, "PRAGMA integrity_check")[0][0] {
+        rusqlite::types::Value::Text(text) => text.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A copy of the file, as one read sees it, is the file at its checkpoint's cut: it names that
+/// cut, and a database opened from it, its log dropped, holds exactly the commits at or below
+/// it, as the database's own file does, and none the log holds above it.
+#[test]
+fn a_file_copy_opens_with_exactly_the_commits_at_its_cut() {
+    let (db, recorder) = leader("file_copy_at_cut.db");
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    for id in 1..=50 {
+        conn.execute(format!("INSERT INTO things VALUES ({id}, 'at {id}')"))
+            .unwrap();
+    }
+    let cut = recorder.last_commit_ts();
+    for id in 51..=60 {
+        conn.execute(format!("INSERT INTO things VALUES ({id}, 'above {id}')"))
+            .unwrap();
+    }
+    recorder.cut_at(Some(cut));
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(db.db.mvcc_checkpointed_through(), Some(cut));
+
+    let to = db.path.with_file_name("file_copy_at_cut_copy.db");
+    let copy = copy_file_to(&db.connect_limbo(), &to);
+    assert_eq!(copy.through, Some(cut));
+    assert_eq!(rows(&conn).len(), 60, "the running database keeps them all");
+    let opened = open_replicated(&to, &Arc::new(Recorder::default()));
+    let read = opened.connect_limbo();
+    let expected: Vec<(i64, String)> = (1..=50).map(|id| (id, format!("at {id}"))).collect();
+    assert_eq!(rows(&read), expected);
+    assert_eq!(opened.db.mvcc_checkpointed_through(), Some(cut));
+    assert_eq!(integrity(&read), "ok");
+    // A copy is refused inside a transaction, whose read is not one of its own.
+    let busy = db.connect_limbo();
+    busy.execute("BEGIN").unwrap();
+    assert!(busy.copy_file(&mut |_, _| Ok(())).is_err());
+}
+
+/// Copies taken while a writer commits and checkpoints run each hold one checkpoint's cut:
+/// exactly the rows committed at or below it, every page of them consistent.
+#[test]
+fn a_file_copy_beside_writers_and_checkpoints_holds_one_cut() {
+    let (db, _recorder) = leader("file_copy_beside_writers.db");
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let committed: Arc<Mutex<Vec<(i64, u64)>>> = Arc::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let conn = db.connect_limbo();
+        let committed = committed.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut id = 0i64;
+            while !stop.load(Ordering::SeqCst) && id < 4000 {
+                id += 1;
+                conn.execute(format!(
+                    "INSERT INTO things VALUES ({id}, '{}')",
+                    "x".repeat(700)
+                ))
+                .unwrap();
+                committed
+                    .lock()
+                    .unwrap()
+                    .push((id, conn.last_commit_ts().unwrap()));
+                if id % 25 == 0 {
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+                }
+            }
+        })
+    };
+    let mut copies = Vec::new();
+    for n in 0..6 {
+        while committed.lock().unwrap().len() < 300 * (n + 1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let to = db
+            .path
+            .with_file_name(format!("file_copy_beside_writers_{n}.db"));
+        let copy = copy_file_to(&db.connect_limbo(), &to);
+        copies.push((to, copy));
+    }
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    let committed = committed.lock().unwrap().clone();
+    let mut cuts = std::collections::BTreeSet::new();
+    for (to, copy) in copies {
+        let through = copy.through.unwrap();
+        cuts.insert(through);
+        let opened = open_replicated(&to, &Arc::new(Recorder::default()));
+        let read = opened.connect_limbo();
+        assert_eq!(integrity(&read), "ok", "the copy at {through}");
+        let ids: Vec<i64> = rows(&read).into_iter().map(|(id, _)| id).collect();
+        let expected: Vec<i64> = committed
+            .iter()
+            .filter(|(_, ts)| *ts <= through)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ids, expected, "the copy at {through}");
+    }
+    assert!(cuts.len() > 1, "the copies were all at one cut: {cuts:?}");
+}
+
+/// A checkpoint that passes the copy's cut while the copy runs changes neither the pages it
+/// copies nor the cut it names: both are the read's.
+#[test]
+fn a_checkpoint_during_a_file_copy_changes_neither_its_pages_nor_its_cut() {
+    let (db, _recorder) = leader("file_copy_checkpoint_during.db");
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    for id in 1..=20 {
+        conn.execute(format!("INSERT INTO things VALUES ({id}, 'before {id}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let before = db.db.mvcc_checkpointed_through().unwrap();
+    let writer = db.connect_limbo();
+    let mut bytes = Vec::new();
+    let mut first = true;
+    let copy = db
+        .connect_limbo()
+        .copy_file(&mut |_, page| {
+            if first {
+                first = false;
+                for id in 21..=40 {
+                    writer
+                        .execute(format!("INSERT INTO things VALUES ({id}, 'during {id}')"))
+                        .unwrap();
+                }
+                writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            }
+            bytes.extend_from_slice(page);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        db.db.mvcc_checkpointed_through().unwrap() > before,
+        "the checkpoint passed the copy's cut"
+    );
+    assert_eq!(copy.through, Some(before));
+    let to = db
+        .path
+        .with_file_name("file_copy_checkpoint_during_copy.db");
+    std::fs::write(&to, bytes).unwrap();
+    let opened = open_replicated(&to, &Arc::new(Recorder::default()));
+    let read = opened.connect_limbo();
+    let expected: Vec<(i64, String)> = (1..=20).map(|id| (id, format!("before {id}"))).collect();
+    assert_eq!(rows(&read), expected);
+    assert_eq!(integrity(&read), "ok");
+}

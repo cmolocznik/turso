@@ -4103,6 +4103,15 @@ impl Database {
         self.log_replicator.get()
     }
 
+    /// Whether a commit that writes may begin here: always, unless the database's log
+    /// replicator takes no commits, as on a node that follows its group, when every such commit
+    /// is refused as read-only. A writer whose writes are optional, such as one that only
+    /// records when it read, asks first rather than be refused.
+    pub fn takes_commits(&self) -> bool {
+        self.log_replicator()
+            .is_none_or(|replicator| replicator.takes_commits())
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()

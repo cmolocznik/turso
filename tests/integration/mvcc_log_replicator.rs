@@ -226,7 +226,16 @@ fn a_commit_the_replicator_refuses_fails_and_leaves_nothing() {
     conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     let log_before = logical_log(&db);
+    assert!(db.db.takes_commits());
+    // One no replicator replicates takes every commit.
+    let alone = TempDatabase::builder()
+        .with_db_name("log_replicator_none.db")
+        .with_opts(replicated())
+        .build();
+    assert!(alone.db.takes_commits());
     recorder.refuse.store(true, Ordering::SeqCst);
+    // A writer may ask first.
+    assert!(!db.db.takes_commits());
     let refused = conn.execute("INSERT INTO things VALUES (1, 'refused')");
     assert!(matches!(refused, Err(LimboError::ReadOnly)), "{refused:?}");
     assert_eq!(

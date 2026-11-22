@@ -2040,6 +2040,21 @@ Tests: in `mvcc_log_replicator` (two) and `test_log_replicator` (one).
   extension, the trailer or the extended header, or with the end offset at its narrowest, or 100
   bytes high, and the SDK or the binding giving the error as a plain one.
 
+### A database says whether its node takes commits
+2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`Database::takes_commits` in `core/database.rs`.
+Why: atoll-forge's object store records when each object was last written, so that its collector
+(its `FORGE.md` decision 100) never deletes one an upload relies on. Only the group's leader
+collects, and only its writes count; on a node that follows, a write is refused as read-only, and
+the refused commit leaves the connection needing a rollback. A writer whose writes are optional
+needs to know before it writes.
+What: `Database::takes_commits` is true without a log replicator, and otherwise as the
+replicator's `takes_commits` says, as each writing commit asks it.
+Tests: in `mvcc_log_replicator` (one).
+- A database no replicator replicates takes commits; one whose replicator takes them does, and
+  stops as the replicator refuses them, before a write is refused as read-only. Each part is seen
+  failing without it: the answer without a replicator reversed, and the replicator not asked.
+
 ### The `trigram` index method and `code_match`
 2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
 `core/index_method/trigram/` (`mod.rs`, the method; `plan.rs`, an expression's trigram query),

@@ -504,6 +504,20 @@ whichever type the parameter has.
 Test: none of its own. It compiles against 0.7.6 here and against 0.7.13 in the atoll-forge
 workspace, whose forge tests pass on it.
 
+### A dropped transaction the engine had ended poisoned its connection
+2026-11-22 `a1190165a`, on branch `commit-replicator`; upstream `main` has the same code.
+`bindings/rust/src/connection.rs`. A `Transaction` dropped unfinished marks its connection to roll
+back on its next use. When the engine had already ended the transaction, as an `OR ROLLBACK`
+conflict does, or a write a database that no longer takes commits refuses, that `ROLLBACK` failed
+with "cannot rollback - no transaction is active" and returned before the mark was cleared: every
+later statement on the connection failed so, for good. The atoll-forge's writer met it as its node
+lost the lead and took it back, and wrote nothing more. A connection in autocommit has no
+transaction left to end, so the mark is cleared and nothing runs, as rusqlite's
+`Transaction::finish_` skips the rollback when the connection is in autocommit.
+Test: `a_transaction_the_engine_rolled_back_and_was_dropped_leaves_its_connection_working`
+(`bindings/rust/tests/integration_tests.rs`), through a statement and through a batch: each
+failed so without the fix.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)

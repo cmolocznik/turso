@@ -327,6 +327,11 @@ impl OptimizeSteps {
                         }
                         Ok(IOResult::Done(())) => {
                             self.lock_wait_over = true;
+                            // The statement's connection committed what its step did: a follower
+                            // records where a merge of its own ends (atoll-forge's decision 103).
+                            if let Some(ts) = steps.last_commit_ts() {
+                                connection.set_last_commit_ts(ts);
+                            }
                             // Under WAL every step but the first held the write lock.
                             let held = steps.mv_store().is_none() && !self.first;
                             self.first = false;

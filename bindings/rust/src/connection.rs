@@ -116,7 +116,28 @@ impl Connection {
         self.inner.as_ref().and_then(|conn| conn.last_commit_ts())
     }
 
+    /// Whether a transaction dropped unfinished has ended already: the engine rolled it back, as
+    /// on an `OR ROLLBACK` conflict or a write the database refuses, and the connection is in
+    /// autocommit again. Its mark is cleared then, and nothing is run, as rusqlite's
+    /// `Transaction::finish_` does; a `ROLLBACK` now would fail, and keep failing, as no
+    /// transaction is active.
+    fn dangling_tx_ended(&self) -> Result<bool> {
+        if !matches!(
+            self.dangling_tx.load(Ordering::SeqCst),
+            DropBehavior::Rollback | DropBehavior::Commit
+        ) || !self.is_autocommit()?
+        {
+            return Ok(false);
+        }
+        self.dangling_tx
+            .store(DropBehavior::Ignore, Ordering::SeqCst);
+        Ok(true)
+    }
+
     pub(crate) async fn maybe_handle_dangling_tx(&self) -> Result<()> {
+        if self.dangling_tx_ended()? {
+            return Ok(());
+        }
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {
                 let mut stmt = self.prepare("ROLLBACK").await?;
@@ -427,6 +448,9 @@ impl Connection {
     }
 
     async fn maybe_handle_dangling_tx_without_operation_guard(&self) -> Result<()> {
+        if self.dangling_tx_ended()? {
+            return Ok(());
+        }
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {
                 self.execute_without_operation_guard("ROLLBACK", ()).await?;

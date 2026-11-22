@@ -2979,3 +2979,56 @@ async fn test_constraint_failure_with_its_own_conflict_resolution_is_constraint_
         }
     }
 }
+
+/// A transaction the engine rolled back itself, as an `OR ROLLBACK` conflict does, and that was
+/// then dropped unfinished, leaves the connection fit for the next statement: there is no
+/// transaction left to roll back, so none is tried, as rusqlite's `Transaction::finish_` skips it.
+#[tokio::test]
+async fn a_transaction_the_engine_rolled_back_and_was_dropped_leaves_its_connection_working() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let mut conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0))",
+        (),
+    )
+    .await
+    .unwrap();
+    {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute("INSERT INTO t VALUES(1, 10)", ()).await.unwrap();
+        let failed = tx
+            .execute("INSERT OR ROLLBACK INTO t VALUES(2, -5)", ())
+            .await;
+        assert!(failed.is_err(), "the CHECK refuses -5");
+        assert!(
+            conn_is_autocommit(&tx),
+            "the engine rolled the transaction back"
+        );
+        // Dropped unfinished, as a caller's `?` drops it.
+    }
+    for n in 3..6 {
+        conn.execute("INSERT INTO t VALUES(?1, 1)", (n,))
+            .await
+            .unwrap();
+    }
+    let tx = conn.transaction().await.unwrap();
+    tx.execute("INSERT INTO t VALUES(6, 1)", ()).await.unwrap();
+    tx.commit().await.unwrap();
+    // A batch, which runs under the connection's exclusive operation, finds it so too.
+    {
+        let tx = conn.transaction().await.unwrap();
+        let failed = tx
+            .execute("INSERT OR ROLLBACK INTO t VALUES(7, -5)", ())
+            .await;
+        assert!(failed.is_err(), "the CHECK refuses -5");
+    }
+    conn.execute_batch("INSERT INTO t VALUES(8, 1)")
+        .await
+        .unwrap();
+    let ids = collect_ids(&conn, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(ids, vec![3, 4, 5, 6, 8]);
+}
+
+fn conn_is_autocommit(conn: &turso::Connection) -> bool {
+    conn.is_autocommit().unwrap()
+}

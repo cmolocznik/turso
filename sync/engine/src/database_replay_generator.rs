@@ -517,6 +517,17 @@ impl DatabaseReplayGenerator {
         table_name: &str,
         columns: usize,
     ) -> Result<ReplayInfo> {
+        self.upsert_rows_query(coro, table_name, columns, 1).await
+    }
+
+    /// [`Self::upsert_query`] for `rows` rows in one statement, each bound after the one before.
+    pub(crate) async fn upsert_rows_query<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        table_name: &str,
+        columns: usize,
+        rows: usize,
+    ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
             self.writable_columns(coro, table_name).await?;
         // The CDC record may have fewer columns than the current schema
@@ -558,9 +569,10 @@ impl DatabaseReplayGenerator {
                 .map(|name| quote_ident(name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let placeholders = ["?"].repeat(columns).join(",");
+            let placeholders =
+                vec![format!("({})", ["?"].repeat(columns).join(",")); rows].join(",");
             let query = format!(
-                "INSERT INTO {quoted_table_name}({col_list}) VALUES ({placeholders}){conflict_clause}"
+                "INSERT INTO {quoted_table_name}({col_list}) VALUES {placeholders}{conflict_clause}"
             );
             return Ok(ReplayInfo {
                 change_type: DatabaseChangeType::Insert,
@@ -579,7 +591,8 @@ impl DatabaseReplayGenerator {
         let rowid_alias = implicit_rowid_alias(table_name, &column_names)?;
         insert_columns.push(rowid_alias.to_string());
 
-        let placeholders = ["?"].repeat(columns + 1).join(",");
+        let placeholders =
+            vec![format!("({})", ["?"].repeat(columns + 1).join(",")); rows].join(",");
         let col_list = insert_columns
             .iter()
             .map(|name| quote_ident(name))
@@ -591,7 +604,7 @@ impl DatabaseReplayGenerator {
             "INSERT"
         };
         let query = format!(
-            "{insert_kind} INTO {quoted_table_name}({col_list}) VALUES ({placeholders}){conflict_clause}"
+            "{insert_kind} INTO {quoted_table_name}({col_list}) VALUES {placeholders}{conflict_clause}"
         );
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Insert,

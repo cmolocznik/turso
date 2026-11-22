@@ -112,9 +112,11 @@ async fn apply_frame(
         changes.recovery_payload,
         changes.op_count,
     )? {
-        for operation in logical_txn_to_tape_operations(&txn)? {
-            replay.replay(coro, operation).await?;
-        }
+        // A run of a transaction's inserts into one table as one statement, as the leader wrote
+        // them: an index that writes a statement's additions as one segment keeps as few here.
+        replay
+            .replay_all(coro, logical_txn_to_tape_operations(&txn)?)
+            .await?;
     }
     Ok(())
 }
@@ -357,6 +359,60 @@ mod tests {
         let all = "SELECT id, body FROM things ORDER BY id";
         assert_eq!(rows(&db, all), rows(&leader, all));
         assert_eq!(rows(&db, all).len(), 3000 - 3000 / 89);
+    }
+
+    /// A statement that adds texts to a trigram index writes one segment of them, so a
+    /// follower that applied each row as a statement of its own would hold a segment per row,
+    /// which its queries read one by one. Applied, the leader's statement is one segment on the
+    /// follower too: a merge there, as on the leader, finds no level of eight to merge.
+    #[test]
+    fn a_follower_s_index_holds_as_few_segments_as_its_leader_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let (leader, recorder) = open(&dir, "leader.db", true);
+        let (follower, _) = open(&dir, "follower.db", false);
+        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        for sql in [
+            "CREATE TABLE docs (path TEXT PRIMARY KEY, text TEXT)",
+            "CREATE INDEX docs_by_trigram ON docs USING trigram (text)",
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY, text TEXT)",
+            "CREATE INDEX plain_by_trigram ON plain USING trigram (text)",
+            "INSERT INTO docs SELECT 'p' || value, 'fn f' || value || '() {}' \
+             FROM generate_series(1, 20)",
+            "INSERT INTO plain SELECT value, 'struct S' || value FROM generate_series(1, 20)",
+            // More rows than one statement binds values for: a run in two statements.
+            "CREATE TABLE many (id INTEGER PRIMARY KEY, n INTEGER)",
+            "INSERT INTO many SELECT value, value * 7 FROM generate_series(1, 20000)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut applier = ReplicatedLogApplier::new(&follower).unwrap();
+        applier.apply(&frames(&recorder)).unwrap();
+        let merged = |conn: &Arc<turso_core::Connection>, index: &str| {
+            let before = conn.last_commit_ts();
+            conn.execute(format!("OPTIMIZE INDEX {index}")).unwrap();
+            conn.last_commit_ts() != before
+        };
+        for (index, check) in [
+            (
+                "docs_by_trigram",
+                "SELECT path FROM docs WHERE code_match(text, 'f1[0-9]\\(') ORDER BY path",
+            ),
+            (
+                "plain_by_trigram",
+                "SELECT id FROM plain WHERE code_match(text, 'S1[0-9]') ORDER BY id",
+            ),
+        ] {
+            assert!(!merged(&conn, index), "the leader merged {index}");
+            assert!(
+                !merged(applier.conn(), index),
+                "the follower merged {index}"
+            );
+            assert_eq!(rows(&follower, check), rows(&leader, check), "{check}");
+            assert_eq!(rows(&follower, check).len(), 10, "{check}");
+        }
+        let many = "SELECT id, n FROM many ORDER BY id";
+        assert_eq!(rows(&follower, many), rows(&leader, many));
+        assert_eq!(rows(&follower, many).len(), 20000);
     }
 
     #[test]

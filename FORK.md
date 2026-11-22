@@ -2004,6 +2004,18 @@ checkpointed into its file and opened again cold, applies updates and deletes wh
 Seen failing without the in-place wait (the replay never finishes), with the replay yielding as
 before, and with the blocking mode ignored. A busy wait's sleep is not tested.
 
+Changed 2026-11-23: a run of a transaction's inserts into one table applies as one statement.
+Replayed a row at a time, each insert was a statement of its own, and the trigram index writes one
+segment per statement: a follower held a segment per text where its leader held one per
+statement, and its queries read each one. Now `DatabaseReplaySession::replay_all` (in
+`sync/engine/src/database_tape.rs`) replays a run of inserts into one table, of records of one
+length, as one multi-row upsert, of at most SQLite's 32,766 bound values. An insert whose key holds
+a NULL still goes alone, its row removed first. Everything else replays as before, and so does a
+sync pull. Tested in `replicated_log.rs`: after a leader's statements of 20 texts each, into two
+tables with trigram indexes, `OPTIMIZE INDEX` on the follower merges nothing, as on the leader
+(under eight segments), and both answer alike. A run of 20,000 rows, two statements' worth,
+applies whole. Seen failing with a run cut at every row: the follower merges.
+
 ### A replicated delete names its row's key
 2026-11-21, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
 `Connection::portable_logical_changes_enabled` in `core/connection.rs`.

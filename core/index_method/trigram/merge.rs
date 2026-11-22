@@ -22,6 +22,10 @@
 //!
 //! Until step 4 a query reads the old segments, after it the new one. A text removed while the
 //! merge runs keeps its identity in the new segment, so its tombstone hides it there too.
+//!
+//! On a connection told to (`Connection::set_index_merges_whole`), a merge takes every segment
+//! instead, as Lucene's `forceMerge(1)`, and a lone segment that holds a removed text too: so no
+//! list holds a number of a text removed before it (atoll-forge's decision 103).
 
 use std::collections::HashSet;
 
@@ -100,6 +104,23 @@ pub(super) fn choose(segments: &[(Vec<u8>, u32)]) -> Option<Vec<(Vec<u8>, u32)>>
         }
     }
     None
+}
+
+/// Every segment, smallest first, as many as one merged segment holds: a whole merge's, of two
+/// or more; a lone one is merged only if it holds a removed text, which is read apart.
+fn choose_whole(segments: &[(Vec<u8>, u32)]) -> Option<Vec<(Vec<u8>, u32)>> {
+    let mut sorted: Vec<&(Vec<u8>, u32)> = segments.iter().collect();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mut chosen = Vec::new();
+    let mut total = 0u64;
+    for segment in sorted {
+        if !chosen.is_empty() && total + u64::from(segment.1) > MAX_TEXTS {
+            break;
+        }
+        total += u64::from(segment.1);
+        chosen.push(segment.clone());
+    }
+    (chosen.len() >= 2).then_some(chosen)
 }
 
 /// What `merges` holds of a merge: its segments, in order, with their sizes, and how far it is.
@@ -235,6 +256,12 @@ enum State {
     Segments {
         reader: Reader,
         segments: Vec<(Vec<u8>, u32)>,
+    },
+    /// A whole merge's lone segment, merged on its own if any text was removed: `reader` stands
+    /// at the first tombstone.
+    Lone {
+        reader: Reader,
+        segment: (Vec<u8>, u32),
     },
     /// Copying texts: `reader` stands in `docs` at the next of the current source.
     Docs {
@@ -410,37 +437,34 @@ impl Step {
                         segments.push((blob_at(&entry, 0)?, texts));
                         continue;
                     }
-                    let Some(sources) = choose(segments) else {
+                    let chosen = if context.connection()?.index_merges_whole() {
+                        if let [segment] = segments.as_slice() {
+                            self.state = State::Lone {
+                                reader: Reader::from_first(),
+                                segment: segment.clone(),
+                            };
+                            continue;
+                        }
+                        choose_whole(segments)
+                    } else {
+                        choose(segments)
+                    };
+                    let Some(sources) = chosen else {
                         self.outcome = OptimizeProgress::Done;
                         self.state = State::Finished;
                         continue;
                     };
-                    self.outcome = OptimizeProgress::Moved;
-                    if self.first {
+                    self.begin(sources, context)?;
+                }
+                State::Lone { reader, segment } => {
+                    let entry = return_if_io!(reader.step(cursors.get(Tree::Tombs)?));
+                    let Some(_) = entry else {
+                        self.outcome = OptimizeProgress::Done;
                         self.state = State::Finished;
                         continue;
-                    }
-                    let merge = Merge {
-                        id: segment_id(context)?,
-                        sources,
-                        progress: Progress::Docs {
-                            source: 0,
-                            number: 0,
-                        },
                     };
-                    // A claim is never read: one exists only beside its merge's rows, which a run
-                    // finds and carries on before it chooses. It is written so that two runs that
-                    // chose a segment in transactions side by side write one key, and one loses
-                    // its commit.
-                    for (segment, _) in &merge.sources {
-                        self.insert(Tree::Claims, key(&[blob(segment)])?);
-                    }
-                    for place in 0..merge.sources.len() {
-                        let record = merge.source_key(place)?;
-                        self.insert(Tree::Merges, record);
-                    }
-                    self.insert(Tree::Merges, merge.progress_key(merge.progress)?);
-                    self.state = State::Write;
+                    let sources = vec![segment.clone()];
+                    self.begin(sources, context)?;
                 }
                 State::Docs {
                     merge,
@@ -780,6 +804,37 @@ impl Step {
     }
 
     /// Carries on a merge from its progress: the first step of a run only says there is work.
+    /// Begins a merge of `sources`: claims them and writes its rows, unless this step only says
+    /// whether there is one.
+    fn begin(&mut self, sources: Vec<(Vec<u8>, u32)>, context: &IndexMethodContext) -> Result<()> {
+        self.outcome = OptimizeProgress::Moved;
+        if self.first {
+            self.state = State::Finished;
+            return Ok(());
+        }
+        let merge = Merge {
+            id: segment_id(context)?,
+            sources,
+            progress: Progress::Docs {
+                source: 0,
+                number: 0,
+            },
+        };
+        // A claim is never read: one exists only beside its merge's rows, which a run finds and
+        // carries on before it chooses. It is written so that two runs that chose a segment in
+        // transactions side by side write one key, and one loses its commit.
+        for (segment, _) in &merge.sources {
+            self.insert(Tree::Claims, key(&[blob(segment)])?);
+        }
+        for place in 0..merge.sources.len() {
+            let record = merge.source_key(place)?;
+            self.insert(Tree::Merges, record);
+        }
+        self.insert(Tree::Merges, merge.progress_key(merge.progress)?);
+        self.state = State::Write;
+        Ok(())
+    }
+
     fn start(&mut self, merge: Merge) -> Result<()> {
         if merge.sources.is_empty() {
             return Err(*corrupt("a merge of no segment"));

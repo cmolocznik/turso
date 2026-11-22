@@ -658,6 +658,10 @@ pub struct Connection {
     /// database, whose commits its database's log replicator neither admits
     /// nor receives.
     pub(super) applies_replicated_commits: AtomicBool,
+    /// Whether an index method's `OPTIMIZE INDEX` merges every segment into one, so that no text
+    /// removed before it stays in any list, as Lucene's `forceMerge(1)` (atoll-forge's decision
+    /// 103: a purge erases what the index held of its texts).
+    pub(super) index_merges_whole: AtomicBool,
     /// The commit timestamp of the last MVCC transaction this connection committed to a logical
     /// log; 0 before any.
     pub(super) last_commit_ts: AtomicU64,
@@ -3252,6 +3256,16 @@ impl Connection {
     pub fn set_applies_replicated_commits(&self, applies: bool) {
         self.applies_replicated_commits
             .store(applies, Ordering::Release);
+    }
+
+    /// Has this connection's `OPTIMIZE INDEX` merge every segment of a trigram index into one,
+    /// dropping every text removed before it, or, given `false`, choose as its merge policy does.
+    pub fn set_index_merges_whole(&self, whole: bool) {
+        self.index_merges_whole.store(whole, Ordering::Release);
+    }
+
+    pub(crate) fn index_merges_whole(&self) -> bool {
+        self.index_merges_whole.load(Ordering::Acquire)
     }
 
     pub fn applies_replicated_commits(&self) -> bool {

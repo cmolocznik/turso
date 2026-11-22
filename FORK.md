@@ -2178,6 +2178,30 @@ Tests: in `index_method::trigram` in `tests/integration`, six more, under `test_
 - The policy: eight segments of a level merge, seven do not, the smallest level first, sizes
   within 2^0.75 are one level, levels apart in size do not mix, no merge passes the largest size.
 
+### `trigram`: a merge of every segment, dropping every removed text
+2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`Connection::set_index_merges_whole` in `core/connection.rs`, passed to the step connection in
+`core/index_method/optimize_steps.rs`; `choose_whole` and the `Lone` state in
+`core/index_method/trigram/merge.rs`.
+Why: atoll-forge erases what it purges from every file (its `FORGE.md` decision 103). A text
+removed from a trigram index leaves its numbers in the lists of its segment until a merge drops
+it, and the merge policy may never take that segment. The trigrams of a secret can give it back.
+Rebuilding the index with `REINDEX` is one transaction, larger than a replicated database's commit
+may be.
+What: a connection told to (`set_index_merges_whole(true)`) has `OPTIMIZE INDEX` of a trigram index
+merge every segment into one, as Lucene's `forceMerge(1)`, in the same bounded steps as any merge,
+as many at a time as one segment holds. A lone segment is merged on its own if any text was
+removed, and left as it is if none was. The step connection the engine opens beside the
+statement's takes the setting from it.
+Limits: it rewrites the whole index. Other index methods choose as before.
+Tests: in `index_method::trigram` (one, under `io_memory_yield`).
+- Three segments, below the policy's level of eight: without the setting the removed texts' lists
+  stay to be read; with it, a query for their word reads about as little as one for a word no text
+  held. A word removed from the lone segment then is dropped too, and the answers stay the same.
+Each part is seen failing without it: the setting ignored, the setting not passed to the step
+connection, and a lone segment never merged. Merging two at a time instead of all is the same,
+since `OPTIMIZE INDEX` merges until nothing is left.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

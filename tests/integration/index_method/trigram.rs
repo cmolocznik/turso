@@ -723,3 +723,86 @@ fn two_merging_at_once_claim_no_segment_twice() {
     }
     turso_core::index_method::trigram::set_trigram_step_bytes_for_test(None);
 }
+
+/// On a connection told to merge whole (atoll-forge's decision 103), `OPTIMIZE INDEX` merges
+/// segments its policy leaves alone, three of them here, and drops every text removed before it:
+/// a query for a word only those texts held then reads about as little as one for a word no text
+/// ever held, where without it their lists stay to be read. A lone segment holding a removed text
+/// is merged on its own too.
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn a_whole_merge_drops_every_removed_text_where_the_policy_merges_nothing() {
+    use turso_core::{
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
+    };
+
+    let io = Arc::new(MemoryYieldIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "trigram_whole_merge.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA page_size = 512").unwrap();
+    conn.execute(TABLE).unwrap();
+    conn.execute(INDEX).unwrap();
+    for statement in 0..3 {
+        let rows: Vec<String> = (0..300)
+            .map(|n| {
+                let word = match (statement, n % 3) {
+                    (1, _) => "qqgonexx",
+                    (2, 0) => "qqsecond",
+                    _ => "keep",
+                };
+                format!("('p{statement}_{n}', '{word} w{n}')")
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO docs VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM docs WHERE text LIKE '%qqgonexx%'")
+        .unwrap();
+    let waits = |pattern: &str, expected: usize| {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA cache_size = 12").unwrap();
+        let (rows, waits) = rows_and_waits(
+            &conn,
+            io.as_ref(),
+            &format!("SELECT path FROM docs WHERE code_match(text, '{pattern}')"),
+        );
+        assert_eq!(rows, expected, "{pattern}");
+        waits
+    };
+    // Its policy merges no level of fewer than eight: the removed texts' lists stay.
+    conn.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    let (unmerged, never) = (waits("qqgonexx", 0), waits("zzvvyyww", 0));
+    assert!(
+        unmerged > never * 3,
+        "unmerged: {unmerged} waits for gone, {never} for never"
+    );
+
+    conn.set_index_merges_whole(true);
+    conn.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    let (gone, never) = (waits("qqgonexx", 0), waits("zzvvyyww", 0));
+    assert!(
+        gone <= never * 2 && gone * 4 < unmerged,
+        "merged whole: {gone} waits for gone, {never} for never, {unmerged} unmerged"
+    );
+    assert_eq!(matching(&conn, "keep w7$").len(), 2);
+
+    // A lone segment that holds a removed text is merged on its own.
+    let held = waits("qqsecond", 100);
+    conn.execute("DELETE FROM docs WHERE text LIKE '%qqsecond%'")
+        .unwrap();
+    conn.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    let (second, never) = (waits("qqsecond", 0), waits("zzvvyyww", 0));
+    assert!(
+        second <= never * 2 && second * 2 < held,
+        "a lone segment: {second} waits for the removed word, {never} for never, {held} held"
+    );
+    assert_eq!(matching(&conn, "keep w7$").len(), 2);
+}

@@ -80,6 +80,16 @@ fn the_index_agrees_with_a_plain_scan(
     indexed: &Arc<turso_core::Connection>,
     steps: u32,
 ) {
+    the_index_agrees_with_a_plain_scan_merging(plain, indexed, steps, None);
+}
+
+/// [`the_index_agrees_with_a_plain_scan`], with `OPTIMIZE INDEX` run every `merge_every` steps.
+fn the_index_agrees_with_a_plain_scan_merging(
+    plain: &Arc<turso_core::Connection>,
+    indexed: &Arc<turso_core::Connection>,
+    steps: u32,
+    merge_every: Option<u32>,
+) {
     let (mut seeds, _) = rng_from_time_or_env();
     let seed = seeds.next_u64();
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -123,6 +133,9 @@ fn the_index_agrees_with_a_plain_scan(
         };
         plain.execute(&statement).unwrap();
         indexed.execute(&statement).unwrap();
+        if merge_every.is_some_and(|every| step % every == 0) {
+            indexed.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+        }
 
         if step % 5 == 0 || step == steps {
             for pattern in PATTERNS {
@@ -406,4 +419,307 @@ fn a_query_reads_only_its_trigrams_lists() {
         needle_large * 10 < every_large,
         "{needle_large} against {every_large}"
     );
+}
+
+/// The same random history with `OPTIMIZE INDEX` run now and then, each merge in steps of a few
+/// hundred bytes, so that it stops within its texts, within its lists and within a trigram:
+/// merges change no answer.
+#[cfg(feature = "test_helper")]
+#[turso_macros::test(mvcc)]
+fn merges_change_no_answer(tmp_db: TempDatabase) {
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(Some(300));
+    let builder = TempDatabase::builder()
+        .with_opts(tmp_db.db_opts)
+        .with_flags(tmp_db.db_flags)
+        .with_init_sql(TABLE);
+    let plain_db = builder.clone().build();
+    let index_db = builder.build();
+    let plain = plain_db.connect_limbo();
+    let indexed = index_db.connect_limbo();
+    indexed.execute(INDEX).unwrap();
+    the_index_agrees_with_a_plain_scan_merging(&plain, &indexed, 400, Some(9));
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(None);
+}
+
+/// Writers add, rewrite and remove texts between the steps of a merge under MVCC, each step
+/// committing on its own: every answer after is a plain scan's.
+#[cfg(feature = "test_helper")]
+#[test]
+fn writers_go_on_between_the_steps_of_a_merge() {
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(Some(200));
+    let tmp_db = mvcc_index_db("trigram-merge-steps.db");
+    let plain_db = TempDatabase::builder().with_init_sql(TABLE).build();
+    let plain = plain_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+    writer.execute(TABLE).unwrap();
+    writer.execute(INDEX).unwrap();
+    let mut rng = ChaCha8Rng::seed_from_u64(11);
+    let mut next = 0;
+    let mut write = |rng: &mut ChaCha8Rng| {
+        next += 1;
+        let statement = match rng.next_u32() % 3 {
+            0 if next > 3 => format!(
+                "UPDATE docs SET text = {} WHERE path = 'p{}'",
+                quoted(&random_text(rng)),
+                rng.next_u32() % next
+            ),
+            1 if next > 3 => format!("DELETE FROM docs WHERE path = 'p{}'", rng.next_u32() % next),
+            _ => format!(
+                "INSERT INTO docs VALUES ('p{next}', {})",
+                quoted(&random_text(rng))
+            ),
+        };
+        plain.execute(&statement).unwrap();
+        // As the steps of the merge do, in a concurrent transaction.
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute(&statement).unwrap();
+        writer.execute("COMMIT").unwrap();
+    };
+    // Twelve segments of a few texts each.
+    for _ in 0..12 {
+        for _ in 0..3 {
+            write(&mut rng);
+        }
+    }
+    let optimizer = tmp_db.connect_limbo();
+    let mut optimize = optimizer.prepare("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    // Each write is a segment of its own, which a later merge takes: writing at every wait, the
+    // run would never be done. The writes stop after forty.
+    let mut waits = 0;
+    loop {
+        match optimize.step().unwrap() {
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::Row => {}
+            _ => {
+                waits += 1;
+                assert!(waits < 100_000, "the merges never ended");
+                if waits <= 40 {
+                    write(&mut rng);
+                }
+                optimize.wait_io().unwrap();
+            }
+        }
+    }
+    assert!(waits > 40, "the merges took {waits} waits");
+    let reader = tmp_db.connect_limbo();
+    for pattern in PATTERNS {
+        assert_eq!(
+            matching(&reader, pattern),
+            matching(&plain, pattern),
+            "pattern {pattern}"
+        );
+    }
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(None);
+}
+
+/// After `OPTIMIZE INDEX` a query for a word one text holds seeks in one segment instead of
+/// many, and waits for IO far less often.
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn a_merged_index_is_read_in_fewer_seeks() {
+    use turso_core::{
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
+    };
+
+    let io = Arc::new(MemoryYieldIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "trigram_merged_reads.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA page_size = 512").unwrap();
+    conn.execute(TABLE).unwrap();
+    conn.execute(INDEX).unwrap();
+    let mut rng = ChaCha8Rng::seed_from_u64(5);
+    for statement in 0..16 {
+        let rows: Vec<String> = (0..20)
+            .map(|n| {
+                let words: Vec<String> = (0..12)
+                    .map(|_| format!("w{}", rng.next_u32() % 5000))
+                    .collect();
+                format!("('p{statement}_{n}', '{}')", words.join(" "))
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO docs VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    conn.execute("UPDATE docs SET text = text || ' needle' WHERE path = 'p3_5'")
+        .unwrap();
+    let waits = || {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA cache_size = 12").unwrap();
+        let (rows, waits) = rows_and_waits(
+            &conn,
+            io.as_ref(),
+            "SELECT path FROM docs WHERE code_match(text, 'needle')",
+        );
+        assert_eq!(rows, 1);
+        waits
+    };
+    let before = waits();
+    conn.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    let after = waits();
+    assert!(
+        after * 3 < before,
+        "{before} waits in 17 segments, {after} merged"
+    );
+}
+
+/// A merge drops the texts removed before it: neither their entries nor their numbers in the
+/// lists are copied, so a query reads no more for them. Of 8,000 texts holding `gone`, all but
+/// the 50 of the last statement are removed; merged, a query for it waits about as often as one
+/// for `kept`, which only those 50 hold.
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn a_merge_drops_the_texts_removed_before_it() {
+    use turso_core::{
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
+    };
+
+    let io = Arc::new(MemoryYieldIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "trigram_dropped_reads.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA page_size = 512").unwrap();
+    conn.execute(TABLE).unwrap();
+    conn.execute(INDEX).unwrap();
+    for statement in 0..16 {
+        let rows: Vec<String> = (0..500)
+            .map(|n| {
+                let kept = if statement == 15 && n < 50 {
+                    " kept"
+                } else {
+                    ""
+                };
+                format!("('p{statement}_{n}', 'gone w{n}{kept}')")
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO docs VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM docs WHERE text NOT LIKE '%kept%'")
+        .unwrap();
+    let waits = |pattern: &str| {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA cache_size = 12").unwrap();
+        let (rows, waits) = rows_and_waits(
+            &conn,
+            io.as_ref(),
+            &format!("SELECT path FROM docs WHERE code_match(text, '{pattern}')"),
+        );
+        assert_eq!(rows, 50, "{pattern}");
+        waits
+    };
+    let before = waits("gone");
+    conn.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    let (gone, kept) = (waits("gone"), waits("kept"));
+    assert!(
+        gone * 2 < kept * 3,
+        "merged, {gone} waits for gone against {kept} for kept ({before} for gone before)"
+    );
+}
+
+/// A merge copies its texts within its step's budget too, not only its lists: with a budget of
+/// one byte, each text copied and each removed is a step, so a merge of 400 texts yields between
+/// steps at least 800 times.
+#[cfg(feature = "test_helper")]
+#[test]
+fn a_merge_copies_texts_a_step_at_a_time() {
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(Some(1));
+    let tmp_db = mvcc_index_db("trigram-step-budget.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute(TABLE).unwrap();
+    conn.execute(INDEX).unwrap();
+    for statement in 0..8 {
+        let rows: Vec<String> = (0..50)
+            .map(|n| format!("('p{statement}_{n}', 'abcd')"))
+            .collect();
+        conn.execute(format!("INSERT INTO docs VALUES {}", rows.join(", ")))
+            .unwrap();
+    }
+    let mut optimize = conn.prepare("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    let mut yields = 0;
+    loop {
+        match optimize.step().unwrap() {
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::Yield => {
+                yields += 1;
+                optimize.wait_io().unwrap();
+            }
+            turso_core::StepResult::Row => {}
+            _ => optimize.wait_io().unwrap(),
+        }
+    }
+    drop(optimize);
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(None);
+    assert!(yields >= 800, "{yields} steps");
+    assert_eq!(matching(&conn, "abcd").len(), 400);
+}
+
+/// Two runs of `OPTIMIZE INDEX` stepped by turns under MVCC choose no segment twice: a step that
+/// claims what the other claimed loses its commit and is done again, carrying the other's merge
+/// on. Both end, and every answer is a plain scan's.
+#[cfg(feature = "test_helper")]
+#[test]
+fn two_merging_at_once_claim_no_segment_twice() {
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(Some(200));
+    let tmp_db = mvcc_index_db("trigram-two-merging.db");
+    let plain_db = TempDatabase::builder().with_init_sql(TABLE).build();
+    let plain = plain_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+    writer.execute(TABLE).unwrap();
+    writer.execute(INDEX).unwrap();
+    let mut rng = ChaCha8Rng::seed_from_u64(13);
+    for n in 0..24 {
+        let statement = format!(
+            "INSERT INTO docs VALUES ('p{n}', {})",
+            quoted(&random_text(&mut rng))
+        );
+        plain.execute(&statement).unwrap();
+        writer.execute(&statement).unwrap();
+        if n % 5 == 4 {
+            let statement = format!("DELETE FROM docs WHERE path = 'p{}'", n - 2);
+            plain.execute(&statement).unwrap();
+            writer.execute(&statement).unwrap();
+        }
+    }
+    let (first, second) = (tmp_db.connect_limbo(), tmp_db.connect_limbo());
+    let mut runs = [
+        Some(first.prepare("OPTIMIZE INDEX docs_by_trigram").unwrap()),
+        Some(second.prepare("OPTIMIZE INDEX docs_by_trigram").unwrap()),
+    ];
+    let mut turns = 0;
+    while runs.iter().any(Option::is_some) {
+        for run in runs.iter_mut() {
+            let Some(statement) = run else { continue };
+            turns += 1;
+            assert!(turns < 200_000, "the merges never ended");
+            match statement.step().unwrap() {
+                turso_core::StepResult::Done => *run = None,
+                turso_core::StepResult::Row => {}
+                _ => statement.wait_io().unwrap(),
+            }
+        }
+    }
+    let reader = tmp_db.connect_limbo();
+    for pattern in PATTERNS {
+        assert_eq!(
+            matching(&reader, pattern),
+            matching(&plain, pattern),
+            "pattern {pattern}"
+        );
+    }
+    turso_core::index_method::trigram::set_trigram_step_bytes_for_test(None);
 }

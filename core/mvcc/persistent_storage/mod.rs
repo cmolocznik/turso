@@ -76,6 +76,10 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// completion and then call `log_tx`.
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>>;
 
+    /// The most bytes `m`'s frame takes once [`Self::log_tx`] writes it, not
+    /// counting the log's header.
+    fn frame_len_bound(&self, m: &LogRecord) -> Result<usize>;
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
 
     /// Sync the log without holding it against appends while the fsyncs run: the checkpoint's
@@ -353,6 +357,10 @@ impl DurableStorage for Storage {
 
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
         self.logical_log.write().upgrade_header_for_log_tx(m)
+    }
+
+    fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+        self.logical_log.read().frame_len_bound(m)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {

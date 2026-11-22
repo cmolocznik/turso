@@ -12,6 +12,10 @@
 //! replicator that is full makes a writer wait, on the completion it returns,
 //! before the writer's commit finishes.
 //!
+//! The replicator also says how large a frame it takes. A commit whose frame
+//! would be larger fails with [`crate::LimboError::TooBig`] before anything of
+//! it is written, as etcd refuses a request over `--max-request-bytes`.
+//!
 //! The replicator also says whether the database takes commits at all, asked
 //! as each commit starts. A commit it refuses fails with
 //! [`crate::LimboError::ReadOnly`] before anything of it is written: a
@@ -48,6 +52,13 @@ pub struct ReplicatedFrame {
 pub trait LogReplicator: Send + Sync {
     /// Whether the database takes a commit now.
     fn takes_commits(&self) -> bool;
+
+    /// The most bytes a frame given to [`Self::replicate`] may hold. A commit
+    /// whose frame would hold more fails with [`crate::LimboError::TooBig`]
+    /// and rolls back before it is written. The default takes any frame.
+    fn frame_limit(&self) -> usize {
+        usize::MAX
+    }
 
     /// Starts replicating `frame`, which is in the log already. The writer
     /// waits on the returned completion before its commit finishes: a

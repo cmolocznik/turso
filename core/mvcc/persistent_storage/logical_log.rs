@@ -1194,6 +1194,8 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
+        #[cfg(debug_assertions)]
+        let bound = self.frame_len_bound(&tx)?;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
@@ -1362,6 +1364,16 @@ impl LogicalLog {
             tx.buf[..LOG_HDR_SIZE].copy_from_slice(&header_bytes);
         }
 
+        #[cfg(debug_assertions)]
+        {
+            let framed = tx.buf.len() - LOG_HDR_SIZE;
+            turso_assert!(
+                framed <= bound && bound - framed <= 9,
+                "a frame's bound holds it within a varint's width",
+                { "framed": framed, "bound": bound }
+            );
+        }
+
         // 6. Observer hook: gets shared ownership of a zero-copy view into the
         // on-disk bytes.
         let raw = Arc::new(tx.buf.into_boxed_slice());
@@ -1408,6 +1420,71 @@ impl LogicalLog {
             self.pending_running_crc = Some(crc);
         }
         Ok((c, buffer_len as u64))
+    }
+
+    /// The most bytes `tx`'s frame takes, not counting the log's header that
+    /// the first write to a file also holds: what [`Self::log_tx_deferred_offset`]
+    /// writes for it, with the portable extension's end offset as wide as a
+    /// varint gets. The frame written is never larger, wherever in the log it
+    /// is written, and at most nine bytes smaller.
+    pub fn frame_len_bound(&self, tx: &LogRecord) -> Result<usize> {
+        let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
+        #[cfg(feature = "conn_raw_api")]
+        let portable = tx.portable_changes_enabled
+            || tx.portable_changes_required
+            || !tx.portable_changes.is_empty();
+        #[cfg(not(feature = "conn_raw_api"))]
+        let portable = false;
+        let tx_header_size = if portable {
+            TX_EXT_HEADER_SIZE
+        } else {
+            TX_HEADER_SIZE
+        };
+        let encryption_overhead = self
+            .encryption_ctx
+            .as_ref()
+            .map(|enc_ctx| (enc_ctx.tag_size(), enc_ctx.nonce_size()));
+        #[cfg(feature = "conn_raw_api")]
+        let extension_size = if portable {
+            // An end offset at or past 2^63 takes ten bytes, a varint's most.
+            let portable_changes = PortableChangePayload::with_stable_end_offset(
+                PortableEndOffsetCtx {
+                    write_offset: 1 << 63,
+                    includes_log_header: false,
+                    tx_header_size,
+                    recovery_payload_size: payload_size,
+                    encrypted_payload_chunk_size: self.encrypted_payload_chunk_size,
+                    encryption_overhead,
+                },
+                tx.tx_timestamp,
+                &tx.portable_changes,
+            )?;
+            extension_record_len(&ExtensionRecord::new(
+                EXTENSION_TYPE_PORTABLE_CHANGES,
+                0,
+                portable_changes,
+            ))?
+        } else {
+            0
+        };
+        #[cfg(not(feature = "conn_raw_api"))]
+        let extension_size = 0;
+        let plaintext_size = payload_size
+            .checked_add(extension_size)
+            .ok_or_else(|| LimboError::InternalError("logical log frame size overflow".into()))?;
+        let body_size = match encryption_overhead {
+            Some((tag_size, nonce_size)) => encrypted_payload_blob_size(
+                plaintext_size,
+                self.encrypted_payload_chunk_size,
+                tag_size,
+                nonce_size,
+            )?,
+            None => plaintext_size,
+        };
+        tx_header_size
+            .checked_add(body_size)
+            .and_then(|size| size.checked_add(TX_TRAILER_SIZE))
+            .ok_or_else(|| LimboError::InternalError("logical log frame size overflow".into()))
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.

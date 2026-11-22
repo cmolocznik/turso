@@ -112,6 +112,11 @@ pub enum Error {
     NotAdb(String),
     #[error("{0}")]
     Corrupt(String),
+    /// A string, blob or commit larger than a limit allows: SQLite's
+    /// `SQLITE_TOOBIG`, as for a commit whose frame is larger than the
+    /// database's log replicator takes.
+    #[error("{0}")]
+    TooBig(String),
     #[error("I/O error ({1}): {0}")]
     IoError(std::io::ErrorKind, &'static str),
     /// A statement of a [`batch`](crate::Connection::batch) failed.
@@ -153,6 +158,7 @@ impl From<turso_sdk_kit::rsapi::TursoError> for Error {
             turso_sdk_kit::rsapi::TursoError::DatabaseFull(err) => Error::DatabaseFull(err),
             turso_sdk_kit::rsapi::TursoError::NotAdb(err) => Error::NotAdb(err),
             turso_sdk_kit::rsapi::TursoError::Corrupt(err) => Error::Corrupt(err),
+            turso_sdk_kit::rsapi::TursoError::TooBig(err) => Error::TooBig(err),
             turso_sdk_kit::rsapi::TursoError::IoError(kind, op) => Error::IoError(kind, op),
         }
     }

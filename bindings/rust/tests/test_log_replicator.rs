@@ -122,6 +122,64 @@ async fn a_log_replicator_needs_mvcc() {
     );
 }
 
+/// Keeps each frame of at most `LIMIT` bytes.
+#[derive(Default)]
+struct Limited {
+    frames: Mutex<Vec<ReplicatedFrame>>,
+}
+
+const LIMIT: usize = 4096;
+
+impl LogReplicator for Limited {
+    fn takes_commits(&self) -> bool {
+        true
+    }
+
+    fn replicate(&self, frame: ReplicatedFrame) -> Completion {
+        self.frames.lock().unwrap().push(frame);
+        Completion::new_yield()
+    }
+
+    fn frame_limit(&self) -> usize {
+        LIMIT
+    }
+}
+
+/// A commit whose frame is larger than the replicator takes fails as too
+/// big, and the next one goes through.
+#[tokio::test]
+async fn a_commit_over_the_replicator_s_limit_fails_as_too_big() {
+    let dir = tempfile::tempdir().unwrap();
+    let replicator = Arc::new(Limited::default());
+    let db = Builder::new_local(dir.path().join("t.db").to_str().unwrap())
+        .with_mvcc(true)
+        .with_log_replicator(replicator.clone())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE things (id INTEGER PRIMARY KEY, body BLOB)",
+        (),
+    )
+    .await
+    .unwrap();
+    let refused = conn
+        .execute("INSERT INTO things VALUES (1, zeroblob(8192))", ())
+        .await;
+    assert!(
+        matches!(refused, Err(turso::Error::TooBig(_))),
+        "{refused:?}"
+    );
+    conn.execute("INSERT INTO things VALUES (2, zeroblob(100))", ())
+        .await
+        .unwrap();
+    assert_eq!(ids(&conn).await, [2]);
+    let frames = replicator.frames.lock().unwrap();
+    assert_eq!(frames.len(), 2, "the table and the row taken");
+    assert!(frames.iter().all(|frame| frame.bytes.len() <= LIMIT));
+}
+
 /// Keeps each frame and gives checkpoints `cut`, when set.
 #[derive(Default)]
 struct Cutting {

@@ -31,7 +31,11 @@
 //! random, so writers of different statements never write the same entry: under MVCC they
 //! commit side by side.
 
+mod merge;
 pub(crate) mod plan;
+
+#[cfg(any(test, feature = "test_helper"))]
+pub use merge::set_trigram_step_bytes_for_test;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -44,7 +48,7 @@ use crate::{
     index_method::{
         parse_patterns, BackingColumn, BackingIndex, BackingSchema, BackingStoreOp, BackingTable,
         IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext,
-        IndexMethodCursor, IndexMethodDefinition, IndexMethodMvccSupport,
+        IndexMethodCursor, IndexMethodDefinition, IndexMethodMvccSupport, OptimizeProgress,
         TRIGRAM_INDEX_METHOD_NAME,
     },
     return_if_io,
@@ -158,7 +162,7 @@ impl IndexMethodAttachment for TrigramAttachment {
             results_materialized: false,
             filtered_queries: false,
             mvcc_support: IndexMethodMvccSupport::TransactionalBackingStore,
-            optimize_in_steps: false,
+            optimize_in_steps: true,
         }
     }
 
@@ -179,17 +183,23 @@ enum Tree {
     Docs = 2,
     Ids = 3,
     Tombs = 4,
+    Merges = 5,
+    Claims = 6,
+    Dropped = 7,
 }
 
-const TREES: [Tree; 5] = [
+const TREES: [Tree; 8] = [
     Tree::Segments,
     Tree::Postings,
     Tree::Docs,
     Tree::Ids,
     Tree::Tombs,
+    Tree::Merges,
+    Tree::Claims,
+    Tree::Dropped,
 ];
 
-/// One table of the method's own, which stays empty, and the five key-only B-trees on it.
+/// One table of the method's own, which stays empty, and the eight key-only B-trees on it.
 fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
     let table = BackingTable::new(
         format!("trigram_{}", configuration.index_name),
@@ -202,6 +212,12 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
             BackingColumn::new("number", Type::Integer),
             BackingColumn::new("row", Type::Integer),
             BackingColumn::new("origin", Type::Blob),
+            BackingColumn::new("merge", Type::Blob),
+            BackingColumn::new("kind", Type::Integer),
+            BackingColumn::new("x", Type::Integer),
+            BackingColumn::new("y", Type::Blob),
+            BackingColumn::new("z", Type::Integer),
+            BackingColumn::new("claimed", Type::Blob),
         ],
     );
     let index = |suffix: &str, names: &[&str]| {
@@ -218,6 +234,9 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
         index("docs", &["segment", "number", "row", "origin"]),
         index("ids", &["row", "origin"]),
         index("tombs", &["origin", "row"]),
+        index("merges", &["merge", "kind", "x", "y", "z"]),
+        index("claims", &["claimed"]),
+        index("dropped", &["merge", "number", "origin", "row"]),
     ];
     BackingSchema::new(vec![table], indexes)
 }
@@ -473,10 +492,10 @@ impl Writes {
     }
 }
 
-/// The cursors of the five trees, and of the indexed table for a query.
+/// The cursors of the eight trees, and of the indexed table for a query.
 #[derive(Default)]
 struct Cursors {
-    trees: [Option<Box<dyn CursorTrait>>; 5],
+    trees: [Option<Box<dyn CursorTrait>>; 8],
     table: Option<Box<dyn CursorTrait>>,
 }
 
@@ -797,7 +816,9 @@ impl Search {
                         blob_at(entry, 0).is_ok_and(|s| s == *segment)
                             && integer_at(entry, 1).is_ok_and(|n| n == i64::from(number))
                     }) else {
-                        return Err(corrupt("a segment's text is missing"));
+                        // A text a merge dropped leaves its number unused.
+                        self.step = SearchStep::Candidate;
+                        continue;
                     };
                     let (row, origin) = (integer_at(&entry, 2)?, blob_at(&entry, 3)?);
                     self.step = SearchStep::Tomb {
@@ -925,6 +946,8 @@ pub struct TrigramCursor {
     search: Option<Search>,
     /// `query_start` made `search` and has not yet given its first answer.
     search_starting: bool,
+    /// A step of `OPTIMIZE INDEX` under way.
+    optimizing: Option<merge::Step>,
 }
 
 impl TrigramCursor {
@@ -941,6 +964,7 @@ impl TrigramCursor {
             removal: None,
             search: None,
             search_starting: false,
+            optimizing: None,
         }
     }
 
@@ -1106,6 +1130,35 @@ impl IndexMethodCursor for TrigramCursor {
             self.pending = Pending::default();
         }
         out
+    }
+
+    /// A step of a merge of segments: see [`merge`].
+    fn optimize_step(
+        &mut self,
+        context: &IndexMethodContext,
+        first: bool,
+    ) -> IOResultOr<OptimizeProgress> {
+        if self.optimizing.is_none() {
+            return_if_io!(self.open_cursors(context, false));
+            self.optimizing = Some(merge::Step::new(first));
+        }
+        let step = self.optimizing.as_mut().expect("made above");
+        let out = step.run(&mut self.cursors, context);
+        if !matches!(out, Ok(IOResult::IO(_))) {
+            self.optimizing = None;
+        }
+        out
+    }
+
+    /// Every merge there is, in the transaction it runs in.
+    fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        loop {
+            match self.optimize_step(context, false)? {
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                IOResult::Done(OptimizeProgress::Done) => return Ok(IOResult::Done(())),
+                IOResult::Done(_) => {}
+            }
+        }
     }
 
     fn abort_statement(&mut self, _context: &IndexMethodContext) {

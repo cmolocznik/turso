@@ -2046,6 +2046,47 @@ side can be empty, changes no query, as such a side's prefixes always hold the e
   more than 100 characters is any character, `c[ab]+c` admits `cabc`, and on 3,000 random
   expressions every text one matches, of more than 20,000, satisfies its query.
 
+### `trigram`: segments merged in steps
+2026-11-22, on branch `commit-replicator` (not yet on `atoll`), in the commit that adds this entry.
+`core/index_method/trigram/merge.rs`, and the query in `core/index_method/trigram/mod.rs`.
+Why: every statement that adds texts is a segment, and a query seeks in each, so an index written
+a statement at a time is read in as many seeks per trigram as it has segments. atoll-forge writes it
+in small statements, as its replicated databases refuse a commit larger than one entry of the Raft
+log, 4 MiB, and so a merge must be written in steps no larger either.
+What: `OPTIMIZE INDEX` merges segments, in steps (`optimize_in_steps`), each writing at most a
+mebibyte, as atoll-forge's object store writes a large object a mebibyte at a time. Which segments
+is Tantivy's `LogMergePolicy`, with its defaults: levels a factor of 2^0.75 apart in size, sizes
+under 10,000 texts counted as 10,000, a level of eight or more merged, smallest first, and no
+segment larger than 10,000,000 texts made or merged. A merge claims its segments (`claims`: a second
+merge claiming one loses its commit; a claim is never read, since one exists only beside its
+merge's rows, which a run finds and carries on before it chooses), copies their texts to the new segment numbered after those of
+the segments before, noting in `dropped` each one removed by then, writes the merged lists a trigram
+at a time, stopping within a trigram whose list is larger than a step and resuming at its next
+block, makes the new segment visible and the old ones not in one step, and then removes the old
+rows, the dropped texts' tombstones and its own rows. Its progress is its rows of `merges`, so a
+merge another run began, or one cut short, is carried on. Until the swap a query reads the old
+segments; a text removed during the merge keeps its identity in the new one, where its tombstone
+hides it too. A number a dropped text left unused is passed over by a query.
+Not done: `ivf_crash`'s kill rounds; a run in Atoll mode; a cost run.
+Tests: in `index_method::trigram` in `tests/integration`, six more, under `test_helper` and
+`io_memory_yield`, and one more in `turso_core`. Each was seen failing on a mutant of the merge:
+15 mutants, of which the claims read was dead code, now removed, and the rest are caught.
+- Merges change no answer: the random history of the entry above with `OPTIMIZE INDEX` every nine
+  statements, each merge in steps of 300 bytes, so within texts, lists and trigrams, under WAL and
+  MVCC.
+- Writers add, rewrite and remove texts between the steps of a merge, in concurrent transactions.
+- Two runs stepped by turns claim no segment twice, and both end.
+- After `OPTIMIZE INDEX`, a query for a word one text holds, in 17 segments, waits for IO a third as
+  often or less.
+- A merge drops the texts removed before it: of 8,000 texts holding a word, all but 50 removed,
+  merged, a query for it waits for IO as often as one for a word only the 50 hold (16 and 16;
+  1,367 against 35 when a removed text is copied, 167 against 33 when its number stays in the
+  lists).
+- A merge copies texts within its step's budget too: with a budget of one byte, a merge of 400
+  texts takes at least 800 steps.
+- The policy: eight segments of a level merge, seven do not, the smallest level first, sizes
+  within 2^0.75 are one level, levels apart in size do not mix, no merge passes the largest size.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

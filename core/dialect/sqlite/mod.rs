@@ -375,6 +375,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "if" | "iif" => Ok(Some(Func::Scalar(ScalarFunc::Iif))),
         "instr" | "strpos" => Ok(Some(Func::Scalar(ScalarFunc::Instr))),
         "path_sync" => Ok(Some(Func::Scalar(ScalarFunc::PathSync))),
+        "code_match" => Ok(Some(Func::Scalar(ScalarFunc::CodeMatch))),
         "like" => Ok(Some(Func::Scalar(ScalarFunc::Like))),
         "abs" => Ok(Some(Func::Scalar(ScalarFunc::Abs))),
         "upper" => Ok(Some(Func::Scalar(ScalarFunc::Upper))),

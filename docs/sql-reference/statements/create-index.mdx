@@ -163,6 +163,8 @@ SELECT * FROM articles WHERE search(articles, 'database performance');
 
 The `path_trie` index method indexes slash-separated paths with a sequence number, for the [`path_sync`](/docs/sql-reference/functions/path) function: rows whose path matches a set of glob patterns, and optionally only those changed since a sequence number.
 
+The `trigram` index method indexes a text column by its trigrams, for the [`code_match`](/docs/sql-reference/functions/code) function: rows whose text a regular expression matches somewhere.
+
 ```sql
 CREATE INDEX files_by_path ON files USING path_trie (path, seq);
 

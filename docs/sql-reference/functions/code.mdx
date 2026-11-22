@@ -1,0 +1,52 @@
+---
+title: Code Match
+description: Find rows whose text a regular expression matches, through an index of trigrams
+sidebarTitle: Code Match
+---
+
+# Code Match
+
+<Info>
+**Turso Extension**: `code_match` and the `trigram` index method are not part of SQLite.
+</Info>
+
+`code_match` answers one question: which rows hold a text that a regular expression matches somewhere. With a `trigram` index, a query reads only the lists of the trigrams the expression needs, not every text, as Google Code Search does.
+
+It is built for searching code: whole files, by regular expression.
+
+---
+
+## code_match(text, pattern)
+
+Returns 1 if the regular expression `pattern` matches somewhere in `text`, and 0 if it does not.
+
+| Argument | Meaning |
+|----------|---------|
+| `text` | The text to search. A value that is not text gives NULL. |
+| `pattern` | A regular expression in the syntax of Rust's `regex` crate. NULL gives NULL. One that does not parse is an error. |
+
+The expression is searched for anywhere in the text, as `regex`'s `is_match` searches. Its flags are its own: `(?i)` for case-insensitive, `(?m)` for `^` and `$` at each line, `(?s)` for `.` to match a newline.
+
+```sql
+SELECT path FROM files WHERE code_match(text, '(?m)^fn\s+main');
+```
+
+---
+
+## The trigram index
+
+```sql
+CREATE INDEX files_by_trigram ON files USING trigram (text);
+```
+
+The index takes exactly one column, the text, and no options. A query whose `WHERE` clause holds `code_match` on that column reads the index.
+
+### How it answers
+
+Each text is split into its trigrams: every three consecutive bytes of its UTF-8. The index keeps, for each trigram, the list of the texts that hold it. A query turns the expression into a query over trigrams that every text it matches satisfies: `abcd` needs `abc` and `bcd`, `(abc|xyz)` needs one of `abc` and `xyz`, and `a.c` needs none. This is Russ Cox's method ("Regular Expression Matching with a Trigram Index"). The index reads the lists of those trigrams, runs the expression on each text the lists admit, and returns exactly the rows `code_match` is 1 for.
+
+An expression that names no trigram, such as `.` or `a.c`, is run on every text.
+
+### Writes
+
+Every statement that adds texts writes them as one segment of their own when it ends, and a text removed is marked removed. A statement's writes touch no other statement's entries, so writers in concurrent transactions under MVCC commit side by side. A query reads, in each segment, only its trigrams' lists: adding texts in a few large statements keeps a query's reads few.

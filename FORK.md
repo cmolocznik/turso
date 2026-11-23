@@ -2252,6 +2252,18 @@ Test: `bindings/rust/tests/statement_metrics.rs` (`cargo test -p turso --feature
 statement_metrics`): a 200-row index range reports 200 to 202 rows read and no sort, `reset_metrics` zeroes the
 counters, and an unindexed ORDER BY reports its sort over all 500 rows.
 
+### A replicated commit's applier, refused by another's write lock, is left in no transaction
+2026-11-23. `sync/engine/src/replicated_log.rs`. A follower's own transactions, a checkpoint or its index's merge,
+may hold its database's write lock when a replicated entry arrives. The applier's `BEGIN IMMEDIATE` is then
+refused with `Busy` before anything begins (every MVCC `Busy` is in a begin path, and a commit's auto-checkpoint
+failing does not fail the commit: `core/mvcc/database/mod.rs`), so the caller may try the same frames again once
+the lock is free and they apply once. A `COMMIT` that fails and leaves its transaction open is now rolled back, so
+the applier's next frames begin a transaction of their own rather than fail inside that one. The forge retries
+`Busy` on the same database's frames (atoll-forge-replica `Machine::apply_frames`, audit A-21).
+Test: `replicated_log::tests::frames_refused_by_another_s_write_lock_apply_once_when_tried_again`: with another
+connection's `BEGIN IMMEDIATE` held, the apply is `Busy`, the applier is in no transaction and committed nothing;
+after its `ROLLBACK` the same frames apply once.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

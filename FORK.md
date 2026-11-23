@@ -2228,6 +2228,30 @@ Each part is seen failing without it: the setting ignored, the setting not passe
 connection, and a lone segment never merged. Merging two at a time instead of all is the same,
 since `OPTIMIZE INDEX` merges until nothing is left.
 
+### The raw WAL API through `turso::Connection` (`conn_raw_api`)
+2026-11-17. `bindings/rust/Cargo.toml`, `bindings/rust/src/connection.rs`, `sdk-kit/src/rsapi.rs`. Core's raw WAL
+API (`wal_state`, `wal_get_frame`, `wal_insert_begin`, `wal_insert_frame`, `wal_insert_end`, behind core's
+`conn_raw_api`) was reachable only through `turso_core::Connection`; a program that opens its databases through the
+`turso` crate held no road to it, because `turso::Connection` keeps its sdk-kit connection private and the sdk-kit
+connection keeps its core one. WorkReef cognition ships each brain's committed WAL frames to object storage and
+restores from them, over databases it opens through `turso`. The binding gains a `conn_raw_api` feature whose five
+methods forward to the core connection (`TursoConnection::core_connection`, the one accessor added to sdk-kit), each
+with core's own semantics; nothing else changes and nothing is on by default.
+Test: `bindings/rust/tests/wal_raw_api.rs` (`cargo test -p turso --features conn_raw_api --test wal_raw_api`): twenty
+committed rows' frames read from one database and inserted into a fresh one read back whole.
+
+### A prepared statement's execution metrics through `turso::Statement` (`statement_metrics`)
+2026-11-22. `core/lib.rs`, `sdk-kit/src/rsapi.rs`, `bindings/rust/src/lib.rs`, `bindings/rust/Cargo.toml`. Core keeps
+per-statement execution metrics (`Statement::metrics` / `reset_metrics`: rows read, b-tree table and index seeks,
+sorts, ...), but `StatementMetrics` sat in the private `vdbe` module and neither the sdk-kit statement nor
+`turso::Statement` reached it. WorkReef cognition measures the rows each brain query walks, to hold every read to
+its matching set rather than the whole store. Core re-exports `StatementMetrics`; `TursoStatement` and
+`turso::Statement` gain `metrics()` (`None` once finalized) and `reset_metrics()`, the binding's behind a new
+`statement_metrics` feature that is off by default; core's semantics are unchanged.
+Test: `bindings/rust/tests/statement_metrics.rs` (`cargo test -p turso --features statement_metrics --test
+statement_metrics`): a 200-row index range reports 200 to 202 rows read and no sort, `reset_metrics` zeroes the
+counters, and an unindexed ORDER BY reports its sort over all 500 rows.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

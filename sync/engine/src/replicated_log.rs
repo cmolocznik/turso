@@ -64,7 +64,10 @@ impl ReplicatedLogApplier {
     /// this database, and returns its commit timestamp here: `None` if the
     /// frames changed nothing this database keeps, so that it committed
     /// nothing. Each frame's CRC must continue from the CRC it says comes
-    /// before it. On an error, nothing of the frames is applied.
+    /// before it. On an error, nothing of the frames is applied, and the
+    /// connection is in no transaction. Another transaction that holds the
+    /// database's write lock refuses the begin with `Busy`, nothing begun:
+    /// the caller tries the same frames again once it is free.
     pub fn apply(&mut self, frames: &[ReplicatedFrame]) -> Result<Option<u64>> {
         let before = self.replay.conn.last_commit_ts();
         self.replay.conn.execute("BEGIN IMMEDIATE")?;
@@ -83,7 +86,14 @@ impl ReplicatedLogApplier {
             self.replay.conn.execute("ROLLBACK")?;
             return Err(err);
         }
-        self.replay.conn.execute("COMMIT")?;
+        if let Err(err) = self.replay.conn.execute("COMMIT") {
+            // A commit refused leaves its transaction open: it is ended, so
+            // the next frames begin one of their own.
+            if !self.replay.conn.get_auto_commit() {
+                self.replay.conn.execute("ROLLBACK")?;
+            }
+            return Err(err.into());
+        }
         let after = self.replay.conn.last_commit_ts();
         Ok(after.filter(|_| after != before))
     }
@@ -256,6 +266,44 @@ mod tests {
             ]
         );
         assert_eq!(applier.apply(&[]).unwrap(), None);
+    }
+
+    /// Another connection's transaction that holds the follower's write
+    /// lock, as a checkpoint or the follower's own index merge may, refuses
+    /// the applier's begin with `Busy` and nothing begun: the connection is
+    /// in no transaction, nothing is committed, and the same frames apply
+    /// once when tried again after the lock is free.
+    #[test]
+    fn frames_refused_by_another_s_write_lock_apply_once_when_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (leader, recorder) = open(&dir, "leader.db", true);
+        let (follower, _) = open(&dir, "follower.db", false);
+        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE log (v TEXT)").unwrap();
+        let mut applier = ReplicatedLogApplier::new(&follower).unwrap();
+        applier.apply(&frames(&recorder)).unwrap();
+        conn.execute("INSERT INTO log VALUES ('once')").unwrap();
+        let pending = frames(&recorder);
+        let holder = follower.connect(turso_core::ConnectOpts::new()).unwrap();
+        holder.execute("BEGIN IMMEDIATE").unwrap();
+        let before = applier.conn().last_commit_ts();
+        let refused = applier.apply(&pending);
+        assert!(
+            matches!(
+                refused,
+                Err(crate::errors::Error::TursoError(turso_core::LimboError::Busy))
+            ),
+            "{refused:?}"
+        );
+        assert!(applier.conn().get_auto_commit());
+        assert_eq!(applier.conn().last_commit_ts(), before);
+        holder.execute("ROLLBACK").unwrap();
+        let applied = applier.apply(&pending).unwrap();
+        assert!(applied > before, "{applied:?} after {before:?}");
+        assert_eq!(
+            rows(&follower, "SELECT v FROM log"),
+            vec![vec![Value::build_text("once")]]
+        );
     }
 
     /// A table keyed by other than the rowid: the follower's rowids need not

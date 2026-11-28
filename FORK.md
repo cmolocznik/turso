@@ -2294,10 +2294,7 @@ entry out if it is still theirs, and finish the completion. An open that finds e
 its executor or parked in a blocking open, and looks again. `Database::open` reserves a file that exists, in
 the lookup that finds nothing registered and before it opens (and locks) the file; a failed open lets go of its
 storage before its mark lets another open go. Upstream has the same code. Not covered: a file that does not
-exist yet is keyed only once created, so two opens that create it at once still race, and the Rust binding's
-`TursoDatabase::open` opens its file before it asks the registry (as on the forge's former branch), so a
-reopen through it still waits for a closing database only after taking a lock the close can drop: a change
-to `sdk-kit`'s open, to be decided before it is made.
+exist yet is keyed only once created, so two opens that create it at once still race.
 Tests (Linux, real files), each seen failing with its part removed:
 `an_open_waits_for_a_closing_database_of_its_file_and_keeps_its_lock` (the entry removed at the last handle's
 drop, as before), `an_async_open_waits_for_a_closing_database_pending_on_its_completion` (a yield handed
@@ -2305,6 +2302,25 @@ back), `an_open_waits_for_the_open_of_its_file_under_way_and_takes_its_database`
 `a_blocking_open_waits_for_the_open_of_its_file_under_way_without_opening_it`,
 `an_open_reserves_its_file_before_it_opens_it`, `a_failed_open_closes_its_file_before_it_lets_another_open_go`
 (the lock still held as the mark is let go), and the opening state's drop finishing its completion.
+
+### `TursoDatabase::open` asks the registry before it opens its file
+2026-11-28, owner's permission. `sdk-kit/src/rsapi.rs`, `core/database.rs`. The open of the SDK, the path
+the Rust binding and the forge take, opened its file and took its lock first, and asked the registry after
+(`Database::open_async`). Closing any descriptor of a file drops every lock the process holds on it, so a
+database of the file closing, or this open's own file closed unused beside a database already open (a
+registry hit kept the file in the open's state until the `TursoDatabase` dropped), dropped the lock of a
+database in use: another process could open it. `Database::reserve_open(state, io, path, options)` is the
+registry's part of an open that opens the file itself: it returns a completion to wait on while an open of
+the file is under way or a database of it is closing, the database already registered (then the open takes
+it and opens no file), or the go-ahead with the file reserved in `state`, which `open_async` then uses. The
+SDK's `open` calls it before `io.open_file`, parks on the wait or returns it to an asynchronous caller, and
+makes its IO once, not at each entry of the phase. `Database::while_closing_for_test` (`test_helper`) holds
+a closing database for a test. Upstream has the same code.
+Tests (Linux, real files), each seen failing with the open of the file first again:
+`a_blocking_open_waits_for_a_closing_database_of_its_file`, `an_async_open_pends_on_a_closing_database_of_its_file`
+(pending on the close, the file not opened, the reopened database's lock held after the old files closed) and
+`a_second_open_of_a_file_takes_its_open_database_and_opens_nothing` (the first's lock held after the second
+is dropped).
 
 ### io_uring runs completion callbacks without the ring's lock
 2026-11-28. `core/io/io_uring.rs`. `drain_cq` ran every completion's callback while holding the ring

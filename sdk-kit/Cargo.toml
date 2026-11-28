@@ -38,6 +38,7 @@ tracing-appender = { workspace = true }
 
 [dev-dependencies]
 libc = "0.2.172"
+turso_core = { workspace = true, features = ["test_helper"] }
 tempfile = { workspace = true }
 
 [build-dependencies]

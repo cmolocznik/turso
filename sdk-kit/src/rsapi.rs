@@ -978,7 +978,7 @@ impl TursoDatabase {
             let mut state = self.open_state.lock().unwrap();
             match state.phase {
                 TursoDatabaseOpenPhase::Init => {
-                    let inner_db = self.db.lock().unwrap();
+                    let mut inner_db = self.db.lock().unwrap();
                     if inner_db.is_some() {
                         return Err(TursoError::Misuse(
                             "database must be opened only once".to_string(),
@@ -986,10 +986,17 @@ impl TursoDatabase {
                     }
                     // keep lock for the whole method since open_async must be called only once and never will be called concurrently
 
-                    let io: Arc<dyn turso_core::IO> = self.open_vfs_io()?;
-
-                    // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
-                    *self.io.lock().unwrap() = Some(io.clone());
+                    // The IO is made once: this phase is entered again after each wait below.
+                    let io: Arc<dyn turso_core::IO> = match &state.io {
+                        Some(io) => io.clone(),
+                        None => {
+                            let io = self.open_vfs_io()?;
+                            // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
+                            *self.io.lock().unwrap() = Some(io.clone());
+                            state.io = Some(io.clone());
+                            io
+                        }
+                    };
 
                     // Opts must be computed BEFORE the file open so we can apply
                     // OpenFlags::NoLock when multiprocess WAL is enabled — taking
@@ -1016,8 +1023,43 @@ impl TursoDatabase {
                     let db_file = if let Some(db_file) = &self.config.db_file {
                         db_file.clone()
                     } else {
-                        let file = io.open_file(&self.config.path, open_flags, true)?;
-                        Arc::new(DatabaseFile::new(file))
+                        // The registry is asked before the file is opened: opening it takes its
+                        // lock, and closing any descriptor of a file drops every lock the
+                        // process holds on it, as a database of the file closing, or this
+                        // open's file closed unused beside a database already open, would.
+                        let options = OpenOptions::new(Arc::new(SqliteDialect))
+                            .flags(open_flags)
+                            .db_opts(opts)
+                            .encryption(self.config.encryption.clone())
+                            .page_codec(self.config.page_codec.clone());
+                        match Database::reserve_open(
+                            &mut state.open_db_state,
+                            &io,
+                            &self.config.path,
+                            &options,
+                        )? {
+                            IOResult::IO(io_completion) => {
+                                if self.config.async_io {
+                                    return Ok(IOResult::IO(io_completion));
+                                }
+                                io_completion.wait(io.deref())?;
+                                continue;
+                            }
+                            IOResult::Done(Some(db)) => {
+                                *inner_db = Some(db);
+                                state.phase = TursoDatabaseOpenPhase::Done;
+                                return Ok(IOResult::Done(()));
+                            }
+                            IOResult::Done(None) => {}
+                        }
+                        match io.open_file(&self.config.path, open_flags, true) {
+                            Ok(file) => Arc::new(DatabaseFile::new(file)),
+                            Err(error) => {
+                                // Nothing is open: the file's reservation goes with the state.
+                                state.open_db_state = OpenDbAsyncState::new();
+                                return Err(error.into());
+                            }
+                        }
                     };
 
                     state.io = Some(io);
@@ -2005,7 +2047,7 @@ mod tests {
         ));
         config.path = dir.path().join("parks.db").to_str().unwrap().to_owned();
         let db = TursoDatabase::new(config);
-        db.open().unwrap();
+        let _ = db.open().unwrap();
         let replicator = Arc::new(Holding::default());
         db.db_core()
             .unwrap()
@@ -2043,6 +2085,149 @@ mod tests {
         let ticks = writer.join().unwrap();
         // A second of waiting: a spinning thread takes about 100 ticks of it.
         assert!(ticks < 30, "the waiting step took {ticks} ticks of CPU");
+    }
+
+    /// Whether the process holds a lock on `file`, as a query of an open file description's write
+    /// lock over it sees.
+    #[cfg(target_os = "linux")]
+    fn locked(file: &std::fs::File) -> bool {
+        use std::os::fd::AsRawFd as _;
+
+        // SAFETY: an all-zero `flock` is a valid one.
+        let mut query: libc::flock = unsafe { std::mem::zeroed() };
+        query.l_type = libc::F_WRLCK as libc::c_short;
+        query.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: the descriptor is open and `query` outlives the call.
+        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut query) };
+        assert_eq!(asked, 0);
+        query.l_type != libc::F_UNLCK as libc::c_short
+    }
+
+    /// A database of a file whose last handle is dropped, its files not yet closed, and a
+    /// `TursoDatabase` of the same file opened meanwhile: the opener waits before it opens the
+    /// file, so that the closing files, whose closing drops every lock the process holds on the
+    /// file, never take the new database's lock.
+    #[cfg(target_os = "linux")]
+    fn reopen_while_closing(async_io: bool) {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopened.db").to_str().unwrap().to_owned();
+        let config = |async_io| {
+            let mut config = config_with_features(None);
+            config.path = path.clone();
+            config.async_io = async_io;
+            config
+        };
+        let first = TursoDatabase::new(config(false));
+        let _ = first.open().unwrap();
+        first
+            .connect()
+            .unwrap()
+            .prepare_single("CREATE TABLE t (x)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+        let io = first.io().unwrap();
+        // Kept open throughout: closing it would drop the process's locks.
+        let probe = std::fs::File::open(&path).unwrap();
+        assert!(locked(&probe), "the open database holds no lock to see");
+        let (closing, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        turso_core::Database::while_closing_for_test(
+            io.as_ref(),
+            &path,
+            Box::new(move || {
+                closing.send(()).unwrap();
+                released.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        let closer = std::thread::spawn(move || drop(first));
+        entered.recv().unwrap();
+
+        let second = TursoDatabase::new(config(async_io));
+        if async_io {
+            // The open is pending on the close, not blocked, and has opened nothing.
+            let turso_core::IOResult::IO(wait) = second.open().unwrap() else {
+                panic!("opened while the old database's files were open");
+            };
+            assert!(!wait.finished());
+            assert!(
+                locked(&probe),
+                "the old database's lock is gone before it closed"
+            );
+            release.send(()).unwrap();
+            closer.join().unwrap();
+            assert!(wait.finished());
+            while let turso_core::IOResult::IO(wait) = second.open().unwrap() {
+                wait.wait(second.io().unwrap().as_ref()).unwrap();
+            }
+        } else {
+            let (opened, opens) = mpsc::channel();
+            let opener = std::thread::spawn(move || {
+                let _ = second.open().unwrap();
+                opened.send(()).unwrap();
+                second
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                opens.try_recv().is_err(),
+                "opened while the old database's files were open"
+            );
+            release.send(()).unwrap();
+            closer.join().unwrap();
+            opens
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the open never went on once the close ended");
+            let second = opener.join().unwrap();
+            assert!(locked(&probe), "the reopened database lost its lock");
+            drop(second);
+            return;
+        }
+        assert!(locked(&probe), "the reopened database lost its lock");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_blocking_open_waits_for_a_closing_database_of_its_file() {
+        reopen_while_closing(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_async_open_pends_on_a_closing_database_of_its_file() {
+        reopen_while_closing(true);
+    }
+
+    /// A second `TursoDatabase` of a file whose database is open takes that database and opens no
+    /// file of its own: closing it later would drop the lock of the first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_open_of_a_file_takes_its_open_database_and_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db").to_str().unwrap().to_owned();
+        let config = || {
+            let mut config = config_with_features(None);
+            config.path = path.clone();
+            config
+        };
+        let first = TursoDatabase::new(config());
+        let _ = first.open().unwrap();
+        let probe = std::fs::File::open(&path).unwrap();
+        assert!(locked(&probe), "the open database holds no lock to see");
+        let second = TursoDatabase::new(config());
+        let _ = second.open().unwrap();
+        assert!(Arc::ptr_eq(
+            &first.db_core().unwrap(),
+            &second.db_core().unwrap()
+        ));
+        drop(second);
+        assert!(
+            locked(&probe),
+            "the second open's close dropped the first's lock"
+        );
+        drop(first);
     }
 
     /// A failed open closes the file it opened, whose closing would drop the process's lock on it,

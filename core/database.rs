@@ -640,6 +640,16 @@ pub(crate) enum RegistryEntry {
     Ready(Weak<Database>, Completion),
 }
 
+/// What one look at the registry tells an open of a file ([`Database::registry_step`]).
+enum RegistryStep {
+    /// The database registered for the file.
+    Hit(Arc<Database>),
+    /// Wait for this to finish, then look again.
+    Wait(Completion),
+    /// Open the file: nothing of it is registered.
+    Go,
+}
+
 /// An open's mark in the registry, the last field of its state, so that it drops once what the
 /// open opened has closed: it then takes its entry out, if it is still the entry, and finishes
 /// its completion, which the opens waiting for it look again on.
@@ -699,7 +709,7 @@ impl Drop for Closed {
 
 /// Run, once, as a database of the file under each key is closing: its last handle dropped, its
 /// files not yet closed. Only a test sets one.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 #[allow(clippy::type_complexity)]
 pub(crate) static WHILE_CLOSING: LazyLock<
     parking_lot::Mutex<HashMap<DatabaseKey, Box<dyn FnOnce() + Send>>>,
@@ -866,7 +876,7 @@ impl fmt::Debug for Database {
 
 /// Runs the hook a test set for a database of this file closing: its last handle dropped, its
 /// files not yet closed.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
     fn drop(&mut self) {
         let Some(closed) = self.closed.get() else {
@@ -993,6 +1003,24 @@ impl Database {
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
         Self::open(io, path, OpenOptions::new(dialect))
+    }
+
+    /// Runs `hook`, once, as the database of the file at `path` is closing: its last handle
+    /// dropped, its files not yet closed. For tests of an open that comes meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// If the file does not exist.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn while_closing_for_test(
+        io: &dyn IO,
+        path: &str,
+        hook: Box<dyn FnOnce() + Send>,
+    ) -> Result<()> {
+        WHILE_CLOSING
+            .lock()
+            .insert(DatabaseKey::File(io.file_id(path)?), hook);
+        Ok(())
     }
 
     /// Registers `db` under `key`, in place of the entry there (an open's own, or a dead one),
@@ -1220,6 +1248,56 @@ impl Database {
         Ok(())
     }
 
+    /// One look at the registry for an open of `path`: the database registered for its file, a
+    /// completion to wait for (an open of the file under way, or a database of it closing), or
+    /// the go-ahead to open it. With the go-ahead for a file that exists, nothing of it is
+    /// registered and this open has reserved it in `state`, before it opens (and locks) the
+    /// file, so no other open of the file opens it meanwhile.
+    fn registry_step(io: &Arc<dyn IO>, state: &mut OpenDbAsyncState, path: &str) -> RegistryStep {
+        if is_memory_like(path) || state.opening.is_some() {
+            return RegistryStep::Go;
+        }
+        // The file does not exist yet: nothing of it can be registered.
+        let Ok(file_id) = io.file_id(path) else {
+            return RegistryStep::Go;
+        };
+        let key = DatabaseKey::File(file_id);
+        let mut registry = DATABASE_MANAGER.lock();
+        match registry.get(&key) {
+            Some(RegistryEntry::Ready(weak, done)) => match weak.upgrade() {
+                Some(db) => RegistryStep::Hit(db),
+                // The last handle dropped: the database's files are closing.
+                None => RegistryStep::Wait(done.clone()),
+            },
+            Some(RegistryEntry::Opening(done)) => RegistryStep::Wait(done.clone()),
+            None => {
+                let done = Completion::new_remote_wait();
+                registry.insert(key.clone(), RegistryEntry::Opening(done.clone()));
+                state.opening = Some(OpeningMark { key, done });
+                RegistryStep::Go
+            }
+        }
+    }
+
+    /// A database taken from the registry must have been opened as this open asks.
+    fn validate_registered(
+        db: &Database,
+        encryption_opts: &Option<EncryptionOpts>,
+        dialect: &dyn Dialect,
+        page_codec: Option<&dyn PageCodec>,
+    ) -> Result<()> {
+        // Validate encryption compatibility (key is not stored for security,
+        // so we can only check cipher mode)
+        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+        if db_is_encrypted && encryption_opts.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "Database is encrypted but no encryption options provided".to_string(),
+            ));
+        }
+        db.validate_page_codec(page_codec)?;
+        Self::check_registry_dialect(db, dialect)
+    }
+
     /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
@@ -1236,48 +1314,57 @@ impl Database {
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
     ) -> Result<Option<Arc<Database>>> {
-        if is_memory_like(path) {
-            return Ok(None);
-        }
-        let file_id = match io::get_file_id(path) {
-            Ok(id) => id,
-            Err(_) => return Ok(None), // file doesn't exist yet
-        };
-        let key = DatabaseKey::File(file_id);
-        let db = loop {
-            let wait = {
-                let mut registry = DATABASE_MANAGER.lock();
-                match registry.get(&key) {
-                    Some(RegistryEntry::Ready(weak, done)) => match weak.upgrade() {
-                        Some(db) => break db,
-                        // The last handle dropped: the database's files are closing.
-                        None => done.clone(),
-                    },
-                    Some(RegistryEntry::Opening(done)) => done.clone(),
-                    None => {
-                        let done = Completion::new_remote_wait();
-                        registry.insert(key.clone(), RegistryEntry::Opening(done.clone()));
-                        state.opening = Some(OpeningMark { key, done });
-                        return Ok(None);
-                    }
+        loop {
+            match Self::registry_step(io, state, path) {
+                RegistryStep::Hit(db) => {
+                    Self::validate_registered(&db, encryption_opts, dialect, page_codec)?;
+                    return Ok(Some(db));
                 }
-            };
-            wait.park_until_finished(io.as_ref())?;
-        };
-
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
+                RegistryStep::Go => return Ok(None),
+                RegistryStep::Wait(done) => done.park_until_finished(io.as_ref())?,
+            }
         }
-        db.validate_page_codec(page_codec)?;
+    }
 
-        Self::check_registry_dialect(&db, dialect)?;
-
-        Ok(Some(db))
+    /// The registry's part of an open that opens the file itself, before [`Database::open_async`]
+    /// takes the file it opened: for a caller that drives the IO loop, as
+    /// [`Database::open`]'s lookup does for one that blocks. Call it before opening the file at
+    /// `path`, and again, after waiting, while it returns IO:
+    ///
+    /// - IO: an open of the file is under way, or a database of it is closing: wait for the
+    ///   completion, then call again.
+    /// - Done with a database: it is registered for the file already; open nothing, and take it.
+    /// - Done with none: open the file and call `open_async` with `state`, which holds the
+    ///   registry's reservation of the file until it is dropped. A file that does not exist yet,
+    ///   or in memory, is reserved by `open_async`.
+    ///
+    /// Opening the file first, as `open_async` alone asks, takes the file's lock before the
+    /// registry is asked, and closing any descriptor of a file drops every lock the process holds
+    /// on it, so a database of the file closing, or another open's file closed unused, would drop
+    /// the lock of this open.
+    ///
+    /// # Errors
+    ///
+    /// If the database registered for the file was opened as `options` do not ask.
+    pub fn reserve_open(
+        state: &mut OpenDbAsyncState,
+        io: &Arc<dyn IO>,
+        path: &str,
+        options: &OpenOptions,
+    ) -> IOResultOr<Option<Arc<Database>>> {
+        match Self::registry_step(io, state, path) {
+            RegistryStep::Hit(db) => {
+                Self::validate_registered(
+                    &db,
+                    &options.encryption,
+                    options.dialect.as_ref(),
+                    options.page_codec.as_deref(),
+                )?;
+                Ok(IOResult::Done(Some(db)))
+            }
+            RegistryStep::Go => Ok(IOResult::Done(None)),
+            RegistryStep::Wait(done) => Ok(IOResult::IO(types::IOCompletions(done))),
+        }
     }
 
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {

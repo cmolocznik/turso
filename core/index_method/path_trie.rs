@@ -209,7 +209,6 @@ pub struct PathTrieCursor {
     by_path: Option<Box<dyn CursorTrait>>,
     by_directory: Option<Box<dyn CursorTrait>>,
     /// An open of its cursors is under way: entered again, it goes on with the cursors it made.
-    opening: bool,
     pending_store_ops: VecDeque<BackingStoreOp>,
     /// The entries an insert or a delete has decided to write, until they are written.
     writes: Option<Writes>,
@@ -225,7 +224,6 @@ impl PathTrieCursor {
             depth,
             by_path: None,
             by_directory: None,
-            opening: false,
             pending_store_ops: VecDeque::new(),
             writes: None,
             query: None,
@@ -242,25 +240,8 @@ impl PathTrieCursor {
     }
 
     fn open_cursors(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        let out = self.open_cursors_inner(context);
-        if !matches!(out, Ok(IOResult::IO(_))) {
-            self.opening = false;
-        }
-        out
-    }
-
-    fn open_cursors_inner(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        if !self.opening {
-            self.by_path = Some(open_store_cursor(context, &self.schema.indexes[0])?);
-            self.by_directory = Some(open_store_cursor(context, &self.schema.indexes[1])?);
-            self.opening = true;
-        }
-        for cursor in [&mut self.by_path, &mut self.by_directory]
-            .into_iter()
-            .flatten()
-        {
-            return_if_io!(cursor.finish_open());
-        }
+        self.by_path = Some(open_store_cursor(context, &self.schema.indexes[0])?);
+        self.by_directory = Some(open_store_cursor(context, &self.schema.indexes[1])?);
         Ok(IOResult::Done(()))
     }
 
@@ -349,7 +330,6 @@ impl IndexMethodCursor for PathTrieCursor {
     fn close(&mut self, _context: &IndexMethodContext) {
         self.by_path = None;
         self.by_directory = None;
-        self.opening = false;
     }
 
     /// Adds the row's entries. It reads nothing: no other row's entry is touched.

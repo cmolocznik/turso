@@ -937,7 +937,6 @@ pub struct TrigramCursor {
     table_name: String,
     cursors: Cursors,
     /// An open of its cursors is under way: entered again, it goes on with the cursors it made.
-    opening: bool,
     pending_store_ops: VecDeque<BackingStoreOp>,
     pending: Pending,
     /// The writes the statement's end decided on, until they are written.
@@ -957,7 +956,6 @@ impl TrigramCursor {
             text_column: configuration.columns[0].pos_in_table,
             table_name: configuration.table_name.clone(),
             cursors: Cursors::default(),
-            opening: false,
             pending_store_ops: VecDeque::new(),
             pending: Pending::default(),
             staging: None,
@@ -977,36 +975,16 @@ impl TrigramCursor {
     }
 
     fn open_cursors(&mut self, context: &IndexMethodContext, read: bool) -> IOResultOr<()> {
-        let out = self.open_cursors_inner(context, read);
-        if !matches!(out, Ok(IOResult::IO(_))) {
-            self.opening = false;
-        }
-        out
-    }
-
-    fn open_cursors_inner(&mut self, context: &IndexMethodContext, read: bool) -> IOResultOr<()> {
-        if !self.opening {
-            for tree in TREES {
-                if self.cursors.trees[tree as usize].is_none() {
-                    self.cursors.trees[tree as usize] = Some(open_store_cursor(
-                        context,
-                        &self.schema.indexes[tree as usize],
-                    )?);
-                }
+        for tree in TREES {
+            if self.cursors.trees[tree as usize].is_none() {
+                self.cursors.trees[tree as usize] = Some(open_store_cursor(
+                    context,
+                    &self.schema.indexes[tree as usize],
+                )?);
             }
-            if read && self.cursors.table.is_none() {
-                self.cursors.table = Some(context.open_table_cursor(&self.table_name)?);
-            }
-            self.opening = true;
         }
-        for cursor in self
-            .cursors
-            .trees
-            .iter_mut()
-            .chain(std::iter::once(&mut self.cursors.table))
-            .flatten()
-        {
-            return_if_io!(cursor.finish_open());
+        if read && self.cursors.table.is_none() {
+            self.cursors.table = Some(context.open_table_cursor(&self.table_name)?);
         }
         Ok(IOResult::Done(()))
     }
@@ -1075,7 +1053,6 @@ impl IndexMethodCursor for TrigramCursor {
 
     fn close(&mut self, _context: &IndexMethodContext) {
         self.cursors = Cursors::default();
-        self.opening = false;
     }
 
     /// Takes the text into the statement's segment. It reads and writes nothing until the

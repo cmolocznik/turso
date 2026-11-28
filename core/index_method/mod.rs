@@ -34,6 +34,8 @@ pub mod trigram;
 pub use backing_store::{
     BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp, BackingTable,
 };
+#[cfg(any(test, feature = "test_helper"))]
+pub use optimize_steps::set_before_claiming_commit_for_test;
 
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
 pub const TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME: &str = "toy_vector_sparse_ivf";

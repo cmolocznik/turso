@@ -1,6 +1,7 @@
 //! The `trigram` index method: `code_match` returns the same rows through the index as a plain
 //! scan does, whatever was inserted, updated and deleted before, and in how many statements.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use core_tester::common::rng_from_time_or_env;
@@ -668,9 +669,10 @@ fn a_merge_copies_texts_a_step_at_a_time() {
     assert_eq!(matching(&conn, "abcd").len(), 400);
 }
 
-/// Two runs of `OPTIMIZE INDEX` stepped by turns under MVCC choose no segment twice: a step that
-/// claims what the other claimed loses its commit and is done again, carrying the other's merge
-/// on. Both end, and every answer is a plain scan's.
+/// A run of `OPTIMIZE INDEX` whose claim of a merge's segments commits after another run claimed
+/// and merged them loses that commit, as each claim is one key both write (a materialized
+/// conflict, Fekete et al., TODS 30(2), 2005), and goes on from what the other left. Both end,
+/// every answer is a plain scan's, and the index merges on.
 #[cfg(feature = "test_helper")]
 #[test]
 fn two_merging_at_once_claim_no_segment_twice() {
@@ -696,23 +698,21 @@ fn two_merging_at_once_claim_no_segment_twice() {
         }
     }
     let (first, second) = (tmp_db.connect_limbo(), tmp_db.connect_limbo());
-    let mut runs = [
-        Some(first.prepare("OPTIMIZE INDEX docs_by_trigram").unwrap()),
-        Some(second.prepare("OPTIMIZE INDEX docs_by_trigram").unwrap()),
-    ];
-    let mut turns = 0;
-    while runs.iter().any(Option::is_some) {
-        for run in runs.iter_mut() {
-            let Some(statement) = run else { continue };
-            turns += 1;
-            assert!(turns < 200_000, "the merges never ended");
-            match statement.step().unwrap() {
-                turso_core::StepResult::Done => *run = None,
-                turso_core::StepResult::Row => {}
-                _ => statement.wait_io().unwrap(),
-            }
+    let ran = Arc::new(AtomicBool::new(false));
+    turso_core::index_method::set_before_claiming_commit_for_test(Some(Box::new({
+        let ran = ran.clone();
+        move || {
+            // A whole other run, between the first run's claim and its commit.
+            second.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+            ran.store(true, Ordering::SeqCst);
         }
-    }
+    })));
+    first.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the other run never ran beside it"
+    );
+    first.execute("OPTIMIZE INDEX docs_by_trigram").unwrap();
     let reader = tmp_db.connect_limbo();
     for pattern in PATTERNS {
         assert_eq!(

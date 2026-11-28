@@ -2287,18 +2287,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let RowKey::Record(record) = &rowid.row_id else {
             panic!("invalid index row_id type, should be Record")
         };
+        if !record.metadata.has_rowid {
+            // A key without an appended rowid (an index method's backing B-tree, or a
+            // WITHOUT ROWID table's primary key) is one entry, whatever the index's
+            // `unique`: the whole key, a NULL in it a value like any other, and two
+            // transactions that write it conflict.
+            if let Some(index_rows) = mvcc_store.index_rows.get(&rowid.table_id) {
+                if let Some(entry) = index_rows.value().get(record) {
+                    let row_versions = entry.value().read();
+                    self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
+                }
+            }
+            return Ok(());
+        }
         if !record.metadata.is_unique {
             // Skip indexes which are not unique or not primary key
             return Ok(());
         }
-        // A key without an appended rowid (an index method's backing B-tree)
-        // is unique over the whole key; keys with a rowid are unique over
-        // everything before it.
-        let num_indexed_cols = if record.metadata.has_rowid {
-            record.metadata.num_cols.saturating_sub(1) // exclude rowid column
-        } else {
-            record.metadata.num_cols
-        };
+        // A key with a rowid is unique over everything before it.
+        let num_indexed_cols = record.metadata.num_cols.saturating_sub(1);
         // In SQLite, NULLs don't violate UNIQUE constraints - skip conflict check for keys containing NULL
         if record.contains_null(num_indexed_cols)? {
             return Ok(());

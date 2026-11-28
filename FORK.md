@@ -2193,11 +2193,19 @@ statement's takes the setting from it.
 Limits: it rewrites the whole index. Other index methods choose as before.
 Tests: in `index_method::trigram` (one, under `io_memory_yield`).
 - Three segments, below the policy's level of eight: without the setting the removed texts' lists
-  stay to be read; with it, a query for their word reads about as little as one for a word no text
-  held. A word removed from the lone segment then is dropped too, and the answers stay the same.
+  stay to be read; with it, a query for their word reads under a third of the pages it read while
+  they stayed. A word removed from the lone segment then is dropped too, and the answers stay the
+  same.
 Each part is seen failing without it: the setting ignored, the setting not passed to the step
-connection, and a lone segment never merged. Merging two at a time instead of all is the same,
-since `OPTIMIZE INDEX` merges until nothing is left.
+connection, a removed text copied into the merged segment (the merge never ends), a removed
+text's number kept in the lists (36 waits of 85), and a lone segment never merged.
+Merging two at a time instead of all is the same, since `OPTIMIZE INDEX` merges until nothing is
+left.
+Changed 2026-11-28 (owner's permission, test only): the test compared the removed word's waits with
+a never-held word's, at most twice them. Both vary with the pages' layout, which the segments'
+random ids shape, so it failed about one run in ten (38 and 65 of 600 for its two parts), nothing
+wrong. It now compares with what the same query read before the merge: at most 20 of 84 and 15 of
+67 over 600 runs, against the third it allows.
 
 ### A replicated commit's applier, refused by another's write lock, is left in no transaction
 2026-11-23. `sync/engine/src/replicated_log.rs`. A follower's own transactions, a checkpoint or its index's merge,

@@ -152,11 +152,8 @@ mod tests {
         {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -173,13 +170,13 @@ mod tests {
         let conn = db.connect_limbo();
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
-        // A new row goes to its place in the stored (reversed) text order:
-        // ananab < elppa < tocirpa < yrrehc.
+        // The type has no DECODE, so words read back as they are stored
+        // (reversed). A new row goes to its place in that order.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
         let rows: Vec<(String,)> =
             conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
-        let words = ["banana", "apple", "apricot", "cherry"];
+        let words = ["ananab", "elppa", "tocirpa", "yrrehc"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
@@ -189,6 +186,138 @@ mod tests {
         let rows: Vec<(i64,)> = conn
             .exec_rows("SELECT id FROM t INDEXED BY t_n_plus_one WHERE n+1 > 10.5 ORDER BY n+1");
         assert_eq!(rows, vec![(2,), (3,)]);
+    }
+
+    /// Under MVCC the schema is rebuilt from sqlite_schema rows when the
+    /// logical log is replayed on open and when a passive checkpoint runs.
+    /// Indexes on columns whose type has its own order must keep that order
+    /// in both.
+    #[test]
+    fn test_mvcc_index_keeps_type_order_after_schema_rebuild() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("mvcc_type_order_rebuild.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_experimental_mvcc_passive_checkpoint(true);
+        let open = || {
+            TempDatabase::builder()
+                .with_db_path(&path)
+                .with_opts(opts)
+                .with_mvcc(true)
+                .build()
+        };
+        let check = |conn: &Arc<turso_core::Connection>, words: &[&str], ids: &[i64]| {
+            let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_eq!(integrity, vec![("ok".to_string(),)]);
+            let rows: Vec<(String,)> =
+                conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+            let words: Vec<(String,)> = words.iter().map(|w| (w.to_string(),)).collect();
+            assert_eq!(rows, words);
+            let ids: Vec<(i64,)> = ids.iter().map(|id| (*id,)).collect();
+            for sql in [
+                "SELECT id FROM t INDEXED BY t_n WHERE n > 10 ORDER BY id",
+                "SELECT id FROM t NOT INDEXED WHERE n > 10 ORDER BY id",
+            ] {
+                let rows: Vec<(i64,)> = conn.exec_rows(sql);
+                assert_eq!(rows, ids, "{sql}");
+            }
+        };
+
+        {
+            let db = open();
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX t_word ON t(word)").unwrap();
+            conn.execute("CREATE INDEX t_n ON t(n)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1,'cherry',9), (2,'apple',10.5)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        // Reopening replays the logical log, which rebuilds the schema.
+        let db = open();
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t VALUES (3,'banana',100)")
+            .unwrap();
+        // Words read back as stored (reversed): ananab < elppa < yrrehc.
+        check(&conn, &["ananab", "elppa", "yrrehc"], &[2, 3]);
+
+        // A passive checkpoint builds its own schema to write the index rows.
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (4,'apricot',50)")
+            .unwrap();
+        check(&conn, &["ananab", "elppa", "tocirpa", "yrrehc"], &[2, 3, 4]);
+    }
+
+    /// Under MVCC, reopening replays the logical log; a domain's DEFAULT and
+    /// NOT NULL must still apply afterwards.
+    #[test]
+    fn test_mvcc_domain_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("mvcc_domain_reopen.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let open = || {
+            TempDatabase::builder()
+                .with_db_path(&path)
+                .with_opts(opts)
+                .with_mvcc(true)
+                .build()
+        };
+
+        {
+            let db = open();
+            let conn = db.connect_limbo();
+            conn.execute("CREATE DOMAIN d AS integer DEFAULT 4 NOT NULL")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a d, b int) STRICT").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = open();
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t(b) VALUES (1)").unwrap();
+        assert!(conn.execute("INSERT INTO t VALUES (NULL, 2)").is_err());
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM t");
+        assert_eq!(rows, vec![(4, 1)]);
+    }
+
+    /// Under MVCC a passive checkpoint builds its own schema to write index
+    /// rows. An index on a domain over numeric must keep the numeric order
+    /// there, or the checkpointed index rows are out of order.
+    #[test]
+    fn test_mvcc_passive_checkpoint_keeps_domain_index_order() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_experimental_mvcc_passive_checkpoint(true);
+        let db = TempDatabase::builder()
+            .with_opts(opts)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE DOMAIN dn AS numeric").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n dn) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX t_n ON t(n)").unwrap();
+        for i in 1..=300 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, {i}.5)"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        for sql in [
+            "SELECT id FROM t INDEXED BY t_n WHERE n > 299 ORDER BY id",
+            "SELECT id FROM t NOT INDEXED WHERE n > 299 ORDER BY id",
+        ] {
+            let rows: Vec<(i64,)> = conn.exec_rows(sql);
+            assert_eq!(rows, vec![(299,), (300,)], "{sql}");
+        }
     }
 
     #[test]
@@ -856,6 +985,339 @@ mod tests {
                 vec![("type_one".to_string(),), ("type_two".to_string(),)],
                 "mvcc={mvcc}"
             );
+            conn.close().unwrap();
+        }
+    }
+
+    /// Every statement that copies a row must copy custom-type values as
+    /// stored. Running DECODE and then ENCODE again changes the value of a
+    /// type whose DECODE does not undo its ENCODE, like `plus1` and `x100`.
+    #[test]
+    fn test_row_copies_keep_custom_type_values() {
+        let mut changed = Vec::new();
+        for copied_type in COPIED_TYPES {
+            for row_copy in [
+                RowCopy::Vacuum,
+                RowCopy::VacuumInto,
+                RowCopy::DropColumn,
+                RowCopy::OnUpdateCascade,
+            ] {
+                if row_copy == RowCopy::OnUpdateCascade && copied_type.new_key.is_none() {
+                    continue;
+                }
+                let column_type = copied_type.column_type;
+                match copy_custom_type_value(copied_type, row_copy) {
+                    Ok((before, after)) if before == after => {}
+                    Ok((before, after)) => {
+                        changed.push(format!("{row_copy:?} {column_type}: {before} -> {after}"))
+                    }
+                    Err(e) => changed.push(format!("{row_copy:?} {column_type}: {e}")),
+                }
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "row copies changed values:\n{}",
+            changed.join("\n")
+        );
+    }
+
+    const CREATE_COPIED_TYPES: &[&str] = &[
+        "CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value",
+        "CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value",
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TYPE shout BASE text ENCODE upper(value) DECODE lower(value)",
+    ];
+
+    // Arrays and types with a DECODE other than `value` can't be keys, so
+    // they have no ON UPDATE CASCADE copy.
+    const COPIED_TYPES: &[CopiedType] = &[
+        CopiedType::new("plus1", "5", Some("9")),
+        CopiedType::new("x100", "1", Some("2")),
+        CopiedType::new("cents", "42", None),
+        CopiedType::new("shout", "'Hi'", None),
+        CopiedType::new("plus1[]", "ARRAY[1, 2]", None),
+        CopiedType::new("shout[]", "ARRAY['a', 'B']", None),
+    ];
+
+    /// A custom-type column and the values to write to it.
+    struct CopiedType {
+        column_type: &'static str,
+        value: &'static str,
+        /// The parent key's new value in the ON UPDATE CASCADE copy, or
+        /// `None` if the type can't be a key.
+        new_key: Option<&'static str>,
+    }
+
+    impl CopiedType {
+        const fn new(
+            column_type: &'static str,
+            value: &'static str,
+            new_key: Option<&'static str>,
+        ) -> Self {
+            Self {
+                column_type,
+                value,
+                new_key,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RowCopy {
+        Vacuum,
+        VacuumInto,
+        DropColumn,
+        OnUpdateCascade,
+    }
+
+    /// Writes a value of `copied_type`, copies it with `row_copy` and returns
+    /// the value read before and after the copy. For ON UPDATE CASCADE these
+    /// are the parent's new key and the child's copy of it.
+    fn copy_custom_type_value(
+        copied_type: &CopiedType,
+        row_copy: RowCopy,
+    ) -> turso_core::Result<(String, String)> {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_vacuum(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        for sql in CREATE_COPIED_TYPES {
+            conn.execute(sql)?;
+        }
+        let CopiedType {
+            column_type,
+            value,
+            new_key,
+        } = copied_type;
+        match row_copy {
+            RowCopy::Vacuum | RowCopy::VacuumInto => {
+                conn.execute(format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v {column_type}) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO t VALUES (1, {value})"))?;
+                let before = first_value(&conn, "SELECT v FROM t")?;
+                if row_copy == RowCopy::Vacuum {
+                    conn.execute("VACUUM")?;
+                    return Ok((before, first_value(&conn, "SELECT v FROM t")?));
+                }
+                let dest_dir = TempDir::new().unwrap();
+                let dest_path = dest_dir.path().join("copy.db");
+                conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+                let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+                let dest_conn = dest_db.connect_limbo();
+                Ok((before, first_value(&dest_conn, "SELECT v FROM t")?))
+            }
+            RowCopy::DropColumn => {
+                conn.execute(format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, dropped INTEGER, v {column_type}) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO t VALUES (1, 0, {value})"))?;
+                let before = first_value(&conn, "SELECT v FROM t")?;
+                conn.execute("ALTER TABLE t DROP COLUMN dropped")?;
+                Ok((before, first_value(&conn, "SELECT v FROM t")?))
+            }
+            RowCopy::OnUpdateCascade => {
+                conn.execute("PRAGMA foreign_keys = ON")?;
+                conn.execute(format!(
+                    "CREATE TABLE parent(k {column_type} PRIMARY KEY) STRICT"
+                ))?;
+                conn.execute(format!(
+                    "CREATE TABLE child(id INTEGER PRIMARY KEY, \
+                     k {column_type} REFERENCES parent(k) ON UPDATE CASCADE) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO parent VALUES ({value})"))?;
+                conn.execute(format!("INSERT INTO child VALUES (1, {value})"))?;
+                let new_key = new_key.expect("only key types are cascaded");
+                conn.execute(format!("UPDATE parent SET k = {new_key}"))?;
+                Ok((
+                    first_value(&conn, "SELECT k FROM parent")?,
+                    first_value(&conn, "SELECT k FROM child")?,
+                ))
+            }
+        }
+    }
+
+    fn first_value(conn: &Arc<turso_core::Connection>, query: &str) -> turso_core::Result<String> {
+        let mut stmt = conn.prepare(query)?;
+        let mut value = None;
+        stmt.run_with_row_callback(|row| {
+            value.get_or_insert(row.get::<&turso_core::Value>(0)?.to_string());
+            Ok(())
+        })?;
+        Ok(value.unwrap_or_else(|| panic!("{query} returned no row")))
+    }
+
+    /// Arrays compare as in PostgreSQL's `array_cmp`: element by element, a
+    /// NULL element is greater than any other element and equal to another
+    /// NULL, and when one array is a prefix of the other the shorter is
+    /// smaller. Checks every pair of arrays of up to two elements, under every
+    /// comparison operator, in WHERE with and without an index, ORDER BY,
+    /// GROUP BY and DISTINCT, against that rule computed here.
+    #[test]
+    fn test_array_comparisons_sort_null_elements_last() {
+        /// An element: `None` is NULL, `Some(k)` is the k-th smallest value.
+        type Array = Vec<Option<usize>>;
+
+        fn expected_order(left: &Array, right: &Array) -> std::cmp::Ordering {
+            use std::cmp::Ordering;
+            for (l, r) in left.iter().zip(right) {
+                let order = match (l, r) {
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                    (Some(l), Some(r)) => l.cmp(r),
+                };
+                if order.is_ne() {
+                    return order;
+                }
+            }
+            left.len().cmp(&right.len())
+        }
+
+        let element_types: [(&str, [&str; 2]); 3] = [
+            ("integer", ["1", "2"]),
+            ("real", ["1.5", "2.5"]),
+            ("text", ["'a'", "'b'"]),
+        ];
+        let symbols = [None, Some(0), Some(1)];
+        let mut arrays: Vec<Array> = vec![vec![]];
+        arrays.extend(symbols.iter().map(|&s| vec![s]));
+        arrays.extend(
+            symbols
+                .iter()
+                .flat_map(|&a| symbols.iter().map(move |&b| vec![a, b])),
+        );
+        let n = arrays.len() as i64;
+        let operators = [
+            ("=", std::cmp::Ordering::is_eq as fn(_) -> bool),
+            ("<>", std::cmp::Ordering::is_ne),
+            ("<", std::cmp::Ordering::is_lt),
+            ("<=", std::cmp::Ordering::is_le),
+            (">", std::cmp::Ordering::is_gt),
+            (">=", std::cmp::Ordering::is_ge),
+        ];
+
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            for (element_type, values) in element_types {
+                // `ARRAY[]` and `ARRAY[NULL]` have no element type to infer, so they
+                // get a CAST, and a CAST keeps the planner from seeking the index.
+                let untyped = |array: &Array| array.iter().all(Option::is_none);
+                let literal = |array: &Array| {
+                    let elements: Vec<&str> = array
+                        .iter()
+                        .map(|e| e.map_or("NULL", |k| values[k]))
+                        .collect();
+                    let literal = format!("ARRAY[{}]", elements.join(","));
+                    if untyped(array) {
+                        format!("CAST({literal} AS {element_type}[])")
+                    } else {
+                        literal
+                    }
+                };
+                let plain = format!("plain_{element_type}");
+                let indexed = format!("indexed_{element_type}");
+                for table in [&plain, &indexed] {
+                    conn.execute(format!(
+                        "CREATE TABLE {table}(id INTEGER PRIMARY KEY, a {element_type}[]) STRICT"
+                    ))
+                    .unwrap();
+                    // Each array twice, as rows i and i + n.
+                    for (i, array) in arrays.iter().enumerate() {
+                        for id in [i as i64, i as i64 + n] {
+                            conn.execute(format!(
+                                "INSERT INTO {table} VALUES ({id}, {})",
+                                literal(array)
+                            ))
+                            .unwrap();
+                        }
+                    }
+                }
+                conn.execute(format!("CREATE INDEX {indexed}_a ON {indexed}(a)"))
+                    .unwrap();
+                let array_of = |id: i64| &arrays[(id % n) as usize];
+                let context = format!("mvcc={mvcc}, {element_type}[]");
+
+                for (op, holds) in operators {
+                    let rows: Vec<(i64, i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT l.id, r.id, l.a {op} r.a FROM {plain} l, {plain} r \
+                         WHERE l.id < {n} AND r.id < {n}"
+                    ));
+                    assert_eq!(rows.len(), arrays.len() * arrays.len(), "{context}");
+                    for (l, r, result) in rows {
+                        let (left, right) = (array_of(l), array_of(r));
+                        assert_eq!(
+                            result,
+                            holds(expected_order(left, right)) as i64,
+                            "{context}: {left:?} {op} {right:?}"
+                        );
+                    }
+
+                    for right in &arrays {
+                        let expected: Vec<(i64,)> = (0..2 * n)
+                            .filter(|&id| holds(expected_order(array_of(id), right)))
+                            .map(|id| (id,))
+                            .collect();
+                        for source in [plain.clone(), format!("{indexed} INDEXED BY {indexed}_a")] {
+                            let query = format!(
+                                "SELECT id FROM {source} WHERE a {op} {} ORDER BY id",
+                                literal(right)
+                            );
+                            if source != plain && op != "<>" && !untyped(right) {
+                                let plan: Vec<(i64, i64, i64, String)> =
+                                    conn.exec_rows(&format!("EXPLAIN QUERY PLAN {query}"));
+                                assert!(
+                                    plan.iter().any(|(.., detail)| detail.starts_with("SEARCH")),
+                                    "{context}: {query} does not seek the index: {plan:?}"
+                                );
+                            }
+                            let rows: Vec<(i64,)> = conn.exec_rows(&query);
+                            assert_eq!(rows, expected, "{context}: {query}");
+                        }
+                    }
+                }
+
+                for table in [&plain, &indexed] {
+                    for direction in ["ASC", "DESC"] {
+                        let ids: Vec<(i64,)> = conn
+                            .exec_rows(&format!("SELECT id FROM {table} ORDER BY a {direction}"));
+                        let sorted: Vec<&Array> = ids.iter().map(|&(id,)| array_of(id)).collect();
+                        assert_eq!(sorted.len(), 2 * arrays.len(), "{context}");
+                        for pair in sorted.windows(2) {
+                            let order = expected_order(pair[0], pair[1]);
+                            let in_order = match direction {
+                                "ASC" => order.is_le(),
+                                _ => order.is_ge(),
+                            };
+                            assert!(
+                                in_order,
+                                "{context}: {table} ORDER BY a {direction}: {sorted:?}"
+                            );
+                        }
+                    }
+
+                    let groups: Vec<(i64, i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT min(id), max(id), count(*) FROM {table} GROUP BY a ORDER BY a"
+                    ));
+                    let mut expected: Vec<(i64, i64, i64)> =
+                        (0..n).map(|i| (i, i + n, 2)).collect();
+                    expected.sort_by(|l, r| expected_order(array_of(l.0), array_of(r.0)));
+                    assert_eq!(groups, expected, "{context}: {table} GROUP BY a");
+
+                    let distinct: Vec<(i64,)> = conn.exec_rows(&format!(
+                        "SELECT count(*) FROM (SELECT DISTINCT a FROM {table})"
+                    ));
+                    assert_eq!(distinct, vec![(n,)], "{context}: {table} DISTINCT a");
+                }
+            }
             conn.close().unwrap();
         }
     }

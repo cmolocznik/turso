@@ -4,6 +4,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -267,6 +268,11 @@ enum ReparsePhase {
     /// Loading the CREATE TYPE statements `type_sqls`, then building the
     /// materialized views and indexes collected by the `sqlite_schema` scan.
     BuildIndexes { type_sqls: Vec<String> },
+    /// Loading roles from the roles table into the role catalog.
+    LoadRoles {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -571,6 +577,18 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Whether non-TEMP triggers fire for statements prepared on this
+    /// connection. TEMP triggers always fire, matching SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER`. Not exposed as a PRAGMA: a SQL
+    /// client must not be able to turn off triggers a database relies on
+    /// for its own rules. Only a Rust API caller (the sync engine's row
+    /// replay) can set it.
+    pub(super) triggers_enabled: AtomicBool,
+    /// Whether INSERT and UPDATE statements prepared on this connection write
+    /// the values they are given to custom-type columns as stored values,
+    /// without ENCODE. Set only on the connection VACUUM builds its copy of
+    /// the database with, like SQLite's `DBFLAG_Vacuum`.
+    pub(super) writes_stored_values: AtomicBool,
     /// Number of active top-level write statements on this connection.
     ///
     /// This is currently only 0 or 1. We return Busy instead of allowing a
@@ -635,6 +653,10 @@ pub struct Connection {
     /// Per-connection last-returned value for each sequence (for currval()),
     /// by the database and normalized name of the sequence.
     pub(crate) sequence_currvals: RwLock<HashMap<(usize, String), i64>>,
+    /// The role the session logged in as. `SET ROLE` checks against it.
+    pub(crate) session_role: RoleId,
+    /// The role whose privileges statements are checked against.
+    pub(crate) current_role: RwLock<RoleId>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -857,7 +879,7 @@ impl Connection {
     }
 
     /// Returns true once the per-connection temp database has been created.
-    pub(crate) fn has_temp_database(&self) -> bool {
+    pub fn has_temp_database(&self) -> bool {
         self.temp.database.read().is_some()
     }
 
@@ -1738,6 +1760,18 @@ impl Connection {
                         &self.syms.read(),
                         type_sqls,
                     )?;
+                    inner.phase = self.load_roles_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadRoles { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "roles must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1764,6 +1798,39 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Returns the phase that loads the roles table into `fresh`, or the
+    /// stats refresh phase if the dialect has no roles or the database has no
+    /// roles table. The fresh
+    /// schema is installed first, because the current schema may not contain
+    /// the roles table yet.
+    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !self.db.dialect().supports_roles()
+            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_roles_read()?;
+        Ok(ReparsePhase::LoadRoles {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Prepares the read of the roles table, for opening the database and
+    /// for reading the schema again. The table belongs to the engine, so its
+    /// name is looked up in every database, whatever the search path says.
+    /// The read is a top-level statement, so it runs in its own read
+    /// transaction when the schema is read outside a transaction.
+    pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
+        self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -2001,6 +2068,28 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Turns non-TEMP triggers on or off for statements prepared from now on.
+    /// TEMP triggers keep firing either way (SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER` rule). Already-prepared statements are
+    /// unaffected until they are reprepared.
+    pub fn set_triggers_enabled(&self, enable: bool) {
+        self.triggers_enabled.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn triggers_enabled(&self) -> bool {
+        self.triggers_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_writes_stored_values(&self, enable: bool) {
+        self.writes_stored_values.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn writes_stored_values(&self) -> bool {
+        self.writes_stored_values.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
@@ -3353,7 +3442,7 @@ impl Connection {
     }
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
-    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+    pub fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
         self.current_qualifiers()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
@@ -3550,7 +3639,7 @@ impl Connection {
     /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the statement itself.
-    fn prepare_namespace_stmt(
+    pub fn prepare_namespace_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
@@ -3596,8 +3685,35 @@ impl Connection {
             .search_order(self.search_path.read().as_deref())
     }
 
+    /// Returns the roles of the main database as seen by this connection.
+    /// Outside a transaction, this includes roles that other connections
+    /// committed.
+    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
+        self.maybe_update_schema();
+        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
+    }
+
+    pub fn session_role(&self) -> RoleId {
+        self.session_role
+    }
+
+    pub fn current_role(&self) -> RoleId {
+        *self.current_role.read()
+    }
+
+    pub fn current_role_is_superuser(&self) -> bool {
+        self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// Statements prepared under the previous role are prepared again, because
+    /// privileges are checked when a statement is prepared.
+    pub fn set_current_role(&self, role: RoleId) {
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
+    }
+
     /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
+    pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => {
                 let schema = self.schema.read();
@@ -4213,6 +4329,11 @@ impl Connection {
     /// leaves MVCC AUTOINCREMENT able to re-emit a rowid already in use after a
     /// WAL→MVCC mode switch, so errors propagate to fail the open rather than
     /// continue into a state where the next INSERT NULL collides on disk.
+    /// A row whose `name` is not text names no table and is logged and skipped
+    /// (WAL mode can never look it up); the table that row once described is
+    /// left without an imported watermark. Unlike WAL mode, which falls back
+    /// to the table's largest rowid when a sequence row is absent, this sync
+    /// has no such floor — closing that gap is a separate fix.
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
@@ -4220,6 +4341,7 @@ impl Connection {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;
+        use crate::vdbe::execute::extract_int_value;
 
         loop {
             match state {
@@ -4241,9 +4363,19 @@ impl Connection {
                 }
                 SyncAutoincrementState::ReadSeqRows { stmt, rows } => {
                     crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        let name = row.get::<&str>(0)?.to_string();
-                        let seq = row.get::<i64>(1)?;
-                        rows.push((name, seq));
+                        // A row only matters for the table it names, so a
+                        // name that is not text names no table and the row is
+                        // skipped — WAL mode can never look it up either.
+                        // The seq value is coerced to an integer with the same
+                        // conversion the INSERT path uses.
+                        let Ok(name) = row.get::<&str>(0) else {
+                            tracing::warn!(
+                                "skipping sqlite_sequence row with non-text name during autoincrement sync"
+                            );
+                            return Ok(());
+                        };
+                        let seq = extract_int_value(row.get_value(1));
+                        rows.push((name.to_string(), seq));
                         Ok(())
                     }));
                     let rows = std::mem::take(rows);
@@ -4424,6 +4556,19 @@ impl Connection {
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()
+    }
+
+    /// Names of the collations registered on this connection, sorted.
+    pub fn get_syms_collation_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .syms
+            .read()
+            .collations
+            .values()
+            .map(|c| c.name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)

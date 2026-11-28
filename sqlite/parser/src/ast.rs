@@ -202,6 +202,11 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: String,
+    },
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -1953,6 +1958,8 @@ pub enum PragmaName {
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// List the collating sequences defined for the connection
+    CollationList,
     /// When ON, each INSERT, UPDATE and DELETE returns one row with the
     /// number of rows it changed.
     CountChanges,

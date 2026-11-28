@@ -10,15 +10,15 @@ use crate::schema::{
 use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
-    collate::{CollationSeq, TextCollation},
+    collate::{key_collation, CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
     expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
+        translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -223,10 +223,12 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
+    // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
@@ -246,6 +248,9 @@ pub fn translate_create_index(
                         );
                     }
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
         }
     }
@@ -450,7 +455,7 @@ pub(crate) fn emit_refill_index(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name,
             has_alias: false,
             internal_id: table_ref,
             join_info: None,
@@ -689,7 +694,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::Halt {
                 constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                description: format_unique_violation_desc(tbl, idx),
                 on_error: None,
                 description_reg: None,
             });
@@ -1088,7 +1093,7 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = index_collation(explicit_collation, column.type_ordering())?
+            let collation = key_collation(explicit_collation, column.type_ordering())?
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
@@ -1109,7 +1114,7 @@ fn resolve_sorted_columns_with_catalog(
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
             let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
-            let collation = index_collation(explicit_collation, ordering)?;
+            let collation = key_collation(explicit_collation, ordering)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,
@@ -1159,21 +1164,6 @@ fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crat
         Ok(WalkControl::Continue)
     })?;
     Ok(has_qualified_column)
-}
-
-/// The collation of an index column: the order of its type when it has one,
-/// otherwise the explicit COLLATE, if any.
-fn index_collation(
-    explicit_collation: Option<TextCollation>,
-    ordering: Option<TypeOrdering>,
-) -> crate::Result<Option<CollationSeq>> {
-    match (ordering, explicit_collation) {
-        (Some(ordering), Some(_)) => {
-            bail_parse_error!("collations are not supported by type {}", ordering.name())
-        }
-        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
-        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
-    }
 }
 
 /// The order of the type of an index expression over `table`'s columns, such
@@ -1362,8 +1352,13 @@ fn emit_index_column_value_from_cursor(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+    let table_ref_id = table_references
+        .joined_tables()
+        .first()
+        .expect("CREATE INDEX reads one table")
+        .internal_id;
+    if let Some(expr) = idx_col.expression() {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -1371,26 +1366,25 @@ fn emit_index_column_value_from_cursor(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
+        let self_table_context = SelfTableContext::ForSelect {
+            table_ref_id,
+            referenced_tables: table_references.clone(),
+        };
+        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
+    } else if table.columns()[idx_col.pos_in_table].is_virtual_generated() {
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_ref_id,
+            table_references,
+            &table.columns()[idx_col.pos_in_table],
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     } else {
         emit_stored_column(
             program,

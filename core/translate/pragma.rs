@@ -890,6 +890,16 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
 
+        PragmaName::CollationList => query_pragma(
+            PragmaName::CollationList,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            namespace,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -1073,6 +1083,29 @@ fn query_pragma(
             }
 
             program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CollationList => {
+            // 2 columns: seq, name. Like SQLite, collations registered on the
+            // connection come first, then the built-in RTRIM, NOCASE and BINARY.
+            // A registered collation with a built-in's name replaces it, so the
+            // built-in is not listed a second time.
+            let base_reg = register;
+            program.alloc_register();
+            let registered = connection.get_syms_collation_names();
+            let builtins = ["RTRIM", "NOCASE", "BINARY"]
+                .into_iter()
+                .filter(|b| !registered.iter().any(|r| r.eq_ignore_ascii_case(b)))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let names = registered.into_iter().chain(builtins);
+            for (seq, name) in names.enumerate() {
+                program.emit_int(seq as i64, base_reg);
+                program.emit_string8(name, base_reg + 1);
+                program.emit_result_row(base_reg, 2);
+            }
+            program.add_pragma_result_column("seq".to_string());
+            program.add_pragma_result_column("name".to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::FunctionList => {
@@ -1278,15 +1311,6 @@ fn query_pragma(
                 resolver.with_schema(table_namespace.database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(table_namespace.id, &table_name) {
                         let btree = table.btree();
-                        let pk_cols: Vec<String> = btree
-                            .as_ref()
-                            .map(|bt| {
-                                bt.primary_key_columns
-                                    .iter()
-                                    .map(|(name, _)| name.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
                         let without_rowid_pk_index = match &btree {
                             Some(bt) => without_rowid_primary_key_index(bt)?,
                             None => None,
@@ -1297,19 +1321,13 @@ fn query_pragma(
                             .map(|index| index.as_ref())
                             .chain(without_rowid_pk_index.as_ref());
                         for (seq, index) in indices.enumerate() {
-                            let origin = if index.name.starts_with("sqlite_autoindex_") {
-                                let idx_cols: Vec<&str> =
-                                    index.columns.iter().map(|c| c.name.as_str()).collect();
-                                if idx_cols.len() == pk_cols.len()
-                                    && idx_cols
-                                        .iter()
-                                        .zip(pk_cols.iter())
-                                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                                {
-                                    "pk"
-                                } else {
-                                    "u"
-                                }
+                            let origin = if btree
+                                .as_ref()
+                                .is_some_and(|bt| bt.is_primary_key_index(index))
+                            {
+                                "pk"
+                            } else if index.name.starts_with("sqlite_autoindex_") {
+                                "u"
                             } else {
                                 "c"
                             };
@@ -2063,7 +2081,34 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        program.emit_string8(column.ty_str.clone(), base_reg + 2);
+        let mut declared_type = column.ty_str.clone();
+        let written_type = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
+        if !column.ty_params.is_empty()
+            && !matches!(
+                written_type.as_bytes().first(),
+                Some(b'"' | b'\'' | b'`' | b'[')
+            )
+        {
+            declared_type.push('(');
+            for (i, param) in column.ty_params.iter().enumerate() {
+                if i > 0 {
+                    declared_type.push(',');
+                }
+                match param.as_ref() {
+                    Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                        declared_type.push('-');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                        declared_type.push('+');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    _ => declared_type.push_str(&param.to_string()),
+                }
+            }
+            declared_type.push(')');
+        }
+        program.emit_string8(declared_type, base_reg + 2);
 
         // notnull
         program.emit_bool(

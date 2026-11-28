@@ -9,11 +9,18 @@ const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
 /// Extracts each element, applies `transform_element` to the register holding
 /// it, stores results into contiguous registers, then rebuilds the blob with
 /// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
+/// A NULL array stays NULL.
 pub(super) fn emit_array_element_loop(
     program: &mut ProgramBuilder,
     reg: usize,
     transform_element: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
+    let null_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: null_label,
+    });
+
     let reg_len = program.alloc_register();
     let reg_idx = program.alloc_register();
     let reg_elem = program.alloc_register();
@@ -108,6 +115,7 @@ pub(super) fn emit_array_element_loop(
         dest: reg,
     });
 
+    program.preassign_label_to_next_insn(null_label);
     Ok(())
 }
 
@@ -197,9 +205,7 @@ pub(crate) fn emit_array_decode(
     }
 
     // Convert record blob to JSON text for display
-    if !program.flags.keep_array_results_as_blobs() {
-        program.emit_insn(Insn::ArrayDecode { reg });
-    }
+    program.emit_insn(Insn::ArrayDecode { reg });
     Ok(())
 }
 
@@ -229,13 +235,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 
         // Handle array columns: encode input (text or blob) -> record blob for storage
         if col.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip_label,
-            });
             emit_array_encode(program, reg, col, resolver, table_name)?;
-            program.preassign_label_to_next_insn(skip_label);
             continue;
         }
 
@@ -295,13 +295,7 @@ pub(crate) fn emit_custom_type_decode_columns(
 
         // Handle array columns: decode record blob -> JSON text for display
         if col.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip_label,
-            });
             emit_array_decode(program, reg, col, resolver)?;
-            program.preassign_label_to_next_insn(skip_label);
             continue;
         }
 
@@ -309,25 +303,9 @@ pub(crate) fn emit_custom_type_decode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
-            continue;
-        };
-
-        // Skip NULL values: jump over decode if NULL
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, reg, reg, resolver)?;
-            }
+        if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
+            emit_decode(program, &resolved.chain, reg, resolver)?;
         }
-
-        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }

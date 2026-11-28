@@ -61,8 +61,8 @@ CREATE TYPE cents BASE integer
 
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
 
-- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
-- **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first). It does not run when VACUUM copies rows or when `ON UPDATE CASCADE` copies the parent's new key into a child column of the same type whose DECODE is `value` (or that has no DECODE): those copy the stored value as it is.
+- **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT, and on CAST after ENCODE (see [CAST Support](#cast-support)).
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 
 ```sql
@@ -125,7 +125,7 @@ The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` tu
 
 ### Sorting and comparing
 
-ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. When ENCODE does not keep the order, ORDER BY follows the stored form:
+ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY on a column of the type fails with `type does not declare OPERATOR '<'`. A column of a type whose DECODE is anything other than `value` cannot be indexed or be any other key, with or without `OPERATOR '<'` (see [Restrictions](#restrictions)); for a type whose DECODE is just `value`, CREATE INDEX needs `OPERATOR '<'` like ORDER BY does. When ENCODE does not keep the order, ORDER BY follows the stored form:
 
 ```sql
 CREATE TYPE reversed_text BASE text
@@ -140,7 +140,9 @@ SELECT w FROM t ORDER BY w;
 -- cherry   (stored as 'yrrehc')
 ```
 
-The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
+`ORDER BY CAST(x AS reversed_text)` sorts by the decoded value instead (apple, banana, cherry), because a CAST gives the decoded value. An index on the CAST holds the decoded value too.
+
+The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and so does a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN` or `CREATE INDEX`. Comparing two types with different orders fails with `cannot compare type x with type y`.
 
 ### Arithmetic
 
@@ -150,7 +152,7 @@ A user-defined type has no arithmetic operators. `+`, `-`, `*`, `/`, `%`, `&`, `
 CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
 CREATE TABLE t(c cents) STRICT;
 SELECT c + 1 FROM t;
--- Parse error: operator does not exist: cents + integer
+-- operator does not exist: cents + integer
 ```
 
 The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The operator is chosen once, when the statement is compiled:
@@ -210,7 +212,7 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression applies a custom type's ENCODE logic, and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)):
+The CAST expression stores the value as a column of the type would, with the type's ENCODE logic and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)), and gives the value such a column reads back, after DECODE. A CAST and a column of the type therefore compare equal when they hold the same value, and the type's operators treat them alike:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -218,16 +220,19 @@ CREATE TYPE cents BASE integer
     DECODE value / 100;
 
 SELECT CAST(42.5 AS cents);
--- 4250
+-- 42.5 (ENCODE gives 4250.0, DECODE gives back 42.5)
+
+SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
+-- -1.50|2.50
 ```
 
-This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
+A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 
-A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the encoded value.
+Earlier versions gave the stored value from a CAST to a type with a DECODE. An index made by an earlier version whose key uses such a CAST holds those stored values, and `PRAGMA integrity_check` reports its rows as missing. A partial index whose WHERE clause uses such a CAST was filled with the earlier result of the WHERE clause; `PRAGMA integrity_check` does not report it, and queries that use it can return wrong rows. Run `REINDEX` on both kinds. Earlier versions also read a virtual generated column of a type with a DECODE without its ENCODE, so an index on such a column needs `REINDEX` too. Triggers, views and CHECK constraints that use such a CAST now get the decoded value.
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+A CHECK constraint sees a custom-type column as a SELECT reads it, after DECODE. `CHECK (ceil(n) > 4)` on a `numeric` column computes from the number, and `CHECK (length(id) = 36)` on a `uuid` column measures the text form. In a STRICT table, a column of a custom type can be compared with any value of the type it takes as input, such as `0`, `-5 - 1` or an `integer` column for `cents`:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -236,9 +241,11 @@ CREATE TYPE cents BASE integer
 
 CREATE TABLE products (
     id INTEGER PRIMARY KEY,
-    price cents CHECK(price >= CAST(0 AS cents))
+    price cents CHECK(price >= 0)
 ) STRICT;
 ```
+
+`CHECK(price >= CAST(0 AS cents))` means the same, because a CAST gives the decoded value too. A domain's CHECK also sees `value` after DECODE, with the domain's type, both on a column of the domain and in a CAST to it.
 
 ## Inspecting Types
 
@@ -538,6 +545,7 @@ If a non-STRICT table was created with a type name that did not exist at the tim
 </Note>
 - **No subqueries in expressions**: The ENCODE, DECODE, and DEFAULT expressions cannot contain subqueries, aggregate functions, or window functions.
 - **No indexes on STRUCT/UNION columns**: CREATE INDEX on a STRUCT or UNION column is not supported.
+- **No keys on types with a DECODE**: A column of a type whose DECODE is anything other than `value` cannot be a key: not in `CREATE INDEX`, `UNIQUE`, `PRIMARY KEY`, or the referencing columns of a `FOREIGN KEY`, and that includes generated columns. (The columns a `FOREIGN KEY` points to need a `UNIQUE` or `PRIMARY KEY`, so they are refused there.) Such a DECODE might read different stored values back as the same value, as `lower(value)` does. This also refuses DECODEs that never do, such as `-value`. Only types with no DECODE, or a DECODE that is just `value`, can be keys. A domain follows its base type and an array follows its element type. For example, with `CREATE TYPE ci BASE text ENCODE value DECODE lower(value) OPERATOR '<'`, `CREATE INDEX i ON t(c)` fails with `column 'c' of type 'ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value. Index CAST(c AS text) instead`. An index on `CAST(c AS text)` or another expression is allowed.
 
 ## Examples
 

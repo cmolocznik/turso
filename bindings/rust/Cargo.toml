@@ -13,11 +13,12 @@ description = "Turso Rust API"
 workspace = true
 
 [features]
-default = ["mimalloc", "fts"]
+default = ["mimalloc", "fts", "simd"]
 mimalloc = ["dep:mimalloc"]
-pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
+pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit?/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
 fts_inspect = ["fts", "turso_core/fts_inspect"]
+simd = ["turso_core/simd", "turso_sdk_kit/simd", "turso_sync_sdk_kit?/simd"]
 stacker = ["turso_core/stacker"]
 test_helper = ["turso_core/test_helper", "turso_sdk_kit/test_helper"]
 # Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.
@@ -27,6 +28,7 @@ conn_raw_api = ["turso_core/conn_raw_api"]
 # A prepared statement's execution metrics: rows read, b-tree seeks, sorts.
 statement_metrics = []
 sync = [
+    "dep:turso_sync_sdk_kit",
     "dep:hyper",
     "dep:tokio",
     "dep:hyper-rustls",
@@ -36,9 +38,12 @@ sync = [
 ]
 
 [dependencies]
-turso_core = { workspace = true }
-turso_sdk_kit = { workspace = true }
-turso_sync_sdk_kit = { workspace = true }
+turso_core = { path = "../../core", version = "0.9.0-pre.2", default-features = false, features = ["baseline"] }
+turso_sdk_kit = { path = "../../sdk-kit", version = "0.9.0-pre.2", default-features = false, features = [
+    "encryption",
+    "pure-rust-crypto",
+] }
+turso_sync_sdk_kit = { path = "../../sync/sdk-kit", version = "0.9.0-pre.2", default-features = false, optional = true }
 thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true

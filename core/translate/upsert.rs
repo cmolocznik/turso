@@ -8,7 +8,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
@@ -36,8 +36,9 @@ use crate::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
         },
         expr::{
-            emit_returning_results, emit_table_column, expr_type::column_custom_type_names,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+            emit_constraint_values_decode, emit_returning_results, emit_table_column,
+            expr_type::column_custom_type_names, translate_expr, translate_expr_no_constant_opt,
+            walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
@@ -835,13 +836,12 @@ pub fn emit_upsert(
             program,
             &bt.check_constraints,
             resolver,
-            &bt.name,
+            &bt,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns().iter().enumerate().filter_map(|(idx, col)| {
-                col.name
-                    .as_deref()
-                    .map(|n| (n, layout.to_register(new_start, idx)))
-            }),
+            bt.columns()
+                .iter()
+                .enumerate()
+                .map(|(idx, col)| (col, layout.to_register(new_start, idx))),
             connection,
             ast::ResolveType::Abort,
             constraint_on_error,
@@ -886,6 +886,7 @@ pub fn emit_upsert(
             TriggerTime::Before,
             Some(set_column_names),
             &btree_table,
+            connection,
         );
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
@@ -894,8 +895,8 @@ pub fn emit_upsert(
             .collect();
         if !relevant_before_update_triggers.is_empty() {
             // NEW row values are in new_start registers. At this point they are
-            // encoded (post-encode for STRICT custom types). Mark new_encoded=true
-            // so fire_trigger's decode_trigger_registers will decode them.
+            // encoded (post-encode for STRICT custom types), so fire_trigger's
+            // decode_trigger_registers decodes them.
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers: Vec<usize> = (0..num_cols)
                 .map(|i| layout.to_register(new_start, i))
@@ -904,13 +905,13 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            // Use new_after variant because NEW values are encoded at this point.
-            let trigger_ctx = TriggerContext::new_after_with_override_conflict(
+            let trigger_ctx = TriggerContext::new(
                 btree_table.clone(),
                 Some(new_registers),
+                DmlRowForm::Stored,
                 Some(old_registers.clone()),
-                ast::ResolveType::Abort,
-            );
+            )
+            .with_override_conflict(ast::ResolveType::Abort);
 
             for trigger in relevant_before_update_triggers {
                 fire_trigger(
@@ -984,6 +985,7 @@ pub fn emit_upsert(
                 TriggerEvent::Update,
                 Some(set_column_names),
                 &btree_table,
+                connection,
             );
             if has_relevant_after_triggers {
                 // Preserve OLD registers for AFTER triggers
@@ -1011,6 +1013,7 @@ pub fn emit_upsert(
                 TriggerEvent::Update,
                 Some(set_column_names),
                 &btree_table,
+                connection,
             );
             if has_relevant_after_triggers {
                 Some(old_registers)
@@ -1197,7 +1200,7 @@ pub fn emit_upsert(
             // NEW key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if ic.expression().is_some() {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -1276,45 +1279,14 @@ pub fn emit_upsert(
                     flags: CmpInsFlags::default(),
                     collation: CollationSeq::for_internal_values(),
                 });
-                let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let bt = table.require_btree()?;
+                let description = format_unique_violation_desc(&bt, &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
-                let idx_col_names: Vec<&str> =
-                    idx_meta.columns.iter().map(|c| c.name.as_str()).collect();
-                let (pk_col_names, pk_constraint_name) = table
-                    .btree()
-                    .map(|bt| {
-                        let cols: Vec<String> = bt
-                            .primary_key_columns
-                            .iter()
-                            .map(|(n, _)| n.clone())
-                            .collect();
-                        (cols, bt.primary_key_constraint_name.clone())
-                    })
-                    .unwrap_or_default();
-                let is_pk = !pk_col_names.is_empty()
-                    && idx_col_names == pk_col_names.iter().map(String::as_str).collect::<Vec<_>>();
-                let (constraint_info, err_code) = if is_pk {
-                    (
-                        Some(Box::new(ConstraintInfo::primary_key(
-                            table.get_name(),
-                            pk_constraint_name,
-                            pk_col_names,
-                            regs,
-                        ))),
-                        SQLITE_CONSTRAINT_PRIMARYKEY,
-                    )
-                } else {
-                    (
-                        Some(Box::new(ConstraintInfo::unique_index(
-                            table.get_name(),
-                            &idx_meta,
-                            regs,
-                        ))),
-                        SQLITE_CONSTRAINT_UNIQUE,
-                    )
-                };
+                let mut constraint_info = ConstraintInfo::unique_index(&bt, &idx_meta, regs);
+                emit_constraint_values_decode(program, resolver, &bt, &mut constraint_info)?;
+                let err_code = constraint_info.kind.sqlite_extended_result_code();
                 program.emit_insn(Insn::Halt {
-                    constraint_info,
+                    constraint_info: Some(Box::new(constraint_info)),
                     err_code,
                     description,
                     on_error: constraint_on_error,
@@ -1356,7 +1328,7 @@ pub fn emit_upsert(
             // DELETE old key
             let del = program.alloc_registers(k + 1);
             for (i, ic) in pending.idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if ic.expression().is_some() {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -1621,6 +1593,7 @@ pub fn emit_upsert(
             TriggerTime::After,
             Some(set_column_names),
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
@@ -1632,12 +1605,13 @@ pub fn emit_upsert(
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
             // NEW values are encoded at this point; fire_trigger will decode them.
-            let trigger_ctx_after = TriggerContext::new_after_with_override_conflict(
+            let trigger_ctx_after = TriggerContext::new(
                 btree_table,
                 Some(new_registers_after),
+                DmlRowForm::Stored,
                 Some(old_regs),
-                ast::ResolveType::Abort,
-            );
+            )
+            .with_override_conflict(ast::ResolveType::Abort);
 
             // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
             // not skip post-row work (RETURNING).
@@ -1836,8 +1810,8 @@ fn emit_upsert_expr_index_value(
     dest_reg: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    let expr = idx_col.expr.as_ref().expect("caller checked is_some");
-    let expr = expr.as_ref().clone();
+    let expr = idx_col.expression().expect("caller checked is_some");
+    let expr = expr.clone();
     let columns = table.columns();
     let bt = table.require_btree()?;
 

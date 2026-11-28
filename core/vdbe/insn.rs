@@ -465,12 +465,17 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+    pub fn unique_index(table: &BTreeTable, index: &Index, regs: Vec<usize>) -> Self {
+        let kind = if table.is_primary_key_index(index) {
+            crate::ConstraintKind::PrimaryKey
+        } else {
+            crate::ConstraintKind::Unique
+        };
         Self {
-            kind: crate::ConstraintKind::Unique,
+            kind,
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
-            table_name: table.to_string(),
+            table_name: table.name.clone(),
             column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
             violation_regs: regs,
             row_col_names: vec![],
@@ -1919,6 +1924,14 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
+    /// Add a role to the in-memory role catalog after its row was inserted
+    AddRole {
+        db: usize,
+        /// Register holding the rowid of the role in the roles table
+        id_reg: usize,
+        name: String,
+        superuser: bool,
+    },
 
     /// Close a cursor.
     Close {
@@ -2575,6 +2588,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::AddRole => execute::op_add_role,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2722,6 +2736,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
+            | Self::AddRole { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

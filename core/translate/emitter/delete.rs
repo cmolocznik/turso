@@ -30,7 +30,7 @@ use crate::{
         trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, DmlRowForm, ProgramBuilder},
         insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
@@ -543,6 +543,7 @@ fn emit_delete_insns<'a>(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -849,7 +850,9 @@ fn emit_delete_row_common(
         let columns_start_reg = columns_start_reg
             .expect("columns_start_reg must be provided when there are triggers or RETURNING");
         let delete_table = unsafe { &*table_reference };
-        let delete_layout = ColumnLayout::from_columns(delete_table.columns())?;
+        let delete_layout = ColumnLayout::Identity {
+            column_count: delete_table.columns().len(),
+        };
         let cache_state = seed_returning_row_image_in_cache(
             program,
             table_references,
@@ -948,6 +951,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -985,6 +989,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::Before,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -1002,6 +1007,7 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx = TriggerContext::new(
                 btree_table,
                 None, // No NEW for DELETE
+                DmlRowForm::Stored,
                 Some(old_registers),
             );
 
@@ -1051,6 +1057,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::After,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -1065,6 +1072,7 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx_after = TriggerContext::new(
                 btree_table,
                 None, // No NEW for DELETE
+                DmlRowForm::Stored,
                 Some(old_registers),
             );
 

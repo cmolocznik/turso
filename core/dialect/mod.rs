@@ -132,10 +132,6 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
-    fn random_value(&self, bits: i64) -> crate::Value {
-        crate::Value::from_i64(bits) // SQLite default
-    }
-
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -205,6 +201,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a database of this dialect stores roles in the roles table.
+    ///
+    /// SQLite has no roles, so a table named like the roles table is an
+    /// ordinary table.
+    fn supports_roles(&self) -> bool {
+        false
+    }
+
     /// The namespaces of a database that has never created or dropped one.
     /// They have ids from 1 in this order and no rows until the first
     /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then
@@ -270,6 +274,16 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL's integer-to-boolean cast does. Otherwise the cast uses the
     /// type's ENCODE, which accepts only 0 and 1.
     fn casts_nonzero_integer_to_true(&self) -> bool {
+        false
+    }
+
+    /// Whether constraint errors report the values that broke the constraint.
+    ///
+    /// PostgreSQL shows them in the error DETAIL, so custom type and array
+    /// values are decoded before the error is raised. SQLite's messages name
+    /// only the columns, so no decode runs, and a DECODE that fails cannot
+    /// replace the constraint error.
+    fn constraint_errors_show_values(&self) -> bool {
         false
     }
 }

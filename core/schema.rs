@@ -19,7 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
-use crate::types::{IOResult, ImmutableRecord};
+use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
@@ -112,15 +112,15 @@ impl Trigger {
     }
 }
 
+use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::{CollationSeq, TextCollation};
+use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
-    column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
-    type_from_name, UnparsedFromSqlIndex,
+    column_declared_type, is_rowid_alias_type, type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
@@ -1103,6 +1103,9 @@ pub struct Schema {
     /// The materialized views met before the names of the namespaces were
     /// loaded, built once they are.
     pending_materialized_views: Option<PendingMaterializedViews>,
+
+    /// The roles of the database. Copies of the schema share them.
+    pub roles: Arc<RoleCatalog>,
 }
 
 /// Materialized views the loader read before the names of the namespaces,
@@ -1299,6 +1302,7 @@ impl Schema {
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
+            roles: Arc::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1850,6 +1854,52 @@ impl Schema {
     /// column whose type is a custom type of a STRICT table.
     pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
         column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
+    }
+
+    /// Whether reading the column runs a DECODE, so a read gives a value other
+    /// than the stored one.
+    pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
+        self.resolve_type(&column.ty_str, is_strict)
+            .ok()
+            .flatten()
+            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
+    }
+
+    /// Fails when `column` is lossy, so it cannot be an index, UNIQUE, PRIMARY KEY
+    /// or FOREIGN KEY column. See [Self::column_is_lossy].
+    pub fn check_column_can_be_key(&self, column: &Column, is_strict: bool) -> crate::Result<()> {
+        if !self.column_is_lossy(column, is_strict) {
+            return Ok(());
+        }
+        let brackets = "[]".repeat(column.array_dimensions() as usize);
+        let name = column.name.as_deref().unwrap_or_default();
+        // A type that cannot be resolved counts as lossy and has no primitive,
+        // so the hint falls back to the type's name.
+        let primitive = match self.resolve_type_unchecked(&column.ty_str) {
+            Ok(Some(resolved)) => resolved.primitive,
+            _ => column.ty_str.clone(),
+        };
+        crate::bail_parse_error!(
+            "column '{name}' of type '{}{brackets}' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value. Index CAST({name} AS {primitive}{brackets}) instead",
+            column.ty_str
+        );
+    }
+
+    /// Whether different stored values of the column might read back as the same
+    /// value, so a key on the column would tell apart values that queries
+    /// treat as equal. The column's type decides: built-in types, types
+    /// without a DECODE and types whose DECODE is `value` are not lossy, and a
+    /// domain or array follows the type it is based on. Everything else is
+    /// lossy, including a type that cannot be resolved.
+    pub fn column_is_lossy(&self, column: &Column, is_strict: bool) -> bool {
+        match self.resolve_type(&column.ty_str, is_strict) {
+            Ok(None) => false,
+            Ok(Some(resolved)) => !resolved
+                .chain
+                .iter()
+                .all(|td| td.is_builtin || td.decode_returns_value_unchanged()),
+            Err(_) => true,
+        }
     }
 
     /// Look up a custom type definition by name without a strictness check.
@@ -3060,14 +3110,9 @@ impl Schema {
                         state.phase = MakeFromBtreePhase::BuildingIndexes;
                         continue;
                     };
-                    // The types table is (name TEXT PRIMARY KEY, sql TEXT).
-                    let ValueRef::Text(sql) = record.get_value(1)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
-                        ))
-                        .into());
-                    };
-                    state.type_sqls.push(sql.as_str().to_string());
+                    state
+                        .type_sqls
+                        .push(Self::type_sql_from_record(&record.as_record_ref())?);
                     state.phase = MakeFromBtreePhase::LoadingTypesAdvance;
                 }
 
@@ -3108,6 +3153,17 @@ impl Schema {
                     return Ok(IOResult::Done(()));
                 }
             }
+        }
+    }
+
+    /// The CREATE TYPE statement stored in a row of the types table,
+    /// which is (name TEXT PRIMARY KEY, sql TEXT).
+    pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
+        match record.get_value_opt(1) {
+            Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
+            _ => Err(LimboError::Corrupt(format!(
+                "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
+            ))),
         }
     }
 
@@ -3777,14 +3833,14 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    match Parser::new(sql.as_bytes()).next_cmd()? {
-                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                    let create_vtab = match Parser::new(sql.as_bytes()).next_cmd()? {
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
                             )));
                         }
-                    }
+                    };
 
                     // a virtual table is found in the sqlite_schema, but it's no
                     // longer in the in-memory schema. We need to recreate it if
@@ -3792,11 +3848,17 @@ impl Schema {
                     let vtab = if let Some(vtab) = syms.vtabs.get(name) {
                         vtab.clone()
                     } else {
-                        let mod_name = module_name_from_sql(sql)?;
+                        // Like SQLite, the module receives the argument text exactly
+                        // as written, the same as when the table was created.
+                        let args = create_vtab
+                            .args
+                            .into_iter()
+                            .map(crate::Value::from_text)
+                            .collect();
                         crate::VirtualTable::table(
                             Some(name),
-                            mod_name,
-                            module_args_from_sql(sql)?,
+                            create_vtab.module_name.as_str(),
+                            args,
                             syms,
                         )?
                     };
@@ -4575,6 +4637,7 @@ impl TryClone for Schema {
             default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
+            roles: self.roles.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
@@ -5275,6 +5338,75 @@ impl BTreeTable {
         Ok(Arc::new(modified))
     }
 
+    /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
+    /// COLLATE and the column's type has its own order. Call this after
+    /// [Self::resolve_custom_types].
+    pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
+        for column in &self.columns {
+            key_collation(column.text_collation(), column.type_ordering())?;
+        }
+        for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
+            if let Some((_, column)) = self.get_column(&key.name) {
+                key_collation(key.collation, column.type_ordering())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails when a column of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table is lossy. See [Schema::check_column_can_be_key].
+    pub(crate) fn check_keys_are_not_lossy(&self, schema: &Schema) -> Result<()> {
+        for column in &self.columns {
+            if self.is_key_column(column) {
+                schema.check_column_can_be_key(column, self.is_strict)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `column` is part of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table.
+    pub(crate) fn is_key_column(&self, column: &Column) -> bool {
+        let Some(name) = column.name.as_deref() else {
+            return false;
+        };
+        let unique_columns = self
+            .unique_sets
+            .iter()
+            .flat_map(|set| set.columns.iter().map(|key| key.name.as_str()));
+        let foreign_columns = self
+            .foreign_keys
+            .iter()
+            .flat_map(|fk| fk.child_columns.iter().map(String::as_str));
+        unique_columns
+            .chain(foreign_columns)
+            .any(|key| key.eq_ignore_ascii_case(name))
+    }
+
+    /// Renames a column inside the UNIQUE, PRIMARY KEY and FOREIGN KEY lists.
+    /// Does not touch the column itself.
+    pub(crate) fn rename_column_in_keys(&mut self, old_name: &str, new_name: &str) {
+        for key in self.unique_sets.iter_mut().flat_map(|set| &mut set.columns) {
+            if key.name.eq_ignore_ascii_case(old_name) {
+                key.name = new_name.to_string();
+            }
+        }
+        for foreign_key in &mut self.foreign_keys {
+            if foreign_key
+                .child_columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(old_name))
+            {
+                let foreign_key = Arc::make_mut(foreign_key);
+                for name in foreign_key.child_columns.iter_mut() {
+                    if name.eq_ignore_ascii_case(old_name) {
+                        *name = new_name.to_string();
+                    }
+                }
+            }
+        }
+    }
+
     /// Fill in what custom type columns get from their type:
     /// - SQLite's name-based type/affinity rules use the BASE type instead of
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
@@ -5308,11 +5440,58 @@ impl BTreeTable {
         Ok(())
     }
 
+    /// Builds the column that `ALTER COLUMN` puts at `column_index`. A table-level
+    /// PRIMARY KEY stays in the stored CREATE TABLE, so a column it names stays part of
+    /// the key, and the new type decides whether the column is a rowid alias.
+    pub fn column_for_alter(
+        &self,
+        column_index: usize,
+        definition: &ColumnDefinition,
+    ) -> Result<Column> {
+        let mut column = Column::from_definition(
+            definition,
+            FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, self.is_strict),
+        )?;
+        if self.columns()[column_index].primary_key() && !self.primary_key_is_inline {
+            if column.is_generated() {
+                bail_parse_error!(
+                    "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                    definition.col_name.as_str()
+                );
+            }
+            column.set_primary_key(true);
+            column.set_rowid_alias(
+                self.has_rowid
+                    && self.primary_key_columns.len() == 1
+                    && definition
+                        .col_type
+                        .as_ref()
+                        .is_some_and(is_rowid_alias_type),
+            );
+        }
+        Ok(column)
+    }
+
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         self.columns
             .iter()
             .enumerate()
             .find(|(_, column)| column.is_rowid_alias())
+    }
+
+    /// Whether `index` is the automatic index that enforces this table's
+    /// PRIMARY KEY. An INTEGER PRIMARY KEY is the rowid and has no such index.
+    pub fn is_primary_key_index(&self, index: &Index) -> bool {
+        self.get_rowid_alias_column().is_none()
+            && index
+                .name
+                .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+            && index.columns.len() == self.primary_key_columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(&self.primary_key_columns)
+                .all(|(index_col, (pk_col, _))| index_col.name.eq_ignore_ascii_case(pk_col))
     }
 
     pub fn has_virtual_columns(&self) -> bool {
@@ -6692,7 +6871,7 @@ pub fn create_table(
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(written_type) => {
-                        typename_exactly_integer = is_rowid_alias_type(&written_type.name);
+                        typename_exactly_integer = is_rowid_alias_type(written_type);
                         type_from_name(&ty_str).0
                     }
                     None => Type::Null,
@@ -6799,64 +6978,13 @@ pub fn create_table(
                             }
                             collation = Some(collation_seq);
                         }
-                        ast::ColumnConstraint::ForeignKey {
-                            clause,
-                            defer_clause,
-                        } => {
-                            if clause.columns.len() > 1 {
-                                crate::bail_parse_error!(
-                                    "foreign key on {} should reference only one column of table {}",
-                                    name,
-                                    clause.tbl_name.as_str()
-                                );
-                            }
-                            let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-                            let (parent_namespace, parent_table) =
-                                demangle_name(supports_namespaces, &mangled_parent_table);
-                            let fk = ForeignKey {
-                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
-                                parent_table: parent_table.to_string(),
-                                parent_namespace,
-                                parent_columns: clause
-                                    .columns
-                                    .iter()
-                                    .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .try_collect()?,
-                                on_delete: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnDelete(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                on_update: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnUpdate(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                child_columns: Box::from([name.clone()]),
-                                deferred: match defer_clause {
-                                    Some(d) => {
-                                        d.deferrable
-                                            && matches!(
-                                                d.init_deferred,
-                                                Some(InitDeferredPred::InitiallyDeferred)
-                                            )
-                                    }
-                                    None => false,
-                                },
-                                decl_order: column_fk_order,
-                            };
+                        ast::ColumnConstraint::ForeignKey { .. } => {
+                            let fk = ForeignKey::from_column_constraint(
+                                &name,
+                                c_def,
+                                column_fk_order,
+                                supports_namespaces,
+                            )?;
                             foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
                         }
@@ -7162,6 +7290,62 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
 }
 
 impl ForeignKey {
+    /// Builds the foreign key of a column constraint such as
+    /// `c REFERENCES parent(p) ON DELETE CASCADE`. Used by CREATE TABLE,
+    /// ADD COLUMN and ALTER COLUMN.
+    pub fn from_column_constraint(
+        child_column: &str,
+        constraint: &ast::NamedColumnConstraint,
+        decl_order: usize,
+        supports_namespaces: bool,
+    ) -> Result<Self> {
+        let ast::ColumnConstraint::ForeignKey {
+            clause,
+            defer_clause,
+        } = &constraint.constraint
+        else {
+            unreachable!("from_column_constraint called with a constraint that is not REFERENCES");
+        };
+        if clause.columns.len() > 1 {
+            crate::bail_parse_error!(
+                "foreign key on {} should reference only one column of table {}",
+                child_column,
+                clause.tbl_name.as_str()
+            );
+        }
+        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+        let (parent_namespace, parent_table) =
+            demangle_name(supports_namespaces, &mangled_parent_table);
+        let find_action = |on_delete: bool| {
+            clause
+                .args
+                .iter()
+                .find_map(|arg| match arg {
+                    ast::RefArg::OnDelete(act) if on_delete => Some(*act),
+                    ast::RefArg::OnUpdate(act) if !on_delete => Some(*act),
+                    _ => None,
+                })
+                .unwrap_or(RefAct::NoAction)
+        };
+        Ok(ForeignKey {
+            constraint_name: constraint.name.as_ref().map(|n| n.as_str().to_owned()),
+            parent_table: parent_table.to_string(),
+            parent_namespace,
+            parent_columns: clause
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .try_collect()?,
+            on_delete: find_action(true),
+            on_update: find_action(false),
+            child_columns: Box::from([child_column.to_string()]),
+            deferred: defer_clause.as_ref().is_some_and(|d| {
+                d.deferrable && matches!(d.init_deferred, Some(InitDeferredPred::InitiallyDeferred))
+            }),
+            decl_order,
+        })
+    }
+
     pub fn child_key_assigned(&self, child: &BTreeTable, updated_cols: &ColumnMask) -> bool {
         self.child_columns.iter().any(|cname| {
             child
@@ -7532,10 +7716,9 @@ impl Column {
             .unwrap_or_default();
 
         let (ty, typename_exactly_integer) = match value.col_type {
-            Some(ref written_type) => (
-                type_from_name(&ty_str).0,
-                is_rowid_alias_type(&written_type.name),
-            ),
+            Some(ref written_type) => {
+                (type_from_name(&ty_str).0, is_rowid_alias_type(written_type))
+            }
             None => (Type::Null, false),
         };
 
@@ -7757,6 +7940,10 @@ impl Column {
         self.info.hidden()
     }
     #[inline]
+    pub fn set_primary_key(&mut self, v: bool) {
+        self.info.set_primary_key(v)
+    }
+    #[inline]
     pub fn set_rowid_alias(&mut self, v: bool) {
         self.info.set_rowid_alias(v)
     }
@@ -7780,6 +7967,13 @@ impl Column {
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         self.info.set_array_dimensions(dims)
+    }
+    /// Whether both columns declare the same type: name, type parameters
+    /// (`varchar(10)` is not `varchar(3)`) and array dimensions.
+    pub fn has_same_declared_type(&self, other: &Column) -> bool {
+        self.ty_str.eq_ignore_ascii_case(&other.ty_str)
+            && self.ty_params == other.ty_params
+            && self.array_dimensions() == other.array_dimensions()
     }
 }
 
@@ -7896,6 +8090,8 @@ pub struct IndexColumn {
     pub explicit_collation: Option<TextCollation>,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
+    /// A column that is a virtual generated column also has its expression
+    /// here, but it is still a column: see [IndexColumn::expression].
     pub expr: Option<Box<Expr>>,
 }
 
@@ -7940,6 +8136,22 @@ impl IndexColumn {
             explicit_collation: None,
             default: None,
             expr: None,
+        }
+    }
+
+    /// The expression of an expression index column such as `lower(name)`.
+    /// None for a table column, including a virtual generated column: its
+    /// value is read like any column's, with the column type's ENCODE, so an
+    /// index on it holds the same values as an index on a stored column.
+    pub fn expression(&self) -> Option<&Expr> {
+        if self.pos_in_table == EXPR_INDEX_SENTINEL {
+            Some(
+                self.expr
+                    .as_deref()
+                    .expect("an expression index column has an expression"),
+            )
+        } else {
+            None
         }
     }
 
@@ -8653,6 +8865,15 @@ mod tests {
     }
 
     use crate::alloc::vec;
+
+    #[test]
+    fn schema_clones_share_the_role_catalog() {
+        let schema = Schema::new();
+
+        let clone = schema.try_clone().unwrap();
+
+        assert!(Arc::ptr_eq(&schema.roles, &clone.roles));
+    }
 
     #[test]
     fn test_column_definition_flag_conversion() {
@@ -10340,6 +10561,11 @@ mod column_info {
         #[inline]
         pub fn is_rowid_alias(&self) -> bool {
             self.0 & F_ROWID_ALIAS != 0
+        }
+
+        #[inline]
+        pub fn set_primary_key(&mut self, v: bool) {
+            self.set_flag(F_PRIMARY_KEY, v);
         }
 
         #[inline]

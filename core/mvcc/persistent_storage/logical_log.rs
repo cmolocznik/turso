@@ -780,10 +780,6 @@ struct LogRing {
     /// The number of the next segment, past every number the log's files have held: a segment
     /// left by a recovery that ended before it can never share its number with a later one.
     next_seq: u64,
-    /// Each slot a checkpoint freed, with whether its truncate may not be durable yet. A purge's
-    /// erasure is durable only once those files are fsynced, so [`LogicalLog::sync_targets`] lists
-    /// them until they are.
-    freed: Vec<(usize, Arc<crate::sync::atomic::AtomicBool>)>,
 }
 
 enum Slot {
@@ -797,6 +793,10 @@ enum Slot {
     Free {
         file: Arc<dyn File>,
         ready: Completion,
+        /// Whether the truncate (or the first fsync) may not be durable yet. New on every free, so
+        /// that no fsync of an earlier cycle clears the mark of a later one, and listed for an
+        /// fsync only once `ready` has succeeded, so that none clears it before the truncate ends.
+        unsynced: Arc<crate::sync::atomic::AtomicBool>,
     },
 }
 
@@ -836,13 +836,13 @@ impl LogRing {
             }
         });
         let ready = start_in_group(group, c, |c| file.truncate(0, c))?;
-        self.slots[slot] = Slot::Free { file, ready };
-        match self.freed.iter().find(|(freed, _)| *freed == slot) {
-            Some((_, unsynced)) => unsynced.store(true, crate::sync::atomic::Ordering::Release),
-            None => self
-                .freed
-                .push((slot, Arc::new(crate::sync::atomic::AtomicBool::new(true)))),
-        }
+        // A purge's erasure is durable only once the truncate is fsynced: the file is listed for
+        // an fsync ([`LogicalLog::sync_targets`]) until one has covered it.
+        self.slots[slot] = Slot::Free {
+            file,
+            ready,
+            unsynced: Arc::new(crate::sync::atomic::AtomicBool::new(true)),
+        };
         Ok(())
     }
 
@@ -871,7 +871,12 @@ impl LogRing {
         )?;
         let c = Completion::new_sync(|_| {});
         let ready = start_in_group(Some(group), c, |c| file.sync(c, FileSyncType::Fsync))?;
-        self.slots[slot] = Slot::Free { file, ready };
+        // The new file's first fsync is what `ready` is: nothing more is owed.
+        self.slots[slot] = Slot::Free {
+            file,
+            ready,
+            unsynced: Arc::new(crate::sync::atomic::AtomicBool::new(false)),
+        };
         Ok(())
     }
 }
@@ -973,7 +978,6 @@ impl LogicalLog {
             sealed: VecDeque::new(),
             roll_pending: false,
             next_seq: 1,
-            freed: Vec::new(),
         }));
         Ok(log)
     }
@@ -1522,8 +1526,9 @@ impl LogicalLog {
 
     pub fn upgrade_header_for_log_tx(&mut self, tx: &LogRecord) -> Result<Option<Completion>> {
         #[cfg(feature = "conn_raw_api")]
-        let portable_changes_enabled =
-            tx.portable_changes_enabled || !tx.portable_changes.is_empty();
+        let portable_changes_enabled = tx.portable_changes_enabled
+            || tx.portable_changes_required
+            || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let portable_changes_enabled = {
             let _ = tx;
@@ -1618,16 +1623,23 @@ impl LogicalLog {
                 });
             }
             // A file a checkpoint truncated holds nothing, but the truncate is not durable until
-            // it is fsynced: a crash would bring back what was erased.
-            for (slot, unsynced) in ring
-                .freed
-                .iter()
-                .filter(|(_, unsynced)| unsynced.load(crate::sync::atomic::Ordering::Acquire))
-            {
-                targets.push(SyncTarget {
-                    file: ring.file(*slot).clone(),
-                    unsynced: Some(unsynced.clone()),
-                });
+            // it is fsynced: a crash would bring back what was erased. Only once the truncate has
+            // succeeded: an fsync before it would clear the mark, and the truncate would go
+            // unsynced.
+            for slot in &ring.slots {
+                if let Slot::Free {
+                    file,
+                    ready,
+                    unsynced,
+                } = slot
+                {
+                    if ready.succeeded() && unsynced.load(crate::sync::atomic::Ordering::Acquire) {
+                        targets.push(SyncTarget {
+                            file: file.clone(),
+                            unsynced: Some(unsynced.clone()),
+                        });
+                    }
+                }
             }
         }
         targets.push(SyncTarget {
@@ -1752,7 +1764,6 @@ impl LogicalLog {
             completion: c,
             empties_log: true,
         });
-        self.generation += 1;
         self.publish_finished_header_change();
         Ok(())
     }
@@ -1891,6 +1902,8 @@ impl LogicalLog {
             self.offset = 0;
             self.pending_running_crc = None;
             self.max_appended_commit_ts = 0;
+            // The old generation's frames are gone only now that the truncate has succeeded.
+            self.generation += 1;
         }
         if self.offset == 0 {
             // No frame is chained yet, so the CRC chain starts from this
@@ -8755,6 +8768,133 @@ mod tests {
         assert_eq!(offset, inner.size().unwrap());
         assert_ne!(running_crc, before.1);
         assert_eq!(commit_timestamps(inner, &io), vec![20]);
+    }
+
+    /// A truncate that has not succeeded has not emptied the log: its generation's frames are on
+    /// disk, so `hold` still names the generation, and it advances only once the truncate has
+    /// succeeded, with the offset (the auditor's A-487).
+    #[test]
+    fn test_the_generation_advances_only_once_the_truncate_has_succeeded() {
+        use crate::mvcc::persistent_storage::{DurableStorage, Storage};
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("generation-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner));
+        let storage = Storage::new(file.clone(), io.clone(), None);
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[table_row_version((-2).into(), 10, 10, "row")],
+            None,
+        );
+        assert!(storage.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+        let (c, bytes) = storage.log_tx(tx, None).unwrap();
+        io.wait_for_completion(c).unwrap();
+        storage
+            .advance_logical_log_offset_after_success(bytes)
+            .unwrap();
+        let generation = storage.logical_log.read().generation;
+        assert_eq!(storage.logical_log.read().hold().oldest, Some(generation));
+
+        let (truncate_c, _) = storage.truncate(u64::MAX).unwrap();
+        assert!(!truncate_c.finished());
+        assert_eq!(
+            storage.logical_log.read().generation,
+            generation,
+            "the generation advanced before the truncate had succeeded"
+        );
+        assert_eq!(storage.logical_log.read().hold().oldest, Some(generation));
+
+        // A truncate that fails leaves it as it was.
+        file.finish_truncate(false);
+        storage.finish_truncate();
+        assert_eq!(storage.logical_log.read().generation, generation);
+        assert_eq!(storage.logical_log.read().hold().oldest, Some(generation));
+
+        // One that succeeds advances it, with the offset.
+        let (truncate_c, _) = storage.truncate(u64::MAX).unwrap();
+        assert!(!truncate_c.finished());
+        file.finish_truncate(true);
+        storage.finish_truncate();
+        assert_eq!(storage.logical_log.read().generation, generation + 1);
+        assert_eq!(storage.logical_log.read().hold().oldest, None);
+    }
+
+    /// A segment file a checkpoint freed is listed for an fsync only once its truncate has
+    /// succeeded, and an fsync that began before, or for an earlier freeing of the same file,
+    /// cannot clear the mark of a later one: either would leave the purged bytes in the file after
+    /// a crash (the auditor's A-490).
+    #[test]
+    fn test_a_freed_segments_truncate_is_fsynced_after_it_succeeds_and_by_no_earlier_fsync() {
+        use super::{sync_files, CompletionGroup, LogRing, Slot};
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let active = io
+            .open_file("freed-sync.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let inner = io
+            .open_file("freed-sync.db-log.1", OpenFlags::Create, false)
+            .unwrap();
+        let held = Arc::new(HeldTruncateFile::new(inner));
+        let held_file: Arc<dyn crate::File> = held.clone();
+        let mut log = LogicalLog::new(active, io.clone(), None);
+        let slots = std::array::from_fn(|slot| {
+            if slot == 1 {
+                Slot::Found(held_file.clone())
+            } else {
+                Slot::Missing
+            }
+        });
+        log.ring = Some(Box::new(LogRing {
+            base: "freed-sync.db-log".to_string(),
+            flags: OpenFlags::Create,
+            slots,
+            active: 0,
+            sealed: std::collections::VecDeque::new(),
+            roll_pending: false,
+            next_seq: 1,
+        }));
+        let listed = |log: &LogicalLog| {
+            log.sync_targets()
+                .iter()
+                .any(|target| Arc::ptr_eq(&target.file, &held_file))
+        };
+        let mut group = CompletionGroup::new(|_| {});
+
+        log.ring
+            .as_deref_mut()
+            .unwrap()
+            .free(1, Some(&mut group))
+            .unwrap();
+        assert!(
+            !listed(&log),
+            "listed while its truncate is in flight: an fsync now would clear the mark"
+        );
+        held.finish_truncate(true);
+        assert!(listed(&log), "its truncate succeeded and no fsync covered it");
+
+        // An fsync begins now, and the file is freed again before its callback runs.
+        let late = log.sync_targets();
+        log.ring
+            .as_deref_mut()
+            .unwrap()
+            .free(1, Some(&mut group))
+            .unwrap();
+        assert!(!listed(&log));
+        held.finish_truncate(true);
+        assert!(listed(&log));
+        io.wait_for_completion(sync_files(late, crate::io::FileSyncType::Fsync).unwrap())
+            .unwrap();
+        assert!(
+            listed(&log),
+            "an fsync of an earlier freeing cleared the mark of the later one"
+        );
+        io.wait_for_completion(
+            sync_files(log.sync_targets(), crate::io::FileSyncType::Fsync).unwrap(),
+        )
+        .unwrap();
+        assert!(!listed(&log), "the fsync that covers its truncate clears the mark");
     }
 
     /// What this test checks: a truncate whose completion fails leaves the log

@@ -322,3 +322,30 @@ fn reindex_makes_the_index_afresh_and_leaves_none_of_the_old_one_in_the_file() {
         );
     }
 }
+
+/// An index whose columns are all filter columns has no searched column; the error says so, as it
+/// does when a filter column comes first among several, not that the query patterns built from no
+/// columns do not parse (the auditor's A-489).
+#[test]
+fn an_fts_index_of_only_filter_columns_is_refused_with_its_own_message() {
+    let db = turso_core::Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(turso_core::DatabaseOpts::default().with_index_method(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, tag TEXT, body TEXT)")
+        .unwrap();
+    let error = conn
+        .execute("CREATE INDEX only_filters ON docs USING fts(tag) WITH (filter_fields = 'tag')")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("needs at least one searched column"),
+        "the index was refused for another reason: {error}"
+    );
+}

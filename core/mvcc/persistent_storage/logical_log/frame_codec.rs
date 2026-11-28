@@ -5,7 +5,7 @@
 //! plaintext wire parts with a separate checksum chain.
 
 use super::{
-    build_encrypted_chunk_aad, derive_initial_crc, encrypted_payload_blob_size,
+    build_encrypted_chunk_aad, encrypted_payload_blob_size,
     encrypted_payload_chunk_count, EncryptionContext, LogHeader, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
     END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE, LOG_VERSION_V2, TX_EXT_HEADER_SIZE,
     TX_HEADER_SIZE, TX_TRAILER_SIZE,
@@ -24,7 +24,7 @@ impl ValidatedLogHeader {
     }
 
     pub fn initial_crc(&self) -> u32 {
-        derive_initial_crc(self.header.salt)
+        self.header.chain_seed()
     }
 
     pub fn bytes(&self) -> &[u8] {

@@ -2921,12 +2921,16 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             if encryption_context.is_some() {
-                // Authenticate before publication so rejection preserves the live state.
-                mvcc::persistent_storage::logical_log::StreamingLogicalLogReader::new(
-                    mv_store.get_logical_log_file(),
-                    encryption_context,
-                )
-                .validate_encryption_key(&self.io)?;
+                // Authenticate before publication so rejection preserves the live state: every
+                // segment file of the log, not only the first, since a rolled log may hold its
+                // frames in the others and leave the first empty.
+                for (_, file) in mv_store.logical_log_files() {
+                    mvcc::persistent_storage::logical_log::StreamingLogicalLogReader::new(
+                        file,
+                        encryption_context.clone(),
+                    )
+                    .validate_encryption_key(&self.io)?;
+                }
             }
             Some(mv_store)
         } else {

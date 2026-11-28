@@ -898,6 +898,14 @@ impl FtsIndexAttachment {
         dialect: &dyn crate::dialect::Dialect,
         cfg: IndexMethodConfiguration,
     ) -> Result<Self> {
+        // Before the patterns are built from the searched columns: with none, they would be SQL that
+        // does not parse, and the error would say so, not what is wrong with the index.
+        let values = value_column_names(&cfg);
+        if cfg.columns.first().is_some_and(|c| values.contains(&c.name)) {
+            return Err(LimboError::ParseError(
+                "an FTS index needs at least one searched column before its filter columns".into(),
+            ));
+        }
         let pattern_sql = query_pattern_sql(&cfg);
         let patterns = parse_patterns(
             dialect,

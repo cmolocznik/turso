@@ -489,15 +489,17 @@ failing on a mutant.
 
 ### A purge's erasure of the logical log is durable: the checkpoint keeps its fsync
 2026-11-28. `core/mvcc/database/checkpoint.rs` (`CheckpointState::FsyncLogicalLog`),
-`core/mvcc/persistent_storage/{mod.rs,logical_log.rs}` (`sync_beside_appends`, `LogRing::freed`).
+`core/mvcc/persistent_storage/{mod.rs,logical_log.rs}` (`sync_beside_appends`, `Slot::Free::unsynced`).
 Upstream stopped fsyncing the logical log after a checkpoint truncates it: a crash that loses the
 truncation brings the old frames back, but recovery skips frames at or below the checkpoint, so SQL
 cannot see them. The bytes are still in the file, and the forge's purge records its erasure after a
 TRUNCATE succeeds, so after a crash the record would stand over bytes that were not erased (the
 auditor's A-486). The checkpoint keeps the fsync, run beside the commits' appends, between the log's
-truncate and the WAL's, and the log now remembers each segment file a checkpoint freed until an fsync
-has covered its truncate, so a rolled log's sealed segments are erased durably too. A failed fsync
-fails the checkpoint.
+truncate and the WAL's, and each segment file a checkpoint frees carries a mark, new on every freeing,
+until an fsync has covered its truncate (listed for an fsync only once the truncate has succeeded, so
+no fsync clears it early and none of an earlier freeing clears a later one: A-490), so a rolled log's
+sealed segments are erased durably too. A failed fsync fails the checkpoint. A log's generation
+advances with its offset once its truncate has succeeded, not when it is issued (A-487).
 Tests, in `tests/integration/storage/erasure.rs`, each on `UnreliableIo`, which loses every write no
 fsync has covered:
 `a_truncating_checkpoint_leaves_no_erased_byte_in_the_durable_log_after_a_crash`,
@@ -505,8 +507,16 @@ fsync has covered:
 `a_truncating_checkpoint_fails_when_the_fsync_of_the_log_fails`; and
 `mvcc::database::a_commit_lands_while_a_passive_checkpoint_is_parked_in_its_log_sync` (no commit
 waits out the fsync).
+Unit tests in `logical_log`:
+`test_a_freed_segments_truncate_is_fsynced_after_it_succeeds_and_by_no_earlier_fsync` and
+`test_the_generation_advances_only_once_the_truncate_has_succeeded`.
 Each mutation is caught: no fsync state (all three crash tests fail); freed files not listed for the
-fsync (the freed-segment test fails).
+fsync (the freed-segment test fails); listed before the truncate succeeded and a generation advanced
+at once (the two unit tests fail).
+Also from the audit of the merge: a restored encrypted database validates the key against every
+segment of its log, not only the first (A-488; not covered by a test: the scenario needs a log
+encrypted under another key than its database file); an FTS index of only filter columns is refused
+with its own message (A-489); a header upgrade counts `portable_changes_required` as a frame does.
 Two of upstream's tests assumed the checkpoint does not fsync the log and are adapted: the attach test
 (`attach::test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode`) checks the commit's
 fsync with no checkpoint in the way, and the power-loss test

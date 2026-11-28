@@ -10491,6 +10491,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.storage.get_logical_log_file()
     }
 
+    /// Every file of the logical log, by slot: a log that rolls holds frames in more than the
+    /// first.
+    pub(crate) fn logical_log_files(&self) -> Vec<(usize, Arc<dyn File>)> {
+        self.storage.log_files()
+    }
+
     pub fn logical_log_offset(&self) -> u64 {
         self.storage.logical_log_offset()
     }

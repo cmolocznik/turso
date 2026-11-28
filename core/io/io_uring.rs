@@ -955,10 +955,10 @@ mod tests {
             move |_| {
                 let done = done.clone();
                 let second = Completion::new_write(move |_| done.send(()).unwrap());
-                file.pwrite(4096, buffer.clone(), second).unwrap();
+                let _write = file.pwrite(4096, buffer.clone(), second).unwrap();
             }
         });
-        file.pwrite(0, buffer, first).unwrap();
+        let _write = file.pwrite(0, buffer, first).unwrap();
         // Driven apart, so that a callback waiting on the ring's lock fails the test.
         let driver = std::thread::spawn(move || {
             while finished.try_recv().is_err() {

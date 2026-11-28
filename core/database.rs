@@ -842,14 +842,14 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
         if matches!(registry.get(&key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
         {
             registry.insert(key.clone(), RegistryEntry::Closing);
-            self.closing = ClosingMark(Some(key.clone()));
+            self.closing = ClosingMark(Some(key));
         }
         drop(registry);
         #[cfg(test)]
-        {
+        if let Some(key) = self.closing.0.as_ref() {
             let hook = {
                 let mut hook = WHILE_CLOSING.lock();
-                matches!(&*hook, Some((of, _)) if *of == key).then(|| hook.take())
+                matches!(&*hook, Some((of, _)) if of == key).then(|| hook.take())
             };
             if let Some(Some((_, run))) = hook {
                 run();
@@ -1207,10 +1207,11 @@ impl Database {
         let db = loop {
             let registry = DATABASE_MANAGER.lock();
             match registry.get(&key) {
-                Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
-                    Some(db) => break db,
-                    None => {}
-                },
+                Some(RegistryEntry::Ready(weak)) => {
+                    if let Some(db) = weak.upgrade() {
+                        break db;
+                    }
+                }
                 Some(RegistryEntry::Closing) => {}
                 _ => return Ok(None),
             }
@@ -5986,7 +5987,7 @@ mod closing_tests {
         let closer = std::thread::spawn(move || drop(first));
         entered.recv().unwrap();
         let opener = std::thread::spawn({
-            let (io, path) = (io.clone(), path.clone());
+            let io = io.clone();
             move || Database::open_file(io, &path, Arc::new(crate::SqliteDialect))
         });
         std::thread::sleep(std::time::Duration::from_millis(300));

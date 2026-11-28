@@ -26038,7 +26038,7 @@ fn passive_scan_survives_rule3_drop_mid_scan(sql: &str, expected: &[String]) {
     let mut stmt = scanner.prepare(sql).unwrap();
     let io = stmt.get_pager().io.clone();
     let mut seen: Vec<String> = Vec::new();
-    let mut step = |stmt: &mut crate::Statement, seen: &mut Vec<String>, limit: usize| loop {
+    let step = |stmt: &mut crate::Statement, seen: &mut Vec<String>, limit: usize| loop {
         if seen.len() >= limit {
             return false;
         }
@@ -26386,7 +26386,7 @@ fn a_commit_lands_while_a_passive_checkpoint_is_parked_in_its_log_sync() {
         .expect("the checkpoint reaches its log sync");
 
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    let writer_db = db_arc.clone();
+    let writer_db = db_arc;
     let writer = std::thread::spawn(move || {
         let conn = writer_db.connect(ConnectOpts::new()).unwrap();
         conn.execute("INSERT INTO t VALUES (1000, 'v01000')").unwrap();

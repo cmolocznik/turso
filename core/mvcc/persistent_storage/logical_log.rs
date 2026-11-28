@@ -4709,6 +4709,32 @@ pub(crate) enum IndexOpKind {
     Delete,
 }
 
+/// A file a log sync covers, with the sealed segment's not-yet-synced mark it clears.
+pub(crate) struct SyncTarget {
+    file: Arc<dyn File>,
+    unsynced: Option<Arc<crate::sync::atomic::AtomicBool>>,
+}
+
+/// Fsync `targets`; a sealed segment's mark clears once its fsync succeeds.
+pub(crate) fn sync_files(targets: Vec<SyncTarget>, sync_type: FileSyncType) -> Result<Completion> {
+    let mut group = CompletionGroup::new(|_| {});
+    for target in targets {
+        let c = match target.unsynced {
+            Some(unsynced) => Completion::new_sync(move |result| {
+                if result.is_ok() {
+                    unsynced.store(false, crate::sync::atomic::Ordering::Release);
+                }
+            }),
+            None => Completion::new_sync(move |_| {
+                tracing::debug!("logical_log_sync finish");
+            }),
+        };
+        group.add(&c);
+        let _c = target.file.sync(c, sync_type)?;
+    }
+    Ok(group.build())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::namespace::NamespaceId;
@@ -9287,30 +9313,4 @@ mod tests {
         // Keep the last chunk variable used so the compiler notices if the range math changes.
         assert!(last_chunk.end > last_chunk.start);
     }
-}
-
-/// A file a log sync covers, with the sealed segment's not-yet-synced mark it clears.
-pub(crate) struct SyncTarget {
-    file: Arc<dyn File>,
-    unsynced: Option<Arc<crate::sync::atomic::AtomicBool>>,
-}
-
-/// Fsync `targets`; a sealed segment's mark clears once its fsync succeeds.
-pub(crate) fn sync_files(targets: Vec<SyncTarget>, sync_type: FileSyncType) -> Result<Completion> {
-    let mut group = CompletionGroup::new(|_| {});
-    for target in targets {
-        let c = match target.unsynced {
-            Some(unsynced) => Completion::new_sync(move |result| {
-                if result.is_ok() {
-                    unsynced.store(false, crate::sync::atomic::Ordering::Release);
-                }
-            }),
-            None => Completion::new_sync(move |_| {
-                tracing::debug!("logical_log_sync finish");
-            }),
-        };
-        group.add(&c);
-        let _c = target.file.sync(c, sync_type)?;
-    }
-    Ok(group.build())
 }

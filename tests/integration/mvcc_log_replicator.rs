@@ -448,6 +448,54 @@ fn an_optimize_on_a_connection_that_applies_replicated_commits_is_neither_asked_
     );
 }
 
+/// The thread's CPU time so far, in clock ticks (`USER_HZ`, 100 a second), as Linux counts it.
+#[cfg(target_os = "linux")]
+fn thread_cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+    let after = &stat[stat.rfind(')').unwrap() + 2..];
+    let fields: Vec<&str> = after.split(' ').collect();
+    // `utime` and `stime`, the 14th and 15th fields of the line.
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+/// A blocking commit that waits on its replicator, a wait another thread completes, parks its
+/// thread, never spinning it on the IO.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blocking_commit_that_waits_parks_its_thread() {
+    let (db, recorder) = leader("log_replicator_parks.db");
+    db.connect_limbo()
+        .execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    recorder.hold.store(true, Ordering::SeqCst);
+    let db = Arc::new(db);
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let conn = db.connect_limbo();
+            let began = thread_cpu_ticks();
+            conn.execute("INSERT INTO things VALUES (1, 'waits')")
+                .unwrap();
+            thread_cpu_ticks() - began
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while recorder.held.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the frame never reached the replicator"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    for held in recorder.held.lock().unwrap().drain(..) {
+        held.complete(0);
+    }
+    let ticks = writer.join().unwrap();
+    // A second of waiting: a spinning thread takes about 100 ticks of it.
+    assert!(ticks < 30, "the waiting commit took {ticks} ticks of CPU");
+}
+
 #[test]
 fn a_full_replicator_makes_the_writer_wait() {
     let (db, recorder) = leader("log_replicator_full.db");

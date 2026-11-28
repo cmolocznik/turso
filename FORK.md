@@ -2250,6 +2250,15 @@ hook (`set_before_claiming_commit_for_test`) runs a whole second `OPTIMIZE INDEX
 its commit; the first loses the commit and goes on. It failed `an entry to remove is missing` before this change,
 and does with the claims removed. Its old form, two runs stepped by turns, passed with the claims removed.
 
+### A wait another thread completes, and a blocking wait that parks on it
+2026-11-28. `core/io/completions.rs`, `core/statement.rs`. A replicator's completion that another thread
+finishes (`Completion::new_remote_wait`, as a log replicator's backpressure, a replicator stopped, or a
+commit replicator's quorum) was waited for by stepping the IO in a loop, which spins a core where a step
+has nothing to deliver. A statement now has `wait_io`, which parks the thread until such a wait is
+completed, stepping the IO between parks, and every blocking run uses it, in its simplest form on this branch's completions.
+Test: `mvcc_log_replicator::a_blocking_commit_that_waits_parks_its_thread` (Linux): a commit held a second
+takes under 30 CPU ticks; stepping in a loop took 100.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

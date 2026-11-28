@@ -266,6 +266,7 @@ impl Debug for CompletionType {
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
             Self::Group(..) => f.debug_tuple("Group").finish(),
             Self::Yield => f.debug_tuple("Yield").finish(),
+            Self::Remote => f.debug_tuple("Remote").finish(),
         }
     }
 }
@@ -277,6 +278,8 @@ pub enum CompletionType {
     Truncate(TruncateCompletion),
     Group(GroupCompletion),
     Yield,
+    /// A wait another thread completes: see [`Completion::new_remote_wait`].
+    Remote,
 }
 
 impl CompletionInner {
@@ -365,6 +368,39 @@ impl Completion {
         Self::new(CompletionType::Yield)
     }
 
+    /// A wait another thread completes, as a replicator's quorum does (`complete`, `error` or
+    /// `abort`): a statement stepped with a waker is woken then, and a blocking wait parks the
+    /// thread until it is, stepping the IO between parks for what it delivers.
+    pub fn new_remote_wait() -> Self {
+        Self::new(CompletionType::Remote)
+    }
+
+    /// Whether another thread completes this wait, so that a blocking waiter parks on it.
+    pub fn is_remote_wait(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Remote))
+    }
+
+    /// Parks the calling thread until this wait is completed, stepping `io` between parks.
+    ///
+    /// # Errors
+    ///
+    /// If stepping the IO fails. The wait's own error is its statement's to read.
+    pub(crate) fn park_until_finished(&self, io: &dyn crate::io::IO) -> crate::Result<()> {
+        self.set_waker(&std::task::Waker::from(Arc::new(Unpark(
+            std::thread::current(),
+        ))));
+        while !self.finished() {
+            io.step()?;
+            if !self.finished() {
+                // Woken by the completion; the timeout steps the IO again meanwhile.
+                std::thread::park_timeout(REMOTE_WAIT_STEP);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `other` is this same completion, not merely an equal one.
     pub(crate) fn ptr_eq(&self, other: &Completion) -> bool {
         match (&self.inner, &other.inner) {
@@ -374,9 +410,12 @@ impl Completion {
     }
 
     pub fn is_wait(&self) -> bool {
-        self.inner
-            .as_ref()
-            .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Yield))
+        self.inner.as_ref().is_some_and(|inner| {
+            matches!(
+                inner.completion_type,
+                CompletionType::Yield | CompletionType::Remote
+            )
+        })
     }
 
     pub fn wake(&self) {
@@ -495,7 +534,7 @@ impl Completion {
                     g.callback(result);
                     None
                 }
-                CompletionType::Yield => None,
+                CompletionType::Yield | CompletionType::Remote => None,
             };
 
             // Use callback error if present, otherwise use the original IO error
@@ -539,6 +578,18 @@ impl Completion {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         }
+    }
+}
+
+/// How often a thread parked on a remote wait steps the IO.
+const REMOTE_WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Wakes a thread parked on a remote wait.
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.unpark();
     }
 }
 

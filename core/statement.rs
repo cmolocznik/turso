@@ -807,6 +807,20 @@ impl Statement {
         result
     }
 
+    /// Waits, blocking the calling thread, for what the statement's last step waits on: a
+    /// remote wait, which another thread completes, parks the thread until it does; anything
+    /// else is one step of the IO.
+    ///
+    /// # Errors
+    ///
+    /// If stepping the IO fails.
+    pub fn wait_io(&self) -> Result<()> {
+        match &self.state.io_completions {
+            Some(io) if io.0.is_remote_wait() => io.0.park_until_finished(self.pager.io.as_ref()),
+            _ => self.pager.io.step(),
+        }
+    }
+
     /// Runs the statement to completion, discarding rows. A busy wait sleeps out each delay the
     /// busy handler asks for: stepping the IO instead would spin until the timeout passed, on any
     /// backend whose step returns at once with nothing pending.
@@ -814,7 +828,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -831,7 +845,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
@@ -853,7 +867,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
@@ -937,7 +951,7 @@ impl Statement {
                 vdbe::StepResult::Done => break None,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
-                    self.pager.io.step()?;
+                    self.wait_io()?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Sleep { duration } => {

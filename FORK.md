@@ -2259,6 +2259,14 @@ completed, stepping the IO between parks, and every blocking run uses it, in its
 Test: `mvcc_log_replicator::a_blocking_commit_that_waits_parks_its_thread` (Linux): a commit held a second
 takes under 30 CPU ticks; stepping in a loop took 100.
 
+### A COMMIT or ROLLBACK ended on its instruction's re-entry lets its transaction go
+2026-11-28. `core/vdbe/execute.rs`. `op_auto_commit` let a transaction go in two places, and the re-entry
+after a yield kept the CDC transaction id (and cleared the deferred foreign-key violations after a COMMIT
+only), so the next transaction's changes were captured under the last one's id. Both call one tail.
+Upstream has the same code.
+Test: `functions::test_cdc::a_commit_that_waits_lets_its_cdc_transaction_id_go` (`io_memory_yield`): it
+failed with the id kept.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

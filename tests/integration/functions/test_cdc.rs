@@ -2902,3 +2902,39 @@ fn test_cdc_order_upsert_do_update_rowid_change_fk_cascade_parent_before_child(d
         ]
     );
 }
+
+/// A COMMIT that waits for IO ends on its instruction's re-entry, and lets its transaction's
+/// CDC id go there as one that ends at once does: the next transaction takes its own.
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn a_commit_that_waits_lets_its_cdc_transaction_id_go() {
+    use turso_core::{
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
+    };
+
+    let db = Database::open_file_with_flags(
+        Arc::new(MemoryYieldIO::new()),
+        "cdc_commit_that_waits.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+    for n in 0..2 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({n})")).unwrap();
+        assert_ne!(conn.get_cdc_transaction_id(), -1, "no change captured");
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(
+            conn.get_cdc_transaction_id(),
+            -1,
+            "transaction {n}'s id kept"
+        );
+    }
+}

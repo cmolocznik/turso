@@ -1352,6 +1352,8 @@ impl Database {
         path: &str,
         options: &OpenOptions,
     ) -> IOResultOr<Option<Arc<Database>>> {
+        Self::reject_wal_path_for_registry_open(options)?;
+        Self::validate_open_options(options)?;
         match Self::registry_step(io, state, path) {
             RegistryStep::Hit(db) => {
                 Self::validate_registered(

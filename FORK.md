@@ -547,7 +547,10 @@ frames were written over, so a crash that lands that frame before theirs cannot 
 (the auditor's A-511). The rewrite's checksum is kept for `commit_prepared_frames`, and the
 connection's chain is untouched until then, so a commit whose sync failed can be retried (A-512).
 The pages written over are submitted before the appended frames. Raw frames cannot follow a
-transaction that wrote frames over (A-514). `Wal` gains
+transaction that wrote frames over (A-514). An I/O call of the rewrite that returns an error at
+once, as `UnixFile` does for ENOSPC, leaves no half-done rewrite to resume: a retried commit starts
+it over from the first frame written over (A-516), and a write transaction that ends leaves no
+rewrite owed (A-517). `Wal` gains
 `prepare_commit_frames`, `checksum_rewrite_needed` and `checksum_rewrite_step`; `PreparedFrames`
 gains `overwrites` and `overwritten`. A frame at or below the committed mark is never written to,
 and neither is a frame `write_frame_raw` wrote: a sync pull's frames sit above the committed mark
@@ -559,13 +562,13 @@ commit, now in page order. A commit with no spill and no repeated page is what i
 
 What proves it: WorkReef's repro at 32,768 rows and a 2,000-page cache writes 28,153 frames for
 28,184 pages in 19 s, and at 2,000 rows and a 200-page cache 1,878 frames for 1,908 pages (179,266
-before); SQLite opens both and passes `integrity_check` with every row. Nineteen unit tests in
+before); SQLite opens both and passes `integrity_check` with every row. Twenty-two unit tests in
 `core/storage/wal.rs` (a page spilled twice, a commit over a spilled page, a rewrite across batches
 and from a frame after the first, a last batch of one frame, a rollback, savepoint rollbacks, the
 commit-marker page and the marker that waits for the rewrite, a retried commit, short reads and
 writes, a committed frame, a raw frame, a raw session after frames written over, the written-over
-page's state and the WAL's owed sync) each fail on a mutant of the code they cover (22 mutants run,
-all killed); five tests in `tests/integration/wal/test_wal.rs` (frames written against pages, SQLite
+page's state and the WAL's owed sync, writes and reads of the rewrite that fail at once) each fail on
+a mutant of the code they cover (24 mutants run, all killed); five tests in `tests/integration/wal/test_wal.rs` (frames written against pages, SQLite
 reading the WAL of a spilling commit, a crash image taken in the middle of a spilling transaction
 that opens as the database before it, and an encrypted spilling commit recovered from its WAL under
 its key) and one in `test_commit_replicator.rs` (a spilling commit's pages reach the replicator

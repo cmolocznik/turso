@@ -3830,9 +3830,27 @@ impl WalFile {
     /// chains their checksums again from the checksum of the frame before, and writes
     /// them back. It only writes frames above the committed high-water mark.
     fn checksum_rewrite_step_inner(&self, last_frame: u64, commit_db_size: u32) -> IOResultOr<()> {
+        let mut slot = self.checksum_rewrite.lock();
+        let result = self.checksum_rewrite_run(&mut slot, last_frame, commit_db_size);
+        if result.is_err() {
+            // However it failed, an I/O call that returned an error as much as a completion
+            // that did, the rewrite starts over from the first frame written over when the
+            // commit is tried again: what it had read and rewritten so far is not to be
+            // resumed.
+            *slot = None;
+        }
+        result
+    }
+
+    /// The steps of `checksum_rewrite_step_inner`, with the rewrite in `slot`.
+    fn checksum_rewrite_run(
+        &self,
+        slot: &mut Option<ChecksumRewrite>,
+        last_frame: u64,
+        commit_db_size: u32,
+    ) -> IOResultOr<()> {
         let header = self.coordination.wal_header();
         let frame_size = header.page_size as u64 + WAL_FRAME_HEADER_SIZE as u64;
-        let mut slot = self.checksum_rewrite.lock();
         if slot.is_none() {
             let from = self.rechecksum_from.load(Ordering::Acquire);
             turso_assert!(from != 0, "a checksum rewrite needs a frame to start from");
@@ -3918,7 +3936,7 @@ impl WalFile {
                         io_yield_one!(read);
                     }
                     if !read.succeeded() {
-                        return failed(&mut slot, "read the frame before its first frame");
+                        return failed(slot, "read the frame before its first frame");
                     }
                     let bytes = buf.as_slice();
                     rewrite.prev = Some((
@@ -3936,7 +3954,7 @@ impl WalFile {
                         io_yield_one!(read);
                     }
                     if !read.succeeded() {
-                        return failed(&mut slot, "read frames");
+                        return failed(slot, "read frames");
                     }
                     let mut prev = rewrite.prev.expect("seeded before the first read");
                     let bytes = buf.as_mut_slice();
@@ -3969,7 +3987,7 @@ impl WalFile {
                         io_yield_one!(write);
                     }
                     if !write.succeeded() {
-                        return failed(&mut slot, "write frames back");
+                        return failed(slot, "write frames back");
                     }
                     rewrite.next += count;
                 }
@@ -4547,6 +4565,9 @@ impl Wal for WalFile {
                 .is_ok(),
             "end_write_tx called while write lock not held according to connection state"
         );
+        // A transaction that ends without its commit (a raw session's forced commit that
+        // failed) leaves no frame bookkeeping behind for the next writer of this connection.
+        self.clear_checksum_rewrite();
         self.coordination.end_write_tx();
     }
 
@@ -7238,7 +7259,10 @@ pub mod test {
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
     use crate::storage::sqlite3_ondisk::recompute_wal_frame_checksum;
-    use crate::sync::{atomic::Ordering, Arc};
+    use crate::sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    };
     use crate::sync::{Mutex, RwLock};
     use crate::{
         io::FileSyncType,
@@ -7638,6 +7662,163 @@ pub mod test {
             Some(1),
             "frame must be visible once its write is durable"
         );
+    }
+
+    /// A WAL file whose next write, or whose read after a number of reads, returns an error
+    /// at once instead of completing with one: what `UnixFile` does for ENOSPC and EIO.
+    struct FailingFile {
+        inner: Arc<dyn File>,
+        fail_next_write: AtomicBool,
+        reads_allowed: AtomicU32,
+    }
+
+    impl FailingFile {
+        fn failure(what: &'static str) -> LimboError {
+            LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::StorageFull,
+                what,
+            ))
+        }
+
+        fn fail_next_write(&self) {
+            self.fail_next_write.store(true, Ordering::SeqCst);
+        }
+
+        /// Reads go through `count` times, and the one after fails.
+        fn allow_reads(&self, count: u32) {
+            self.reads_allowed.store(count, Ordering::SeqCst);
+        }
+    }
+
+    impl File for FailingFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            let allowed = self.reads_allowed.load(Ordering::SeqCst);
+            if allowed != u32::MAX {
+                if allowed == 0 {
+                    self.reads_allowed.store(u32::MAX, Ordering::SeqCst);
+                    return Err(Self::failure("pread"));
+                }
+                self.reads_allowed.store(allowed - 1, Ordering::SeqCst);
+            }
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                return Err(Self::failure("pwrite"));
+            }
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn pwritev(
+            &self,
+            pos: u64,
+            buffers: Vec<Arc<Buffer>>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                return Err(Self::failure("pwritev"));
+            }
+            self.inner.pwritev(pos, buffers, c)
+        }
+
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    /// `make_initialized_memory_wal` over a `FailingFile`.
+    fn make_initialized_failing_wal(
+        page_size: u32,
+    ) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile, Arc<FailingFile>) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("failing-rewrite.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let failing = Arc::new(FailingFile {
+            inner: file,
+            fail_next_write: AtomicBool::new(false),
+            reads_allowed: AtomicU32::new(u32::MAX),
+        });
+        let shared = WalFileShared::new_shared(failing.clone()).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let page_size = PageSize::new(page_size).unwrap();
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
+        (io, buffer_pool, wal, failing)
+    }
+
+    /// Prepares the commit of `pages`, writes its frames, and runs the checksum rewrite until
+    /// it is done or fails; returns the rewrite's result.
+    fn commit_until_rewrite_fails(
+        io: &Arc<dyn IO>,
+        wal: &WalFile,
+        page_size: u32,
+        pages: &[PageRef],
+        arm: impl FnOnce(),
+    ) -> Result<()> {
+        let prepared = wal
+            .prepare_commit_frames(pages, PageSize::new(page_size).unwrap(), Some(99), None)
+            .unwrap();
+        let file = wal.wal_file().unwrap();
+        let mut writes = vec![file
+            .pwritev(
+                prepared.offset,
+                prepared.bufs.clone(),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap()];
+        for (offset, bufs) in &prepared.overwrites {
+            writes.push(
+                file.pwritev(*offset, bufs.clone(), Completion::new_write(|_| {}))
+                    .unwrap(),
+            );
+        }
+        for write in writes {
+            io.wait_for_completion(write).unwrap();
+        }
+        arm();
+        loop {
+            match wal.checksum_rewrite_step(prepared.final_max_frame, 99) {
+                Ok(IOResult::Done(())) => return Ok(()),
+                Ok(IOResult::IO(pending)) => io.wait_for_completion(pending.0).unwrap(),
+                Err(error) => return Err(*error),
+            }
+        }
     }
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
@@ -8344,7 +8525,7 @@ pub mod test {
         let read = read_in_full(1000, 16);
         assert!(read(Ok((buf.clone(), 16))).is_none());
         assert!(matches!(
-            read(Ok((buf.clone(), 9))),
+            read(Ok((buf, 9))),
             Some(CompletionError::ShortReadWalFrame {
                 offset: 1000,
                 expected: 16,
@@ -8516,9 +8697,89 @@ pub mod test {
             .get_contents()
             .as_ptr()
             .to_vec();
-        let result =
-            wal.write_frame_raw(buffer_pool.clone(), 2, 9, 99, &bytes, FileSyncType::Fsync);
+        let result = wal.write_frame_raw(buffer_pool, 2, 9, 99, &bytes, FileSyncType::Fsync);
         assert!(matches!(result, Err(LimboError::TxError(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_write_of_the_rewrite_that_fails_at_once_leaves_nothing_for_the_retry_to_resume() {
+        let page_size = 512;
+        let (io, buffer_pool, wal, failing) = make_initialized_failing_wal(page_size);
+        for seed in [0x10u8, 0x20] {
+            spill_test_pages(
+                &io,
+                &wal,
+                page_size,
+                vec![page_with_pattern(7, seed, &buffer_pool)],
+            );
+        }
+        assert!(wal.checksum_rewrite_needed());
+
+        let commit_page = || page_with_pattern(9, 0x90, &buffer_pool);
+        let result = commit_until_rewrite_fails(&io, &wal, page_size, &[commit_page()], || {
+            failing.fail_next_write()
+        });
+        assert!(result.is_err(), "the rewrite's write must fail: {result:?}");
+        assert!(wal.checksum_rewrite_needed(), "the commit still owes it");
+
+        commit_test_pages(&io, &wal, page_size, &[commit_page()]);
+        assert_eq!(wal.get_max_frame(), 2);
+        assert_eq!(first_broken_frame(&io, &wal, 2), None);
+        assert_eq!(last_valid_commit_frame(&io, &wal, 2), Some(2));
+    }
+
+    #[test]
+    fn a_read_of_a_later_batch_that_fails_at_once_restarts_the_rewrite_from_the_first_frame() {
+        let page_size = 512;
+        let (io, buffer_pool, wal, failing) = make_initialized_failing_wal(page_size);
+        let pages_count = CHECKSUM_REWRITE_FRAMES as i64 + 40;
+        for seed in [0x40u8, 0x60] {
+            let pages = (10..10 + pages_count)
+                .map(|id| page_with_pattern(id, seed, &buffer_pool))
+                .collect::<Vec<_>>();
+            for chunk in pages.chunks(100) {
+                spill_test_pages(&io, &wal, page_size, chunk.to_vec());
+            }
+        }
+        let frames = pages_count as u64 + 1;
+        let commit_page = || page_with_pattern(3, 0x03, &buffer_pool);
+        // The first batch is read and written back; the read of the second fails.
+        let result = commit_until_rewrite_fails(&io, &wal, page_size, &[commit_page()], || {
+            failing.allow_reads(1)
+        });
+        assert!(
+            result.is_err(),
+            "the second batch's read must fail: {result:?}"
+        );
+
+        // The retry also changes pages the first batch covered: the rewrite must cover them
+        // again, so it starts over from the first frame written over.
+        let changed = (10..20)
+            .map(|id| page_with_pattern(id, 0x77, &buffer_pool))
+            .collect::<Vec<_>>();
+        let mut retry = changed;
+        retry.push(commit_page());
+        commit_test_pages(&io, &wal, page_size, &retry);
+        assert_eq!(wal.get_max_frame(), frames);
+        assert_eq!(first_broken_frame(&io, &wal, frames), None);
+        assert_eq!(last_valid_commit_frame(&io, &wal, frames), Some(frames));
+    }
+
+    #[test]
+    fn a_write_transaction_that_ends_leaves_no_rewrite_owed() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        for seed in [0x10u8, 0x20] {
+            spill_test_pages(
+                &io,
+                &wal,
+                page_size,
+                vec![page_with_pattern(7, seed, &buffer_pool)],
+            );
+        }
+        assert!(wal.checksum_rewrite_needed());
+        wal.end_write_tx();
+        assert!(!wal.checksum_rewrite_needed());
     }
 
     #[test]

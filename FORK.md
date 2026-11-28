@@ -507,6 +507,11 @@ fsync has covered:
 waits out the fsync).
 Each mutation is caught: no fsync state (all three crash tests fail); freed files not listed for the
 fsync (the freed-segment test fails).
+Two of upstream's tests assumed the checkpoint does not fsync the log and are adapted: the attach test
+(`attach::test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode`) checks the commit's
+fsync with no checkpoint in the way, and the power-loss test
+(`mvcc::database::test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames`) takes its
+crash image at the log's fsync, before the truncation is durable.
 
 ## Additions
 

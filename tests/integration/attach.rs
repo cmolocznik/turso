@@ -182,10 +182,20 @@ fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> any
         before.get(AUX_PATH),
         "an attached MVCC checkpoint must write and fsync the attached database"
     );
+    // The checkpoint above truncated the log and, as the fork's checkpoint fsyncs that truncation
+    // (a purge's erasure must be durable), the durable log is empty again; so the commit's own
+    // fsync is checked with no checkpoint in the way.
+    aux_db
+        .get_mv_store()
+        .as_ref()
+        .expect("attached database must use MVCC")
+        .set_checkpoint_threshold(1_000_000_000);
     let aux_log_path = format!("{AUX_PATH}-log");
+    let before_log = io.durable_files().get(&aux_log_path).cloned();
+    conn.execute("INSERT INTO aux.t VALUES (2)")?;
     assert_ne!(
-        after.get(&aux_log_path),
-        before.get(&aux_log_path),
+        io.durable_files().get(&aux_log_path).cloned(),
+        before_log,
         "an attached MVCC commit must fsync using aux.synchronous=FULL"
     );
     Ok(())

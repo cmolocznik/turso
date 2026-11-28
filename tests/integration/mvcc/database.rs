@@ -13013,15 +13013,36 @@ fn test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames() {
     // durable only when the checkpoint writes it to the database file.
     conn.execute("PRAGMA synchronous = NORMAL").unwrap();
     conn.execute("UPDATE t SET v = 'new' WHERE id = 1").unwrap();
+    // The fork's checkpoint fsyncs the log's truncation (a purge's erasure must be durable). The
+    // power loss is the one that strikes at that fsync, with the database file durable and the
+    // truncation not: the INSERT frame comes back.
+    let log = format!("{db_path}-log");
+    io.arm_crash_on_sync(&log);
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let durable_log_len = io.durable_files()[&format!("{db_path}-log")].len();
+    let snapshot = io
+        .take_crash_snapshot()
+        .expect("the checkpoint never fsynced the logical log");
     assert!(
-        durable_log_len > LOG_HDR_SIZE,
+        snapshot.files[&log].len() > LOG_HDR_SIZE,
         "after a power loss, the logical log must still have the INSERT frame"
     );
 
-    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("recovered.db"), &snapshot.files[db_path]).unwrap();
+    for suffix in ["-wal", "-log"] {
+        if let Some(bytes) = snapshot.files.get(&format!("{db_path}{suffix}")) {
+            std::fs::write(dir.path().join(format!("recovered.db{suffix}")), bytes).unwrap();
+        }
+    }
+    let recovered_db = Database::open_file(
+        Arc::new(PlatformIO::new().unwrap()),
+        dir.path().join("recovered.db").to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let recovered = recovered_db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         get_rows(&recovered, "SELECT id, v FROM t"),
         vec![vec![

@@ -523,6 +523,42 @@ fsync with no checkpoint in the way, and the power-loss test
 (`mvcc::database::test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames`) takes its
 crash image at the log's fsync, before the truncation is durable.
 
+### A transaction writes each page to the WAL once
+2026-11-29 `e3099c719`.
+`core/storage/wal.rs`, `core/storage/pager.rs`. A write transaction whose dirty pages do not fit the
+page cache spills them to the WAL, and the WAL took a new frame for every spill of a page, and one
+more at the commit, which also read every spilled page back and wrote it again. WorkReef's brain
+test (32,768 rows into three tables with 132 indexes, one transaction, 2,000-page cache) wrote
+3,339,972 frames for a database of 28,387 pages: 117.7 frames a page, a 13.8 GB WAL, 250 s.
+SQLite writes that fill in 28,467 frames and 15.6 s. The forge keeps the engine's default cache of
+2,000 pages, so a large landing into index-heavy tables met the same amplification.
+
+A spill and the commit now write a page over the frame this transaction already gave it, as
+SQLite's `walFrames` does (3.50.2, `sqlite3.c` 69892), except the page that carries the commit
+marker, which is appended as in SQLite. The frames written over keep their old checksums, and every
+frame after them chains from those, so the commit rewrites the chain from the first frame written
+over to the last, before the WAL is synced (SQLite's `walRewriteChecksums`, 69843): a state of the
+commit machine, `CommitState::RewriteChecksums`, whose reads and writes are completions, in batches
+of 256 frames, so nothing blocks and memory does not grow with the transaction. `Wal` gains
+`prepare_commit_frames`, `checksum_rewrite_needed` and `checksum_rewrite_step`; `PreparedFrames`
+gains `overwrites` and `overwritten`. A frame at or below the committed mark is never written to,
+and neither is a frame `write_frame_raw` wrote: a sync pull's frames sit above the committed mark
+until its last frame commits them, and an earlier version of this change mistook them for spills.
+A rollback to a savepoint keeps the rewrite owed by frames written over before it; the pager
+already restores such a page as dirty (`rollback_to_snapshot`, as SQLite's `pager_playback_one_page`
+does), so the commit writes it again. The commit replicator still receives every page of the
+commit, now in page order. A commit with no spill and no repeated page is what it was.
+
+What proves it: WorkReef's repro at 32,768 rows and a 2,000-page cache writes 28,153 frames for
+28,184 pages in 19 s, and at 2,000 rows and a 200-page cache 1,878 frames for 1,908 pages (179,266
+before); SQLite opens both and passes `integrity_check` with every row. Ten unit tests in
+`core/storage/wal.rs` (a page spilled twice, a commit over a spilled page, a rewrite across batches
+and from a frame after the first, a last batch of one frame, a rollback, a savepoint rollback, the
+commit-marker page, a committed frame, a raw frame) each fail on a mutant of the code they cover;
+three tests in `tests/integration/wal/test_wal.rs`: frames written against pages, SQLite reading
+the WAL of a spilling commit, and a crash image taken in the middle of a spilling transaction that
+opens as the database before it.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)

@@ -530,11 +530,14 @@ page cache spills them to the WAL, and the WAL took a new frame for every spill 
 more at the commit, which also read every spilled page back and wrote it again. WorkReef's brain
 test (32,768 rows into three tables with 132 indexes, one transaction, 2,000-page cache) wrote
 3,339,972 frames for a database of 28,387 pages: 117.7 frames a page, a 13.8 GB WAL, 250 s.
-SQLite writes that fill in 28,467 frames and 15.6 s. A connection's default cache is
-`CacheSize::DEFAULT`, -2000: 2,000 KiB, about 500 pages of 4 KiB (the cache never goes below 200 and
-spills past 90% of it). The forge sets none, so a large landing into index-heavy tables met the same
-amplification, from a smaller cache than WorkReef's test (an earlier version of this entry said 2,000
-pages, which is the page cache's own constructor default and not what a connection starts with).
+SQLite writes that fill in 28,467 frames and 15.6 s. A connection that never sets
+`PRAGMA cache_size` holds 2,000 pages (`PageCache::default()`, `DEFAULT_PAGE_CACHE_SIZE_IN_PAGES`),
+though the pragma reads back -2000, the header's default, which only fills the connection's
+`cache_size` field; only the pragma resizes the cache (`Pager::change_page_cache_size`). A run of
+the repro with no pragma makes the read and write calls of a run at `cache_size=2000` (344,704 and
+456,809 against 345,444 and 456,082) and not those of a run at 500 pages (764,142 and 817,029). The
+forge sets no cache size, so a large landing into index-heavy tables met the same amplification at
+2,000 pages. (An earlier version of this entry, and a correction to it, each said otherwise.)
 
 A spill and the commit now write a page over the frame this transaction already gave it, as
 SQLite's `walFrames` does (3.50.2, `sqlite3.c` 69892), except the page that carries the commit

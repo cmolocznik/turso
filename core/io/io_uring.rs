@@ -442,12 +442,16 @@ impl RingState {
                     written,
                     remaining
                 );
+                // A handle of our own, taken while the lock is held: once the write is
+                // resubmitted, another thread that takes the lock may reap its entry and
+                // finish the completion, and the kernel's reference with it.
+                let progressed = clone_user_data(user_data);
                 self.submit_writev(ring, user_data, state)?;
                 // Progress wake, once the lock is released: the future is parked on the
                 // parent completion's waker, but `complete()` only fires on the final
                 // chunk. Without this, intermediate-chunk completions never wake the
                 // future, the resubmitted chunks pile up, and the task deadlocks.
-                Ok(Taken::Progressed)
+                Ok(Taken::Progressed(progressed))
             }
         }
     }
@@ -598,8 +602,9 @@ impl IO for UringIO {
 enum Taken {
     /// The request ended: its callback runs.
     Ended(std::result::Result<i32, CompletionError>),
-    /// A partial write was resubmitted: its waiter is woken to see the progress.
-    Progressed,
+    /// A partial write was resubmitted: its waiter is woken to see the progress, through a
+    /// handle taken before the lock was released.
+    Progressed(Completion),
 }
 
 impl UringIO {
@@ -615,7 +620,7 @@ impl UringIO {
             match taken {
                 Taken::Ended(Ok(n)) => completion_from_key(user_data).complete(n),
                 Taken::Ended(Err(e)) => completion_from_key(user_data).error(e),
-                Taken::Progressed => wake_user_data(user_data),
+                Taken::Progressed(completion) => completion.wake_progress(),
             }
         }
         taken
@@ -691,12 +696,11 @@ fn completion_from_key(key: u64) -> Completion {
     }
 }
 
-/// Wake the waker registered on the completion identified by `key` (and on
-/// its parent group, if any) without consuming the kernel's `Arc::into_raw`
-/// reference. Used to fire a progress wake when an operation is resubmitted
-/// (e.g., a writev split across chunks) so the future re-polls and continues
-/// draining the CQ.
-fn wake_user_data(key: u64) {
+/// A handle to the completion identified by `key`, without consuming the kernel's
+/// `Arc::into_raw` reference. The caller holds the ring's lock, or the kernel's reference is
+/// otherwise known to stand: a completion's entry is not reaped by another thread until the
+/// lock is released.
+fn clone_user_data(key: u64) -> Completion {
     let ptr = key as *const CompletionInner;
     // SAFETY: kernel owns one strong ref via the Arc::into_raw'd `key`. We
     // re-materialize the Arc to clone it, then re-leak the original so the
@@ -707,7 +711,6 @@ fn wake_user_data(key: u64) {
     Completion {
         inner: Some(cloned),
     }
-    .wake_progress();
 }
 
 pub struct UringFile {

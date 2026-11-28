@@ -2310,8 +2310,10 @@ back), `an_open_waits_for_the_open_of_its_file_under_way_and_takes_its_database`
 2026-11-28. `core/io/io_uring.rs`. `drain_cq` ran every completion's callback while holding the ring
 state's mutex, so a callback that submits more IO, which takes that mutex, waited on itself forever. The
 CQEs are taken under the lock and their callbacks run once it is released; a writev's partial completion is
-still resubmitted under the lock, and its progress wake and its final outcome reported after it. Upstream
-has the same code.
+still resubmitted under the lock, and its progress wake and its final outcome reported after it, the wake
+through a handle of the completion taken under the lock: once a write is resubmitted another thread may
+reap its entry and finish the completion as soon as the lock is released (audit A-482). Upstream has the
+same code.
 Test: `io::io_uring::tests::a_callback_may_submit_io`: without the change the callback's write never runs.
 The progress wake outside the lock is not tested: a file never returns the short write that resubmits.
 

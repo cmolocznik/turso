@@ -1,3 +1,4 @@
+use crate::app::{database_name_without_query, database_uri, quote_ident};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,12 +9,13 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use turso_core::ast::{Cmd, Stmt};
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect,
-    Value as DbValue,
+    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SessionRole,
+    Value as DbValue, IO,
 };
-use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -82,16 +84,21 @@ impl StmtClass {
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
             | Stmt::CreateRole { .. }
+            | Stmt::DropRole { .. }
+            | Stmt::Grant(_)
             | Stmt::CreateSequence { .. }
             | Stmt::CreateSchema { .. }
             | Stmt::DropSchema { .. }
+            | Stmt::CreatePolicy(_)
+            | Stmt::DropPolicy { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
             | Stmt::DropTrigger { .. }
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::DropSequence { .. } => Some(Self::Schema),
+            | Stmt::DropSequence { .. }
+            | Stmt::AlterSequenceOwnedBy { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
@@ -196,16 +203,28 @@ fn parse_request_line(line: &str) -> Result<JsonRpcRequest, Box<JsonRpcResponse>
 pub struct TursoMcpServer {
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
-    current_db_path: Arc<Mutex<Option<String>>>,
+    current_db_path: Arc<Mutex<String>>,
+    /// The options with which the `open_database` tool opens a database.
+    db_opts: DatabaseOpts,
 }
 
 impl TursoMcpServer {
-    pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+    /// Creates a server for the open connection `conn`. The `open_database`
+    /// tool opens other databases with `db_opts`, which are usually the
+    /// options that tursodb was started with.
+    pub fn new(
+        conn: Arc<Connection>,
+        io: &dyn IO,
+        db_path: String,
+        interrupt_count: Arc<AtomicUsize>,
+        db_opts: DatabaseOpts,
+    ) -> Self {
         conn.set_load_extension_enabled(false);
         Self {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
-            current_db_path: Arc::new(Mutex::new(None)),
+            current_db_path: Arc::new(Mutex::new(reported_db_path(io, db_path))),
+            db_opts,
         }
     }
 
@@ -355,7 +374,7 @@ impl TursoMcpServer {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Path to the database file (absolute or relative). Use ':memory:' for in-memory database."
+                                    "description": "Path to the database file (absolute or relative), or a file: URI. Use ':memory:' for in-memory database."
                                 }
                             },
                             "required": ["path"]
@@ -553,8 +572,16 @@ impl TursoMcpServer {
             None => return Err("Missing path parameter".to_string()),
         };
 
-        // Create parent directories if needed
-        if path != ":memory:" {
+        // Read the name as `.open` does: a `file:` URI, or a `path?key=value`
+        // name, is a URI whose query gives the open options.
+        let uri = database_uri(&path);
+        // The query can hold the encryption key, so messages show the name
+        // without it.
+        let shown = database_name_without_query(&path);
+
+        // Create parent directories if needed. A URI is not a file system path,
+        // so its parent is not a directory to create.
+        if path != ":memory:" && uri.is_none() {
             let db_path = PathBuf::from(&path);
             if let Some(parent) = db_path.parent() {
                 if !parent.exists() {
@@ -566,40 +593,40 @@ impl TursoMcpServer {
         }
 
         // Open the new database connection
-        let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
-            match Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect)) {
-                Ok((_io, c)) => c,
-                Err(e) => return Err(format!("Failed to open database '{path}': {e}")),
+        let (io, conn) = if let Some(uri) = uri {
+            match Connection::from_uri(&uri, self.db_opts, Arc::new(SqliteDialect)) {
+                Ok(opened) => opened,
+                Err(e) => return Err(format!("Failed to open database '{shown}': {e}")),
             }
         } else {
             match Database::open_new(
                 &path,
                 None::<&str>,
                 OpenFlags::default(),
-                DatabaseOpts::new().with_autovacuum(false),
+                self.db_opts,
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
-                    Ok(c) => c,
-                    Err(e) => return Err(format!("Failed to connect to database '{path}': {e}")),
+                Ok((io, db)) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
+                    Ok(c) => (io, c),
+                    Err(e) => return Err(format!("Failed to connect to database '{shown}': {e}")),
                 },
-                Err(e) => return Err(format!("Failed to open database '{path}': {e}")),
+                Err(e) => return Err(format!("Failed to open database '{shown}': {e}")),
             }
         };
 
         // Update the connection and path
         *self.conn.lock().unwrap() = conn;
-        *self.current_db_path.lock().unwrap() = Some(path.clone());
+        *self.current_db_path.lock().unwrap() = reported_db_path(io.as_ref(), path.clone());
 
-        Ok(format!("Successfully opened database: {path}"))
+        Ok(format!("Successfully opened database: {shown}"))
     }
 
     fn current_database(&self) -> Result<String, String> {
-        Ok(match &*self.current_db_path.lock().unwrap() {
-            Some(path) => format!("Current database: {path}"),
-            None => "Current database: :memory: (default)".to_string(),
-        })
+        Ok(format!(
+            "Current database: {}",
+            self.current_db_path.lock().unwrap()
+        ))
     }
 
     fn list_tables(&self) -> Result<String, String> {
@@ -641,7 +668,7 @@ impl TursoMcpServer {
         };
 
         // Use table_xinfo to include generated columns (table_info hides them)
-        let query = format!("PRAGMA table_xinfo({table_name})");
+        let query = format!("PRAGMA table_xinfo({})", quote_ident(table_name));
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(&query) {
@@ -685,7 +712,8 @@ impl TursoMcpServer {
                                     "NULL"
                                 },
                                 default_str,
-                                if matches!(pk, DbValue::Numeric(Numeric::Integer(1))) {
+                                if matches!(pk, DbValue::Numeric(Numeric::Integer(position)) if *position > 0)
+                                {
                                     "PRIMARY KEY"
                                 } else {
                                     ""
@@ -811,15 +839,39 @@ impl TursoMcpServer {
     }
 }
 
+/// The path to show for a database: `:memory:` when its IO keeps the data in memory
+/// (`--vfs memory`, `?mode=memory`, `?vfs=memory`), so a file name is never shown for
+/// a database that does not use that file. Otherwise, the path without its URI
+/// query, which can hold the encryption key.
+fn reported_db_path(io: &dyn IO, path: String) -> String {
+    if io.is_memory() {
+        ":memory:".to_string()
+    } else {
+        database_name_without_query(&path).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn memory_server() -> TursoMcpServer {
-        let (_io, conn) =
+        memory_server_with_opts(DatabaseOpts::default())
+    }
+
+    /// A server on an in-memory database, whose `open_database` tool opens
+    /// databases with `db_opts`.
+    fn memory_server_with_opts(db_opts: DatabaseOpts) -> TursoMcpServer {
+        let (io, conn) =
             Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
                 .expect("open memory database");
-        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)))
+        TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            ":memory:".to_string(),
+            Arc::new(AtomicUsize::new(0)),
+            db_opts,
+        )
     }
 
     fn query_arg(sql: &str) -> Option<Value> {
@@ -923,14 +975,189 @@ mod tests {
     }
 
     #[test]
+    fn current_database_reports_path_opened_at_startup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("startup.db").to_string_lossy().to_string();
+        let (io, conn) =
+            Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect)).unwrap();
+        let server = TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            path.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            DatabaseOpts::default(),
+        );
+
+        assert_eq!(
+            server.current_database(),
+            Ok(format!("Current database: {path}"))
+        );
+
+        server
+            .open_database(&Some(json!({ "path": ":memory:" })))
+            .unwrap();
+        assert_eq!(
+            server.current_database(),
+            Ok("Current database: :memory:".to_string())
+        );
+    }
+
+    #[test]
+    fn current_database_reports_memory_when_the_file_is_not_used() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("real.db").to_string_lossy().to_string();
+        let memory = Ok("Current database: :memory:".to_string());
+
+        let (io, db) = Database::open_new(
+            &path,
+            Some("memory"),
+            OpenFlags::default(),
+            DatabaseOpts::default(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let server = TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            path.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            DatabaseOpts::default(),
+        );
+        assert_eq!(server.current_database(), memory, "--vfs memory");
+
+        for uri in [
+            format!("file:{path}?mode=memory"),
+            format!("file:{path}?vfs=memory"),
+        ] {
+            let (io, conn) =
+                Connection::from_uri(&uri, DatabaseOpts::default(), Arc::new(SqliteDialect))
+                    .unwrap();
+            let server = TursoMcpServer::new(
+                conn,
+                io.as_ref(),
+                uri.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                DatabaseOpts::default(),
+            );
+            assert_eq!(server.current_database(), memory, "startup {uri}");
+
+            let server = memory_server();
+            server.open_database(&Some(json!({ "path": uri }))).unwrap();
+            assert_eq!(server.current_database(), memory, "open_database {uri}");
+            let uri_parent = PathBuf::from(&uri).parent().unwrap().to_path_buf();
+            assert!(
+                !uri_parent.exists(),
+                "open_database {uri} created {uri_parent:?}"
+            );
+        }
+    }
+
+    /// `open_database` reads a name with a query as a URI, as `.open` does.
+    /// The query, which can hold the encryption key, is not a part of a file
+    /// name, and the messages of the tools do not show it.
+    #[test]
+    fn open_database_applies_encryption_uri_parameters() {
+        let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        let marker = "plaintext-marker";
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_names = || -> Vec<String> {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Without encryption in the options, the open fails and creates no file.
+        let path = dir.path().join("secret.db").to_string_lossy().to_string();
+        let error = memory_server()
+            .open_database(&Some(json!({
+                "path": format!("{path}?cipher=aegis256&hexkey={hexkey}")
+            })))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("Failed to open database '{path}': encryption is an opt in feature")
+        );
+        assert_eq!(file_names(), Vec::<String>::new());
+
+        let encryption = DatabaseOpts::new().with_encryption(true);
+        let server = memory_server_with_opts(encryption);
+        for (prefix, file_name) in [("", "secret.db"), ("file:", "uri.db")] {
+            let path = dir.path().join(file_name).to_string_lossy().to_string();
+            let name = format!("{prefix}{path}?cipher=aegis256&hexkey={hexkey}");
+            assert_eq!(
+                server.open_database(&Some(json!({ "path": name }))),
+                Ok(format!("Successfully opened database: {prefix}{path}"))
+            );
+            assert_eq!(
+                server.current_database(),
+                Ok(format!("Current database: {prefix}{path}"))
+            );
+            let conn = server.conn.lock().unwrap().clone();
+            conn.execute("CREATE TABLE t(v TEXT)").unwrap();
+            conn.execute(format!("INSERT INTO t VALUES ('{marker}')"))
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            server
+                .open_database(&Some(json!({ "path": ":memory:" })))
+                .unwrap();
+
+            let names = file_names();
+            assert!(
+                names.iter().all(|name| !name.contains("hexkey")),
+                "a file name holds the key: {names:?}"
+            );
+            for name in &names {
+                let contents = std::fs::read(dir.path().join(name)).unwrap();
+                assert!(
+                    !contents
+                        .windows(marker.len())
+                        .any(|window| window == marker.as_bytes()),
+                    "{name} holds the row in plaintext"
+                );
+            }
+            let db = std::fs::read(&path).unwrap();
+            assert!(
+                db.len() >= 16 && &db[..16] != b"SQLite format 3\0",
+                "{file_name} does not start with an encrypted header"
+            );
+
+            let (_io, conn) = Connection::from_uri(
+                &format!("file:{path}?cipher=aegis256&hexkey={hexkey}"),
+                encryption,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let mut rows = conn.query("SELECT v FROM t").unwrap().unwrap();
+            let mut values = Vec::new();
+            rows.run_with_row_callback(|row| {
+                values.push(row.get::<&str>(0)?.to_string());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(values, vec![marker.to_string()], "{file_name}");
+        }
+    }
+
+    #[test]
     fn execute_query_cannot_load_extensions() {
-        let (_io, conn) = Connection::from_uri(
+        let (io, conn) = Connection::from_uri(
             ":memory:",
             DatabaseOpts::new().turso_cli(),
             Arc::new(SqliteDialect),
         )
         .expect("open memory database");
-        let server = TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)));
+        let server = TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            ":memory:".to_string(),
+            Arc::new(AtomicUsize::new(0)),
+            DatabaseOpts::default(),
+        );
 
         let result = server
             .execute_query(&query_arg("SELECT load_extension('nonexistent')"))
@@ -1114,5 +1341,44 @@ mod tests {
         let response = call_tool(&server, "no_such_tool", json!({}));
         assert!(response.result.is_none());
         assert_eq!(response.error.expect("JSON-RPC error").code, -32601);
+    }
+
+    #[test]
+    fn describe_table_accepts_names_that_need_quoting() {
+        let server = memory_server();
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute(r#"CREATE TABLE "order items" (id INTEGER, label TEXT)"#)
+            .unwrap();
+        conn.execute(r#"CREATE TABLE "a""b" (x INTEGER)"#).unwrap();
+        conn.execute("CREATE TABLE plain (y TEXT)").unwrap();
+
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "order items" }))),
+            Ok("Table 'order items' columns:\nid INTEGER NULL\nlabel TEXT NULL".to_string())
+        );
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "a\"b" }))),
+            Ok("Table 'a\"b' columns:\nx INTEGER NULL".to_string())
+        );
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "plain" }))),
+            Ok("Table 'plain' columns:\ny TEXT NULL".to_string())
+        );
+    }
+
+    #[test]
+    fn describe_table_marks_every_column_of_a_composite_primary_key() {
+        let server = memory_server();
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, c TEXT, PRIMARY KEY (a, b))")
+            .unwrap();
+
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "t" }))),
+            Ok(
+                "Table 't' columns:\na INTEGER NULL  PRIMARY KEY\nb INTEGER NULL  PRIMARY KEY\nc TEXT NULL"
+                    .to_string()
+            )
+        );
     }
 }

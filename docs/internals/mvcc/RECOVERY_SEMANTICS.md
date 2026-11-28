@@ -1,7 +1,7 @@
 # MVCC Recovery and Checkpoint Semantics
 
 This document describes the MVCC recovery and checkpoint behavior as implemented in
-`core/mvcc/database/mod.rs` and `core/mvcc/database/checkpoint_state_machine.rs`.
+`core/mvcc/database/mod.rs` and `core/mvcc/database/checkpoint.rs`.
 
 The checkpoint model is stop-the-world (blocking checkpoint lock).
 
@@ -43,12 +43,18 @@ Recovery classifies startup state using two checks:
 | Case | Startup artifacts | Recovery behavior |
 |---|---|---|
 | 1 | WAL has committed frames + log header valid | Complete interrupted checkpoint: backfill WAL into DB, sync DB, truncate WAL. Then run logical-log recovery with metadata cutoff. |
-| 2 | WAL has committed frames + log header missing (`NoLog`) | Fail closed with `Corrupt`. |
+| 2 | WAL has committed frames + log header missing (`NoLog`) | Complete interrupted checkpoint (as case 1), then write a fresh log header. A TRUNCATE checkpoint leaves this state when killed between steps 8 and 10; the log is only cleared once the WAL holds every frame it had. Passive checkpoints leave it as their steady state. |
 | 3 | WAL has committed frames + log header invalid/torn | Fail closed with `Corrupt`. |
 | 4 | WAL has no committed frames | Truncate/discard WAL tail bytes and continue logical-log recovery. |
 | 5 | No WAL + log header invalid/torn | Fail closed with `Corrupt`. |
 | 6 | No WAL + valid header, no frames (size <= `LOG_HDR_SIZE`) | No replay needed; timestamp state comes from metadata row. |
 | 7 | No WAL + empty log (0 bytes / `NoLog`) | Timestamp state loaded from metadata row if present; no replay. |
+
+A read-only open cannot write, so it handles cases 1 and 2 without completing the
+checkpoint: it leaves the WAL in place, reads the pages and the metadata row through
+it, and replays the logical-log frames above that boundary in memory only. This is
+the state a read-write open reaches after completing the checkpoint. Cases 3 and 5
+fail closed as in a read-write open.
 
 Notes:
 - After checkpoint, the log is truncated to 0 bytes. On restart this is case 7.
@@ -66,12 +72,20 @@ Notes:
 6. Checkpoint WAL (backfill WAL frames into DB file).
 7. Fsync DB file (unless `SyncMode::Off`).
 8. Truncate logical log to 0 (salt regenerated in memory; header written with next frame).
-9. Fsync logical log (unless `SyncMode::Off`).
-10. Truncate WAL.
-11. Finalize: GC checkpointed versions, release lock.
+9. Truncate WAL.
+10. Finalize: GC checkpointed versions, release lock.
 
-WAL truncation is last. Until the DB file and logical-log cleanup are durable,
-the WAL remains the authoritative recovery source.
+WAL truncation is last. Until the DB file is durable, the WAL remains the
+authoritative recovery source.
+
+The logical log needs no fsync after step 8. If a crash loses the truncation,
+the old frames come back, but their `commit_ts` is at or below
+`persistent_tx_ts_max`, so recovery skips them (invariant 5).
+
+A switch from MVCC to WAL mode (`PRAGMA journal_mode = 'wal'`) is different. It
+fsyncs the logical log after the checkpoint, before it writes the WAL-mode
+header, because a database in WAL mode does not open while its logical log has
+frames.
 
 ## Correctness Invariants
 
@@ -92,13 +106,16 @@ logical ordering or fail-closed validation behavior.
 
 ## Test Coverage
 
-Key tests in `core/mvcc/database/tests.rs`:
+Key tests in `tests/integration/mvcc/`:
 - `test_bootstrap_completes_interrupted_checkpoint_with_committed_wal`
 - `test_bootstrap_rejects_committed_wal_without_log_file`
 - `test_bootstrap_rejects_torn_log_header_with_committed_wal`
 - `test_bootstrap_handles_committed_wal_when_log_truncated`
 - `test_bootstrap_ignores_wal_frames_without_commit_marker`
 - `test_bootstrap_rejects_corrupt_log_header_without_wal`
+- `test_read_only_open_reads_wal_left_by_passive_checkpoint`
+- `test_read_only_open_after_interrupted_checkpoint_reads_wal_in_place`
+- `test_read_only_open_rejects_torn_log_header_with_committed_wal`
 - `test_empty_log_recovery_loads_checkpoint_watermark`
 - `test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit`
 - `test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_recoverable`

@@ -1,6 +1,44 @@
 use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
+#[test]
+fn postgres_cannot_attach_a_sqlite_database() {
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenOptions, SessionRole};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sqlite.db");
+    {
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t(a REAL, b INTEGER); CREATE INDEX t_a ON t(a); \
+             INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);",
+            )
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let db = Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
+        ":memory:",
+        OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true)),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("ATTACH '{}' AS aux", path.display()))
+        .expect_err("a PostgreSQL connection must not attach a SQLite file");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(sqlite.execute("DELETE FROM t WHERE b = 1", []).unwrap(), 1);
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
     let conn = db.connect_postgres();
@@ -223,85 +261,25 @@ fn test_postgres_simple_select_literal(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_postgres_comment_on_supported_object_forms_are_noops(db: TempDatabase) {
+fn comment_on_a_kind_of_object_without_stored_comments_is_refused(db: TempDatabase) {
     let conn = db.connect_postgres();
 
-    // COMMENT ON is intentionally accepted without validating or storing the
-    // referenced object, so cover the distinct PostgreSQL grammar forms here.
-    for (object_kind, sql) in [
-        ("table", "COMMENT ON TABLE comment_docs IS 'documentation'"),
-        (
-            "column",
-            "COMMENT ON COLUMN comment_docs.title IS 'column documentation'",
-        ),
-        (
-            "constraint",
-            "COMMENT ON CONSTRAINT comment_docs_pkey ON comment_docs IS 'constraint documentation'",
-        ),
-        (
-            "database",
-            "COMMENT ON DATABASE main IS 'database documentation'",
-        ),
-        (
-            "domain",
-            "COMMENT ON DOMAIN email IS 'domain documentation'",
-        ),
-        ("type", "COMMENT ON TYPE status IS 'type documentation'"),
-        (
-            "index",
-            "COMMENT ON INDEX comment_docs_idx IS 'index documentation'",
-        ),
-        (
-            "view",
-            "COMMENT ON VIEW comment_view IS 'view documentation'",
-        ),
-        (
-            "materialized view",
-            "COMMENT ON MATERIALIZED VIEW comment_matview IS 'materialized view documentation'",
-        ),
-        (
-            "schema",
-            "COMMENT ON SCHEMA accounting IS 'schema documentation'",
-        ),
-        (
-            "sequence",
-            "COMMENT ON SEQUENCE comment_docs_id_seq IS 'sequence documentation'",
-        ),
-        (
-            "trigger",
-            "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'trigger documentation'",
-        ),
-        (
-            "function",
-            "COMMENT ON FUNCTION format_comment(integer) IS 'function documentation'",
-        ),
-        (
-            "cast",
-            "COMMENT ON CAST (text AS integer) IS 'cast documentation'",
-        ),
-        (
-            "operator",
-            "COMMENT ON OPERATOR + (integer, integer) IS 'operator documentation'",
-        ),
-        (
-            "operator class",
-            "COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'operator class documentation'",
-        ),
-        (
-            "policy",
-            "COMMENT ON POLICY access_policy ON comment_docs IS 'policy documentation'",
-        ),
-        (
-            "rule",
-            "COMMENT ON RULE update_rule ON comment_docs IS 'rule documentation'",
-        ),
-        (
-            "language",
-            "COMMENT ON LANGUAGE plpgsql IS 'language documentation'",
-        ),
+    for sql in [
+        "COMMENT ON CONSTRAINT comment_docs_pkey ON comment_docs IS 'x'",
+        "COMMENT ON DATABASE main IS 'x'",
+        "COMMENT ON DOMAIN email IS 'x'",
+        "COMMENT ON TYPE status IS 'x'",
+        "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'x'",
+        "COMMENT ON FUNCTION format_comment(integer) IS 'x'",
+        "COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'x'",
+        "COMMENT ON POLICY access_policy ON comment_docs IS 'x'",
+        "COMMENT ON RULE update_rule ON comment_docs IS 'x'",
+        "COMMENT ON LANGUAGE plpgsql IS 'x'",
+        "COMMENT ON ROLE postgres IS 'x'",
+        "COMMENT ON EXTENSION plpgsql IS 'x'",
     ] {
-        conn.execute(sql)
-            .unwrap_or_else(|err| panic!("COMMENT ON {object_kind} should be accepted: {err}"));
+        let error = conn.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("is not supported"), "{sql}: {error}");
     }
 }
 
@@ -689,6 +667,32 @@ fn altering_the_columns_of_a_table_of_a_schema_survives_reopening(db: TempDataba
     assert_eq!(rows_of(&conn, "SELECT * FROM app.u"), ["3"]);
     conn.execute("INSERT INTO t VALUES (5)").unwrap();
     assert_eq!(rows_of(&conn, "SELECT * FROM t"), ["5"]);
+}
+
+#[turso_macros::test]
+fn a_view_with_distinct_on_survives_a_column_rename_and_reopening(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a int, b int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5), (2, 30)")
+        .unwrap();
+    conn.execute("CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC")
+        .unwrap();
+    conn.execute("ALTER TABLE t RENAME COLUMN a TO z").unwrap();
+    assert_eq!(rows_of(&conn, "SELECT * FROM v"), ["1|20", "2|30"]);
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    assert_eq!(rows_of(&conn, "SELECT * FROM v"), ["1|20", "2|30"]);
 }
 
 fn rows_of(conn: &turso_pg::Connection, sql: &str) -> Vec<String> {
@@ -1207,7 +1211,7 @@ fn test_postgres_add_column_with_a_default_of_the_wrong_type_fails(db: TempDatab
     assert!(
         error
             .to_string()
-            .contains("cannot store TEXT value in INTEGER column"),
+            .contains("column \"n\" is of type integer but default expression is of type text"),
         "{error}"
     );
     assert!(conn.query("SELECT n FROM t").is_err());
@@ -1913,6 +1917,45 @@ fn test_postgres_window_avg_partition(db: TempDatabase) {
         Value::Numeric(Numeric::Integer(avg)) => assert_eq!(*avg, 150),
         other => panic!("expected numeric, got {other:?}"),
     }
+}
+
+// PostgreSQL rejects `1e308::float8 * 10` as an overflow, so its results
+// below come from the same rows written with 'Infinity'::float8. NaN is
+// returned as NULL.
+#[turso_macros::test(mvcc)]
+fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (n int, x float8)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1, 1e308::float8 * 10), (2, 1), (3, 2), (4, 4), \
+         (5, -1e308::float8 * 10), (6, 1e308::float8 * 10), (7, 8)",
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT n, avg(x) OVER (ORDER BY n ROWS BETWEEN CURRENT ROW AND CURRENT ROW) \
+             FROM t ORDER BY n",
+        ),
+        ["1|Inf", "2|1.0", "3|2.0", "4|4.0", "5|-Inf", "6|Inf", "7|8.0"]
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT n, sum(x) OVER w, avg(x) OVER w FROM t \
+             WINDOW w AS (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY n",
+        ),
+        [
+            "1|Inf|Inf",
+            "2|Inf|Inf",
+            "3|3.0|1.5",
+            "4|6.0|3.0",
+            "5|-Inf|-Inf",
+            "6||",
+            "7|Inf|Inf",
+        ]
+    );
 }
 
 // ==================== OPERATORS: ||, ILIKE, JSON ====================
@@ -3244,9 +3287,12 @@ fn test_postgres_insert_default(db: TempDatabase) {
     conn.execute("INSERT INTO t (id, name, score) VALUES (2, 'alice', DEFAULT), (3, DEFAULT, 99)")
         .unwrap();
 
-    // All columns DEFAULT
-    conn.execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
-        .unwrap();
+    // All columns DEFAULT: the key has no default, so it is NULL
+    let error = conn
+        .execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("null value in column \"id\""), "{error}");
 
     // Verify results
     let mut stmt = conn
@@ -3268,15 +3314,12 @@ fn test_postgres_insert_default(db: TempDatabase) {
             _ => {}
         }
     }
-    // id=DEFAULT → NULL (no default defined), all others get their defaults
-    // INTEGER PRIMARY KEY with NULL → auto-assigned rowid
     assert_eq!(
         results,
         vec![
             "1,unknown,42", // name=DEFAULT → 'unknown'
             "2,alice,0",    // score=DEFAULT → 0
             "3,unknown,99", // name=DEFAULT → 'unknown'
-            "4,unknown,0",  // all DEFAULT
         ]
     );
 }
@@ -4204,20 +4247,19 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
     drop(rows);
 
-    // unknown type: error
+    // unknown type: the statement fails, as in PostgreSQL
     let mut rows = conn
         .query("SELECT message, sql_error_code FROM pg_input_error_info('x', 'nonexistent_type')")
         .unwrap()
         .unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    assert_eq!(
-        row.get_value(0).to_string(),
-        "type \"nonexistent_type\" does not exist"
+    let error = rows.step().unwrap_err();
+    assert_eq!(error.sqlstate, "42704", "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("type \"nonexistent_type\" does not exist"),
+        "{error}"
     );
-    assert_eq!(row.get_value(1).to_string(), "42704");
     drop(rows);
 
     // oid: valid
@@ -4577,7 +4619,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
 
     let mut rows = conn
         .inner()
-        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' ORDER BY name")
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name NOT IN ('sqlite_sequence', 'pg_description', 'pg_class') ORDER BY name")
         .unwrap();
     let mut stored = Vec::new();
     while let StepResult::Row = rows.step().unwrap() {
@@ -4601,4 +4643,47 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
             ),
         ]
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_oid_param_is_read_as_oid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (o oid)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4294967295)").unwrap();
+
+    let count = |sql: &str, value: Value| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), value)
+            .unwrap();
+        stmt.run_collect_rows()
+    };
+    let one = vec![vec![Value::from_i64(1)]];
+    let none = vec![vec![Value::from_i64(0)]];
+    for sql in [
+        "SELECT count(*) FROM t WHERE o = $1",
+        "SELECT count(*) FROM t WHERE $1 = o",
+        "SELECT count(*) FROM t WHERE o IN ($1)",
+    ] {
+        for value in [
+            Value::from_i64(-1),
+            Value::from_i64(4294967295),
+            Value::from_text("-1".to_owned()),
+            Value::from_text("4294967295".to_owned()),
+        ] {
+            assert_eq!(
+                count(sql, value.clone()).unwrap(),
+                one,
+                "{sql} with {value:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count("SELECT count(*) FROM t WHERE o > $1", Value::from_i64(-1)).unwrap(),
+        none
+    );
+    assert!(count(
+        "SELECT count(*) FROM t WHERE o = $1",
+        Value::from_i64(4294967296)
+    )
+    .is_err());
 }

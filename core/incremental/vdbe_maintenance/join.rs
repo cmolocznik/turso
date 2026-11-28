@@ -6,9 +6,11 @@ use super::stream::{
     ArrangementIdentityColumn, DeltaIdentity,
 };
 use super::MaintenanceInput;
+use crate::ast;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
@@ -18,7 +20,6 @@ use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
 
 const JOIN_ARITY: usize = 2;
 
@@ -539,8 +540,10 @@ pub(super) fn emit_inner_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
@@ -790,8 +793,10 @@ pub(super) fn emit_semi_or_anti_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));

@@ -16,15 +16,15 @@ use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
-use turso_core::SqliteDialect;
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
+use turso_core::ast::{ColumnConstraint, SortOrder};
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
 use turso_core::{
-    CheckpointMode, CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts,
-    IO, LimboError, OpenFlags, Statement, Value,
+    CheckpointMode, CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionKey,
+    EncryptionOpts, IO, LimboError, OpenFlags, Statement, Value,
 };
-use turso_parser::ast::{ColumnConstraint, SortOrder};
+use turso_sqlite::SqliteDialect;
 
 mod allocation_fault;
 pub mod chaotic_btree;
@@ -39,6 +39,7 @@ pub mod operations;
 pub mod properties;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod protocol;
+pub mod swarm;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod worker;
 pub mod workloads;
@@ -69,6 +70,7 @@ pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
 }
 pub use io::{IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
+use turso_core::SessionRole;
 use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
 
 struct InstalledYieldInjector<'a> {
@@ -778,8 +780,15 @@ impl Whopper {
             }
         };
 
-        let bootstrap_conn = match db.connect(ConnectOpts::new()) {
-            Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
+        let bootstrap_conn = match db.connect(
+            ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                encryption_opts
+                    .as_ref()
+                    .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+                    .transpose()?,
+            ),
+        ) {
+            Ok(conn) => conn,
             Err(e) => {
                 return Err(anyhow::anyhow!("Connection failed: {}", e));
             }
@@ -1253,10 +1262,12 @@ impl Whopper {
             )));
             if let Err(e) = op.init_op(&mut ctx) {
                 let err = e.to_string().to_lowercase();
-                // Allow "no such table/index" and "already exists" errors
+                // Allow "no such table/index" and "already exists" errors, and
+                // the refusal to drop a sequence that a table still uses
                 if err.contains("no such")
                     || err.contains("already exists")
                     || err.contains("not exist")
+                    || err.contains("other objects depend on it")
                 {
                     debug!("init operation skipped: {}", err);
                     return Ok(());
@@ -1725,9 +1736,15 @@ impl Whopper {
 
         for i in 0..self.max_connections {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(
+                    ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                        self.encryption_opts
+                            .as_ref()
+                            .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+                            .transpose()?,
+                    ),
+                )
                 .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
-            let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
             self.context.fibers.push(SimulatorFiber {
                 connection: conn,
                 yield_injector: Arc::new(SimulatorYieldInjector::new(fiber_yield_seed(
@@ -1746,17 +1763,6 @@ impl Whopper {
 
         Ok(())
     }
-}
-
-fn may_be_set_encryption(
-    conn: Arc<Connection>,
-    opts: &Option<EncryptionOpts>,
-) -> anyhow::Result<Arc<Connection>> {
-    if let Some(opts) = opts {
-        conn.pragma_update("cipher", format!("'{}'", opts.cipher.clone()))?;
-        conn.pragma_update("hexkey", format!("'{}'", opts.hexkey.clone()))?;
-    }
-    Ok(conn)
 }
 
 pub fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateIndex> {

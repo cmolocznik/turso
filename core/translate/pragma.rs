@@ -2,13 +2,14 @@
 //! More info: <https://www.sqlite.org/pragma.html>.
 
 use crate::alloc::TursoIteratorExt;
+use crate::ast::PragmaName;
+use crate::ast::{self, Expr, Literal};
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
 use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
-use turso_parser::ast::PragmaName;
-use turso_parser::ast::{self, Expr, Literal};
 
+use super::foreign_key_check::translate_foreign_key_check;
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
@@ -16,7 +17,6 @@ use crate::function::Func;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
-use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
@@ -282,6 +282,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::ForeignKeyCheck
             | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
@@ -615,37 +616,16 @@ fn update_pragma(
                 ));
             };
             pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
-            let largest_root_page_number_reg = program.alloc_register();
-            program.emit_insn(Insn::ReadCookie {
-                db: database_id,
-                dest: largest_root_page_number_reg,
-                cookie: Cookie::LargestRootPageNumber,
-            });
-            let set_cookie_label = program.allocate_label();
-            program.emit_insn(Insn::If {
-                reg: largest_root_page_number_reg,
-                target_pc: set_cookie_label,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::Halt {
-                constraint_info: None,
-                err_code: 0,
-                description: "Early halt because auto vacuum mode is not enabled".to_string(),
-                on_error: None,
-                description_reg: None,
-            });
-            program.preassign_label_to_next_insn(set_cookie_label);
-            program.emit_insn(Insn::SetCookie {
-                db: database_id,
-                cookie: Cookie::IncrementalVacuum,
-                value: i32::from(u8::from(auto_vacuum_mode)) - 1,
-                p5: 0,
-            });
             Ok(TransactionMode::None)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
+            if !connection.dialect().supports_capture_data_changes() {
+                crate::bail_parse_error!(
+                    "capture_data_changes is not supported with this frontend"
+                );
+            }
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             // InitCdcVersion handles everything at execution time:
@@ -667,6 +647,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyCheck => unreachable!("foreign_key_check cannot be set"),
         PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
@@ -689,17 +670,10 @@ fn update_pragma(
             schema_was_explicit,
             program,
         ),
-        PragmaName::EncryptionKey => {
-            let value = parse_string(&value)?;
-            let key = EncryptionKey::from_hex_string(&value)?;
-            connection.set_encryption_key(key)?;
-            Ok(TransactionMode::None)
-        }
-        PragmaName::EncryptionCipher => {
-            let value = parse_string(&value)?;
-            let cipher = CipherMode::try_from(value.as_str())?;
-            connection.set_encryption_cipher(cipher)?;
-            Ok(TransactionMode::None)
+        PragmaName::EncryptionKey | PragmaName::EncryptionCipher => {
+            Err(LimboError::InvalidArgument(
+                "encryption must be configured when opening the database".into(),
+            ))
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
@@ -826,9 +800,19 @@ fn update_pragma(
             connection.set_count_changes(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::DeferForeignKeys => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_defer_foreign_keys(enabled);
+            Ok(TransactionMode::None)
+        }
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::AutomaticIndex => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_automatic_index(enabled);
             Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
@@ -1350,6 +1334,35 @@ fn query_pragma(
             }
             Ok(TransactionMode::Read)
         }
+        PragmaName::ForeignKeyCheck => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_string()),
+                Some(other) => Some(other.to_string()),
+                None => None,
+            };
+            let mut check_namespace = namespace;
+            if let Some(table_name) = &table_name {
+                check_namespace = resolve_table_pragma_namespace(
+                    resolver,
+                    namespace,
+                    schema_was_explicit,
+                    table_name,
+                )?;
+            }
+            translate_foreign_key_check(
+                program,
+                resolver,
+                check_namespace.database_id,
+                check_namespace.id,
+                table_name.as_deref(),
+            )?;
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::Read)
+        }
         PragmaName::ForeignKeyList => {
             let table_name = match value {
                 Some(ast::Expr::Name(name)) => Some(name),
@@ -1746,7 +1759,7 @@ fn query_pragma(
         }
         PragmaName::EncryptionKey => {
             let msg = {
-                if connection.encryption_key.read().is_some() {
+                if connection.encryption_key.is_some() {
                     "encryption key is set for this session"
                 } else {
                     "encryption key is not set for this session"
@@ -1857,10 +1870,25 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::DeferForeignKeys => {
+            let enabled = connection.defer_foreign_keys();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::IgnoreCheckConstraints => {
             let ignored = connection.check_constraints_ignored();
             let register = program.alloc_register();
             program.emit_int(ignored as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::AutomaticIndex => {
+            let enabled = connection.automatic_index();
+            program.emit_bool(enabled, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
@@ -1922,14 +1950,14 @@ fn query_pragma(
                     program.emit_string8(display_name, base_reg);
                     program.emit_string8(type_def.base().to_string(), base_reg + 1);
                     let clauses = [
-                        type_def.encode(),
-                        type_def.coerce(),
-                        type_def.decode(),
-                        type_def.default_expr(),
+                        type_def.encode().map(ToString::to_string),
+                        type_def.coerce().map(ToString::to_string),
+                        type_def.decode().map(ToString::to_string),
+                        type_def.default_expr().map(ToString::to_string),
                     ];
                     for (i, clause) in clauses.into_iter().enumerate() {
                         match clause {
-                            Some(expr) => program.emit_string8(expr.to_string(), base_reg + 2 + i),
+                            Some(text) => program.emit_string8(text, base_reg + 2 + i),
                             None => program.emit_null(base_reg + 2 + i, None),
                         }
                     }
@@ -2028,7 +2056,7 @@ fn emit_index_column_cid_and_name(program: &mut ProgramBuilder, col: &IndexColum
 /// 0-based index of `column` within `primary_key_columns`, if present.
 fn column_pk_index(
     column: &crate::schema::Column,
-    primary_key_columns: &[(String, turso_parser::ast::SortOrder)],
+    primary_key_columns: &[(String, crate::ast::SortOrder)],
 ) -> Option<usize> {
     let name = column.name.as_deref()?;
     primary_key_columns
@@ -2041,7 +2069,7 @@ fn column_pk_index(
 fn emit_columns_for_table_info(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
-    primary_key_columns: Option<&[(String, turso_parser::ast::SortOrder)]>,
+    primary_key_columns: Option<&[(String, crate::ast::SortOrder)]>,
     base_reg: usize,
     extended: bool,
 ) {
@@ -2063,6 +2091,8 @@ fn emit_columns_for_table_info(
             1
         } else if column.is_virtual_generated() {
             2
+        } else if column.is_stored_generated() {
+            3
         } else {
             // normal column
             0
@@ -2081,34 +2111,7 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        let mut declared_type = column.ty_str.clone();
-        let written_type = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
-        if !column.ty_params.is_empty()
-            && !matches!(
-                written_type.as_bytes().first(),
-                Some(b'"' | b'\'' | b'`' | b'[')
-            )
-        {
-            declared_type.push('(');
-            for (i, param) in column.ty_params.iter().enumerate() {
-                if i > 0 {
-                    declared_type.push(',');
-                }
-                match param.as_ref() {
-                    Expr::Unary(ast::UnaryOperator::Negative, inner) => {
-                        declared_type.push('-');
-                        declared_type.push_str(&inner.to_string());
-                    }
-                    Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-                        declared_type.push('+');
-                        declared_type.push_str(&inner.to_string());
-                    }
-                    _ => declared_type.push_str(&param.to_string()),
-                }
-            }
-            declared_type.push(')');
-        }
-        program.emit_string8(declared_type, base_reg + 2);
+        program.emit_string8(column.declared_type(), base_reg + 2);
 
         // notnull
         program.emit_bool(

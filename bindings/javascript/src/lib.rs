@@ -24,8 +24,8 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
-use turso_core::ConnectOpts;
-use turso_core::SqliteDialect;
+use turso_core::{ConnectOpts, SessionRole};
+use turso_sqlite::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///
@@ -158,6 +158,7 @@ pub enum EncryptionCipher {
     Aegis128l,
     Aegis128x2,
     Aegis128x4,
+    Aegis256x4,
 }
 
 impl EncryptionCipher {
@@ -167,6 +168,7 @@ impl EncryptionCipher {
             EncryptionCipher::Aes256Gcm => "aes256gcm",
             EncryptionCipher::Aegis256 => "aegis256",
             EncryptionCipher::Aegis256x2 => "aegis256x2",
+            EncryptionCipher::Aegis256x4 => "aegis256x4",
             EncryptionCipher::Aegis128l => "aegis128l",
             EncryptionCipher::Aegis128x2 => "aegis128x2",
             EncryptionCipher::Aegis128x4 => "aegis128x4",
@@ -211,9 +213,12 @@ pub struct TableColumn {
     pub name: String,
     #[napi(ts_type = "string | null")]
     pub r#type: Option<String>,
-    pub column: Option<()>,
-    pub table: Option<()>,
-    pub database: Option<()>,
+    #[napi(ts_type = "string | null")]
+    pub column: Option<String>,
+    #[napi(ts_type = "string | null")]
+    pub table: Option<String>,
+    #[napi(ts_type = "string | null")]
+    pub database: Option<String>,
 }
 
 /// Step one statement. Returns the step constant plus the requested sleep in
@@ -352,7 +357,7 @@ pub fn apply_experimental_features(
             // always enabled, kept for backwards compatibility
             "strict" | "generated_columns" => opts,
             "custom_types" => opts.with_custom_types(true),
-            "encryption" => opts.with_encryption(true),
+            "encryption" | "sync_encryption" => opts.with_encryption(true),
             "index_method" => opts.with_index_method(true),
             "autovacuum" => opts.with_autovacuum(true),
             "vacuum" => opts.with_vacuum(true),
@@ -429,7 +434,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<(), String> {
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key))
         .map_err(to_sqlite_error)?;
 
     if let Some(busy_timeout) = busy_timeout {
@@ -712,7 +717,8 @@ impl Database {
     /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
     #[napi(js_name = "classifySql")]
     pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
-        use turso_parser::{ast::Stmt, parser::Parser};
+        use turso_core::ast::Stmt;
+        use turso_parser::parser::Parser;
         let mut parser = Parser::new(sql.as_bytes());
         match parser.next_cmd() {
             Ok(Some(cmd)) => {
@@ -869,16 +875,17 @@ impl Statement {
     /// * `value_type` - The type constant (0=null, 1=int, 2=float, 3=text, 4=blob).
     /// * `value` - The value to bind.
     #[napi]
-    pub fn bind_at(&self, index: u32, value: Unknown) -> Result<()> {
+    pub fn bind_at(&self, env: &Env, index: u32, value: Unknown) -> Result<()> {
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
             create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
         let value_type = value.get_type()?;
         let turso_value = match value_type {
-            ValueType::Null => turso_core::Value::Null,
+            ValueType::Null | ValueType::Undefined => turso_core::Value::Null,
             ValueType::Number => {
                 let n: f64 = unsafe { value.cast()? };
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                // `i64::MAX as f64` is 2^63, one past the largest i64, so the upper bound is exclusive.
+                if n.fract() == 0.0 && n >= i64::MIN as f64 && n < i64::MAX as f64 {
                     turso_core::Value::from_i64(n as i64)
                 } else {
                     turso_core::Value::from_f64(n)
@@ -902,23 +909,13 @@ impl Statement {
             ValueType::Object => {
                 let obj = value.coerce_to_object()?;
 
-                if obj.is_buffer()? || obj.is_typedarray()? {
-                    let length = obj.get_named_property::<u32>("length")?;
-                    let mut bytes = Vec::with_capacity(length as usize);
-                    for i in 0..length {
-                        let byte = obj.get_element::<u32>(i)?;
-                        bytes.push(byte as u8);
-                    }
-                    turso_core::Value::Blob(bytes)
+                if obj.is_buffer()? || obj.is_typedarray()? || obj.is_dataview()? {
+                    turso_core::Value::Blob(array_buffer_view_bytes(env, value)?)
                 } else {
-                    let s = value.coerce_to_string()?.into_utf8()?;
-                    turso_core::Value::Text(s.as_str()?.to_owned().into())
+                    return throw_unbindable_value(env);
                 }
             }
-            _ => {
-                let s = value.coerce_to_string()?.into_utf8()?;
-                turso_core::Value::Text(s.as_str()?.to_owned().into())
-            }
+            _ => return throw_unbindable_value(env),
         };
 
         self.statement_handle()?
@@ -1031,23 +1028,15 @@ impl Statement {
 
         for i in 0..column_count {
             let mut js_obj = Object::new(env)?;
-            let column_name = stmt.get_column_name(i);
-            let column_type = stmt.get_column_type_name(i);
-
-            // Set the name property
-            js_obj.set("name", column_name.as_ref())?;
-
-            // Set type property if available
-            match column_type {
-                Some(type_str) => js_obj.set("type", type_str.as_str())?,
-                None => js_obj.set("type", ToNapiValue::into_unknown(Null, env)?)?,
-            }
-
-            // For now, set other properties to null since turso_core doesn't provide this metadata
-            js_obj.set("column", ToNapiValue::into_unknown(Null, env)?)?;
-            js_obj.set("table", ToNapiValue::into_unknown(Null, env)?)?;
-            js_obj.set("database", ToNapiValue::into_unknown(Null, env)?)?;
-
+            let origin = stmt.get_column_origin(i);
+            js_obj.set("name", stmt.get_column_name(i).as_ref())?;
+            js_obj.set("column", origin.as_ref().map(|o| o.column.as_str()))?;
+            js_obj.set("table", origin.as_ref().map(|o| o.table.as_str()))?;
+            js_obj.set("database", origin.as_ref().map(|o| o.database.as_str()))?;
+            js_obj.set(
+                "type",
+                origin.as_ref().and_then(|o| o.declared_type.as_deref()),
+            )?;
             js_array.set(i as u32, js_obj)?;
         }
 
@@ -1060,6 +1049,72 @@ impl Statement {
         *self.stmt.borrow_mut() = None;
         Ok(())
     }
+}
+
+fn throw_unbindable_value(env: &Env) -> Result<()> {
+    env.throw_type_error(
+        "SQLite3 can only bind numbers, strings, bigints, buffers, and null",
+        None,
+    )?;
+    Err(Error::from_status(Status::PendingException))
+}
+
+/// Copies the bytes a typed array, Buffer or DataView covers.
+///
+/// The view's buffer, byte offset and byte length are read with the built-in
+/// getters of `%TypedArray%.prototype` or `DataView.prototype`. The N-API layer
+/// of the WASM build (emnapi) reads them as ordinary properties and checks the
+/// view type with `instanceof`, so passing the view to it directly gives wrong
+/// bytes for a view with overridden properties and fails for a view from
+/// another realm (an iframe or a `vm` context) or with a changed prototype.
+fn array_buffer_view_bytes(env: &Env, view: Unknown) -> Result<Vec<u8>> {
+    let global = env.get_global()?;
+    let reflect_get: Function<FnArgs<(Object, Unknown, Unknown)>, Unknown> = global
+        .get_named_property::<Object>("Reflect")?
+        .get_named_property("get")?;
+    let uint8_array: Function<FnArgs<(Unknown, Unknown, f64)>> =
+        global.get_named_property("Uint8Array")?;
+    let typed_array_prototype: Object = uint8_array
+        .get_named_property::<Object>("prototype")?
+        .get_prototype_unchecked()?;
+    // The `Symbol.toStringTag` getter of `%TypedArray%.prototype` returns
+    // undefined for anything that is not a typed array.
+    let to_string_tag = global
+        .get_named_property::<Function>("Symbol")?
+        .get_named_property::<Unknown>("toStringTag")?;
+    let tag = reflect_get.call((typed_array_prototype, to_string_tag, view).into())?;
+    let is_data_view = tag.get_type()? == ValueType::Undefined;
+    let prototype = if is_data_view {
+        global
+            .get_named_property::<Function>("DataView")?
+            .get_named_property("prototype")?
+    } else {
+        typed_array_prototype
+    };
+    let get = |name: &str| -> Result<Unknown> {
+        let name = env.create_string(name)?.to_unknown();
+        reflect_get.call((prototype, name, view).into())
+    };
+    // When the buffer is detached or was resized to end before the view does,
+    // the typed array getter returns 0 and the DataView getter throws. The view
+    // then covers no bytes, and a Uint8Array cannot be created over it.
+    let byte_length = match get("byteLength") {
+        Ok(byte_length) => f64::from_unknown(byte_length)?,
+        Err(_) if is_data_view => 0.0,
+        Err(err) => return Err(err),
+    };
+    if byte_length == 0.0 {
+        return Ok(Vec::new());
+    }
+    let bytes = uint8_array
+        .new_instance((get("buffer")?, get("byteOffset")?, byte_length).into())?
+        .coerce_to_object()?;
+    // Reading the elements one at a time avoids `napi_get_buffer_info`, which in
+    // emnapi copies the whole underlying ArrayBuffer into WASM memory and keeps
+    // that copy, sized at first use, until the ArrayBuffer is garbage collected.
+    (0..byte_length as u32)
+        .map(|i| Ok(bytes.get_element::<u32>(i)? as u8))
+        .collect()
 }
 
 /// Async task for running the I/O loop.

@@ -122,7 +122,11 @@ await replica.SyncAsync();
 
 `Sync Interval` is the automatic pull period in seconds. `AutomaticSyncStatus` and `AutomaticSyncStatusChanged` expose waiting, running, retrying, faulted, and stopped states along with attempt times, the last pull result, the next attempt, and terminal failures. Automatic sync retries transient transport, I/O, and timeout failures twice; other failures are terminal and are also surfaced by `Close`.
 
-Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`. Local `Encryption Cipher` and `Encryption Key` do not configure remote replica encryption.
+Connection-string replicas also map `Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`, `Partial Bootstrap Prefix`/`Query`, `Partial Sync Segment Size`/`Prefetch`, `Remote Encryption Cipher`/`Key`, `Local Encryption Key`, `Push Operations Threshold`, `Pull Bytes Threshold`, `Force Logical MVCC Pull`, and `Sync Experimental Features` to `TursoSyncDatabaseOptions`.
+
+Local replica encryption requires `Sync Experimental Features=sync_encryption`. For encrypted replicas, use `Remote Encryption Cipher` as the shared cipher, `Local Encryption Key` for the hex local key, and `Remote Encryption Key` for the base64 cloud key. The SQLite-compatible provider accepts the same options. A pooled replica requires matching local and cloud credentials. An omitted local key selects plaintext storage; a quoted empty or whitespace-only key value is rejected. The cloud key may be omitted when reopening an initialized encrypted replica offline. Standalone `Encryption Cipher` and `Encryption Key` options do not configure synced replicas.
+
+Connection-string builders follow ADO.NET removal semantics: `Local Encryption Key=` omits the option, and `Remove("LocalEncryptionKey")` or assigning `null` clears it. Explicit empty or whitespace-only local and remote key values, including `Remote Encryption Key=""`, are rejected when a connection string is parsed or a builder property is assigned, for all connection types.
 
 Direct remote and opened embedded replica connections support ADO.NET `DbBatch`:
 
@@ -209,6 +213,30 @@ connection!.ConnectionString = "Data Source=:memory:";
 connection.Open();
 ```
 
+## Page codecs
+
+A page codec transforms every page of a local database on its way to and from storage, for example to encrypt it with
+a key the application manages. Implement `Turso.Raw.Public.ITursoPageCodec` and set it on the connection before
+opening it; a connection string cannot carry it:
+
+```C#
+using var connection = new TursoConnection("Data Source=app.db") { PageCodec = codec };
+connection.Open();
+```
+
+The raw API is `TursoBindings.OpenDatabaseWithPageCodec`, `OpenDatabaseReadOnlyWithPageCodec` (read-only) and
+`OpenSharedDatabase(path, codec)`.
+
+- The codec gets whole pages, the reserved tail included. Per-page metadata such as a nonce and tag goes in the last
+  `ReservedSpace` bytes; opening an existing database fails unless its header holds the same value.
+- `CodecId` must be non-zero and must change whenever encoded bytes could differ, such as with another key. A
+  process keeps one database per path and refuses a connection whose codec ID differs from the one the database was
+  opened with, instead of reading through the wrong codec.
+- Callbacks run concurrently on any thread that steps a statement, so the codec must be thread-safe and must not call
+  back into Turso. An exception thrown by the codec fails the page operation with a generic message.
+- The codec does not cover temporary files: run `PRAGMA temp_store = memory` on each connection. It cannot be combined
+  with `Encryption Cipher`, `ATTACH`, MVCC, remote URLs or embedded replicas.
+
 ## Migrating from Microsoft.Data.Sqlite
 
 For common embedded SQLite usage, the `Turso.Data.Sqlite.Provider` package exposes a SQLite-compatible `Turso.Data.Sqlite` facade over the Turso engine:
@@ -261,8 +289,8 @@ Supported common connection string keywords include:
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
 | `Pooling` | Defaults to `True`. Local files stay open after the last connection closes so the next `Open()` skips reloading the schema and WAL; each connection still gets fresh connection state. Call `SqliteConnection.ClearPool` or `ClearAllPools` before deleting or replacing a pooled file. `:memory:` and shared in-memory databases are never pooled. |
 | `Vfs` | Parsed and preserved for compatibility. |
-| `Encryption Cipher` | Turso local encryption cipher. |
-| `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
+| `Encryption Cipher` | Not supported by `SqliteConnection`, which rejects it. `TursoConnection` only: local encryption cipher. Give it together with `Encryption Key`. |
+| `Encryption Key` | Not supported by `SqliteConnection`, which rejects it. `TursoConnection` only: hex-encoded local encryption key. Give it together with `Encryption Cipher`. |
 | `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
 | `Replica Path` | Local path for an embedded replica of the remote `Data Source`. |
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |

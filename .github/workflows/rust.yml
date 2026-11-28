@@ -197,9 +197,11 @@ jobs:
           LOCAL_SYNC_SERVER_DIR: "1"
         run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
         timeout-minutes: 20
-      - name: Memory leak check (repeated database open/workload/drop)
-        if: matrix.suite == 'extra'
-        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+      - name: Test encrypted sync through Rust SDK
+        if: runner.os == 'Linux' && matrix.suite == 'extra'
+        run: |
+          cargo build --locked -p turso --example sync_encryption_e2e --all-features
+          python3 testing/cli_tests/sync_encryption.py
         timeout-minutes: 10
       - name: Test doctests
         if: matrix.suite == 'extra'
@@ -394,6 +396,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     strategy:
+      # Each profile tests different code, so a failure in one profile must not
+      # cancel the others.
+      fail-fast: false
       matrix:
         profile:
           - name: default
@@ -408,6 +413,11 @@ jobs:
           - name: Faultless
             iterations: 10
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          # The default backend, not memory: it rejects an operation with a
+          # fault when it is issued, as `UnixFile::truncate` does.
+          - name: MvccSingleConnection
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile mvcc_single_connection --io-backend=default"
           - name: SavepointStress
             iterations: 5
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"
@@ -423,6 +433,19 @@ jobs:
           - name: Differential
             iterations: 10
             args: "--maximum-tests 1000 --differential --io-backend=memory"
+          # Swarm testing: each iteration picks its statement mix, properties,
+          # faults, connection count, I/O backend, I/O latency and clock ticks
+          # from its seed, so the job gives none of these flags. The log shows
+          # the picked settings, and the same seed repeats the run. Pull requests
+          # use the seeds 1 to `iterations`, which pass on main, so a failure
+          # on a pull request comes from its change. All other runs (pushes
+          # to main and manual runs) use random seeds to try new settings.
+          # There, a failure is a bug to investigate, and it does not block
+          # an unrelated pull request.
+          - name: Swarm
+            iterations: 100
+            args: "--maximum-tests 1000 --swarm"
+            swarm: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -433,22 +456,34 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The simulator profile (Cargo.toml) optimizes the code but keeps
+      # debug assertions; simulations run about ten times faster than with
+      # the dev profile.
       - name: Build simulator
-        run: cargo build -p limbo_sim --bin limbo_sim --locked
+        run: cargo build -p limbo_sim --bin limbo_sim --locked --profile simulator
       - name: Simulator ${{ matrix.profile.name }}
         env:
           SIM_ARGS: ${{ matrix.profile.args }}
+          FIXED_SEEDS: ${{ github.event_name == 'pull_request' && matrix.profile.swarm || false }}
         run: |
           set -euo pipefail
+          # The step picks the seed, so that a failed iteration can print it
+          # even if the simulator stops before it prints the seed.
           seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
             i="$1"
             log="sim-run-$i.log"
             read -r -a args <<< "$SIM_ARGS"
-            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
-              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
+            if [ "$FIXED_SEEDS" = true ]; then
+              seed="$i"
             else
-              echo "iteration $i FAILED:"
+              seed=$(od -An -N8 -tu8 /dev/urandom | tr -d " ")
+            fi
+            if ./target/simulator/limbo_sim "${args[@]}" --seed "$seed" >"$log" 2>&1; then
+              echo "iteration $i ok: seed: $seed"
+            else
+              echo "iteration $i FAILED (seed: $seed):"
               cat "$log"
+              echo "Reproduce with: cargo run -p limbo_sim --profile simulator -- $SIM_ARGS --seed $seed"
               exit 255
             fi
           ' _
@@ -503,10 +538,14 @@ jobs:
   # same PR always generates the same SQL, a green run stays green, and a
   # failure blocks the merge and reproduces exactly. All other runs (pushes to
   # main and manual runs) use new random seeds, where a failure is a bug to
-  # investigate and does not block an unrelated pull request.
+  # investigate and does not block an unrelated pull request. A failure on main
+  # is filed as an issue.
   differential-fuzzer:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
     env:
       DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
     strategy:
@@ -528,6 +567,8 @@ jobs:
       - name: Build differential_fuzzer
         run: cargo build -p differential-fuzzer --bin differential_fuzzer
       - name: Run differential_fuzzer on ${{ github.event_name == 'pull_request' && 'fixed' || 'random' }} seeds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Reproduce a failure locally with:
           #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
@@ -540,18 +581,30 @@ jobs:
               seeds+=("$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')")
             done
           fi
+          # Makes exit_code the fuzzer's, not tee's.
+          set -o pipefail
+          log="$RUNNER_TEMP/fuzzer-output.log"
           for seed in "${seeds[@]}"; do
             echo "Starting fuzzer run. Seed: $seed. Profile: ${{ matrix.profile }}."
             exit_code=0
             # One slow statement must not consume the complete CI job.
             timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
               target/debug/differential_fuzzer \
-                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 \
+                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 2>&1 \
+              | tee "$log" \
               || exit_code=$?
             if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
               echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
             fi
             if [ "$exit_code" -ne 0 ]; then
+              if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+                # GitHub rejects issue bodies over 65536 characters.
+                tail -n 100 "$log" | tail -c 60000 > "$log.tail"
+                gh issue create --label fuzzing \
+                  --title "differential fuzzer ${{ matrix.profile }} failure seed $seed" \
+                  --body "$(printf 'Exit code %s in %s/%s/actions/runs/%s\n\n```\ncargo run -p differential-fuzzer --bin differential_fuzzer -- --seed %s --profile %s -n 1000\n```\n\nLast 100 lines of output:\n\n````\n%s\n````\n' \
+                    "$exit_code" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$seed" "${{ matrix.profile }}" "$(cat "$log.tail")")"
+              fi
               exit "$exit_code"
             fi
           done
@@ -775,6 +828,22 @@ jobs:
           - name: multiprocess-kill (4/4)
             iterations: 2
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          # Swarm testing: each iteration picks its workloads, connection
+          # count and fault probabilities from its seed. The log shows the
+          # picked settings, and the same seed repeats the run. Pull requests
+          # use the seeds 1 to `iterations`, which pass on main, so a failure
+          # on a pull request comes from its change. All other runs (pushes
+          # to main and manual runs) use random seeds to try new settings.
+          # There, a failure is a bug to investigate, and it does not block
+          # an unrelated pull request.
+          - name: in-process-swarm
+            iterations: 100
+            args: "--mode fast --swarm"
+            swarm: true
+          - name: in-process-mvcc-swarm
+            iterations: 50
+            args: "--mode fast --enable-mvcc --swarm"
+            swarm: true
     steps:
       - uses: actions/checkout@v4
       - name: Download turso_whopper
@@ -787,6 +856,8 @@ jobs:
       - name: Run turso_whopper (${{ matrix.toolchain }}, ${{ matrix.profile.name }})
         env:
           WHOPPER_ARGS: ${{ matrix.profile.args }}
+          FIXED_SEEDS: ${{ github.event_name == 'pull_request' && matrix.profile.swarm || false }}
+          REPRO_CARGO: ${{ matrix.toolchain == 'nightly' && 'RUSTFLAGS="--cfg nightly" cargo +nightly-2025-12-17' || 'cargo' }}
         run: |
           # A single whopper run drives its connections serially (one blocking
           # step at a time), so it only keeps about one core busy. Run
@@ -795,11 +866,16 @@ jobs:
           seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
             i="$1"
             log="whopper-run-$i.log"
+            if [ "$FIXED_SEEDS" = true ]; then
+              export SEED="$i"
+            fi
             if ./target/release/turso_whopper $WHOPPER_ARGS >"$log" 2>&1; then
               echo "iteration $i ok: $(grep -m1 "^seed = " "$log")"
             else
-              echo "iteration $i FAILED ($(grep -m1 "^seed = " "$log")):"
+              seed=$(grep -m1 "^seed = " "$log" | cut -d" " -f3)
+              echo "iteration $i FAILED (seed = $seed):"
               cat "$log"
+              echo "Reproduce with: SEED=$seed $REPRO_CARGO run --release -p turso_whopper -- $WHOPPER_ARGS"
               exit 255
             fi
           ' _
@@ -838,6 +914,7 @@ jobs:
       - name: Run Windows core multiprocess regressions
         run: |
           cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
+          cargo test -q -p core_tester --test integration_tests --features win_iocp multiprocess:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
         run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01 --max-steps 10000
 

@@ -1,0 +1,522 @@
+use asserting::prelude::*;
+use turso_core::namespace::NamespaceId;
+use turso_core::schema::Schema;
+use turso_core::security::roles::SessionRole;
+use turso_core::sync::Arc;
+use turso_core::ConnectOpts;
+use turso_core::Database;
+use turso_core::DatabaseOpts;
+use turso_core::OpenFlags;
+use turso_core::PlatformIO;
+use turso_core::IO;
+use turso_sqlite::SqliteDialect;
+
+use crate::assertions::AssertQueryPlan;
+use crate::common::limbo_exec_rows;
+
+/// Regression test for #11581: once a database has `sqlite_stat1`, opening
+/// a new connection must not deep-clone the whole schema just to install
+/// the ANALYZE stats. Every connection keeps sharing the database schema.
+#[test]
+fn new_connections_share_schema_when_stat1_exists() {
+    let (_dir, db) = open_db();
+    create_table_and_analyze(&db);
+    let mut connections = Vec::new();
+    for _ in 0..5 {
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&conn.current_schema(), &db.clone_schema()),
+            "new connection must share the database schema instead of deep-cloning it"
+        );
+        connections.push(conn);
+    }
+    assert_eq!(connections.len(), 5);
+    assert_table_t_stats(&db.clone_schema());
+}
+
+/// An existing connection that runs ANALYZE itself ends up sharing the
+/// database schema and carrying the correct stats (#11581).
+#[test]
+fn existing_connection_shares_schema_after_analyze() {
+    let (_dir, db) = open_db();
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER);
+             CREATE INDEX t_a ON t(a, c);
+             CREATE INDEX t_b ON t(b);
+             INSERT INTO t (a, b, c) VALUES ('x', 'y', 1), ('z', 'w', 2);",
+        )
+        .unwrap();
+    drop(setup);
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    assert!(
+        Arc::ptr_eq(&conn.current_schema(), &db.clone_schema()),
+        "connection that ran ANALYZE must share the database schema"
+    );
+    assert_table_t_stats(&conn.current_schema());
+    assert_table_t_stats(&db.clone_schema());
+}
+
+/// When the stats actually changed, the shared schema is updated and the
+/// connection is pointed at the new shared schema (#11581).
+#[test]
+fn analyze_after_more_rows_updates_shared_stats() {
+    let (_dir, db) = open_db();
+    create_table_and_analyze(&db);
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t (a, b, c) VALUES ('p', 'q', 3), ('r', 's', 4), ('u', 'v', 5);
+         ANALYZE",
+    )
+    .unwrap();
+    assert!(
+        Arc::ptr_eq(&conn.current_schema(), &db.clone_schema()),
+        "connection must share the database schema after re-ANALYZE"
+    );
+    let shared = db.clone_schema();
+    assert_eq!(
+        shared
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "t")
+            .unwrap()
+            .row_count,
+        Some(5)
+    );
+    drop(shared);
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(Arc::ptr_eq(&conn2.current_schema(), &db.clone_schema()));
+    assert_eq!(
+        conn2
+            .current_schema()
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "t")
+            .unwrap()
+            .row_count,
+        Some(5)
+    );
+}
+
+/// A connection holding a private copy of the schema at the same version
+/// (installed here by a reparse without publishing, the shape a sync
+/// checkpoint leaves behind) is not pointed at the shared schema by a
+/// stats refresh: it keeps its own schema and still gets the stats
+/// (#11581).
+#[test]
+fn private_same_version_schema_survives_analyze() {
+    let (_dir, db) = open_db();
+    create_table_and_analyze(&db);
+    let a = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let other = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let shared_before = db.clone_schema();
+    a.force_reparse_schema_without_publish().unwrap();
+    assert!(
+        !Arc::ptr_eq(&a.current_schema(), &db.clone_schema()),
+        "test setup must leave a private schema on the connection"
+    );
+    assert!(
+        Arc::ptr_eq(&shared_before, &db.clone_schema()),
+        "force_reparse_schema_without_publish must not mutate or clone the shared schema"
+    );
+    assert!(
+        Arc::ptr_eq(&other.current_schema(), &db.clone_schema()),
+        "other connections must keep sharing the database schema"
+    );
+    assert_table_t_stats(&a.current_schema());
+    a.execute("ANALYZE").unwrap();
+    assert!(
+        !Arc::ptr_eq(&a.current_schema(), &db.clone_schema()),
+        "refresh must not discard a private same-version schema"
+    );
+    assert_table_t_stats(&a.current_schema());
+}
+
+/// Control case for #11581: without `sqlite_stat1` there is nothing to
+/// install, so new connections trivially keep sharing the database schema.
+#[test]
+fn connections_share_schema_without_stat1() {
+    let (_dir, db) = open_db();
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    drop(setup);
+    let mut connections = Vec::new();
+    for _ in 0..5 {
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&conn.current_schema(), &db.clone_schema()),
+            "new connection must share the database schema"
+        );
+        connections.push(conn);
+    }
+    assert_eq!(connections.len(), 5);
+}
+
+/// Regression test for #12397: a NULL `tbl` row in `sqlite_stat1` must not
+/// fail stats loading on reopen and discard valid statistics.
+#[test]
+fn reopen_loads_valid_stats_when_stat1_has_null_tbl_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_null_tbl.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE t(a, b);
+             CREATE INDEX ia ON t(a);
+             CREATE INDEX ib ON t(b);
+             ANALYZE;
+             INSERT INTO sqlite_stat1 VALUES
+                 ('t', 'ia', '2000 2000'),
+                 ('t', 'ib', '2000 1'),
+                 (NULL, NULL, NULL);",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    let t = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t")
+        .expect("valid stats for table t must survive a NULL tbl row");
+    assert_eq!(t.row_count, Some(2000));
+    assert_eq!(
+        t.index_stats
+            .get("ia")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![2000]
+    );
+    assert_eq!(
+        t.index_stats
+            .get("ib")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
+}
+
+/// Regression test for #12397: non-text `tbl` rows that do not match any table
+/// must be skipped instead of failing stats loading on reopen.
+#[test]
+fn reopen_loads_valid_stats_when_stat1_has_non_text_tbl_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_non_text_tbl.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE t(a, b);
+             CREATE INDEX ia ON t(a);
+             CREATE INDEX ib ON t(b);
+             ANALYZE;
+             INSERT INTO sqlite_stat1 VALUES
+                 (123, 'x', '10 1'),
+                 (1.5, 'x', '10 1'),
+                 (X'fffe', 'x', '10 1'),
+                 ('t', 'ia', '2000 2000'),
+                 ('t', 'ib', '2000 1');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    let t = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t")
+        .expect("valid stats for table t must survive non-text tbl rows");
+    assert_eq!(
+        t.index_stats
+            .get("ib")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
+}
+
+/// Regression test for #12397: non-text `tbl`, `idx`, and `stat` values in
+/// `sqlite_stat1` are coerced to text on reopen (like SQLite's analysisLoader).
+#[test]
+fn reopen_coerces_non_text_stat1_columns_to_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_coerced.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE \"123\"(a, b);
+             CREATE INDEX \"111\" ON \"123\"(a);
+             CREATE INDEX \"222\" ON \"123\"(b);
+             CREATE TABLE counts(x);
+             CREATE TABLE blob_t(a, b);
+             CREATE INDEX bia ON blob_t(a);
+             CREATE INDEX bib ON blob_t(b);
+             ANALYZE;
+             INSERT INTO sqlite_stat1 VALUES
+                 (123, 111, '2000 2000'),
+                 (123, 222, '2000 1'),
+                 ('counts', NULL, 50000),
+                 (X'626c6f625f74', X'626961', X'323030302032303030'),
+                 (X'626c6f625f74', X'626962', X'323030302031');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+
+    let t123 = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "123")
+        .expect("integer tbl 123 must match table \"123\"");
+    assert_eq!(
+        t123.index_stats
+            .get("111")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![2000]
+    );
+    assert_eq!(
+        t123.index_stats
+            .get("222")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+
+    let counts = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "counts")
+        .expect("integer stat 50000 must populate row_count");
+    assert_eq!(counts.row_count, Some(50000));
+
+    let blob_t = schema
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "blob_t")
+        .expect("blob tbl/idx/stat must coerce to UTF-8 text");
+    assert_eq!(
+        blob_t
+            .index_stats
+            .get("bia")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![2000]
+    );
+    assert_eq!(
+        blob_t
+            .index_stats
+            .get("bib")
+            .unwrap()
+            .avg_rows_per_distinct_prefix,
+        vec![1]
+    );
+}
+
+/// Regression test for #12397: matching SQLite's analysisLoader, a `sqlite_stat1`
+/// row whose `idx` does not match any index on `tbl` (whether non-text or text)
+/// sets the table's row count from the first number in `stat`.
+#[test]
+fn reopen_unmatched_idx_sets_table_row_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_unmatched_idx.db");
+    let path_str = path.to_str().unwrap();
+
+    {
+        let db = open_db_at(path_str, DatabaseOpts::new());
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE x(a);
+             CREATE TABLE y(a);
+             CREATE INDEX xa ON x(a);
+             CREATE INDEX ya ON y(a);
+             CREATE TABLE z(a);
+             ANALYZE;
+             DELETE FROM sqlite_stat1;
+             INSERT INTO sqlite_stat1 VALUES
+                 ('x', 1, '1000000'),
+                 ('y', 1, '10'),
+                 ('z', 'nosuchidx', '42');",
+        )
+        .unwrap();
+    }
+
+    let db = open_db_at(path_str, DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let schema = conn.current_schema();
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "x")
+            .unwrap()
+            .row_count,
+        Some(1_000_000)
+    );
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "y")
+            .unwrap()
+            .row_count,
+        Some(10)
+    );
+    assert_eq!(
+        schema
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "z")
+            .unwrap()
+            .row_count,
+        Some(42)
+    );
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM x, y WHERE x.a = y.a",
+    ))
+    .has_table_access_order(["y", "x"])
+    .uses_index("xa");
+}
+
+/// Regression test for #12397: VACUUM schema reparse also preserves valid
+/// statistics when `sqlite_stat1` contains a NULL `tbl` row.
+#[test]
+fn vacuum_preserves_valid_stats_when_stat1_has_null_tbl_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stat1_vacuum.db");
+    let db = open_db_at(
+        path.to_str().unwrap(),
+        DatabaseOpts::new().with_vacuum(true),
+    );
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE t(a, b);
+         CREATE INDEX ia ON t(a);
+         CREATE INDEX ib ON t(b);
+         ANALYZE;
+         INSERT INTO sqlite_stat1 VALUES
+             ('t', 'ia', '2000 2000'),
+             ('t', 'ib', '2000 1'),
+             (NULL, NULL, NULL);
+         VACUUM;",
+    )
+    .unwrap();
+
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 5",
+    ))
+    .uses_index("ib");
+}
+
+/// Open a fresh temporary database for the stats tests above.
+fn open_db() -> (tempfile::TempDir, Arc<Database>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    let db = open_db_at(path.to_str().unwrap(), DatabaseOpts::new());
+    (dir, db)
+}
+
+/// Open a database at the given path with the supplied options.
+fn open_db_at(path: &str, opts: DatabaseOpts) -> Arc<Database> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap()
+}
+
+/// Create table `t` (2 rows, 2 indexes) and ANALYZE it on a fresh
+/// connection, which is dropped on return.
+fn create_table_and_analyze(db: &Arc<Database>) {
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER);
+             CREATE INDEX t_a ON t(a, c);
+             CREATE INDEX t_b ON t(b);
+             INSERT INTO t (a, b, c) VALUES ('x', 'y', 1), ('z', 'w', 2);
+             ANALYZE",
+        )
+        .unwrap();
+}
+
+/// The stats the tests expect for table `t` after ANALYZE on its 2 rows.
+fn assert_table_t_stats(schema: &Schema) {
+    let stats = &schema.analyze_stats;
+    assert_eq!(stats.tables.len(), 1, "only table t should have stats");
+    let t = stats
+        .table_stats(NamespaceId::ROOT, "t")
+        .expect("table t must have stats");
+    assert_eq!(t.row_count, Some(2));
+    let t_a = t.index_stats.get("t_a").expect("index t_a must have stats");
+    assert_eq!(t_a.total_rows, Some(2));
+    let t_b = t.index_stats.get("t_b").expect("index t_b must have stats");
+    assert_eq!(t_b.total_rows, Some(2));
+}

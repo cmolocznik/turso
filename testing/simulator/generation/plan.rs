@@ -195,7 +195,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         stats,
                         env.profile.mvcc,
                         &conn_ctx,
-                        env.sequence_info(),
+                        env.sequence_info(interaction.connection_index),
                     );
 
                     let Some(InteractionsType::Property(property)) = self
@@ -208,7 +208,8 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                     };
 
                     let queries = possible_queries(conn_ctx.tables());
-                    let query_distr = QueryDistribution::new(queries, &remaining_, false);
+                    let query_distr =
+                        QueryDistribution::new(queries, &remaining_, false, env.profile.mvcc);
 
                     let query_gen = property.get_extensional_query_gen_function();
 
@@ -380,13 +381,13 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
             stats,
             env.profile.mvcc,
             conn_ctx,
-            env.sequence_info(),
+            env.sequence_info(conn_index),
         );
 
         let queries = possible_queries(conn_ctx.tables());
-        let allow_checkpoints =
-            !env.profile.mvcc && !matches!(env.type_, SimulationType::Differential);
-        let query_distr = QueryDistribution::new(queries, &remaining_, allow_checkpoints);
+        let allow_checkpoints = !matches!(env.type_, SimulationType::Differential);
+        let query_distr =
+            QueryDistribution::new(queries, &remaining_, allow_checkpoints, env.profile.mvcc);
 
         #[expect(clippy::type_complexity)]
         let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![

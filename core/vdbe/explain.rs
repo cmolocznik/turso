@@ -1,10 +1,10 @@
+use crate::ast::SortOrder;
 use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -639,10 +639,9 @@ pub fn insn_to_row(
             } => {
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
-                    CursorType::BTreeTable(table) => {
-                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
-                        name
-                    }
+                    CursorType::BTreeTable(table) => table
+                        .column_at_physical_offset(*column)
+                        .and_then(|v| v.name.as_ref()),
                     CursorType::BTreeIndex(index) => {
                         let name = index.columns.get(*column).map(|c| &c.name);
                         name
@@ -688,9 +687,9 @@ pub fn insn_to_row(
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name = |column: usize| -> String {
                     let name: Option<&String> = match cursor_type {
-                        CursorType::BTreeTable(table) => {
-                            table.columns().get(column).and_then(|v| v.name.as_ref())
-                        }
+                        CursorType::BTreeTable(table) => table
+                            .column_at_physical_offset(column)
+                            .and_then(|v| v.name.as_ref()),
                         CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
                         _ => {
                             None
@@ -754,6 +753,34 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ConvertToType {
+                reg,
+                storage_class,
+                description,
+            } => (
+                "ConvertToType",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(crate::types::StrictType::Stores(*storage_class).name()),
+                0,
+                description.clone(),
+            ),
+            Insn::TypeConversion {
+                function: _,
+                reg,
+                params_reg,
+                param_count,
+                description,
+            } => (
+                "TypeConversion",
+                *reg as i64,
+                *params_reg as i64,
+                *param_count as i64,
+                Value::build_text(""),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,
@@ -761,10 +788,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                format!("{} ({})", data.target, data.element_type),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
@@ -805,19 +829,6 @@ pub fn insn_to_row(
                 "MakeArray",
                 *start_reg as i64,
                 *count as i64,
-                *dest as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::MakeArrayDynamic {
-                start_reg,
-                count_reg,
-                dest,
-            } => (
-                "MakeArrayDynamic",
-                *start_reg as i64,
-                *count_reg as i64,
                 *dest as i64,
                 Value::build_text(""),
                 0,
@@ -871,19 +882,6 @@ pub fn insn_to_row(
                 *src_reg as i64,
                 *dest as i64,
                 *expected_tag as i64,
-                Value::build_text(""),
-                0,
-                String::new(),
-            ),
-            Insn::RegCopyOffset {
-                src,
-                base,
-                offset_reg,
-            } => (
-                "RegCopyOffset",
-                *src as i64,
-                *base as i64,
-                *offset_reg as i64,
                 Value::build_text(""),
                 0,
                 String::new(),
@@ -1051,6 +1049,15 @@ pub fn insn_to_row(
                 on_error.map_or(0, |rt| rt.bit_value() as i64),
                 *target_reg as i64,
                 Value::build_text(description.clone()),
+                0,
+                "".to_string(),
+            ),
+            Insn::RowSecurityViolation { denial } => (
+                "RowSecurityViolation",
+                0,
+                0,
+                0,
+                Value::build_text(denial.to_string()),
                 0,
                 "".to_string(),
             ),
@@ -1393,7 +1400,13 @@ pub fn insn_to_row(
                     data.func.as_str().to_string()
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                match data.minmax_keeps_best_reg {
+                    Some(reg) => format!(
+                        "accum=r[{}] step(r[{}]); r[{}]=1 if accum kept its value",
+                        data.acc_reg, data.col, reg
+                    ),
+                    None => format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                },
             ),
             Insn::AggInverse {
                 func,
@@ -1496,8 +1509,8 @@ pub fn insn_to_row(
                             coll => format!("{sign}{coll}"),
                         };
                         match nulls {
-                            Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
-                            Some(turso_parser::ast::NullsOrder::Last) => format!("{coll_str} NL"),
+                            Some(crate::ast::NullsOrder::First) => format!("{coll_str} NF"),
+                            Some(crate::ast::NullsOrder::Last) => format!("{coll_str} NL"),
                             None => coll_str,
                         }
                     })
@@ -2123,19 +2136,18 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
-            Insn::AddRole {
+            Insn::CatalogApply {
                 db,
-                id_reg,
-                name,
-                superuser,
+                apply,
+                value_regs,
             } => (
-                "AddRole",
+                "CatalogApply",
                 *db as i64,
-                *id_reg as i64,
+                value_regs.first().map_or(0, |reg| *reg as i64),
                 0,
-                Value::build_text(name.clone()),
+                Value::build_text(format!("{apply:?}")),
                 0,
-                format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
+                "apply the change to the dialect's state in the schema".to_string(),
             ),
             Insn::DropView {
                 db,

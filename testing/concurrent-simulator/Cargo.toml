@@ -30,6 +30,7 @@ name = "regression_tests_cross_platform"
 path = "regression_tests_cross_platform.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 memmap2 = "0.9"
@@ -39,7 +40,6 @@ sql_generation = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 turso_core = { workspace = true, features = ["simulator", "fs", "experimental_win_iocp", "fts"]}
-turso_parser = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = "0.4.3"

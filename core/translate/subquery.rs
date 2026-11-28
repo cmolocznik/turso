@@ -3,25 +3,27 @@ use std::sync::Arc;
 use crate::alloc::TursoSliceExt;
 use crate::translate::expr_context::ExprContext;
 
+use crate::ast::{self, SortOrder, SubqueryType, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
-use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
     emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},
-    main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
+    select::first_aggregate_without_over_clause,
 };
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr::expr_type::{type_of, TypeEnv};
+use crate::translate::expr::expr_type::query_column_type;
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
-    schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
+    schema::{
+        BTreeCharacteristics, BTreeTable, Column, FromClauseSubquery, Index, IndexColumn, Table,
+    },
     translate::{
         collate::in_subquery_collation,
-        compound_select::emit_program_for_compound_select,
+        compound_select::{emit_program_for_compound_select, set_select_plan_destination},
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
         },
@@ -29,11 +31,14 @@ use crate::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
-        expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
+        },
+        insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated,
-            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinInfo,
+            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt, JoinInfo,
             JoinOrderMember, JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
             WhereTerm,
@@ -327,7 +332,7 @@ pub fn plan_subqueries_from_select_plan(
                 connection,
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
-                !group_by.exprs.is_empty(),
+                SubqueryPosition::Having.allow_correlated(),
                 &mut cse_map,
                 &mut same_query_map,
                 &[],
@@ -397,7 +402,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan, resolver)?;
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -587,6 +592,42 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
+/// Compute query plans for subqueries in an UPSERT's DO UPDATE SET values or
+/// WHERE clause, which can reference the row of the target table that
+/// conflicted and the row that failed to insert.
+pub fn plan_subqueries_from_upsert_do_update<'a>(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    origin: SubqueryOrigin,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let position = match origin {
+        SubqueryOrigin::DmlSet => SubqueryPosition::ResultColumn,
+        SubqueryOrigin::DmlWhere => SubqueryPosition::Where,
+        _ => unreachable!("DO UPDATE has only SET values and a WHERE clause"),
+    };
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        exprs,
+        connection,
+        position,
+        origin,
+        position.allow_correlated(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &[],
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
+    Ok(())
+}
+
 /// Plan subqueries in an expression that has no FROM clause, such as a trigger
 /// WHEN clause or a VACUUM INTO path, so there are no outer query references.
 /// Trigger NEW/OLD references should already be rewritten to Expr::Register.
@@ -632,24 +673,40 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    let mut subquery_parser = get_subquery_parser(
-        program,
-        out_subqueries,
-        referenced_tables,
-        resolver,
-        connection,
-        &outer_query_refs_for_correlated_subquery,
-        position,
-        origin,
-        allow_correlated,
-        cse_map,
-        same_query_map,
-        shared,
-    );
-    for expr in exprs {
-        walk_expr_mut(expr, &mut subquery_parser)?;
+    // Only custom types and arrays fail the checks below, and without custom
+    // types enabled there are neither.
+    let custom_types_enabled = !resolver.schema().type_registry.is_empty();
+    let mut with_subqueries = Vec::new();
+    {
+        let mut subquery_parser = get_subquery_parser(
+            program,
+            out_subqueries,
+            referenced_tables,
+            resolver,
+            connection,
+            &outer_query_refs_for_correlated_subquery,
+            position,
+            origin,
+            allow_correlated,
+            cse_map,
+            same_query_map,
+            shared,
+        );
+        for expr in exprs {
+            let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
+            walk_expr_mut(expr, &mut subquery_parser)?;
+            if has_subquery {
+                let expr: &ast::Expr = expr;
+                with_subqueries.push(expr);
+            }
+        }
     }
-
+    // Binding checked these with the types of their subqueries not known yet.
+    // Check them again with those types, as compiling them would, in case
+    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
+    for expr in with_subqueries {
+        check_custom_types(expr, Some(referenced_tables), resolver)?;
+    }
     Ok(())
 }
 
@@ -782,7 +839,7 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
 
-                let plan = prepare_select_plan(
+                let mut plan = prepare_select_plan(
                     *subselect,
                     resolver,
                     program,
@@ -790,11 +847,6 @@ fn get_subquery_parser<'a>(
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
                 )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
-                };
                 // EXISTS only checks whether a row comes out, so ORDER BY and
                 // DISTINCT cannot change the result and SQLite drops them
                 // (select.c, "dropping superfluous ORDER BY"). Dropping them
@@ -803,20 +855,31 @@ fn get_subquery_parser<'a>(
                 // never evaluated: an ORDER BY term that would error at
                 // runtime (e.g. an integer overflow) must not fail the query.
                 // LIMIT and OFFSET stay: with DISTINCT gone they count plain
-                // rows, which matches SQLite.
-                plan.order_by.clear();
-                plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                // rows, which matches SQLite. An OFFSET after DISTINCT ON
+                // counts groups, as in PostgreSQL, so that pair stays whole.
+                match &mut plan {
+                    Plan::Select(plan) => {
+                        let offset_counts_distinct_on_groups =
+                            plan.offset.is_some() && plan.distinctness.is_distinct_on();
+                        if !offset_counts_distinct_on_groups {
+                            plan.order_by.clear();
+                            plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                        }
+                    }
+                    Plan::CompoundSelect { order_by, .. } => *order_by = None,
+                    _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
+                }
+                let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    optimize_select_plan(&mut plan, resolver)?;
+                    optimize_subquery_plan(&mut plan, resolver)?;
                 }
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     same_query: None,
                     query_type: subquery_type,
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(Plan::Select(plan))),
+                        plan: Some(Box::new(plan)),
                     },
                     correlated,
                     origin,
@@ -866,6 +929,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::RowValue {
                         result_reg_start: 0,
                         num_regs: 0,
+                        row_count_reg: None,
                     },
                 };
                 let ast::Expr::Subquery(subselect) = ({
@@ -874,7 +938,7 @@ fn get_subquery_parser<'a>(
                 }) else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let mut plan = prepare_select_plan(
                     *subselect,
                     resolver,
                     program,
@@ -882,29 +946,25 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
-                        "compound SELECT queries not supported yet in WHERE clause subqueries"
-                    );
-                };
-                let correlated = select_plan_has_outer_scope_dependency(&plan);
+                let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    optimize_select_plan(&mut plan, resolver)?;
+                    optimize_subquery_plan(&mut plan, resolver)?;
                 }
-                let reg_count = plan.result_columns.len();
+                let reg_count = plan.select_result_columns().len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                let env = TypeEnv::new(Some(&plan.table_references), resolver);
+                // Like SQLite, a compound takes the affinity of its last SELECT.
                 let columns: Vec<_> = plan
-                    .result_columns
+                    .select_result_columns()
                     .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
+                    .enumerate()
+                    .map(|(i, result_col)| RowValueSubqueryColumn {
                         affinity: get_expr_affinity(
                             &result_col.expr,
-                            &ExprContext::new(Some(&plan.table_references), resolver),
+                            &ExprContext::new(Some(plan.select_table_references()), resolver),
                         ),
-                        expr_type: type_of(&result_col.expr, &env),
+                        expr_type: query_column_type(&plan, i, resolver),
                     })
                     .collect();
                 if let [column] = columns.as_slice() {
@@ -918,35 +978,75 @@ fn get_subquery_parser<'a>(
                     },
                 );
 
-                plan.query_destination = QueryDestination::RowValueSubqueryResult {
-                    result_reg_start: reg_start,
-                    num_regs: reg_count,
-                };
+                // An aggregate without GROUP BY returns one row, so it needs no row count.
+                let is_single_row_aggregate = matches!(&plan, Plan::Select(plan)
+                    if !plan.aggregates.is_empty()
+                        && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+                        && plan.window.is_none());
+                let row_count_reg = (resolver
+                    .catalog
+                    .dialect
+                    .rejects_scalar_subquery_with_several_rows()
+                    && !is_single_row_aggregate)
+                    .then(|| program.alloc_register());
+                set_select_plan_destination(
+                    &mut plan,
+                    &QueryDestination::RowValueSubqueryResult {
+                        result_reg_start: reg_start,
+                        num_regs: reg_count,
+                        row_count_reg,
+                    },
+                );
+                let limit = plan
+                    .select_limit_mut()
+                    .expect("a scalar subquery is a SELECT");
 
-                // RowValue subqueries are satisfied after at most 1 row has been returned,
+                let numeric =
+                    |n: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
+                // When a second row is an error, the subquery stops after the second row:
+                // LIMIT 0 and LIMIT 1 stay, and any other LIMIT (a negative one means no limit)
+                // becomes 2, as `CASE X WHEN 0 THEN 0 WHEN 1 THEN 1 ELSE 2 END`.
+                // Otherwise RowValue subqueries are satisfied after at most 1 row has been returned,
                 // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
                 // Like SQLite, an existing LIMIT X becomes X != 0, with the 0 given NUMERIC
                 // affinity so that a text '0' also means no rows. Integer literals are folded here.
-                plan.limit = Some(match plan.limit.take() {
-                    None => Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
-                    Some(expr) => match parse_signed_number(&expr) {
-                        Ok(Value::Numeric(Numeric::Integer(v))) => Box::new(ast::Expr::Literal(
-                            ast::Literal::Numeric(((v != 0) as i64).to_string()),
-                        )),
-                        _ => Box::new(ast::Expr::Binary(
-                            expr,
-                            ast::Operator::NotEquals,
-                            Box::new(ast::Expr::cast(
-                                ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
-                                Some(ast::Type {
-                                    name: "NUMERIC".to_string(),
-                                    size: None,
-                                    array_dimensions: 0,
-                                }),
+                if row_count_reg.is_some() {
+                    *limit = Some(match limit.take() {
+                        None => numeric(2),
+                        Some(expr) => match parse_signed_number(&expr) {
+                            Ok(Value::Numeric(Numeric::Integer(v))) => {
+                                numeric(if (0..2).contains(&v) { v } else { 2 })
+                            }
+                            _ => Box::new(ast::Expr::Case {
+                                base: Some(expr),
+                                when_then_pairs: vec![
+                                    (numeric(0), numeric(0)),
+                                    (numeric(1), numeric(1)),
+                                ],
+                                else_expr: Some(numeric(2)),
+                            }),
+                        },
+                    });
+                } else {
+                    *limit = Some(match limit.take() {
+                        None => numeric(1),
+                        Some(expr) => match parse_signed_number(&expr) {
+                            Ok(Value::Numeric(Numeric::Integer(v))) => numeric((v != 0) as i64),
+                            _ => Box::new(ast::Expr::Binary(
+                                expr,
+                                ast::Operator::NotEquals,
+                                Box::new(ast::Expr::cast(
+                                    ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+                                    Some(ast::Type {
+                                        name: "NUMERIC".to_string(),
+                                        size: None,
+                                        array_dimensions: 0,
+                                    }),
+                                )),
                             )),
-                        )),
-                    },
-                });
+                        },
+                    });
+                }
 
                 let ast::Expr::SubqueryResult {
                     subquery_id,
@@ -956,6 +1056,7 @@ fn get_subquery_parser<'a>(
                         SubqueryType::RowValue {
                             result_reg_start,
                             num_regs,
+                            row_count_reg: expr_row_count_reg,
                         },
                 } = &mut *expr
                 else {
@@ -963,6 +1064,7 @@ fn get_subquery_parser<'a>(
                 };
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
+                *expr_row_count_reg = row_count_reg;
                 let subquery_id = *subquery_id;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -971,9 +1073,10 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::RowValue {
                         result_reg_start: reg_start,
                         num_regs: reg_count,
+                        row_count_reg,
                     },
                     state: SubqueryState::Unevaluated {
-                        plan: Some(Box::new(Plan::Select(plan))),
+                        plan: Some(Box::new(plan)),
                     },
                     correlated,
                     origin: effective_origin,
@@ -1032,20 +1135,7 @@ fn get_subquery_parser<'a>(
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
-                    match &mut plan {
-                        Plan::Select(select_plan) => {
-                            optimize_select_plan(select_plan, resolver)?;
-                        }
-                        Plan::CompoundSelect {
-                            left, right_most, ..
-                        } => {
-                            optimize_select_plan(right_most, resolver)?;
-                            for (select_plan, _) in left.iter_mut() {
-                                optimize_select_plan(select_plan, resolver)?;
-                            }
-                        }
-                        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
-                    }
+                    optimize_subquery_plan(&mut plan, resolver)?;
                 }
                 let result_columns = plan.select_result_columns();
                 let table_references = plan.select_table_references();
@@ -1085,6 +1175,15 @@ fn get_subquery_parser<'a>(
                     lhs_exprs.push(lhs_expr);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
+
+                // A string literal or parameter on the left is read as the
+                // type of the column it is compared with.
+                resolver.in_subquery_column_types.insert(
+                    subquery_id,
+                    (0..result_columns.len())
+                        .map(|i| query_column_type(&plan, i, resolver))
+                        .collect(),
+                );
 
                 let columns = result_columns
                     .iter()
@@ -1163,6 +1262,23 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     })
+}
+
+/// Optimize each SELECT of a subquery plan.
+fn optimize_subquery_plan(plan: &mut Plan, resolver: &Resolver) -> Result<()> {
+    match plan {
+        Plan::Select(select_plan) => optimize_select_plan(select_plan, resolver),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            optimize_select_plan(right_most, resolver)?;
+            for (select_plan, _) in left.iter_mut() {
+                optimize_select_plan(select_plan, resolver)?;
+            }
+            Ok(())
+        }
+        _ => unreachable!("prepare_select_plan cannot return Delete/Update"),
+    }
 }
 
 /// Recollect all aggregates after subquery planning.
@@ -1423,8 +1539,8 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                         "pre-materializing shared CTE"
                     );
                     let (result_columns_start, cursor_id, shared_table) = program
-                        .with_cte_materialization_eqp(
-                            cte_id,
+                        .with_materialization_eqp(
+                            Some(cte_id),
                             &from_clause_subquery.name,
                             |program| {
                                 emit_materialized_subquery_table(
@@ -1458,16 +1574,15 @@ enum QueryLevel {
 /// Describe how a FROM-clause subquery reference will be executed, for
 /// EXPLAIN QUERY PLAN consumers. Returns None for plain tables.
 fn eqp_subquery_info(
-    program: &ProgramBuilder,
     table_reference: &JoinedTable,
     execution_mode: Option<&FromClauseSubqueryExecutionMode>,
+    reuses_materialized_cte: bool,
 ) -> Option<EqpSubquery> {
     let Table::FromClauseSubquery(from_clause_subquery) = &table_reference.table else {
         return None;
     };
     let cte_id = from_clause_subquery.cte_id();
-    let already_materialized = cte_id.is_some_and(|id| program.get_materialized_cte(id).is_some());
-    let exec = if already_materialized {
+    let exec = if reuses_materialized_cte {
         EqpSubqueryExec::MaterializedReuse
     } else {
         match execution_mode {
@@ -1491,6 +1606,7 @@ fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
     from_clause_has_right_or_full_join: bool,
+    coroutine_would_rerun: bool,
 ) -> FromClauseSubqueryExecutionMode {
     if from_clause_has_right_or_full_join {
         // SQLite does not use a coroutine in a FROM list with RIGHT or FULL JOIN.
@@ -1523,7 +1639,7 @@ fn choose_from_clause_subquery_execution_mode(
             })
         }
         _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
-        _ if from_clause_subquery.requires_table_materialization() => {
+        _ if from_clause_subquery.requires_table_materialization() || coroutine_would_rerun => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
@@ -1577,177 +1693,323 @@ pub fn emit_from_clause_subqueries(
         .try_collect()?;
 
     for table_index in visit_order {
-        allocate_cursors_read_by_lateral_subquery(program, t_ctx, tables, join_order, table_index)?;
-        let table_reference = &mut tables.joined_tables_mut()[table_index];
-        let execution_mode = match &table_reference.table {
-            Table::FromClauseSubquery(from_clause_subquery) => {
-                Some(choose_from_clause_subquery_execution_mode(
-                    &table_reference.op,
-                    from_clause_subquery.as_ref(),
-                    from_clause_has_right_or_full_join,
-                ))
-            }
-            _ => None,
+        emit_from_clause_table(
+            program,
+            t_ctx,
+            tables,
+            join_order,
+            table_index,
+            from_clause_has_right_or_full_join,
+            &outer_table_set,
+        )?;
+    }
+
+    explain_right_join_passes(program, tables);
+    Ok(())
+}
+
+/// Emits the rows of one table of a FROM clause, if the table is a subquery,
+/// and lists the table in the query plan.
+///
+/// This function is on the stack one time for each level of nested FROM
+/// clause subqueries. The work before and after the emission of the subquery
+/// is in functions that are not inlined, so that their values are not in this
+/// frame while the subquery is emitted.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn emit_from_clause_table(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    tables: &mut TableReferences,
+    join_order: &[JoinOrderMember],
+    table_index: usize,
+    from_clause_has_right_or_full_join: bool,
+    outer_table_set: &TableMask,
+) -> Result<()> {
+    allocate_cursors_read_by_lateral_subquery(program, t_ctx, tables, join_order, table_index)?;
+    let coroutine_would_rerun =
+        coroutine_would_rerun_for_outer_rows(tables, join_order, table_index);
+    let table_reference = &mut tables.joined_tables_mut()[table_index];
+    let (execution_mode, reuses_materialized_cte) = match &table_reference.table {
+        Table::FromClauseSubquery(from_clause_subquery) => (
+            Some(choose_from_clause_subquery_execution_mode(
+                &table_reference.op,
+                from_clause_subquery.as_ref(),
+                from_clause_has_right_or_full_join,
+                coroutine_would_rerun,
+            )),
+            from_clause_subquery
+                .cte_id()
+                .is_some_and(|cte_id| program.get_materialized_cte(cte_id).is_some()),
+        ),
+        _ => (None, false),
+    };
+    // As in SQLite, the MATERIALIZE step that fills a subquery's table comes
+    // before the step that reads the table. A coroutine's body stays below the
+    // step that reads it.
+    let fills_table = !reuses_materialized_cte
+        && matches!(
+            execution_mode,
+            Some(
+                FromClauseSubqueryExecutionMode::MaterializedTable
+                    | FromClauseSubqueryExecutionMode::DirectMaterializedIndex(_)
+            )
+        );
+    if !fills_table {
+        explain_from_clause_table(
+            program,
+            t_ctx,
+            table_reference,
+            execution_mode.as_ref(),
+            reuses_materialized_cte,
+            outer_table_set.get(table_index),
+            table_index,
+        );
+    }
+
+    if let Some(execution_mode) = &execution_mode {
+        let JoinedTable {
+            table: Table::FromClauseSubquery(from_clause_subquery),
+            col_used_mask,
+            identifier,
+            internal_id,
+            ..
+        } = table_reference
+        else {
+            unreachable!("only a FROM clause subquery has an execution mode");
         };
-        emit_explain!(program, true, {
-            let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
-            let eqp_join = EqpJoin::from_join_info(
-                table_reference.join_info.as_ref(),
-                outer_table_set.get(table_index),
-            );
-            if t_ctx
-                .materialized_build_inputs
-                .get(&table_index)
-                .is_some_and(|input| input.requires_build_table())
-            {
-                eqp_detail_for_rowid_search(table_reference, eqp_join, eqp_subquery)
-            } else {
-                eqp_detail_for_table_op(table_reference, eqp_join, eqp_subquery)
+        let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+        if from_clause_subquery.parenthesized_join_columns.is_some() {
+            keep_used_join_group_columns(from_clause_subquery, col_used_mask, execution_mode);
+        }
+        if !reuse_materialized_cte(program, from_clause_subquery, identifier, *internal_id) {
+            emit_from_clause_subquery_rows(
+                program,
+                t_ctx,
+                from_clause_subquery,
+                *internal_id,
+                execution_mode,
+            )?;
+        }
+    }
+
+    if fills_table {
+        explain_from_clause_table(
+            program,
+            t_ctx,
+            &tables.joined_tables()[table_index],
+            execution_mode.as_ref(),
+            false,
+            outer_table_set.get(table_index),
+            table_index,
+        );
+    }
+    program.pop_current_parent_explain();
+    Ok(())
+}
+
+/// Lists one table of a FROM clause in the query plan. This function is not
+/// inlined, so that the [EqpDetail] that it makes is not in the frame of
+/// [emit_from_clause_table].
+#[inline(never)]
+fn explain_from_clause_table(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    table_reference: &JoinedTable,
+    execution_mode: Option<&FromClauseSubqueryExecutionMode>,
+    reuses_materialized_cte: bool,
+    is_outer: bool,
+    table_index: usize,
+) {
+    emit_explain!(program, true, {
+        let eqp_subquery =
+            eqp_subquery_info(table_reference, execution_mode, reuses_materialized_cte);
+        let eqp_join = EqpJoin::from_join_info(table_reference.join_info.as_ref(), is_outer);
+        if t_ctx
+            .materialized_build_inputs
+            .get(&table_index)
+            .is_some_and(|input| input.requires_build_table())
+        {
+            eqp_detail_for_rowid_search(table_reference, eqp_join, eqp_subquery)
+        } else {
+            eqp_detail_for_table_op(table_reference, eqp_join, eqp_subquery)
+        }
+    });
+}
+
+/// Prepares the result columns of a parenthesized join group for the columns
+/// that the parent query reads.
+#[inline(never)]
+fn keep_used_join_group_columns(
+    from_clause_subquery: &mut FromClauseSubquery,
+    col_used_mask: &ColumnUsedMask,
+    execution_mode: &FromClauseSubqueryExecutionMode,
+) {
+    let stores_rows_in_table = matches!(
+        execution_mode,
+        FromClauseSubqueryExecutionMode::MaterializedTable
+    );
+    let is_correlated = plan_is_correlated(&from_clause_subquery.plan);
+    let Plan::Select(select_plan) = from_clause_subquery.plan.as_mut() else {
+        unreachable!("a parenthesized join must produce one SELECT plan");
+    };
+    if stores_rows_in_table || !is_correlated {
+        // Unused outputs become NULL. SQLite's general rule for this
+        // (disableUnusedSubqueryResultColumns, select.c) skips
+        // correlated subqueries, but EXPLAIN shows that SQLite also
+        // stores NULL for unused columns of a correlated join group
+        // that it stores in a table.
+        for (column_index, result_column) in select_plan.result_columns.iter_mut().enumerate() {
+            if !col_used_mask.get(column_index) {
+                result_column.expr = ast::Expr::Literal(ast::Literal::Null);
             }
-        });
+        }
+    }
+    if stores_rows_in_table {
+        // A stored row ends at the last column the parent reads, but
+        // keeps at least column 0 so each joined row still stores a
+        // row. EXPLAIN shows SQLite does the same: a join group with
+        // 7 columns, of which the parent reads columns 0 to 2, stores
+        // `MakeRecord .. 3` records.
+        let result_column_count = col_used_mask
+            .iter()
+            .last()
+            .map_or(1, |column_index| column_index + 1);
+        select_plan.result_columns.truncate(result_column_count);
+    }
+}
 
-        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
-            let execution_mode =
-                execution_mode.expect("execution mode was computed above for subquery tables");
-            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            if from_clause_subquery.parenthesized_join_columns.is_some() {
-                let stores_rows_in_table = matches!(
-                    &execution_mode,
-                    FromClauseSubqueryExecutionMode::MaterializedTable
-                );
-                let is_correlated = plan_is_correlated(&from_clause_subquery.plan);
-                let Plan::Select(select_plan) = from_clause_subquery.plan.as_mut() else {
-                    unreachable!("a parenthesized join must produce one SELECT plan");
-                };
-                if stores_rows_in_table || !is_correlated {
-                    // Unused outputs become NULL. SQLite's general rule for this
-                    // (disableUnusedSubqueryResultColumns, select.c) skips
-                    // correlated subqueries, but EXPLAIN shows that SQLite also
-                    // stores NULL for unused columns of a correlated join group
-                    // that it stores in a table.
-                    for (column_index, result_column) in
-                        select_plan.result_columns.iter_mut().enumerate()
-                    {
-                        if !table_reference.col_used_mask.get(column_index) {
-                            result_column.expr = ast::Expr::Literal(ast::Literal::Null);
-                        }
-                    }
-                }
-                if stores_rows_in_table {
-                    // A stored row ends at the last column the parent reads, but
-                    // keeps at least column 0 so each joined row still stores a
-                    // row. EXPLAIN shows SQLite does the same: a join group with
-                    // 7 columns, of which the parent reads columns 0 to 2, stores
-                    // `MakeRecord .. 3` records.
-                    let result_column_count = table_reference
-                        .col_used_mask
-                        .iter()
-                        .last()
-                        .map_or(1, |column_index| column_index + 1);
-                    select_plan.result_columns.truncate(result_column_count);
-                }
-            }
-            // Check if this is a CTE that's already materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id() {
-                if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
-                    program.emit_insn(Insn::Gosub {
-                        target_pc: cte_info.fill_subroutine.label,
-                        return_reg: cte_info.fill_subroutine.return_reg,
-                    });
-                    if from_clause_subquery.materialized_cursor_id.is_some() {
-                        tracing::trace!(
-                            cte_id,
-                            identifier = %table_reference.identifier,
-                            "reusing pre-materialized CTE on original reference"
-                        );
-                        program.pop_current_parent_explain();
-                        continue;
-                    }
-                    // === SUBSEQUENT CTE REFERENCE: Use OpenDup ===
-                    // Create a dup cursor pointing to the same ephemeral table
-                    let dup_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(cte_info.table.clone()));
-                    program.emit_insn(Insn::OpenDup {
-                        new_cursor_id: dup_cursor_id,
-                        original_cursor_id: cte_info.cursor_id,
-                    });
-                    tracing::trace!(
-                        cte_id,
-                        identifier = %table_reference.identifier,
-                        original_cursor_id = cte_info.cursor_id,
-                        dup_cursor_id,
-                        "opening duplicate cursor for materialized CTE"
-                    );
+/// Makes a reference to a CTE read the rows that an earlier reference stored,
+/// if the CTE is already materialized. Returns whether it did. In that case,
+/// the subquery is not emitted again.
+#[inline(never)]
+fn reuse_materialized_cte(
+    program: &mut ProgramBuilder,
+    from_clause_subquery: &mut FromClauseSubquery,
+    identifier: &str,
+    internal_id: TableInternalId,
+) -> bool {
+    let Some(cte_id) = from_clause_subquery.cte_id() else {
+        return false;
+    };
+    let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() else {
+        return false;
+    };
+    program.emit_insn(Insn::Gosub {
+        target_pc: cte_info.fill_subroutine.label,
+        return_reg: cte_info.fill_subroutine.return_reg,
+    });
+    if from_clause_subquery.materialized_cursor_id.is_some() {
+        tracing::trace!(
+            cte_id,
+            identifier = %identifier,
+            "reusing pre-materialized CTE on original reference"
+        );
+        return true;
+    }
+    // === SUBSEQUENT CTE REFERENCE: Use OpenDup ===
+    // Create a dup cursor pointing to the same ephemeral table
+    let dup_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cte_info.table.clone()));
+    program.emit_insn(Insn::OpenDup {
+        new_cursor_id: dup_cursor_id,
+        original_cursor_id: cte_info.cursor_id,
+    });
+    tracing::trace!(
+        cte_id,
+        identifier = %identifier,
+        original_cursor_id = cte_info.cursor_id,
+        dup_cursor_id,
+        "opening duplicate cursor for materialized CTE"
+    );
 
-                    // Update the plan's query destination to EphemeralTable so that
-                    // main_loop knows to use Rewind/Next instead of coroutine Yield
-                    if let Some(dest) = from_clause_subquery.plan.select_query_destination_mut() {
-                        *dest = QueryDestination::EphemeralTable {
-                            cursor_id: dup_cursor_id,
-                            table: cte_info.table.clone(),
-                            rowid_mode: super::plan::EphemeralRowidMode::Auto,
-                        };
-                    }
+    // Update the plan's query destination to EphemeralTable so that
+    // main_loop knows to use Rewind/Next instead of coroutine Yield
+    if let Some(dest) = from_clause_subquery.plan.select_query_destination_mut() {
+        *dest = QueryDestination::EphemeralTable {
+            cursor_id: dup_cursor_id,
+            table: cte_info.table.clone(),
+            rowid_mode: super::plan::EphemeralRowidMode::Auto,
+        };
+    }
 
-                    // Each CTE reference needs its OWN registers to read column values into.
-                    // We cannot share the original's result_columns_start_reg because multiple
-                    // iterators of the same CTE (e.g., outer query and subquery) would
-                    // overwrite each other's values when reading columns from their cursors.
-                    let result_columns_start = program.alloc_registers(cte_info.num_columns);
-                    from_clause_subquery.materialized_cursor_id = Some(dup_cursor_id);
-                    from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-                    program
-                        .set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-                    program.pop_current_parent_explain();
-                    continue; // Skip normal emission
-                }
-            }
+    // Each CTE reference needs its OWN registers to read column values into.
+    // We cannot share the original's result_columns_start_reg because multiple
+    // iterators of the same CTE (e.g., outer query and subquery) would
+    // overwrite each other's values when reading columns from their cursors.
+    let result_columns_start = program.alloc_registers(cte_info.num_columns);
+    from_clause_subquery.materialized_cursor_id = Some(dup_cursor_id);
+    from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+    program.set_subquery_result_reg(internal_id, result_columns_start);
+    true
+}
 
-            let result_columns_start = match execution_mode {
-                FromClauseSubqueryExecutionMode::Coroutine => Some(emit_from_clause_subquery(
-                    program,
-                    from_clause_subquery.plan.as_mut(),
-                    t_ctx,
-                )?),
-                FromClauseSubqueryExecutionMode::MaterializedTable => {
-                    let (result_columns_start, cursor_id, shared_table) =
+/// Emits the rows of a FROM clause subquery in the given execution mode, and
+/// records the first register of its result columns.
+fn emit_from_clause_subquery_rows(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    from_clause_subquery: &mut FromClauseSubquery,
+    internal_id: TableInternalId,
+    execution_mode: &FromClauseSubqueryExecutionMode,
+) -> Result<()> {
+    let result_columns_start = match execution_mode {
+        FromClauseSubqueryExecutionMode::Coroutine => Some(emit_from_clause_subquery(
+            program,
+            from_clause_subquery.plan.as_mut(),
+            t_ctx,
+        )?),
+        FromClauseSubqueryExecutionMode::MaterializedTable => {
+            let (result_columns_start, cursor_id, shared_table) = program
+                .with_materialization_eqp(
+                    from_clause_subquery.cte_id(),
+                    &from_clause_subquery.name,
+                    |program| {
                         emit_materialized_subquery_table(
                             program,
                             from_clause_subquery.plan.as_mut(),
                             t_ctx,
                             &from_clause_subquery.columns,
-                        )?;
-                    from_clause_subquery.materialized_cursor_id = Some(cursor_id);
-                    if let (Some(cte_id), Some(cte_info)) =
-                        (from_clause_subquery.cte_id(), shared_table)
-                    {
-                        program.register_materialized_cte(cte_id, cte_info);
-                    }
-                    Some(result_columns_start)
-                }
-                FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
+                        )
+                    },
+                )?;
+            from_clause_subquery.materialized_cursor_id = Some(cursor_id);
+            if let (Some(cte_id), Some(cte_info)) = (from_clause_subquery.cte_id(), shared_table) {
+                program.register_materialized_cte(cte_id, cte_info);
+            }
+            Some(result_columns_start)
+        }
+        FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
+            program.with_materialization_eqp(
+                from_clause_subquery.cte_id(),
+                &from_clause_subquery.name,
+                |program| {
                     emit_indexed_materialized_subquery(
                         program,
                         from_clause_subquery.plan.as_mut(),
                         t_ctx,
-                        table_reference.internal_id,
-                        direct_index.index,
-                        direct_index.affinity_str,
-                    )?;
-                    None
-                }
-            };
-
-            from_clause_subquery.result_columns_start_reg = result_columns_start;
-            if let Some(result_columns_start) = result_columns_start {
-                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
-            }
+                        internal_id,
+                        direct_index.index.clone(),
+                        direct_index.affinity_str.clone(),
+                    )
+                },
+            )?;
+            None
         }
+    };
 
-        program.pop_current_parent_explain();
+    from_clause_subquery.result_columns_start_reg = result_columns_start;
+    if let Some(result_columns_start) = result_columns_start {
+        program.set_subquery_result_reg(internal_id, result_columns_start);
     }
+    Ok(())
+}
 
-    // SQLite lists each RIGHT-JOIN pass after the normal source plans.
+/// Lists each RIGHT JOIN pass in the query plan, after the plans of the normal
+/// sources, as SQLite does. This function is not inlined, so that the
+/// [EqpDetail] values that it makes are not in the frame of
+/// [emit_from_clause_subqueries].
+#[inline(never)]
+fn explain_right_join_passes(program: &mut ProgramBuilder, tables: &TableReferences) {
     for table in tables.joined_tables() {
         if table
             .join_info
@@ -1760,7 +2022,106 @@ pub fn emit_from_clause_subqueries(
             program.pop_current_parent_explain();
         }
     }
-    Ok(())
+}
+
+/// Whether a coroutine for the FROM-clause subquery at `table_index` may sit
+/// in an inner loop of the join and so run the whole subquery again for each
+/// row of the outer loops. SQLite stores the subquery in a table instead when
+/// an earlier FROM term is a subquery, or when this term or an earlier one is
+/// joined by an outer join or CROSS JOIN, which keeps it after the earlier
+/// terms (rules 1c-i and 1c-ii of `fromClauseTermCanBeCoroutine` in select.c).
+/// A semi join or anti join that Turso makes from EXISTS or NOT EXISTS also
+/// keeps its table after the earlier terms, so it is treated the same way.
+/// SQLite applies these rules only to subqueries that it does not flatten into
+/// the outer query, so a subquery that SQLite may flatten keeps its coroutine.
+fn coroutine_would_rerun_for_outer_rows(
+    tables: &TableReferences,
+    join_order: &[JoinOrderMember],
+    table_index: usize,
+) -> bool {
+    let joined_tables = tables.joined_tables();
+    let Table::FromClauseSubquery(from_clause_subquery) = &joined_tables[table_index].table else {
+        return false;
+    };
+    // SQLite may merge any other subquery into the outer query, which
+    // evaluates its expressions, for example random() or a read of a table
+    // that an UPDATE changes, again for each outer row. A table filled once
+    // would not.
+    if !sqlite_never_flattens_from_clause_subquery(&joined_tables[table_index]) {
+        return false;
+    }
+    // A subquery that reads a row of an outer query has to run again for
+    // each such row, so a table filled once cannot replace it.
+    if plan_has_outer_scope_dependency(&from_clause_subquery.plan) {
+        return false;
+    }
+    // The first table of the join order is read once.
+    if join_order
+        .first()
+        .is_some_and(|member| member.original_idx == table_index)
+    {
+        return false;
+    }
+    joined_tables[..table_index].iter().any(|table| {
+        matches!(table.table, Table::FromClauseSubquery(_))
+            && sqlite_never_flattens_from_clause_subquery(table)
+    }) || joined_tables[..=table_index].iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_ordering_constrained)
+    })
+}
+
+/// Whether SQLite's `flattenSubquery` (select.c) refuses to merge the
+/// FROM-clause subquery of `table` into an outer query that has more than one
+/// FROM term, whatever that outer query is. Only restrictions that depend on
+/// the subquery alone are checked, because SQLite may turn an outer join into
+/// an inner join before it flattens, which changes the restrictions that
+/// depend on the outer query.
+fn sqlite_never_flattens_from_clause_subquery(table: &JoinedTable) -> bool {
+    let Table::FromClauseSubquery(from_clause_subquery) = &table.table else {
+        return false;
+    };
+    if from_clause_subquery.materialize_hint() {
+        return true;
+    }
+    match from_clause_subquery.plan.as_ref() {
+        Plan::Select(plan) => !select_core_can_be_flattened(plan),
+        Plan::CompoundSelect {
+            left,
+            right_most,
+            limit,
+            order_by,
+            ..
+        } => {
+            // Restrictions (8), (17a), (17b), (17c), (17e) and (20).
+            limit.is_some()
+                || order_by.is_some()
+                || left.iter().any(|(plan, operator)| {
+                    !matches!(operator, ast::CompoundOperator::UnionAll)
+                        || !select_core_can_be_flattened(plan)
+                })
+                || !select_core_can_be_flattened(right_most)
+        }
+        // Restriction (22): a recursive CTE is not flattened.
+        _ => true,
+    }
+}
+
+/// Whether one SELECT of a FROM-clause subquery passes the restrictions of
+/// SQLite's `flattenSubquery` that depend only on that SELECT: it has no
+/// aggregate (checked by its caller in select.c), DISTINCT (4), window
+/// function (25), LIMIT (8, as the outer query has more than one FROM term),
+/// and it has a FROM clause (7).
+fn select_core_can_be_flattened(plan: &SelectPlan) -> bool {
+    plan.aggregates.is_empty()
+        && plan.group_by.is_none()
+        && !plan.distinctness.is_distinct()
+        && plan.window.is_none()
+        && plan.limit.is_none()
+        && plan.offset.is_none()
+        && !plan.joined_tables().is_empty()
 }
 
 fn allocate_cursors_read_by_lateral_subquery(
@@ -1856,51 +2217,13 @@ pub fn emit_from_clause_subquery(
     let result_column_start_reg = program.nested(|program| -> Result<usize> {
         Ok(match plan {
             Plan::Select(select_plan) => {
-                let mut metadata = Box::new(TranslateCtx {
-                    labels_main_loop: (0..select_plan.joined_tables().len())
-                        .map(|_| LoopLabels::new(program))
-                        .collect(),
-                    label_main_loop_end: None,
-                    meta_group_by: None,
-                    meta_left_joins: (0..select_plan.joined_tables().len())
-                        .map(|_| None)
-                        .collect(),
-                    meta_right_joins: (0..select_plan.joined_tables().len())
-                        .map(|_| None)
-                        .collect(),
-                    meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                        .map(|_| None)
-                        .collect(),
-                    meta_sort: None,
-                    reg_agg_start: None,
-                    reg_nonagg_emit_once_flag: None,
-                    reg_result_cols_start: None,
-                    limit_ctx: None,
-                    reg_offset: None,
-                    reg_limit_offset_sum: None,
-                    resolver: t_ctx.resolver.fork_with_expr_cache(),
-                    non_aggregate_expressions: Vec::new(),
-                    agg_leaf_columns: Vec::new(),
-                    cdc_cursor_id: None,
-                    meta_window: None,
-                    meta_in_seeks: (0..select_plan.joined_tables().len())
-                        .map(|_| None)
-                        .collect(),
-                    materialized_build_inputs: HashMap::default(),
-                    hash_table_contexts: HashMap::default(),
-                    unsafe_testing: t_ctx.unsafe_testing,
-                });
-                metadata.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+                let mut metadata = new_subquery_translate_ctx(program, select_plan, t_ctx)?;
                 emit_query(program, select_plan, &mut metadata)?
             }
-            Plan::CompoundSelect { .. } => {
-                let resolver = t_ctx.resolver.fork_with_expr_cache();
-                // emit_program_for_compound_select returns the result column start register
-                // for coroutine mode, which is needed by the outer query.
-                emit_program_for_compound_select(program, &resolver, plan)?
-                    .expect("compound CTE in coroutine mode must have result register")
-            }
+            // emit_program_for_compound_select returns the result column start
+            // register for coroutine mode, which is needed by the outer query.
+            Plan::CompoundSelect { .. } => emit_compound_subquery(program, plan, &t_ctx.resolver)?
+                .expect("compound CTE in coroutine mode must have result register"),
             Plan::RecursiveCte(recursive_cte) => {
                 super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?
             }
@@ -1914,6 +2237,30 @@ pub fn emit_from_clause_subquery(
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
 }
+
+/// Makes the context to emit a SELECT that is the body of a FROM clause
+/// subquery, and emits its materialized build inputs.
+///
+/// The functions that emit FROM clause subqueries are on the stack one time
+/// for each level of nested subqueries. This function is not inlined, so that
+/// the large [TranslateCtx] that it makes is not in their frames.
+#[inline(never)]
+fn new_subquery_translate_ctx<'a>(
+    program: &mut ProgramBuilder,
+    select_plan: &mut SelectPlan,
+    t_ctx: &TranslateCtx<'a>,
+) -> Result<Box<TranslateCtx<'a>>> {
+    let mut metadata = Box::new(TranslateCtx::new(
+        program,
+        t_ctx.resolver.fork_with_expr_cache(),
+        select_plan.joined_tables().len(),
+        t_ctx.unsafe_testing,
+    ));
+    metadata.materialized_build_inputs =
+        emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+    Ok(metadata)
+}
+
 /// Materialize a single-reference seekable FROM-subquery directly into an
 /// ephemeral index.
 ///
@@ -1956,47 +2303,11 @@ fn emit_indexed_materialized_subquery(
 
     match plan {
         Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_right_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork_with_expr_cache(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+            let mut metadata = new_subquery_translate_ctx(program, select_plan, t_ctx)?;
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork_with_expr_cache();
-            emit_program_for_compound_select(program, &resolver, plan)?;
+            emit_compound_subquery(program, plan, &t_ctx.resolver)?;
         }
         Plan::RecursiveCte(_) => {
             unreachable!("recursive CTEs require table-backed materialization for indexed access")
@@ -2086,47 +2397,11 @@ fn emit_materialized_subquery_table(
     // Emit the subquery - it will insert rows into the ephemeral table
     match plan {
         Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_right_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork_with_expr_cache(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+            let mut metadata = new_subquery_translate_ctx(program, select_plan, t_ctx)?;
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork_with_expr_cache();
-            emit_program_for_compound_select(program, &resolver, plan)?;
+            emit_compound_subquery(program, plan, &t_ctx.resolver)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
             super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
@@ -2152,6 +2427,23 @@ fn emit_materialized_subquery_table(
         fill_subroutine,
     });
     Ok((result_columns_start_reg, cursor_id, shared_table))
+}
+
+/// Emits a compound SELECT that is the body of a FROM clause subquery, with a
+/// fork of the resolver. Returns what [emit_program_for_compound_select]
+/// returns: the first register of the result columns in coroutine mode.
+///
+/// The functions that emit FROM clause subqueries are on the stack one time
+/// for each level of nested subqueries. This function is not inlined, so that
+/// the forked resolver is not in their frames.
+#[inline(never)]
+fn emit_compound_subquery(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    resolver: &Resolver,
+) -> Result<Option<usize>> {
+    let resolver = resolver.fork_with_expr_cache();
+    emit_program_for_compound_select(program, &resolver, plan)
 }
 
 /// Translate a subquery that is not part of the FROM clause.
@@ -2264,11 +2556,18 @@ pub fn emit_non_from_clause_subquery(
             SubqueryType::RowValue {
                 result_reg_start,
                 num_regs,
+                row_count_reg,
             } => {
                 for result_reg in *result_reg_start..*result_reg_start + *num_regs {
                     program.emit_insn(Insn::Null {
                         dest: result_reg,
                         dest_end: None,
+                    });
+                }
+                if let Some(row_count_reg) = *row_count_reg {
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: row_count_reg,
                     });
                 }
             }
@@ -2366,13 +2665,15 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let has_grouped_output = plan
         .group_by
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
     let has_direct_row_output =
         !has_grouped_output && plan.aggregates.is_empty() && plan.window.is_none();
+    let has_ungrouped_aggregate_output =
+        !has_grouped_output && !plan.aggregates.is_empty() && plan.window.is_none();
     let has_unmatched_right_rows = plan.table_references.has_right_or_full_join();
 
     // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
@@ -2393,19 +2694,31 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         }
     }
 
-    let mut outer_aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    let mut output_phase_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
+        // Code generation finds an aggregate by its register, and a subquery
+        // that runs after this query's aggregation loop would find this
+        // query's register for an aggregate in its WHERE clause. SQLite never
+        // allows an aggregate in a WHERE clause, so reject it here.
+        if let Some(func) = aggregate_in_subquery_where(subquery, resolver) {
+            crate::bail_parse_error!("misuse of aggregate function {}()", func);
+        }
         // A subquery that reads an aggregate the outer query computes must run
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if subquery_reads_outer_aggregate(subquery) {
+        if let Some(func) = outer_aggregate_read_by_subquery(subquery, resolver) {
+            // An aggregate's arguments are evaluated for each input row, before
+            // this query has computed the aggregate the subquery reads.
+            if aggregate_subquery_ids.contains(&subquery.internal_id) {
+                crate::bail_parse_error!("misuse of aggregate: {}()", func);
+            }
             subquery.eval_phase = if has_grouped_output {
                 SubqueryEvalPhase::GroupedOutput
             } else {
                 SubqueryEvalPhase::UngroupedAggregateOutput
             };
-            outer_aggregate_subquery_ids.push(subquery.internal_id);
+            output_phase_subquery_ids.push(subquery.internal_id);
             continue;
         }
         // These subqueries run once per input row: in output columns and
@@ -2431,32 +2744,57 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             {
                 SubqueryEvalPhase::GroupedOutput
             }
+            // HAVING without GROUP BY filters the one aggregate row, so a
+            // correlated subquery in it reads the row values saved for it.
+            SubqueryOrigin::SelectHaving
+                if subquery.correlated
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
+            // A correlated subquery in the result columns of an aggregate query
+            // without GROUP BY reads the same saved row as the bare columns.
+            // Run in the loop, it would read the last row when its result
+            // column is computed after the loop.
+            SubqueryOrigin::SelectList
+                if subquery.correlated
+                    && has_ungrouped_aggregate_output
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
+                output_phase_subquery_ids.push(subquery.internal_id);
+                SubqueryEvalPhase::UngroupedAggregateOutput
+            }
             _ => subquery.origin.phase_floor(),
         };
     }
 
-    // A result column that reads one of these subqueries depends on an
-    // aggregate computed in the output phase, so it must be evaluated there
+    // A result column that reads one of these subqueries depends on a value
+    // computed in the output phase, so it must be evaluated there
     // rather than once per input row — the same treatment SQLite gives any
     // result-column expression that references an aggregate result (select.c
     // evaluates those after the aggregation loop, in the output step). Mark it
     // so the emitter defers it, instead of taking an arbitrary row's NULL
     // during the scan.
     for rc in plan.result_columns.iter_mut() {
-        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &outer_aggregate_subquery_ids) {
+        if !rc.contains_aggregates && expr_reads_subquery(&rc.expr, &output_phase_subquery_ids) {
             rc.contains_aggregates = true;
         }
     }
 
-    let columns_read_by_group_subqueries = columns_read_by_group_subqueries(plan);
+    let columns_read_by_group_subqueries =
+        columns_read_by_subqueries(plan, SubqueryEvalPhase::GroupedOutput);
     if let Some(group_by) = plan.group_by.as_mut() {
         group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
     }
+    Ok(())
 }
 
 /// The columns of `plan`'s own tables that are read by its subqueries that run
-/// once per group.
-fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
+/// in `phase`.
+pub(crate) fn columns_read_by_subqueries(
+    plan: &SelectPlan,
+    phase: SubqueryEvalPhase,
+) -> Vec<ast::Expr> {
     let mut columns = Vec::new();
     for subquery in &plan.non_from_clause_subqueries {
         let SubqueryState::Unevaluated {
@@ -2465,7 +2803,7 @@ fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
         else {
             continue;
         };
-        if subquery.eval_phase != SubqueryEvalPhase::GroupedOutput {
+        if subquery.eval_phase != phase {
             continue;
         }
         for outer_ref in subquery_plan.used_outer_query_refs() {
@@ -2511,8 +2849,28 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
     found
 }
 
-/// True when a result column of the subquery contains an aggregate whose value
-/// the outer query computes: a plain aggregate call that is not one of the
+/// The name of an aggregate function, called without an `OVER` clause, in the
+/// WHERE clause of `subquery`. Subqueries nested in that WHERE clause are not
+/// searched: they own their aggregates.
+fn aggregate_in_subquery_where(
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Option<String> {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return None;
+    };
+    let Plan::Select(select) = plan.as_ref() else {
+        return None;
+    };
+    select.where_clause.iter().find_map(|term| {
+        first_aggregate_without_over_clause(&term.expr, resolver)
+            .expect("walking an expression with an infallible visitor cannot fail")
+            .map(str::to_string)
+    })
+}
+
+/// The name of an aggregate in a result column of the subquery whose value the
+/// outer query computes: a plain aggregate call that is not one of the
 /// subquery's own aggregates, because its argument referenced an outer column
 /// and it was moved to the outer query during resolution. The subquery reads
 /// that aggregate back from the register the outer query finalizes it into.
@@ -2520,14 +2878,22 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
+fn outer_aggregate_read_by_subquery(
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Option<String> {
+    // EXISTS only checks whether a row comes out and never evaluates its
+    // result columns, as in SQLite.
+    if matches!(subquery.query_type, SubqueryType::Exists { .. }) {
+        return None;
+    }
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
-        return false;
+        return None;
     };
     let Plan::Select(select) = plan.as_ref() else {
-        return false;
+        return None;
     };
-    let mut found = false;
+    let mut found = None;
     for rc in &select.result_columns {
         let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
             if let ast::Expr::FunctionCall {
@@ -2539,17 +2905,17 @@ fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
             {
                 let is_plain_aggregate = filter_over.over_clause.is_none()
                     && matches!(
-                        crate::function::Func::resolve_function(name.as_str(), args.len()),
-                        Ok(Some(crate::function::Func::Agg(_)))
+                        resolver.resolve_function(name.as_str(), args.len()),
+                        Ok(Some(func)) if func.is_aggregate()
                     );
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
-                    found = true;
+                    found = Some(name.as_str().to_string());
                     return Ok(WalkControl::SkipChildren);
                 }
             }
             Ok(WalkControl::Continue)
         });
-        if found {
+        if found.is_some() {
             break;
         }
     }

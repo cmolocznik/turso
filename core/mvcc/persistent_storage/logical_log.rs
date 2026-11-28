@@ -184,11 +184,16 @@
 //! 3. checkpoint WAL pages into DB file;
 //! 4. fsync DB file (unless `SyncMode::Off`);
 //! 5. truncate logical log to 0 (regenerates salt in memory; header written with next frame);
-//! 6. fsync logical log (unless `SyncMode::Off`);
-//! 7. truncate WAL last.
+//! 6. truncate WAL last.
 //!
 //! WAL-last is intentional: if crash happens mid-checkpoint, WAL remains a safety net until
-//! logical-log cleanup is complete.
+//! the DB file is durable.
+//!
+//! The logical log needs no fsync after step 5. If a crash loses the truncation, the old
+//! frames come back, but their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery
+//! skips them. A switch from MVCC to WAL mode is different: it fsyncs the log after the
+//! checkpoint, before it writes the WAL-mode header, because a database in WAL mode does not
+//! open while its logical log has frames.
 //!
 //! ### Frame Layout: Unencrypted vs Encrypted
 //!
@@ -269,7 +274,7 @@ use crate::turso_assert;
 use crate::types::IOResultOr;
 use crate::{
     alloc::{ConcurrentAllocator, TursoAllocator},
-    io::{CompletionGroup, ReadComplete},
+    io::{start_in_group, CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     return_if_io,
@@ -285,6 +290,8 @@ use crate::storage::encryption::EncryptionContext;
 use crate::File;
 use std::collections::VecDeque;
 
+#[cfg(feature = "conn_raw_api")]
+pub mod frame_codec;
 mod serializer;
 use serializer::EncryptedPayload;
 #[cfg(feature = "conn_raw_api")]
@@ -339,12 +346,12 @@ const LOG_HDR_FLAG_SEGMENT: u8 = 1 << 0;
 /// The files a log that rolls writes through: the segment being written, the ones sealed behind it
 /// until a checkpoint covers them, and one freed for the next roll.
 pub(crate) const LOG_SEGMENT_FILES: usize = 4;
-pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
-pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
+pub const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
-pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
+pub const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
 // Fixed AAD width for one encrypted chunk:
 // salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
 const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
@@ -498,7 +505,7 @@ pub struct LogHeader {
 
 impl LogHeader {
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
-        Self::new_with_version(io, LOG_VERSION_V2)
+        Self::new_with_version(io, LOG_VERSION)
     }
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
@@ -699,6 +706,18 @@ fn derive_initial_crc(salt: u64) -> u32 {
     crc32c::crc32c(&salt.to_le_bytes())
 }
 
+/// A file operation that changes the log header, issued but not yet published
+/// to the in-memory log state.
+struct PendingHeaderChange {
+    /// Becomes `LogicalLog::header` once `completion` succeeded.
+    header: LogHeader,
+    /// The header write, or the truncate that empties the file.
+    completion: Completion,
+    /// `completion` truncates the file to zero bytes, so once it succeeded the
+    /// log holds no frames.
+    empties_log: bool,
+}
+
 #[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
@@ -715,10 +734,9 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
-    /// A header write whose result has not been looked at yet. Its header
-    /// becomes `header` once the write succeeded; see
-    /// `publish_finished_header_write`.
-    pending_header_write: Option<(LogHeader, Completion)>,
+    /// A header write or truncate whose result has not been looked at yet; see
+    /// `publish_finished_header_change`.
+    pending_header_change: Option<PendingHeaderChange>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -811,10 +829,7 @@ impl LogRing {
                 tracing::error!("logical log segment truncate failed: {err}");
             }
         });
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let ready = file.truncate(0, c)?;
+        let ready = start_in_group(group, c, |c| file.truncate(0, c))?;
         self.slots[slot] = Slot::Free { file, ready };
         Ok(())
     }
@@ -843,8 +858,7 @@ impl LogRing {
             false,
         )?;
         let c = Completion::new_sync(|_| {});
-        group.add(&c);
-        let ready = file.sync(c, FileSyncType::Fsync)?;
+        let ready = start_in_group(Some(group), c, |c| file.sync(c, FileSyncType::Fsync))?;
         self.slots[slot] = Slot::Free { file, ready };
         Ok(())
     }
@@ -895,7 +909,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
-            pending_header_write: None,
+            pending_header_change: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -1012,7 +1026,7 @@ impl LogicalLog {
             }
             return Ok(());
         };
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         if let Some(ring) = self.ring.as_deref_mut() {
             let mut in_use = [false; LOG_SEGMENT_FILES];
             for segment in &recovered.segments {
@@ -1075,7 +1089,7 @@ impl LogicalLog {
     /// them ([`Self::roll_with_portable_changes`]).
     fn rolls(&self) -> bool {
         self.ring.is_some()
-            && self.pending_header_write.is_none()
+            && self.pending_header_change.is_none()
             && self.header.as_ref().is_some_and(|header| {
                 header.version == LOG_VERSION_V2 || self.rolls_with_portable_changes
             })
@@ -1169,7 +1183,7 @@ impl LogicalLog {
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         self.running_crc = header.chain_seed();
         self.header = Some(header);
     }
@@ -1195,7 +1209,7 @@ impl LogicalLog {
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
         #[cfg(debug_assertions)]
@@ -1228,17 +1242,12 @@ impl LogicalLog {
         let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
-        // Non-portable logs remain LML2 so a deployment that does not enable
-        // portable extensions can still roll back to readers that only know LML2.
+        // New logs are always LML3, so a later portable frame never needs the
+        // header rewritten in place.
         let is_first_write = self.offset == 0;
         if is_first_write && self.header.is_none() {
-            let version = if portable_changes_enabled {
-                LOG_VERSION
-            } else {
-                LOG_VERSION_V2
-            };
-            let header = LogHeader::new_with_version(&self.io, version);
-            self.running_crc = derive_initial_crc(header.salt);
+            let header = LogHeader::new(&self.io);
+            self.running_crc = header.chain_seed();
             self.header = Some(header);
         }
         if portable_changes_enabled {
@@ -1508,13 +1517,16 @@ impl LogicalLog {
             false
         };
 
-        if !portable_changes_enabled || self.offset == 0 {
-            return Ok(None);
+        // A frame must not be written while a header write or truncate is in
+        // flight: its offset and CRC chain depend on whether that operation
+        // succeeds, and a truncate could cut it.
+        self.publish_finished_header_change();
+        if let Some(pending) = &self.pending_header_change {
+            return Ok(Some(pending.completion.clone()));
         }
 
-        self.publish_finished_header_write();
-        if let Some((_, c)) = &self.pending_header_write {
-            return Ok(Some(c.clone()));
+        if !portable_changes_enabled || self.offset == 0 {
+            return Ok(None);
         }
 
         let header = self.header.as_ref().ok_or_else(|| {
@@ -1624,8 +1636,12 @@ impl LogicalLog {
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
         let (header, c) = self.write_header(header, group)?;
-        self.pending_header_write = Some((header, c.clone()));
-        self.publish_finished_header_write();
+        self.pending_header_change = Some(PendingHeaderChange {
+            header,
+            completion: c.clone(),
+            empties_log: false,
+        });
+        self.publish_finished_header_change();
         Ok(c)
     }
 
@@ -1656,26 +1672,23 @@ impl LogicalLog {
                 );
             }
         });
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let c = self.file.pwrite(0, buffer, c)?;
+        let c = start_in_group(group, c, |c| self.file.pwrite(0, buffer, c))?;
         Ok((header, c))
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         let header = self.current_or_new_header()?;
         self.write_header_and_publish_on_success(header, None)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self, group: &mut CompletionGroup) -> Result<()> {
+        // The truncate supersedes a header write still in flight.
+        self.pending_header_change = None;
+        let mut header = self.current_or_new_header()?;
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
-        self.publish_finished_header_write();
-        self.pending_header_write = None;
-        let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         if let Some(segment) = header.segment {
             let prior_max_ts = segment.prior_max_ts.max(self.max_appended_commit_ts);
@@ -1685,20 +1698,23 @@ impl LogicalLog {
                 prior_max_ts,
             ));
         }
-        self.running_crc = header.chain_seed();
-        self.pending_running_crc = None;
-        self.header = Some(header);
 
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
-        group.add(&completion);
-        let _truncate_c = self.file.truncate(0, completion)?;
-        self.offset = 0;
-        self.max_appended_commit_ts = 0;
+        // The log keeps its offset, CRC chain and header until the truncate
+        // succeeded: if it fails, the file still holds the old frames and the
+        // next frame must be chained after them.
+        let c = start_in_group(Some(group), completion, |c| self.file.truncate(0, c))?;
+        self.pending_header_change = Some(PendingHeaderChange {
+            header,
+            completion: c,
+            empties_log: true,
+        });
         self.generation += 1;
+        self.publish_finished_header_change();
         Ok(())
     }
 
@@ -1716,6 +1732,7 @@ impl LogicalLog {
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
         use super::LogicalLogTruncateOutcome;
+        self.publish_finished_header_change();
         let mut group = CompletionGroup::new(|_| {});
         if let Some(ring) = self.ring.as_deref_mut() {
             while ring
@@ -1764,7 +1781,7 @@ impl LogicalLog {
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
-        self.finish_pending_header_write();
+        self.finish_pending_header_change();
         let mut group = CompletionGroup::new(|_| {});
         if let Some(ring) = self.ring.as_deref_mut() {
             // Every sealed segment goes with the rest of the log.
@@ -1775,8 +1792,8 @@ impl LogicalLog {
         }
         let mut header = self.current_or_new_header()?;
         // The log is empty after the reset, so the CRC chain restarts from the
-        // header salt: the current salt until the new header is written, the
-        // new salt once that write succeeded.
+        // header's seed: the current header's until the new one is written, the
+        // new one's once that write succeeded.
         self.offset = 0;
         self.pending_running_crc = None;
         self.running_crc = header.chain_seed();
@@ -1791,38 +1808,50 @@ impl LogicalLog {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
-        group.add(&c);
-        let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
+        let _truncate_c = start_in_group(Some(&mut group), c, |c| {
+            self.file.truncate(LOG_HDR_SIZE as u64, c)
+        })?;
         self.generation += 1;
         Ok(group.build())
     }
 
-    /// Publishes a finished header write and checks that none is still in
-    /// flight. Used before the header is read or rewritten by a path that
-    /// never runs while a header write is in progress.
-    fn finish_pending_header_write(&mut self) {
-        self.publish_finished_header_write();
+    /// Publishes a finished header write or truncate and checks that none is
+    /// still in flight. Used before the header is read or rewritten by a path
+    /// that never runs while a header write or truncate is in progress.
+    fn finish_pending_header_change(&mut self) {
+        self.publish_finished_header_change();
         turso_assert!(
-            self.pending_header_write.is_none(),
-            "logical log header was used while a header write was in flight"
+            self.pending_header_change.is_none(),
+            "logical log header was used while a header write or truncate was in flight"
         );
     }
 
-    /// Makes the header of a finished, successful header write the in-memory
-    /// header. A failed write leaves the in-memory header as it was, so no
-    /// later frame is chained against a header the file never received. A
-    /// write still in flight stays pending.
+    /// Makes the header of a finished, successful header write or truncate the
+    /// in-memory header; a successful truncate also empties the log. A failed
+    /// operation leaves the log state as it was, so no later frame is chained
+    /// against a header or offset the file does not have. An operation still
+    /// in flight stays pending.
     #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
-    fn publish_finished_header_write(&mut self) {
-        let Some((header, c)) = self.pending_header_write.take() else {
+    pub fn publish_finished_header_change(&mut self) {
+        let Some(pending) = self.pending_header_change.take() else {
             return;
         };
-        if !c.finished() {
-            self.pending_header_write = Some((header, c));
+        if !pending.completion.finished() {
+            self.pending_header_change = Some(pending);
             return;
         }
-        if !c.succeeded() {
+        if !pending.completion.succeeded() {
             return;
+        }
+        let PendingHeaderChange {
+            header,
+            empties_log,
+            ..
+        } = pending;
+        if empties_log {
+            self.offset = 0;
+            self.pending_running_crc = None;
+            self.max_appended_commit_ts = 0;
         }
         if self.offset == 0 {
             // No frame is chained yet, so the CRC chain starts from this
@@ -1945,10 +1974,12 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
     Ok(decoded)
 }
 
+/// Validate all extension records and collect payloads of the requested type.
+/// With `wanted_type = None`, validate without collecting payload bytes.
 fn find_extension_payload(
     extension_block: &[u8],
     extension_record_count: u32,
-    wanted_type: u16,
+    wanted_type: Option<u16>,
 ) -> Result<Vec<u8>> {
     let mut offset = 0usize;
     let mut payload = Vec::new();
@@ -1988,7 +2019,7 @@ fn find_extension_payload(
                 "extension record payload is truncated".to_string(),
             ));
         }
-        if extension_type == wanted_type {
+        if Some(extension_type) == wanted_type {
             payload.extend_from_slice(&extension_block[payload_start..payload_end]);
         }
         offset = payload_end;
@@ -2315,6 +2346,36 @@ enum HeaderParseOutcome {
     Invalid,
 }
 
+/// The header bytes of a transaction frame in a stack buffer: the
+/// TX_HEADER_SIZE bytes of the base header and, for an extension frame, the
+/// extension header that follows them.
+struct FrameHeaderBytes {
+    buf: [u8; TX_EXT_HEADER_SIZE],
+    len: usize,
+}
+
+impl FrameHeaderBytes {
+    /// The header bytes that were read.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Whether the frame has an extension header.
+    fn has_extension_header(&self) -> bool {
+        self.len == TX_EXT_HEADER_SIZE
+    }
+}
+
+/// Outcome of reading the header bytes of a transaction frame.
+enum FrameHeaderRead {
+    Header(FrameHeaderBytes),
+    /// The log ends before the end of the header.
+    Eof,
+    /// The frame magic is not FRAME_MAGIC, or EXT_FRAME_MAGIC where an
+    /// extension frame is permitted.
+    BadMagic,
+}
+
 /// Outcome of parsing a payload phase. Corruption is signalled via
 /// `Err(LimboError::Corrupt(..))` and translated to `Invalid` by the caller,
 /// mirroring the previous control flow.
@@ -2435,6 +2496,14 @@ impl StreamingLogicalLogReader {
         }
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn validate_encryption_key(mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
+        if matches!(self.try_read_header(io)?, HeaderReadResult::Valid(_)) {
+            while io.block(|| self.next_frame())?.is_some() {}
+        }
+        Ok(())
+    }
+
     pub fn new(file: Arc<dyn File>, encryption_ctx: Option<EncryptionContext>) -> Self {
         Self::new_internal(file, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
     }
@@ -2553,6 +2622,34 @@ impl StreamingLogicalLogReader {
     ) -> Result<Option<Vec<ParsedOp>>> {
         let io = io.clone();
         io.block(|| self.next_frame())
+    }
+
+    /// Reads the operations of every remaining transaction frame.
+    #[cfg(feature = "test_helper")]
+    pub fn read_ops_for_testing(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<Vec<LogOpForTesting>> {
+        let mut ops = Vec::new();
+        while let Some(frame) = io.block(|| self.next_frame())? {
+            ops.extend(frame.into_iter().map(|op| match op {
+                ParsedOp::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                    ..
+                } => LogOpForTesting::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                },
+                ParsedOp::UpdateHeader { .. } => LogOpForTesting::UpdateHeader,
+                ParsedOp::UpsertTable { .. }
+                | ParsedOp::UpsertIndex { .. }
+                | ParsedOp::DeleteIndex { .. } => LogOpForTesting::Other,
+            }));
+        }
+        Ok(ops)
     }
 
     /// Reads the next complete transaction frame.
@@ -2785,13 +2882,7 @@ impl StreamingLogicalLogReader {
             let next_crc = crc32c::crc32c_append(running_crc, blob);
             let ciphertext = &blob[..plaintext_len + payload_ctx.tag_size];
             let nonce = &blob[plaintext_len + payload_ctx.tag_size..];
-            encryption_ctx
-                .decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch)
-                .map_err(|e| {
-                    LimboError::Corrupt(format!(
-                        "decrypt_chunk failed for chunk {chunk_index}: {e}"
-                    ))
-                })?;
+            encryption_ctx.decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch)?;
             (next_crc, decrypt_scratch.len())
         };
 
@@ -3236,8 +3327,11 @@ impl StreamingLogicalLogReader {
                         )
                         .into());
                     }
-                    let mut payload = payload;
-                    let record_bytes = payload.split_off(rowid_len);
+                    // The payload is a buffer of its own, so the rowid bytes
+                    // are removed in place instead of copying the record into
+                    // a new buffer.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
                     ParsedOp::UpsertTable {
                         table_id,
@@ -3262,8 +3356,9 @@ impl StreamingLogicalLogReader {
                         .into());
                     }
                     let rowid_i64 = rowid_u64 as i64;
-                    let mut payload = payload;
-                    let mut record_bytes = payload.split_off(rowid_len);
+                    // See OP_UPSERT_TABLE: the rowid bytes are removed in place.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let mut pk_record_bytes = crate::alloc::vec![];
                     if !portable_extension.is_empty() {
                         let decoded = decode_delete_portable_extension(&portable_extension)?;
@@ -3419,7 +3514,7 @@ impl StreamingLogicalLogReader {
                     let portable_changes = match find_extension_payload(
                         &bytes,
                         extension_record_count,
-                        EXTENSION_TYPE_PORTABLE_CHANGES,
+                        Some(EXTENSION_TYPE_PORTABLE_CHANGES),
                     ) {
                         Ok(payload) => payload,
                         Err(LimboError::Corrupt(msg)) => {
@@ -3500,36 +3595,18 @@ impl StreamingLogicalLogReader {
         //
         // TX HEADER v3 extension frames append:
         // extension_size(8) | extension_record_count(4) | frame_flags(4)
-        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
-            Some(bytes) => bytes,
-            None => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
-        };
-
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
+        // A v2 log has no extension frames.
         let is_v2 = self
             .header
             .as_ref()
             .is_some_and(|header| header.version == LOG_VERSION_V2);
-        let has_extension_header = !is_v2 && frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
-            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-        }
-        if is_v2 && frame_magic != FRAME_MAGIC {
-            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-        }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(HeaderParseOutcome::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let header = match return_if_io!(self.try_consume_frame_header(!is_v2)) {
+            FrameHeaderRead::Header(header) => header,
+            FrameHeaderRead::Eof => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
+            FrameHeaderRead::BadMagic => return Ok(IOResult::Done(HeaderParseOutcome::Invalid)),
+        };
+        let has_extension_header = header.has_extension_header();
+        let header_bytes = header.bytes();
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -3586,13 +3663,7 @@ impl StreamingLogicalLogReader {
                 header_bytes[38],
                 header_bytes[39],
             ]);
-            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-            }
-            if extension_size == 0 && extension_record_count != 0 {
-                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-            }
-            if extension_size > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            if !valid_extension_header(extension_size as u64, extension_record_count, frame_flags) {
                 return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
             }
             (extension_size, extension_record_count, frame_flags)
@@ -3609,7 +3680,7 @@ impl StreamingLogicalLogReader {
         };
 
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC).
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        let running_crc = crc32c::crc32c_append(self.running_crc, header_bytes);
 
         Ok(IOResult::Done(HeaderParseOutcome::Ok(FrameHeader {
             payload_size,
@@ -3630,6 +3701,14 @@ impl StreamingLogicalLogReader {
     /// propagates as `Err(LimboError::Corrupt(..))` for the caller to map to an
     /// invalid frame.
     fn parse_payload_phase(&mut self) -> IOResultOr<PayloadOutcome> {
+        if self.encryption_ctx.is_some()
+            && matches!(
+                return_if_io!(self.validate_encrypted_frame_checksum()),
+                PayloadOutcome::Eof
+            )
+        {
+            return Ok(IOResult::Done(PayloadOutcome::Eof));
+        }
         let (payload_size, op_count, commit_ts, extension_size, extension_record_count, header_crc) = {
             let fip = self.frame_in_progress.as_ref().expect("frame in progress");
             (
@@ -3668,7 +3747,7 @@ impl StreamingLogicalLogReader {
             let portable_changes = find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
-                EXTENSION_TYPE_PORTABLE_CHANGES,
+                Some(EXTENSION_TYPE_PORTABLE_CHANGES),
             )?;
             let parsed_ops = parse_ops_from_plaintext(
                 &plaintext[recovery_start..recovery_end],
@@ -3705,6 +3784,36 @@ impl StreamingLogicalLogReader {
         // Unencrypted: resumable per-op machine that checkpoints into
         // `frame_in_progress` (parsed ops + CRC + byte count) as it goes.
         self.parse_streaming_payload()
+    }
+
+    fn validate_encrypted_frame_checksum(&mut self) -> IOResultOr<PayloadOutcome> {
+        let frame = self.frame_in_progress.as_ref().expect("frame in progress");
+        let plaintext_size = frame
+            .payload_size
+            .checked_add(frame.extension_size)
+            .ok_or_else(|| {
+                LimboError::Corrupt("encrypted plaintext size overflows usize".into())
+            })?;
+        if plaintext_size > self.remaining_bytes() {
+            return Ok(IOResult::Done(PayloadOutcome::Eof));
+        }
+        let header_crc = frame.running_crc;
+        let payload_size = self.encrypted_payload_on_disk_size(plaintext_size)?;
+        let Some(crc) = return_if_io!(self.consume_and_crc_bytes(payload_size, header_crc)) else {
+            return Ok(IOResult::Done(PayloadOutcome::Eof));
+        };
+        let Some(trailer) = return_if_io!(self.try_consume_fixed::<TX_TRAILER_SIZE>()) else {
+            return Ok(IOResult::Done(PayloadOutcome::Eof));
+        };
+        // Keep the payload buffered for decryption after its on-disk checksum verifies.
+        self.buffer_offset = self.frame_anchor;
+        if trailer[..4] != crc.to_le_bytes() || trailer[4..] != END_MAGIC.to_le_bytes() {
+            return Err(LimboError::Corrupt(
+                "invalid encrypted frame checksum or end marker".into(),
+            )
+            .into());
+        }
+        Ok(IOResult::Done(PayloadOutcome::Ok))
     }
 
     /// Commit the consume cursor as the new rewind point. Called once a unit
@@ -3816,30 +3925,16 @@ impl StreamingLogicalLogReader {
         }
         let frame_start = self.offset.saturating_sub(self.bytes_can_read());
 
-        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
-            Some(bytes) => bytes,
-            None => return Ok(IOResult::Done(ParseResult::Eof)),
+        let header = match return_if_io!(self.try_consume_frame_header(true)) {
+            FrameHeaderRead::Header(header) => header,
+            FrameHeaderRead::Eof => return Ok(IOResult::Done(ParseResult::Eof)),
+            FrameHeaderRead::BadMagic => {
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
         };
-
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        let has_extension_header = frame_magic == EXT_FRAME_MAGIC;
-        if frame_magic != FRAME_MAGIC && !has_extension_header {
-            self.last_valid_offset = frame_start;
-            return Ok(IOResult::Done(ParseResult::InvalidFrame));
-        }
-        if has_extension_header {
-            let Some(extension_header) =
-                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
-            else {
-                return Ok(IOResult::Done(ParseResult::Eof));
-            };
-            header_bytes.extend_from_slice(&extension_header);
-        }
+        let has_extension_header = header.has_extension_header();
+        let header_bytes = header.bytes();
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
             header_bytes[5],
@@ -3889,15 +3984,7 @@ impl StreamingLogicalLogReader {
                 header_bytes[38],
                 header_bytes[39],
             ]);
-            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(IOResult::Done(ParseResult::InvalidFrame));
-            }
-            if extension_size_u64 == 0 && extension_record_count != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(IOResult::Done(ParseResult::InvalidFrame));
-            }
-            if extension_size_u64 > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            if !valid_extension_header(extension_size_u64, extension_record_count, frame_flags) {
                 self.last_valid_offset = frame_start;
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
@@ -3923,7 +4010,7 @@ impl StreamingLogicalLogReader {
             }
         };
 
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        let running_crc = crc32c::crc32c_append(self.running_crc, header_bytes);
         let encrypted_extension_size = if self.encryption_ctx.is_some() {
             extension_size
         } else {
@@ -3963,7 +4050,7 @@ impl StreamingLogicalLogReader {
             let portable_changes = match find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
-                EXTENSION_TYPE_PORTABLE_CHANGES,
+                Some(EXTENSION_TYPE_PORTABLE_CHANGES),
             ) {
                 Ok(payload) => payload,
                 Err(LimboError::Corrupt(msg)) => {
@@ -3982,7 +4069,7 @@ impl StreamingLogicalLogReader {
                         let portable_changes = match find_extension_payload(
                             &bytes,
                             extension_record_count,
-                            EXTENSION_TYPE_PORTABLE_CHANGES,
+                            Some(EXTENSION_TYPE_PORTABLE_CHANGES),
                         ) {
                             Ok(payload) => payload,
                             Err(LimboError::Corrupt(msg)) => {
@@ -4156,6 +4243,44 @@ impl StreamingLogicalLogReader {
         let bytes = crate::types::value_blob_from_slice(&buffer[start..end])?;
         self.buffer_offset = end;
         Ok(IOResult::Done(Some(bytes)))
+    }
+
+    /// Reads the header of a transaction frame into a stack buffer, without
+    /// an allocation for each frame: the base header, then, when its magic is
+    /// EXT_FRAME_MAGIC and `allow_extension` is true, the extension header
+    /// that follows. Any other magic than FRAME_MAGIC gives BadMagic. Always
+    /// inlined, so that the buffer is not copied into the result for each
+    /// frame.
+    #[inline(always)]
+    fn try_consume_frame_header(&mut self, allow_extension: bool) -> IOResultOr<FrameHeaderRead> {
+        let Some(base_header) = return_if_io!(self.try_consume_fixed::<TX_HEADER_SIZE>()) else {
+            return Ok(IOResult::Done(FrameHeaderRead::Eof));
+        };
+        let mut header = FrameHeaderBytes {
+            buf: [0u8; TX_EXT_HEADER_SIZE],
+            len: TX_HEADER_SIZE,
+        };
+        header.buf[..TX_HEADER_SIZE].copy_from_slice(&base_header);
+        let frame_magic = u32::from_le_bytes([
+            base_header[0],
+            base_header[1],
+            base_header[2],
+            base_header[3],
+        ]);
+        let has_extension_header = allow_extension && frame_magic == EXT_FRAME_MAGIC;
+        if frame_magic != FRAME_MAGIC && !has_extension_header {
+            return Ok(IOResult::Done(FrameHeaderRead::BadMagic));
+        }
+        if has_extension_header {
+            let Some(extension_header) =
+                return_if_io!(self.try_consume_fixed::<{ TX_EXT_HEADER_SIZE - TX_HEADER_SIZE }>())
+            else {
+                return Ok(IOResult::Done(FrameHeaderRead::Eof));
+            };
+            header.buf[TX_HEADER_SIZE..].copy_from_slice(&extension_header);
+            header.len = TX_EXT_HEADER_SIZE;
+        }
+        Ok(IOResult::Done(FrameHeaderRead::Header(header)))
     }
 
     fn try_consume_fixed<const N: usize>(&mut self) -> IOResultOr<Option<[u8; N]>> {
@@ -4419,8 +4544,14 @@ enum PayloadParseResult {
     Eof,
 }
 
+fn valid_extension_header(size: u64, count: u32, flags: u32) -> bool {
+    flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0
+        && (size != 0 || count == 0)
+        && (size == 0 || flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0)
+}
+
 /// Result of reading and decrypting one encrypted chunk into `decrypt_scratch`.
-/// Corruption (decryption failure, length mismatch) is returned as
+/// Authentication failures propagate as errors; malformed lengths return
 /// `Err(LimboError::Corrupt(...))`.
 enum EncryptedChunkReadResult {
     Ok { running_crc: u32 },
@@ -4741,6 +4872,23 @@ impl LogChainReader {
     }
 }
 
+/// A logical log operation, as [`StreamingLogicalLogReader::read_ops_for_testing`]
+/// returns it to integration tests.
+#[cfg(feature = "test_helper")]
+#[derive(Debug)]
+pub enum LogOpForTesting {
+    DeleteTable {
+        rowid: RowID,
+        /// The deleted row's record, which a delete may leave out.
+        record_bytes: crate::ValueBlob,
+        /// A record of the deleted row's primary key values.
+        pk_record_bytes: crate::ValueBlob,
+    },
+    UpdateHeader,
+    /// Any operation that is not one of the above.
+    Other,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum IndexOpKind {
     Upsert,
@@ -4767,19 +4915,16 @@ pub(crate) fn sync_files(targets: Vec<SyncTarget>, sync_type: FileSyncType) -> R
                 tracing::debug!("logical_log_sync finish");
             }),
         };
-        group.add(&c);
-        let _c = target.file.sync(c, sync_type)?;
+        let _c = start_in_group(Some(&mut group), c, |c| target.file.sync(c, sync_type))?;
     }
     Ok(group.build())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
     use std::sync::Once;
 
     use quickcheck_macros::quickcheck;
@@ -4793,15 +4938,13 @@ mod tests {
     use crate::sync::Arc;
     use crate::{
         mvcc::database::{
-            tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-            MVTableId, Row, RowID, RowKey, SortableIndexKey,
+            tests::generate_simple_string_row, MVTableId, Row, RowID, RowKey, SortableIndexKey,
         },
-        schema::Table,
         storage::sqlite3_ondisk::{
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
-        types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, SharedBufferData, Value, ValueRef,
+        types::{ImmutableRecord, IndexInfo, Text},
+        Buffer, Completion, SharedBufferData, Value,
     };
 
     use super::{
@@ -5096,6 +5239,77 @@ mod tests {
         }
     }
 
+    /// Holds each truncate until the test finishes it with `finish_truncate`,
+    /// or fails it as soon as it is issued while `fail_on_issue` is set.
+    struct HeldTruncateFile {
+        inner: Arc<dyn crate::File>,
+        held: std::sync::Mutex<Option<(u64, Completion)>>,
+        fail_on_issue: std::sync::atomic::AtomicBool,
+    }
+
+    impl HeldTruncateFile {
+        fn new(inner: Arc<dyn crate::File>) -> Self {
+            Self {
+                inner,
+                held: std::sync::Mutex::new(None),
+                fail_on_issue: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn finish_truncate(&self, succeed: bool) {
+            let (len, c) = self.held.lock().unwrap().take().unwrap();
+            if succeed {
+                let inner_c = self.inner.truncate(len, Completion::new_trunc(|_| {}));
+                assert!(inner_c.unwrap().succeeded());
+                c.complete(0);
+            } else {
+                c.error(crate::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected truncate failure",
+                ));
+            }
+        }
+    }
+
+    impl crate::File for HeldTruncateFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            if self.fail_on_issue.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::LimboError::InternalError(
+                    "injected truncate failure".to_string(),
+                ));
+            }
+            *self.held.lock().unwrap() = Some((len, c.clone()));
+            Ok(c)
+        }
+    }
+
     /// Read an entire (synchronous) file into a `Vec`.
     fn read_file_to_vec(file: &Arc<dyn crate::File>) -> Vec<u8> {
         let size = file.size().unwrap() as usize;
@@ -5317,402 +5531,6 @@ mod tests {
             recovered, expected,
             "encrypted forced-yield recovery must match the synchronous path exactly"
         );
-    }
-
-    /// What this test checks: A committed transaction written to the logical log is replayed correctly after restart.
-    /// Why this matters: This is the baseline durability/recovery guarantee for MVCC commits.
-    #[test]
-    fn test_logical_log_read() {
-        init_tracing();
-        // Load a transaction
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-            let table_id: MVTableId = (-100).into();
-            let tx_id = mvcc_store.begin_tx(pager).unwrap();
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            // now insert a row into table -2
-            let row = generate_simple_string_row(table_id, 1, "foo");
-            mvcc_store.insert(tx_id, row).unwrap();
-            commit_tx(mvcc_store, &conn, tx_id).unwrap();
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now try to read it back - recovery happens automatically during bootstrap
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        let row = mvcc_store
-            .read(tx, &RowID::new((-100).into(), RowKey::Int(1)))
-            .unwrap()
-            .unwrap();
-        let record = ImmutableRecordRef::from_bin_record(row.payload());
-        let foo = record.iter().unwrap().next().unwrap().unwrap();
-        let ValueRef::Text(foo) = foo else {
-            unreachable!()
-        };
-        assert_eq!(foo.as_str(), "foo");
-    }
-
-    /// What this test checks: A long sequence of committed frames is replayed in order without dropping or reordering transactions.
-    /// Why this matters: Recovery must preserve commit order to maintain MVCC visibility semantics.
-    #[test]
-    fn test_logical_log_read_multiple_transactions() {
-        init_tracing();
-        let table_id: MVTableId = (-100).into();
-        let values = (0..100)
-            .map(|i| {
-                (
-                    RowID::new(table_id, RowKey::Int(i as i64)),
-                    format!("foo_{i}"),
-                )
-            })
-            .collect::<Vec<(RowID, String)>>();
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            // now insert a row into table -2
-            // generate insert per transaction
-            for (rowid, value) in &values {
-                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                let row = generate_simple_string_row(
-                    rowid.table_id,
-                    rowid.row_id.to_int_or_panic(),
-                    value,
-                );
-                mvcc_store.insert(tx_id, row).unwrap();
-                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            }
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now try to read it back - recovery happens automatically during bootstrap
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        for (rowid, value) in &values {
-            let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let foo = record.iter().unwrap().next().unwrap().unwrap();
-            let ValueRef::Text(foo) = foo else {
-                unreachable!()
-            };
-            assert_eq!(foo.as_str(), value.as_str());
-        }
-    }
-
-    /// What this test checks: Randomized insert/delete workloads round-trip through write + restart replay with matching final contents.
-    /// Why this matters: Fuzz-style coverage catches edge combinations that hand-written examples miss.
-    #[test]
-    fn test_logical_log_read_fuzz() {
-        init_tracing();
-        let table_id: MVTableId = (-100).into();
-        let seed = rng().random();
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let num_transactions = rng.next_u64() % 128;
-        let mut txns = vec![];
-        let mut present_rowids = BTreeSet::new();
-        let mut non_present_rowids = BTreeSet::new();
-        for _ in 0..num_transactions {
-            let num_operations = rng.next_u64() % 8;
-            let mut ops = vec![];
-            for _ in 0..num_operations {
-                let op_type = rng.next_u64() % 2;
-                match op_type {
-                    0 => {
-                        // Generate a positive rowid that fits in i64
-                        let row_id = (rng.next_u64() % (i64::MAX as u64)) as i64;
-                        let rowid = RowID::new(table_id, RowKey::Int(row_id));
-                        let row = generate_simple_string_row(
-                            rowid.table_id,
-                            rowid.row_id.to_int_or_panic(),
-                            &format!("row_{row_id}"),
-                        );
-                        ops.push((true, Some(row), rowid.clone()));
-                        present_rowids.insert(rowid.clone());
-                        non_present_rowids.remove(&rowid);
-                        tracing::debug!("insert {rowid:?}");
-                    }
-                    1 => {
-                        if present_rowids.is_empty() {
-                            continue;
-                        }
-                        let row_id_pos = rng.next_u64() as usize % present_rowids.len();
-                        let row_id = present_rowids.iter().nth(row_id_pos).unwrap().clone();
-                        ops.push((false, None, row_id.clone()));
-                        present_rowids.remove(&row_id);
-                        non_present_rowids.insert(row_id.clone());
-                        tracing::debug!("removed {row_id:?}");
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            txns.push(ops);
-        }
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        let pager = {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-
-            // insert rows
-            for ops in &txns {
-                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                for (is_insert, maybe_row, rowid) in ops {
-                    if *is_insert {
-                        mvcc_store
-                            .insert(tx_id, maybe_row.as_ref().unwrap().clone())
-                            .unwrap();
-                    } else {
-                        mvcc_store.delete(tx_id, rowid.clone()).unwrap();
-                    }
-                }
-                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            }
-
-            conn.close().unwrap();
-            pager
-        };
-
-        db.restart();
-
-        // connect after restart should recover log.
-        let _conn = db.connect();
-        let mvcc_store = db.get_mvcc_store();
-
-        // Check rowids that weren't deleted
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-        for present_rowid in present_rowids {
-            let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let foo = record.iter().unwrap().next().unwrap().unwrap();
-            let ValueRef::Text(foo) = foo else {
-                unreachable!()
-            };
-
-            assert_eq!(
-                foo.as_str(),
-                format!("row_{}", present_rowid.row_id.to_int_or_panic())
-            );
-        }
-
-        // Check rowids that were deleted
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        for present_rowid in non_present_rowids {
-            let row = mvcc_store.read(tx, &present_rowid).unwrap();
-            assert!(
-                row.is_none(),
-                "row {present_rowid:?} should have been removed"
-            );
-        }
-    }
-
-    /// What this test checks: Recovery rebuilds both table rows and index rows from logical-log operations.
-    /// Why this matters: Table/index divergence after restart would break query correctness.
-    #[test]
-    fn test_logical_log_read_table_and_index_rows() {
-        init_tracing();
-        // Test that both table rows and index rows can be read back after recovery
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-
-            // Create a table with an index
-            conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)")
-                .unwrap();
-            conn.execute("CREATE INDEX idx_data ON test(data)").unwrap();
-
-            // Checkpoint to ensure the index has a root_page mapping
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-            // Insert some data - this will create both table rows and index rows in the logical log
-            // Don't checkpoint after inserts so they remain in the logical log for recovery testing
-            conn.execute("INSERT INTO test(id, data) VALUES (1, 'foo')")
-                .unwrap();
-            conn.execute("INSERT INTO test(id, data) VALUES (2, 'bar')")
-                .unwrap();
-            conn.execute("INSERT INTO test(id, data) VALUES (3, 'baz')")
-                .unwrap();
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now verify that both table rows and index rows can be read back
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        let schema = conn.schema.read();
-        let table = schema
-            .get_table(NamespaceId::ROOT, "test")
-            .expect("table test should exist");
-        let Table::BTree(table) = table.as_ref() else {
-            panic!("table test should be btree");
-        };
-        let table_id = mvcc_store.get_table_id_from_root_page(table.root_page);
-
-        // Get the index from schema
-        let index = schema
-            .get_index(NamespaceId::ROOT, "test", "idx_data")
-            .expect("Index should exist");
-        // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
-        let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
-        let index_info = Arc::new(IndexInfo::new_from_index(index).unwrap());
-
-        // Verify table rows can be read
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
-            let row = mvcc_store
-                .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
-                .unwrap()
-                .expect("Table row should exist");
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let values = record.get_values().unwrap();
-            let data_value = values.get(1).expect("Should have data column");
-            let ValueRef::Text(data_text) = data_value else {
-                panic!("Data column should be text");
-            };
-            assert_eq!(data_text.as_str(), expected_data);
-        }
-
-        // Verify index rows can be read
-        // Note: Index rows are written to the logical log, but we need to construct the correct key format
-        // The index key format is (indexed_column_value, table_rowid)
-        for (row_id, data_value) in [(1, "foo"), (2, "bar"), (3, "baz")] {
-            // Create the index key: (data_value, rowid)
-            // The index on data column stores (data_value, table_rowid) as the key
-            let key_record = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new(data_value.to_string())),
-                    Value::from_i64(row_id),
-                ],
-                2,
-            )
-            .unwrap();
-            let sortable_key = SortableIndexKey::new_from_payload_in(
-                &key_record,
-                index_info.clone(),
-                crate::alloc::TursoAllocator,
-            )
-            .unwrap();
-            let index_rowid = RowID::new(index_id, RowKey::Record(Arc::new(sortable_key)));
-
-            // Use read_from_table_or_index to read the index row
-            // This verifies that index rows were properly serialized and deserialized from the logical log
-            let index_row_opt = mvcc_store
-                .read_from_table_or_index(tx, &index_rowid, Some(index_id))
-                .unwrap_or_else(|e| {
-                    panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}",
-                           data_value, row_id, e, index_id, index.root_page)
-                });
-
-            let Some(index_row) = index_row_opt else {
-                panic!(
-                    "Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log."
-                );
-            };
-            // Verify the index row contains the correct data
-            let RowKey::Record(sortable_key) = index_row.id.row_id else {
-                panic!("Index row should have a record row_id");
-            };
-            let record = sortable_key.key.clone();
-            let values = record.get_values().unwrap();
-            assert_eq!(
-                values.len(),
-                2,
-                "Index row should have 2 columns (data, rowid)"
-            );
-            let ValueRef::Text(index_data) = values[0] else {
-                panic!("First index column should be text");
-            };
-            assert_eq!(index_data.as_str(), data_value, "Index data should match");
-            let ValueRef::Numeric(crate::numeric::Numeric::Integer(index_rowid_val)) = values[1]
-            else {
-                panic!("Second index column should be integer (rowid)");
-            };
-            assert_eq!(index_rowid_val, row_id, "Index rowid should match");
-        }
     }
 
     /// What this test checks: If the last frame is torn, recovery keeps the valid prefix and ignores only the incomplete tail.
@@ -6956,7 +6774,7 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         // Verify the on-disk CRC matches a fresh computation over the header bytes
         let encoded = header.encode();
         let mut check_buf = [0u8; LOG_HDR_SIZE];
@@ -6973,7 +6791,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let header = LogHeader::new(&io);
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
@@ -7240,6 +7058,352 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_matches_reader_for_empty_extension_blocks() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        for version in [LOG_VERSION_V2, LOG_VERSION] {
+            for flags in [0, super::TX_FRAME_FLAG_HAS_EXTENSION_BLOCK] {
+                let bytes = LogHeader::new_with_version(&io, version).encode();
+                let header = validate_log_header(&bytes).unwrap();
+                let mut frame = vec![0; TX_EXT_HEADER_SIZE];
+                frame[..4].copy_from_slice(&EXT_FRAME_MAGIC.to_le_bytes());
+                frame[16..24].copy_from_slice(&1u64.to_le_bytes());
+                frame[36..40].copy_from_slice(&flags.to_le_bytes());
+                let crc = crc32c::crc32c_append(header.initial_crc(), &frame);
+                frame.extend(crc.to_le_bytes());
+                frame.extend(END_MAGIC.to_le_bytes());
+                let file = open_test_file(&io, &format!("empty-extension-{version}-{flags}"));
+                let mut stored = bytes.to_vec();
+                stored.extend(&frame);
+                overwrite_file_bytes(file.clone(), &io, &stored);
+                let mut reader = StreamingLogicalLogReader::new(file, None);
+                reader.read_header(&io).unwrap();
+                let native = io.block(|| reader.parse_next_transaction()).unwrap();
+                let accepted = version != LOG_VERSION_V2;
+                assert_eq!(matches!(native, ParseResult::Frame(_)), accepted);
+                let mut output = Vec::new();
+                assert_eq!(
+                    validate_frame_into(
+                        &header,
+                        LOG_HDR_SIZE as u64,
+                        &frame,
+                        header.initial_crc(),
+                        None,
+                        &mut output,
+                    )
+                    .is_ok(),
+                    accepted,
+                    "version={version}, flags={flags}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_matches_native_writer() {
+        use super::frame_codec::*;
+        use crate::{CipherMode, EncryptionContext, EncryptionKey};
+
+        for cipher in [
+            CipherMode::Aes128Gcm,
+            CipherMode::Aes256Gcm,
+            CipherMode::Aegis128L,
+            CipherMode::Aegis128X2,
+            CipherMode::Aegis128X4,
+            CipherMode::Aegis256,
+            CipherMode::Aegis256X2,
+            CipherMode::Aegis256X4,
+        ] {
+            let key = if cipher.required_key_size() == 16 {
+                EncryptionKey::new_128([42; 16])
+            } else {
+                EncryptionKey::new_256([42; 32])
+            };
+            let crypto = EncryptionContext::new(cipher, &key, 4096).expect("crypto");
+            for portable in [false, true] {
+                let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+                let file = open_test_file(&io, "codec.db-log");
+                let mut log = LogicalLog::new(file.clone(), io.clone(), Some(crypto.clone()));
+                for size in [0, 100, 32768, 100_000] {
+                    let rows = if size == 0 {
+                        Vec::new()
+                    } else {
+                        vec![make_test_row_version(
+                            (-2).into(),
+                            size,
+                            &"x".repeat(size as usize),
+                            size as u64,
+                        )]
+                    };
+                    let mut tx =
+                        crate::mvcc::database::LogRecord::for_test(size as u64, &rows, None);
+                    tx.portable_changes_enabled = portable;
+                    io.wait_for_completion(log.log_tx(tx).expect("write"))
+                        .expect("complete write");
+                }
+                let stored = read_file_bytes(file, &io);
+                let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+                let mut source_crc = header.initial_crc();
+                let mut wire_crc = source_crc;
+                let mut offset = LOG_HDR_SIZE;
+                let mut normalized = header.bytes().to_vec();
+                let mut output = Vec::new();
+                while offset < stored.len() {
+                    let layout = inspect_frame_prefix(&stored[offset..], Some(&crypto))
+                        .expect("layout")
+                        .expect("complete prefix");
+                    let end = offset + layout.stored_size();
+                    let frame = validate_frame_into(
+                        &header,
+                        offset as u64,
+                        &stored[offset..end],
+                        source_crc,
+                        Some(&crypto),
+                        &mut output,
+                    )
+                    .expect("frame");
+                    assert_eq!(frame.source_end(), end as u64);
+                    assert_eq!(frame.wire_size(), layout.wire_size());
+                    let keyless = inspect_frame_prefix_with_overhead(
+                        &stored[offset..],
+                        Some((cipher.tag_size(), cipher.nonce_size())),
+                    )
+                    .expect("keyless layout")
+                    .expect("complete header");
+                    assert_eq!(keyless.stored_size(), layout.stored_size());
+                    assert_eq!(keyless.wire_size(), frame.wire_size());
+                    assert_eq!(frame.extension().is_empty(), !portable);
+                    let wire = plaintext_wire_parts(&frame, wire_crc);
+                    normalized.extend_from_slice(wire.header);
+                    normalized.extend_from_slice(wire.body);
+                    normalized.extend_from_slice(&wire.trailer);
+                    wire_crc = wire.next_crc;
+                    source_crc = frame.source_crc();
+                    offset = end;
+                }
+                let plain_file = open_test_file(&io, "normalized.db-log");
+                overwrite_file_bytes(plain_file.clone(), &io, &normalized);
+                let mut reader = StreamingLogicalLogReader::new(plain_file, None);
+                reader.read_header(&io).expect("wire header");
+                for expected_ops in [0, 1, 1, 1] {
+                    let ParseResult::Frame(frame) = io
+                        .block(|| reader.parse_next_transaction())
+                        .expect("wire decode")
+                    else {
+                        panic!("expected complete wire frame");
+                    };
+                    assert_eq!(frame.ops.len(), expected_ops);
+                }
+                assert!(matches!(
+                    io.block(|| reader.parse_next_transaction())
+                        .expect("wire EOF"),
+                    ParseResult::Eof
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_rejects_corruption_and_truncation() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "codec-corrupt.db-log");
+        let crypto = test_enc_ctx();
+        let mut tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version(
+                (-2).into(),
+                1,
+                &"private".repeat(10_000),
+                10,
+            )],
+            None,
+        );
+        tx.portable_changes_enabled = true;
+        write_first_encrypted_tx(file.clone(), &io, &crypto, tx);
+        let stored = read_file_bytes(file, &io);
+        let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+        let frame = &stored[LOG_HDR_SIZE..];
+        let mut output = Vec::new();
+        for length in [0, 3, 23, 39, 40, 32768, frame.len() - 1] {
+            assert!(validate_frame_into(
+                &header,
+                56,
+                &frame[..length],
+                header.initial_crc(),
+                Some(&crypto),
+                &mut output
+            )
+            .is_err());
+        }
+        let mut corrupt = frame.to_vec();
+        corrupt[TX_EXT_HEADER_SIZE] ^= 1;
+        assert!(validate_frame_into(
+            &header,
+            56,
+            &corrupt,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output
+        )
+        .is_err());
+        let trailer = corrupt.len() - TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(header.initial_crc(), &corrupt[..trailer]);
+        corrupt[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+        let error = validate_frame_into(
+            &header,
+            56,
+            &corrupt,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output,
+        )
+        .expect_err("recomputed CRC must not bypass authentication");
+        assert!(error.to_string().contains("authentication"));
+        assert!(output.is_empty());
+        assert!(validate_frame_into(
+            &header,
+            56,
+            frame,
+            header.initial_crc(),
+            Some(&wrong_key_enc_ctx()),
+            &mut output
+        )
+        .is_err());
+        let mut other_header = stored[..LOG_HDR_SIZE].to_vec();
+        other_header[8] ^= 1;
+        other_header[52..].fill(0);
+        let crc = crc32c::crc32c(&other_header);
+        other_header[52..].copy_from_slice(&crc.to_le_bytes());
+        let other_header = validate_log_header(&other_header).expect("valid different salt");
+        assert!(validate_frame_into(
+            &other_header,
+            56,
+            frame,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output
+        )
+        .is_err());
+        let mut overflow = frame[..TX_EXT_HEADER_SIZE].to_vec();
+        overflow[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(inspect_frame_prefix(&overflow, Some(&crypto)).is_err());
+        assert!(inspect_frame_prefix(&overflow, None).is_err());
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_rejects_authenticated_malformed_extensions() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "malformed-extensions.db-log");
+        let crypto = test_enc_ctx();
+        let mut tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "portable", 10)],
+            None,
+        );
+        tx.portable_changes_enabled = true;
+        write_first_encrypted_tx(file.clone(), &io, &crypto, tx);
+        let stored = read_file_bytes(file, &io);
+        let log_header = validate_log_header(&stored[..LOG_HDR_SIZE]).unwrap();
+        let frame = &stored[LOG_HDR_SIZE..];
+        let mut plaintext = Vec::new();
+        let extension_size = validate_frame_into(
+            &log_header,
+            LOG_HDR_SIZE as u64,
+            frame,
+            log_header.initial_crc(),
+            Some(&crypto),
+            &mut plaintext,
+        )
+        .unwrap()
+        .extension()
+        .len();
+        assert!(extension_size >= EXTENSION_RECORD_HEADER_SIZE);
+
+        let encode = |header: &[u8], plaintext: &[u8]| {
+            let mut frame = header.to_vec();
+            let count = plaintext.len().div_ceil(ENCRYPTED_PAYLOAD_CHUNK_SIZE);
+            for (index, chunk) in plaintext.chunks(ENCRYPTED_PAYLOAD_CHUNK_SIZE).enumerate() {
+                let aad = build_encrypted_chunk_aad(
+                    u64::from_le_bytes(stored[8..16].try_into().unwrap()),
+                    (index + 1 == count).then_some(plaintext.len() as u64),
+                    u32::from_le_bytes(header[12..16].try_into().unwrap()),
+                    u64::from_le_bytes(header[16..24].try_into().unwrap()),
+                    index as u32,
+                );
+                let (ciphertext, nonce) = crypto.encrypt_chunk(chunk, &aad).unwrap();
+                frame.extend(ciphertext);
+                frame.extend(nonce);
+            }
+            let crc = crc32c::crc32c_append(log_header.initial_crc(), &frame);
+            frame.extend(crc.to_le_bytes());
+            frame.extend(END_MAGIC.to_le_bytes());
+            frame
+        };
+        for case in [
+            "unknown flags",
+            "missing flag",
+            "zero count",
+            "extra record",
+            "record flags",
+            "record length",
+            "trailing bytes",
+        ] {
+            let mut header = frame[..TX_EXT_HEADER_SIZE].to_vec();
+            let mut body = plaintext.clone();
+            let expected = match case {
+                "unknown flags" => {
+                    header[36..40].copy_from_slice(&2u32.to_le_bytes());
+                    "extension flags or count"
+                }
+                "missing flag" => {
+                    header[36..40].fill(0);
+                    "extension flags or count"
+                }
+                "zero count" => {
+                    header[32..36].fill(0);
+                    "extension flags or count"
+                }
+                "extra record" => {
+                    header[32..36].copy_from_slice(&2u32.to_le_bytes());
+                    "extension record header is truncated"
+                }
+                "record flags" => {
+                    body[2] = 1;
+                    "unsupported extension flags for type"
+                }
+                "record length" => {
+                    body[4..8].copy_from_slice(&(extension_size as u32).to_le_bytes());
+                    "extension record payload is truncated"
+                }
+                "trailing bytes" => {
+                    body[4..8].fill(0);
+                    "extension block has trailing bytes"
+                }
+                _ => unreachable!(),
+            };
+            let malformed = encode(&header, &body);
+            let mut output = vec![0xff];
+            let error = validate_frame_into(
+                &log_header,
+                LOG_HDR_SIZE as u64,
+                &malformed,
+                log_header.initial_crc(),
+                Some(&crypto),
+                &mut output,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+            assert!(output.is_empty(), "{case} exposed an invalid frame");
+        }
+    }
+
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
         use crate::storage::encryption::{CipherMode, EncryptionKey};
         let key = EncryptionKey::Key128([0x42u8; 16]);
@@ -7318,12 +7482,12 @@ mod tests {
             IndexInfo::new(
                 [
                     crate::types::KeyInfo {
-                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        sort_order: crate::ast::SortOrder::Asc,
                         collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
                     crate::types::KeyInfo {
-                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        sort_order: crate::ast::SortOrder::Asc,
                         collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
@@ -8189,15 +8353,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_first_write_uses_lml2_header_and_v2_frame() {
+    fn test_non_portable_first_write_uses_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file(
-                "non-portable-first-write-lml2.db-log",
-                OpenFlags::Create,
-                false,
-            )
+            .open_file("non-portable-first-write.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -8211,7 +8371,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -8219,11 +8379,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_appends_keep_lml2_header_and_v2_frames() {
+    fn test_non_portable_appends_keep_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file("non-portable-appends-lml2.db-log", OpenFlags::Create, false)
+            .open_file("non-portable-appends.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -8244,7 +8404,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -8267,6 +8427,17 @@ mod tests {
         );
     }
 
+    /// A log whose first write will use a version 2 (LML2) header, as logs
+    /// created by older versions do.
+    #[cfg(feature = "conn_raw_api")]
+    fn lml2_logical_log(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> LogicalLog {
+        let mut log = LogicalLog::new(file, io.clone(), None);
+        let header = LogHeader::new_with_version(io, LOG_VERSION_V2);
+        log.running_crc = derive_initial_crc(header.salt);
+        log.header = Some(header);
+        log
+    }
+
     #[cfg(feature = "conn_raw_api")]
     #[test]
     fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
@@ -8279,7 +8450,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
@@ -8342,7 +8513,7 @@ mod tests {
             inner: inner.clone(),
             fail_header_write: std::sync::atomic::AtomicBool::new(false),
         });
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
@@ -8470,6 +8641,149 @@ mod tests {
             LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap().salt,
             after.salt
         );
+    }
+
+    fn commit_timestamps(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> Vec<u64> {
+        read_table_ops(file, io)
+            .into_iter()
+            .map(|op| match op {
+                ExpectedTableOp::Upsert { commit_ts, .. }
+                | ExpectedTableOp::Delete { commit_ts, .. } => commit_ts,
+            })
+            .collect()
+    }
+
+    /// What this test checks: a checkpoint truncate leaves the log offset, the
+    /// shadow offset, the running CRC and the header as they were until the
+    /// truncate succeeded, and a commit waits for it before writing its frame.
+    #[test]
+    fn test_truncate_keeps_log_state_until_truncate_succeeds() {
+        use crate::mvcc::persistent_storage::{DurableStorage, LogicalLogTruncateOutcome, Storage};
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("held-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner.clone()));
+        let storage = Storage::new(file.clone(), io.clone(), None);
+        let commit = |commit_ts: u64| {
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &[table_row_version(
+                    (-2).into(),
+                    commit_ts as i64,
+                    commit_ts,
+                    "row",
+                )],
+                None,
+            );
+            assert!(storage.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+            let (c, bytes) = storage.log_tx(tx, None).unwrap();
+            io.wait_for_completion(c).unwrap();
+            storage
+                .advance_logical_log_offset_after_success(bytes)
+                .unwrap();
+        };
+        let log_state = || {
+            let log = storage.logical_log.read();
+            (log.offset, log.running_crc, log.header().unwrap().salt)
+        };
+
+        commit(10);
+        let before = log_state();
+
+        let (truncate_c, outcome) = storage.truncate(u64::MAX).unwrap();
+        assert_eq!(outcome, LogicalLogTruncateOutcome::Truncated);
+        assert!(!truncate_c.finished());
+        assert_eq!(log_state(), before);
+        assert_eq!(storage.logical_log_offset(), before.0);
+        let next_tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[table_row_version((-2).into(), 20, 20, "row")],
+            None,
+        );
+        let wait_c = storage.upgrade_header_for_log_tx(&next_tx).unwrap();
+        assert!(
+            wait_c.is_some_and(|c| !c.finished()),
+            "a commit must wait for a truncate in flight"
+        );
+
+        file.finish_truncate(true);
+        commit(20);
+        let (offset, running_crc, salt) = log_state();
+        assert_ne!(salt, before.2, "salt must change on truncation");
+        assert_eq!(storage.logical_log_offset(), offset);
+        assert_eq!(offset, inner.size().unwrap());
+        assert_ne!(running_crc, before.1);
+        assert_eq!(commit_timestamps(inner, &io), vec![20]);
+    }
+
+    /// What this test checks: a truncate whose completion fails leaves the log
+    /// state as it was, so the next frame is chained after the frames the file
+    /// still holds and recovery reads all of them.
+    #[test]
+    fn test_failed_truncate_keeps_log_state_and_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner.clone()));
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        let before = (log.offset, log.running_crc, log.header().unwrap().salt);
+
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        file.finish_truncate(false);
+        assert!(io.wait_for_completion(c).is_err());
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+
+        assert_eq!(log.header().unwrap().salt, before.2);
+        assert!(log.offset > before.0);
+        assert_eq!(log.offset, inner.size().unwrap());
+        assert_eq!(commit_timestamps(inner.clone(), &io), vec![10, 20]);
+        // The frames are still checkpointed through 20, so the next truncate
+        // goes ahead.
+        let (c, outcome) = log.truncate(20).unwrap();
+        assert_eq!(
+            outcome,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome::Truncated
+        );
+        file.finish_truncate(true);
+        io.wait_for_completion(c).unwrap();
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "c");
+        assert_eq!(log.offset, inner.size().unwrap());
+        assert_eq!(commit_timestamps(inner, &io), vec![30]);
+    }
+
+    /// What this test checks: a truncate that the file rejects when it is
+    /// issued leaves the log state as it was, so the next frame is chained
+    /// after the frames the file still holds and recovery reads all of them.
+    #[test]
+    fn test_rejected_truncate_keeps_log_state_and_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("rejected-truncate.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeldTruncateFile::new(inner.clone()));
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        let before = (log.offset, log.running_crc, log.header().unwrap().salt);
+
+        file.fail_on_issue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(log.truncate(u64::MAX).is_err());
+        assert_eq!(
+            (log.offset, log.running_crc, log.header().unwrap().salt),
+            before
+        );
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+        assert_eq!(log.offset, inner.size().unwrap());
+        assert_eq!(commit_timestamps(inner, &io), vec![10, 20]);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -8762,10 +9076,11 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
-        match io.block(|| reader.parse_next_transaction()).unwrap() {
-            ParseResult::InvalidFrame => {}
-            other => panic!("expected InvalidFrame after payload_size tamper, got {other:?}"),
-        }
+        // An overstated size can look incomplete when checksum validation runs first.
+        assert!(matches!(
+            io.block(|| reader.parse_next_transaction()).unwrap(),
+            ParseResult::InvalidFrame | ParseResult::Eof
+        ));
     }
 
     #[test]
@@ -9085,10 +9400,8 @@ mod tests {
             let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
             reader.read_header(&io).unwrap();
 
-            match io.block(|| reader.parse_next_transaction()).unwrap() {
-                ParseResult::InvalidFrame => {}
-                other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
-            }
+            let error = io.block(|| reader.parse_next_transaction()).unwrap_err();
+            assert!(error.to_string().contains("decryption failed"), "{error}");
         }
 
         // ── Tampered TX header (commit_ts) ──

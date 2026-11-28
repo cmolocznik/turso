@@ -3,8 +3,8 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::iter;
 
+use crate::ast::{self, SortOrder, TableInternalId};
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
@@ -49,10 +49,10 @@ use super::{
     join::JoinPlanningContext,
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        MultiIndexTableWork,
     },
     order::{
-        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
-        EqualityPrefixScope, OrderTarget,
+        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget, OrderTarget,
     },
     AvailableIndexes,
 };
@@ -88,18 +88,9 @@ pub enum AccessMethodParams {
         /// a non-empty list means a search.
         constraint_refs: Vec<RangeConstraintRef>,
     },
-    VirtualTable {
-        /// Index identifier returned by the table's `best_index` method.
-        idx_num: i32,
-        /// Optional index string returned by the table's `best_index` method.
-        idx_str: Option<String>,
-        /// Constraint descriptors passed to the virtual table’s `filter` method.
-        /// Each corresponds to a column/operator pair from the WHERE clause.
-        constraints: Vec<ConstraintInfo>,
-        /// Information returned by the virtual table's `best_index` method
-        /// describing how each constraint will be used.
-        constraint_usages: Vec<ConstraintUsage>,
-    },
+    /// Boxed, as the query of `IndexMethod`: these two variants are the
+    /// largest, and the planner moves many access methods of other tables.
+    VirtualTable(Box<VirtualTableAccess>),
     /// FROM-subquery scan. Coroutine-backed scans run forwards; materialized
     /// subqueries may also be scanned backwards when their intrinsic order
     /// matches the requested extremum order.
@@ -139,7 +130,7 @@ pub enum AccessMethodParams {
     /// should be used for table access in a join query.
     IndexMethod {
         /// The fully constructed IndexMethodQuery operation to apply to this table.
-        query: IndexMethodQuery,
+        query: Box<IndexMethodQuery>,
         /// Index in WHERE clause that was covered by this index method (if any).
         where_covered: Option<usize>,
     },
@@ -160,6 +151,21 @@ pub enum AccessMethodParams {
         affinity: Affinity,
         where_term_idx: usize,
     },
+}
+
+/// How the planner reads a virtual table: what its `best_index` method chose.
+#[derive(Debug, Clone)]
+pub struct VirtualTableAccess {
+    /// Index identifier returned by the table's `best_index` method.
+    pub idx_num: i32,
+    /// Optional index string returned by the table's `best_index` method.
+    pub idx_str: Option<String>,
+    /// Constraint descriptors passed to the virtual table’s `filter` method.
+    /// Each corresponds to a column/operator pair from the WHERE clause.
+    pub constraints: Vec<ConstraintInfo>,
+    /// Information returned by the virtual table's `best_index` method
+    /// describing how each constraint will be used.
+    pub constraint_usages: Vec<ConstraintUsage>,
 }
 
 /// Result of generic btree candidate selection before it is wrapped into a full
@@ -297,11 +303,9 @@ pub(super) fn choose_best_btree_candidate(
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
             if let Some(order_target) = maybe_order_target {
                 // Reuse the same index-vs-order matching logic as final plan
-                // validation, but allow any equality-constrained seek prefix to
-                // be skipped here. Candidate scoring only needs to know whether
+                // validation. Candidate scoring only needs to know whether
                 // this specific access path can emit rows ordered after its seek
-                // key; final global ORDER BY validation is stricter and only
-                // skips globally constant prefixes.
+                // key.
                 let all_same_direction = btree_access_order_consumed(
                     rhs_table,
                     IterationDirection::Forwards,
@@ -310,7 +314,6 @@ pub(super) fn choose_best_btree_candidate(
                     order_target,
                     0,
                     schema,
-                    EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
                     == order_target.columns.len();
@@ -322,7 +325,6 @@ pub(super) fn choose_best_btree_candidate(
                     order_target,
                     0,
                     schema,
-                    EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
                     == order_target.columns.len();
@@ -409,18 +411,15 @@ pub(super) fn choose_best_btree_candidate(
                 .into_iter()
                 .flatten()
                 {
-                    let c = &rhs_constraints.constraints[idx];
-                    mask = mask.iter().chain(c.lhs_mask.iter()).try_collect()?;
+                    mask.union_with(&rhs_constraints.constraints[idx].lhs_mask)?;
                 }
             }
             mask
         };
         // Tables whose constraints this loop can account for: the loop's own
         // prerequisite tables plus the current table itself.
-        let allowed_mask: TableMask = loop_prereq_mask
-            .iter()
-            .chain(rhs_table_mask.iter())
-            .try_collect()?;
+        let mut allowed_mask = loop_prereq_mask;
+        allowed_mask.union_with(&rhs_table_mask)?;
 
         // Collect which constraint positions are consumed by the index seek.
         let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
@@ -488,7 +487,13 @@ pub(super) fn choose_best_btree_candidate(
 
     // `best_choice` starts as a table scan even when INDEXED BY removed that choice.
     // Do not return that placeholder if all forced candidates were rejected.
-    Ok(has_valid_candidate.then_some(best_choice))
+    // Not `has_valid_candidate.then_some(best_choice)`: for it, the compiler
+    // copies the candidate three times, and for `Ok(Some(best_choice))` once.
+    // The join order search calls this function for each table that it tries.
+    if !has_valid_candidate {
+        return Ok(None);
+    }
+    Ok(Some(best_choice))
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -554,6 +559,9 @@ pub(super) fn choose_best_in_seek_candidate(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
     };
+    if !has_in_seek_constraint(rhs_constraints) {
+        return Ok(None);
+    }
 
     let base = *base_row_count;
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
@@ -633,7 +641,7 @@ pub(super) fn choose_best_in_seek_candidate(
                     continue;
                 }
                 let constrained_column = &rhs_table.table.columns()[col_pos];
-                let idx_aff = constrained_column.affinity();
+                let idx_aff = constrained_column.comparison_affinity();
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
@@ -659,11 +667,7 @@ pub(super) fn choose_best_in_seek_candidate(
             }
 
             let lhs_affinity = if let Some(col_pos) = constraint.table_col_pos {
-                btree
-                    .columns()
-                    .get(col_pos)
-                    .map(|col| col.affinity())
-                    .unwrap_or(Affinity::Blob)
+                btree.columns()[col_pos].comparison_affinity()
             } else {
                 Affinity::Integer
             };
@@ -680,6 +684,14 @@ pub(super) fn choose_best_in_seek_candidate(
     }
 
     Ok(best_in_seek)
+}
+
+/// Whether a constraint of the table is an `IN` that can drive an IN seek.
+pub(super) fn has_in_seek_constraint(constraints: &TableConstraints) -> bool {
+    constraints
+        .constraints
+        .iter()
+        .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -770,13 +782,13 @@ fn replace_if_cheaper(
 
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
-pub fn find_best_access_method_for_join_order(
+pub fn find_best_access_method_for_join_order<'a>(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -786,6 +798,7 @@ pub fn find_best_access_method_for_join_order(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -806,10 +819,14 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
             planning_context.resolver,
+            multi_index_work,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
+            rhs_table,
             vtab,
             &rhs_constraints.constraints,
+            where_clause,
+            lhs_mask,
             join_order,
             input_cardinality,
             base_row_count,
@@ -847,14 +864,14 @@ pub fn find_best_access_method_for_join_order(
 
 #[allow(clippy::too_many_arguments)]
 /// Return the best B-tree access method, or `None` if `INDEXED BY` leaves no valid method.
-fn find_best_access_method_for_btree(
+fn find_best_access_method_for_btree<'a>(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -865,6 +882,7 @@ fn find_best_access_method_for_btree(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     resolver: &Resolver,
+    multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     let Some(best) = choose_best_btree_candidate(
@@ -939,7 +957,16 @@ fn find_best_access_method_for_btree(
             iter_dir: best.iter_dir,
             index: best.index,
             build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
+            // For refs that the `SmallVec` keeps inline, `into_vec` moves the
+            // `SmallVec` into an iterator and collects the refs one at a time
+            // into a `Vec` with space for four. A copy of the slice allocates
+            // only space for the refs. Spilled refs already have a heap
+            // buffer, which `into_vec` keeps.
+            constraint_refs: if best.constraint_refs.spilled() {
+                best.constraint_refs.into_vec()
+            } else {
+                best.constraint_refs.to_vec()
+            },
         },
     };
     let mut best_cost_with_filters =
@@ -1074,7 +1101,9 @@ fn find_best_access_method_for_btree(
 
         // Multi-index scans do not record matched rowids for a RIGHT or FULL JOIN,
         // so the unmatched-row pass would emit matched right rows again.
-        if keeps_right_rows {
+        // They also check each branch's conditions on rows before the loop
+        // checks their row-level security filter.
+        if keeps_right_rows || rhs_table.row_filter.is_some() {
             return Ok(Some(best_access_method));
         }
 
@@ -1092,6 +1121,7 @@ fn find_best_access_method_for_btree(
             lhs_mask,
             analyze_stats,
             resolver,
+            multi_index_work,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1120,6 +1150,7 @@ fn find_best_access_method_for_btree(
             lhs_mask,
             analyze_stats,
             resolver,
+            multi_index_work,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1153,14 +1184,62 @@ fn has_two_local_constraint_terms(
     false
 }
 
+/// Whether an argument of this table function reads a table that is not joined before it.
+fn table_function_argument_reads_a_later_table(
+    table_function: &JoinedTable,
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    lhs_mask: &TableMask,
+    join_order: &[JoinOrderMember],
+) -> bool {
+    let own_index = join_order
+        .iter()
+        .find(|member| member.table_id == table_function.internal_id)
+        .map(|member| member.original_idx);
+    constraints.iter().any(|constraint| {
+        let term = &where_clause[constraint.where_clause_pos.0];
+        if term.origin.table_function_table() != Some(table_function.internal_id) {
+            return false;
+        }
+        let mut read = constraint.lhs_mask.clone();
+        if let Some(own_index) = own_index {
+            read.clear(own_index);
+        }
+        !lhs_mask.contains_all_set_bits_of(&read)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn find_best_access_method_for_vtab(
+    table: &JoinedTable,
     vtab: &VirtualTable,
     constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
+    debug_assert!(
+        where_clause
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| term.origin.table_function_table() == Some(table.internal_id))
+            .all(|(pos, _)| constraints
+                .iter()
+                .any(|constraint| constraint.where_clause_pos.0 == pos)),
+        "every argument of a table function must be one of its constraints"
+    );
+    if table_function_argument_reads_a_later_table(
+        table,
+        constraints,
+        where_clause,
+        lhs_mask,
+        join_order,
+    ) {
+        return Ok(None);
+    }
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
 
     // TODO: get proper order_by information to pass to the vtab.
@@ -1210,12 +1289,12 @@ fn find_best_access_method_for_vtab(
                 ),
                 estimated_rows_per_outer_row,
                 consumed_where_terms,
-                params: AccessMethodParams::VirtualTable {
+                params: AccessMethodParams::VirtualTable(Box::new(VirtualTableAccess {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
                     constraints: vtab_constraints,
                     constraint_usages: index_info.constraint_usages,
-                },
+                })),
             }))
         }
         Err(ResultCode::ConstraintViolation) => Ok(None),
@@ -1387,7 +1466,7 @@ pub fn try_hash_join_access_method(
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
     joined_before_probe_mask: &TableMask,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
     build_cardinality: f64,
@@ -1847,10 +1926,11 @@ fn find_best_access_method_for_subquery(
 
     // SQLite does not build an automatic index on the right side of a
     // RIGHT JOIN or FULL JOIN. The unmatched-row pass must scan that source.
-    if rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(JoinInfo::keeps_right_rows)
+    if !planning_context.allow_automatic_index
+        || rhs_table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
     {
         return Ok(Some(AccessMethod {
             cost: scan_cost,
@@ -2114,14 +2194,14 @@ fn materialized_subquery_ephemeral_index(
 ) -> Result<Arc<Index>> {
     let mut index_columns: crate::alloc::Vec<IndexColumn> =
         crate::alloc::Vec::try_with_capacity_ext(subquery.columns.len())?;
-    let mut seen_col_positions = std::collections::HashSet::new();
+    let mut is_key_column = vec![false; subquery.columns.len()];
 
     for &col_pos in key_col_positions {
         let column = subquery
             .columns
             .get(col_pos)
             .expect("key column position out of bounds for materialized subquery");
-        if !seen_col_positions.insert(col_pos) {
+        if std::mem::replace(&mut is_key_column[col_pos], true) {
             continue;
         }
         index_columns
@@ -2139,7 +2219,7 @@ fn materialized_subquery_ephemeral_index(
     }
 
     for (col_pos, column) in subquery.columns.iter().enumerate() {
-        if seen_col_positions.contains(&col_pos) {
+        if is_key_column[col_pos] {
             continue;
         }
         index_columns
@@ -2201,7 +2281,6 @@ fn materialized_subquery_order_properties(
         order_target,
         0,
         schema,
-        EqualityPrefixScope::AnyEquality,
     )
     .consumed
         == order_target.columns.len();
@@ -2213,7 +2292,6 @@ fn materialized_subquery_order_properties(
         order_target,
         0,
         schema,
-        EqualityPrefixScope::AnyEquality,
     )
     .consumed
         == order_target.columns.len();
@@ -2232,4 +2310,17 @@ fn materialized_subquery_order_properties(
         true,
         order_bonus,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccessMethod;
+
+    /// The join order search moves access methods by value many times. On
+    /// x86-64 the compiler copies a value of up to 128 bytes with inline
+    /// loads and stores, and calls memcpy for a larger one.
+    #[test]
+    fn access_method_stays_small() {
+        assert!(std::mem::size_of::<AccessMethod>() <= 128);
+    }
 }

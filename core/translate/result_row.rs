@@ -8,16 +8,19 @@ use crate::{
     Result,
 };
 
-use turso_parser::ast;
+use crate::ast;
 
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode,
         expr_type::{type_of, TypeEnv},
         translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
     },
-    plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
+    expr_context::ExprContext,
+    plan::{
+        Distinctness, QueryDestination, RecursiveCteQueue, ResultSetColumn, SelectPlan,
+        TableReferences,
+    },
 };
 
 /// Emits the bytecode for:
@@ -36,6 +39,27 @@ pub fn emit_select_result(
     reg_result_cols_start: usize,
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
+    let label_after_row = program.allocate_label();
+    if let Distinctness::DistinctOnRowsInOrder { keys, registers } = &plan.distinctness {
+        let registers = registers
+            .as_ref()
+            .expect("DISTINCT ON registers are allocated before the rows are read");
+        let mut key_collations = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                key,
+                registers.reg_key_start + i,
+                resolver,
+            )?;
+            key_collations.push(
+                ExprContext::new(Some(&plan.table_references), resolver).expr_collation(key)?,
+            );
+        }
+        registers.emit_skip_unless_first_row_of_group(program, key_collations, label_after_row);
+    }
+
     let has_distinct = matches!(plan.distinctness, Distinctness::Distinct { .. });
     if !has_distinct {
         if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
@@ -128,7 +152,7 @@ pub fn emit_select_result(
     }
 
     // Handle SELECT DISTINCT deduplication
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = plan.result_columns.len();
         distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
@@ -141,6 +165,7 @@ pub fn emit_select_result(
     }
 
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
+    program.preassign_label_to_next_insn(label_after_row);
     Ok(())
 }
 
@@ -320,13 +345,13 @@ pub fn emit_columns_to_destination(
         }
         QueryDestination::RecursiveCteQueue {
             cursor_id,
-            index,
-            sort_keys,
+            queue,
             seen_rows,
         } => {
-            let skip_seen_row = seen_rows.as_ref().map(|(cursor_id, index)| {
+            let seen_row = seen_rows.as_ref().map(|(cursor_id, index)| {
                 let skip_seen_row = program.allocate_label();
-                // Build the probe record once and reuse it for the insert.
+                // Build the probe record once and reuse it for the insert,
+                // and for the queue insert when the queue is a rowid table.
                 // The failed Found leaves the cursor at the insertion point
                 // (both run the same eq-only GE seek), so the insert can skip
                 // its own descent via USE_SEEK, as SQLite does.
@@ -351,68 +376,101 @@ pub fn emit_columns_to_destination(
                     unpacked_count: Some(to_u32(num_columns)),
                     flags: IdxInsertFlags::new().no_op_duplicate().use_seek(true),
                 });
-                skip_seen_row
+                (skip_seen_row, record_reg)
             });
 
-            let sort_key_column_count = sort_keys
-                .iter()
-                .map(|key| 1 + usize::from(key.nulls_override.is_some()))
-                .sum::<usize>();
-            let queue_row_start_reg =
-                program.alloc_registers(sort_key_column_count + 1 + num_columns);
-            let mut queue_key_reg = queue_row_start_reg;
-            for key in sort_keys {
-                if let Some(nulls) = key.nulls_override {
-                    let nulls_last = matches!(nulls, ast::NullsOrder::Last);
-                    let null_rank_ready = program.allocate_label();
-                    program.emit_insn(Insn::Integer {
-                        value: i64::from(nulls_last),
-                        dest: queue_key_reg,
+            match queue {
+                RecursiveCteQueue::Fifo { table } => {
+                    let record_reg = match seen_row {
+                        Some((_, record_reg)) => record_reg,
+                        None => {
+                            let record_reg = program.alloc_register();
+                            program.emit_insn(Insn::MakeRecord {
+                                start_reg: to_u32(start_reg),
+                                count: to_u32(num_columns),
+                                dest_reg: to_u32(record_reg),
+                                index_name: Some(table.name.clone()),
+                                affinity_str: None,
+                            });
+                            record_reg
+                        }
+                    };
+                    let rowid_reg = program.alloc_register();
+                    program.emit_insn(Insn::NewRowid {
+                        cursor: *cursor_id,
+                        rowid_reg,
+                        prev_largest_reg: 0,
                     });
-                    program.emit_insn(Insn::IsNull {
-                        reg: start_reg + key.result_column_index,
-                        target_pc: null_rank_ready,
+                    program.emit_insn(Insn::Insert {
+                        cursor: *cursor_id,
+                        key_reg: rowid_reg,
+                        record_reg,
+                        flag: InsertFlags::new().is_ephemeral_table_insert(),
+                        table_name: table.name.clone(),
                     });
-                    program.emit_insn(Insn::Integer {
-                        value: i64::from(!nulls_last),
-                        dest: queue_key_reg,
-                    });
-                    program.preassign_label_to_next_insn(null_rank_ready);
-                    queue_key_reg += 1;
                 }
-                program.emit_insn(Insn::Copy {
-                    src_reg: start_reg + key.result_column_index,
-                    dst_reg: queue_key_reg,
-                    extra_amount: 0,
-                });
-                queue_key_reg += 1;
+                RecursiveCteQueue::Ordered { index, sort_keys } => {
+                    let sort_key_column_count = sort_keys
+                        .iter()
+                        .map(|key| 1 + usize::from(key.nulls_override.is_some()))
+                        .sum::<usize>();
+                    let queue_row_start_reg =
+                        program.alloc_registers(sort_key_column_count + 1 + num_columns);
+                    let mut queue_key_reg = queue_row_start_reg;
+                    for key in sort_keys {
+                        if let Some(nulls) = key.nulls_override {
+                            let nulls_last = matches!(nulls, ast::NullsOrder::Last);
+                            let null_rank_ready = program.allocate_label();
+                            program.emit_insn(Insn::Integer {
+                                value: i64::from(nulls_last),
+                                dest: queue_key_reg,
+                            });
+                            program.emit_insn(Insn::IsNull {
+                                reg: start_reg + key.result_column_index,
+                                target_pc: null_rank_ready,
+                            });
+                            program.emit_insn(Insn::Integer {
+                                value: i64::from(!nulls_last),
+                                dest: queue_key_reg,
+                            });
+                            program.preassign_label_to_next_insn(null_rank_ready);
+                            queue_key_reg += 1;
+                        }
+                        program.emit_insn(Insn::Copy {
+                            src_reg: start_reg + key.result_column_index,
+                            dst_reg: queue_key_reg,
+                            extra_amount: 0,
+                        });
+                        queue_key_reg += 1;
+                    }
+                    program.emit_insn(Insn::Sequence {
+                        cursor_id: *cursor_id,
+                        target_reg: queue_row_start_reg + sort_key_column_count,
+                    });
+                    program.emit_insn(Insn::Copy {
+                        src_reg: start_reg,
+                        dst_reg: queue_row_start_reg + sort_key_column_count + 1,
+                        extra_amount: num_columns - 1,
+                    });
+                    let record_reg = program.alloc_register();
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: to_u32(queue_row_start_reg),
+                        count: to_u32(sort_key_column_count + 1 + num_columns),
+                        dest_reg: to_u32(record_reg),
+                        index_name: Some(index.name.clone()),
+                        affinity_str: None,
+                    });
+                    program.emit_insn(Insn::IdxInsert {
+                        cursor_id: *cursor_id,
+                        record_reg,
+                        unpacked_start: None,
+                        unpacked_count: None,
+                        flags: IdxInsertFlags::new().no_op_duplicate(),
+                    });
+                }
             }
-            program.emit_insn(Insn::Sequence {
-                cursor_id: *cursor_id,
-                target_reg: queue_row_start_reg + sort_key_column_count,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: start_reg,
-                dst_reg: queue_row_start_reg + sort_key_column_count + 1,
-                extra_amount: num_columns - 1,
-            });
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(queue_row_start_reg),
-                count: to_u32(sort_key_column_count + 1 + num_columns),
-                dest_reg: to_u32(record_reg),
-                index_name: Some(index.name.clone()),
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: *cursor_id,
-                record_reg,
-                unpacked_start: None,
-                unpacked_count: None,
-                flags: IdxInsertFlags::new().no_op_duplicate(),
-            });
 
-            if let Some(skip_seen_row) = skip_seen_row {
+            if let Some((skip_seen_row, _)) = seen_row {
                 program.preassign_label_to_next_insn(skip_seen_row);
             }
         }
@@ -433,12 +491,33 @@ pub fn emit_columns_to_destination(
         QueryDestination::RowValueSubqueryResult {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
             turso_assert_eq!(
                 num_columns,
                 *num_regs,
                 "Row value subqueries should have the same number of result columns as the number of registers"
             );
+            if let Some(row_count_reg) = *row_count_reg {
+                let first_row = program.allocate_label();
+                let counted = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: row_count_reg,
+                    target_pc: first_row,
+                    jump_if_null: false,
+                });
+                program.emit_insn(Insn::Null {
+                    dest: row_count_reg,
+                    dest_end: None,
+                });
+                program.emit_insn(Insn::Goto { target_pc: counted });
+                program.preassign_label_to_next_insn(first_row);
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: row_count_reg,
+                });
+                program.preassign_label_to_next_insn(counted);
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: start_reg,
                 dst_reg: *result_reg_start,
@@ -519,20 +598,7 @@ pub(crate) fn emit_array_decode_for_results(
     let env = TypeEnv::new(Some(table_references), resolver);
     for (i, rc) in result_columns.iter().enumerate() {
         if type_of(&rc.expr, &env).is_array() {
-            // An array column's elements may have a custom type to decode.
-            let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
-                table_references
-                    .find_table_by_internal_id(*table)
-                    .and_then(|(_, t)| t.get_column_at(*column))
-            } else {
-                None
-            };
-            let reg = start_reg + i;
-            if let Some(col) = array_col {
-                emit_array_decode(program, reg, col, resolver)?;
-            } else {
-                program.emit_insn(Insn::ArrayDecode { reg });
-            }
+            program.emit_insn(Insn::ArrayDecode { reg: start_reg + i });
         }
     }
     Ok(())

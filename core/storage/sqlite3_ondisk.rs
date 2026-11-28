@@ -61,7 +61,7 @@ use super::wal::{
 };
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
+use crate::io::{start_in_group, Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
@@ -601,10 +601,7 @@ pub fn begin_read_page(
         None
     });
     let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    db_file.read_page(page_idx, io_ctx, c)
+    start_in_group(group, c, |c| db_file.read_page(page_idx, io_ctx, c))
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -654,11 +651,10 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::new_write(write_complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
     let io_ctx = pager.io_ctx.read();
-    page_source.write_page(page_id, buffer, &io_ctx, c)
+    start_in_group(group, c, |c| {
+        page_source.write_page(page_id, buffer, &io_ctx, c)
+    })
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -750,13 +746,13 @@ pub fn write_pages_vectored(
                 done_cl.store(true, Ordering::Release);
             }
         });
-        group.add(&cmp);
         let io_ctx = pager.io_ctx.read();
         let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
-        match pager
-            .db_file
-            .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)
-        {
+        match start_in_group(Some(&mut *group), cmp, |c| {
+            pager
+                .db_file
+                .write_pages(start_id, page_sz, bufs, &io_ctx, c)
+        }) {
             Ok(c) => completions.push(c),
             Err(e) => {
                 // We failed to submit this run at all. Mark batch failed+done and cancel already-submitted.
@@ -1285,67 +1281,54 @@ pub fn read_text(payload: &[u8]) -> Result<&str> {
 
 #[inline(always)]
 pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
-    match serial_type {
-        1 => {
-            if buf.is_empty() {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 1-byte int");
-            }
-            Ok(buf[0] as i8 as i64)
-        }
-        2 => {
-            if buf.len() < 2 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 2-byte int");
-            }
-            Ok(i16::from_be_bytes([buf[0], buf[1]]) as i64)
-        }
+    match try_read_integer(buf, serial_type) {
+        Some((value, _)) => Ok(value),
+        None => invalid_integer(serial_type),
+    }
+}
+
+/// The integer of an integer `serial_type` at the start of `buf`, and its
+/// number of data bytes. None for a serial type that is not an integer, and
+/// for a `buf` that is too short: [read_integer] gives an error in these
+/// cases. This function makes no error value, so that a caller in a hot
+/// loop, as the comparison of two MVCC index keys, gets no error code where
+/// it is inlined.
+#[inline(always)]
+pub fn try_read_integer(buf: &[u8], serial_type: u8) -> Option<(i64, usize)> {
+    // The arithmetic shifts give the sign of the 3-byte and the 6-byte
+    // integers.
+    Some(match serial_type {
+        1 => (i64::from(i8::from_be_bytes(*buf.first_chunk()?)), 1),
+        2 => (i64::from(i16::from_be_bytes(*buf.first_chunk()?)), 2),
         3 => {
-            if buf.len() < 3 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 3-byte int");
-            }
-            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
-            Ok(i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64)
+            let &[b0, b1, b2] = buf.first_chunk()?;
+            (i64::from(i32::from_be_bytes([b0, b1, b2, 0]) >> 8), 3)
         }
-        4 => {
-            if buf.len() < 4 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 4-byte int");
-            }
-            Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64)
-        }
+        4 => (i64::from(i32::from_be_bytes(*buf.first_chunk()?)), 4),
         5 => {
-            if buf.len() < 6 {
-                mark_unlikely();
-                crate::bail_corrupt_error!("Invalid 6-byte int");
-            }
-            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
-            Ok(i64::from_be_bytes([
-                sign_extension,
-                sign_extension,
-                buf[0],
-                buf[1],
-                buf[2],
-                buf[3],
-                buf[4],
-                buf[5],
-            ]))
+            let &[b0, b1, b2, b3, b4, b5] = buf.first_chunk()?;
+            (i64::from_be_bytes([b0, b1, b2, b3, b4, b5, 0, 0]) >> 16, 6)
         }
-        6 => {
-            if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid 8-byte int");
-            }
-            Ok(i64::from_be_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]))
-        }
-        8 => Ok(0),
-        9 => Ok(1),
-        _ => {
-            mark_unlikely();
-            crate::bail_corrupt_error!("Invalid serial type for integer")
-        }
+        6 => (i64::from_be_bytes(*buf.first_chunk()?), 8),
+        8 => (0, 0),
+        9 => (1, 0),
+        _ => return None,
+    })
+}
+
+/// The error of [read_integer] when `serial_type` is not an integer type or
+/// the buffer is too short for it.
+#[cold]
+#[inline(never)]
+fn invalid_integer(serial_type: u8) -> Result<i64> {
+    match serial_type {
+        1 => crate::bail_corrupt_error!("Invalid 1-byte int"),
+        2 => crate::bail_corrupt_error!("Invalid 2-byte int"),
+        3 => crate::bail_corrupt_error!("Invalid 3-byte int"),
+        4 => crate::bail_corrupt_error!("Invalid 4-byte int"),
+        5 => crate::bail_corrupt_error!("Invalid 6-byte int"),
+        6 => crate::bail_corrupt_error!("Invalid 8-byte int"),
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 
@@ -1508,7 +1491,16 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
     n
 }
 
+/// Appends the varint of `value` to `payload`.
+#[inline(always)]
 pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
+    // The varint of a value of less than 128 is one byte that is the value
+    // itself. A copy of `varint[0..n]` has a length that is not known at
+    // compile time, and costs a call of memcpy.
+    if value < 0x80 {
+        payload.push(value as u8);
+        return;
+    }
     let mut varint = [0u8; 9];
     let n = write_varint(&mut varint, value);
     payload.extend_from_slice(&varint[0..n]);
@@ -1639,6 +1631,9 @@ impl BuildSharedWal {
                     self.phase = BuildSharedWalPhase::AwaitHeader(c);
                 }
                 BuildSharedWalPhase::AwaitHeader(c) => {
+                    if let Some(err) = c.get_error() {
+                        return Err(err.into());
+                    }
                     if !c.succeeded() {
                         io_yield_one!(c);
                     }
@@ -1666,6 +1661,9 @@ impl BuildSharedWal {
                     };
                 }
                 BuildSharedWalPhase::AwaitChunk { completion, offset } => {
+                    if let Some(err) = completion.get_error() {
+                        return Err(err.into());
+                    }
                     if !completion.succeeded() {
                         io_yield_one!(completion);
                     }
@@ -1757,8 +1755,7 @@ impl StreamingWalReader {
         let reader = self.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let _reader = reader.clone();
-            _reader.handle_header_read(res);
-            None
+            _reader.handle_header_read(res)
         });
         let c = Completion::new_read(header_buf, completion);
         self.file.pread(0, c)
@@ -1792,22 +1789,31 @@ impl StreamingWalReader {
         let completion: Box<ReadComplete> = Box::new(move |res| {
             tracing::debug!("WAL chunk read complete");
             let reader = me.clone();
-            reader.handle_chunk_read(res);
-            None
+            reader.handle_chunk_read(offset, res)
         });
         let c = Completion::new_read(buf, completion);
         let guard = self.file.pread(offset, c)?;
         Ok((read_size, guard))
     }
 
-    fn handle_header_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_header_read(
+        self: Arc<Self>,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return None;
         };
+        // The file is at least as long as the header, so a read that returns
+        // fewer bytes does not mean that the WAL has no header. If recovery
+        // treated it that way, the committed frames would not be visible and
+        // the next write would overwrite them.
         if bytes_read != WAL_HEADER_SIZE as i32 {
-            self.finalize_loading();
-            return;
+            return Some(CompletionError::ShortReadWalFrame {
+                offset: 0,
+                expected: WAL_HEADER_SIZE,
+                actual: bytes_read as usize,
+            });
         }
 
         let (page_sz, c1, c2, use_native, ok) = {
@@ -1851,7 +1857,7 @@ impl StreamingWalReader {
         if PageSize::new(page_sz).is_none() || !ok {
             *self.header.lock() = WalHeader::default();
             self.finalize_loading();
-            return;
+            return None;
         }
         {
             let mut st = self.state.write();
@@ -1864,14 +1870,28 @@ impl StreamingWalReader {
         self.off_atomic
             .store(WAL_HEADER_SIZE as u64, Ordering::Release);
         self.page_atomic.store(page_sz as u64, Ordering::Release);
+        None
     }
 
-    fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
+    fn handle_chunk_read(
+        self: Arc<Self>,
+        offset: u64,
+        res: Result<(Arc<Buffer>, i32), CompletionError>,
+    ) -> Option<CompletionError> {
         let Ok((buf, bytes_read)) = res else {
             self.finalize_loading();
-            return;
+            return None;
         };
-        let buf_slice = &buf.as_slice()[..bytes_read as usize];
+        // The requested bytes are all inside the file, so a read that returns
+        // fewer bytes does not show where the valid frames end.
+        if bytes_read as usize != buf.len() {
+            return Some(CompletionError::ShortReadWalFrame {
+                offset,
+                expected: buf.len(),
+                actual: bytes_read as usize,
+            });
+        }
+        let buf_slice = buf.as_slice();
         // Snapshot salts/endianness once to avoid per-frame header locks
         let (header_copy, use_native) = {
             let st = self.state.read();
@@ -1885,6 +1905,7 @@ impl StreamingWalReader {
         if consumed < buf_slice.len() || self.off_atomic.load(Ordering::Acquire) >= self.file_size {
             self.finalize_loading();
         }
+        None
     }
 
     // Processes frames from a buffer, returns bytes processed
@@ -2136,10 +2157,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         PageTransform::None => complete,
     };
     let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    io.pread(offset, c)
+    start_in_group(group, c, |c| io.pread(offset, c))
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
@@ -2255,11 +2273,7 @@ pub fn begin_write_wal_header<F: File + ?Sized>(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    let c = io.pwrite(0, buffer, c)?;
-    Ok(c)
+    start_in_group(group, c, |c| io.pwrite(0, buffer, c))
 }
 
 /// If the payload overflows the given limits, returns `Some(local_size)`, where `local_size` is
@@ -2593,6 +2607,39 @@ mod tests {
         assert!(read_varint(buf).is_err());
     }
 
+    /// A page read whose submission fails must not leave an unfinished
+    /// child in its group: anything waiting on the group (for example
+    /// `drain_completions` in `balance_non_root`) would wait forever.
+    #[test]
+    fn failed_page_read_submission_finishes_its_group_child() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io
+            .open_file("failed-read.db", crate::OpenFlags::Create, false)
+            .unwrap();
+        let db_file = crate::storage::database::DatabaseFile::new(file);
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(4096)
+            .expect("initialize buffer pool");
+        let page = Arc::new(crate::storage::pager::Page::new(0));
+        let mut group = CompletionGroup::new(|_| {});
+
+        // `DatabaseFile::read_page` rejects page 0 before submitting the read.
+        let result = begin_read_page(
+            &db_file,
+            buffer_pool,
+            page,
+            0,
+            false,
+            &IOContext::default(),
+            Some(&mut group),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(group.len(), 1);
+        assert!(group.completions().iter().all(|c| c.finished()));
+    }
+
     #[test]
     fn streaming_reader_ignores_uncommitted_checksums() {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
@@ -2752,5 +2799,20 @@ mod tests {
             seen_lengths,
             (1..=9).collect::<std::collections::HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn write_varint_to_vec_appends_the_bytes_of_write_varint() {
+        let values = (0..64)
+            .flat_map(|bits| [(1u64 << bits) - 1, 1u64 << bits])
+            .chain([u64::MAX]);
+        for value in values {
+            let mut expected = [0u8; 9];
+            let len = write_varint(&mut expected, value);
+            let mut appended = std::vec![0xab_u8];
+            write_varint_to_vec(value, &mut appended);
+            assert_eq!(appended[0], 0xab, "value {value}");
+            assert_eq!(&appended[1..], &expected[..len], "value {value}");
+        }
     }
 }

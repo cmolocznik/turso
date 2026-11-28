@@ -2,12 +2,13 @@ use crate::translate::expr_context::ExprContext;
 use crate::{alloc::TursoVecExt, sync::Arc};
 
 use crate::alloc::*;
-use turso_parser::ast::{self, SortOrder};
+use crate::ast::{self, SortOrder};
 
 use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
+    turso_assert,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -19,7 +20,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
+    plan::{DistinctOnRegisters, Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -50,6 +51,19 @@ fn result_column_custom_type_info<'a>(
     }
 }
 
+/// For a sort key that is a column of a custom type with a DECODE, returns
+/// the type: the sort key holds the column's stored form, so that the sorter
+/// compares stored values. An array of the type holds the values of its
+/// elements instead, as it does everywhere outside its column.
+fn sort_key_stored_form_type(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<std::sync::Arc<crate::schema::TypeDef>> {
+    let (column, type_def) = result_column_custom_type_info(expr, referenced_tables, schema)?;
+    (!column.is_array() && type_def.decode().is_some()).then_some(type_def)
+}
+
 // Metadata for handling ORDER BY operations
 #[derive(Debug)]
 pub struct SortMetadata {
@@ -78,14 +92,11 @@ impl EmitOrderBy {
         program: &mut ProgramBuilder,
         t_ctx: &mut TranslateCtx,
         result_columns: &[ResultSetColumn],
-        order_by: &[(
-            Box<ast::Expr>,
-            SortOrder,
-            Option<turso_parser::ast::NullsOrder>,
-        )],
+        order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
+        has_limit: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         for (expr, _, _) in order_by.iter() {
@@ -107,8 +118,9 @@ impl EmitOrderBy {
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
         let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
-        let use_heap_sort =
-            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
+        // The LIMIT counter is set up after this function runs (see `emit_query`), so the
+        // choice depends on whether the query has a LIMIT, not on `t_ctx.limit_ctx`.
+        let use_heap_sort = !has_distinct && !has_group_by && has_limit && !has_explicit_nulls;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -291,9 +303,16 @@ impl EmitOrderBy {
             sort_cursor
         };
 
-        program.preassign_label_to_next_insn(sort_loop_start_label);
+        let distinct_on = match plan.distinctness {
+            Distinctness::DistinctOn { key_count } => {
+                turso_assert!(!use_heap_sort, "DISTINCT ON reads its rows from a sorter");
+                emit_explain!(program, false, EqpDetail::DistinctOn);
+                Some(DistinctOnRegisters::alloc(program, key_count))
+            }
+            _ => None,
+        };
 
-        emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
+        program.preassign_label_to_next_insn(sort_loop_start_label);
 
         if !use_heap_sort {
             program.emit_insn(Insn::SorterData {
@@ -302,6 +321,28 @@ impl EmitOrderBy {
                 pseudo_cursor: cursor_id,
             });
         }
+
+        if let (Some(distinct_on), Distinctness::DistinctOn { key_count }) =
+            (&distinct_on, &plan.distinctness)
+        {
+            for i in 0..*key_count {
+                program.emit_column_or_rowid(cursor_id, i, distinct_on.reg_key_start + i);
+            }
+            let mut key_collations = std::vec::Vec::with_capacity(*key_count);
+            for (expr, _, _) in &plan.order_by[..*key_count] {
+                key_collations.push(
+                    ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?,
+                );
+            }
+            distinct_on.emit_skip_unless_first_row_of_group(
+                program,
+                key_collations,
+                sort_loop_next_label,
+            );
+        }
+
+        emit_offset(program, sort_loop_next_label, t_ctx.reg_offset);
 
         // We emit the columns in SELECT order, not sorter order (sorter always has the sort keys first).
         // This is tracked in sort_metadata.remappings.
@@ -319,21 +360,22 @@ impl EmitOrderBy {
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
             if remapping.deduplicated {
-                if let Some((_, type_def)) = result_column_custom_type_info(
+                if let Some(type_def) = sort_key_stored_form_type(
                     &rc.expr,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(decode_expr) = type_def.decode() {
+                    if let Some(decode) = type_def.decode() {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
                             target_pc: skip_label,
                         });
-                        super::expr::emit_type_expr(
+                        super::expr::emit_conversion(
                             program,
-                            decode_expr,
-                            reg,
+                            &type_def,
+                            "DECODE",
+                            decode,
                             reg,
                             &t_ctx.resolver,
                         )?;
@@ -426,12 +468,12 @@ impl EmitOrderBy {
                     extra_amount: 0,
                 });
             } else {
-                // Sort keys must be encoded (on-disk) values. Suppress decode so the
-                // sorter compares stored values, with SQLite's comparison or the
-                // built-in type's own order (numeric).
+                // Sort keys of custom type columns hold stored values. Suppress
+                // decode so the sorter compares them with SQLite's comparison or
+                // the built-in type's own order (numeric).
                 let is_custom =
-                    result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
-                        .is_some_and(|(_, td)| td.decode().is_some());
+                    sort_key_stored_form_type(expr, &plan.table_references, resolver.schema())
+                        .is_some();
                 if is_custom {
                     program.flags.set_suppress_custom_type_decode(true);
                 }
@@ -467,14 +509,21 @@ impl EmitOrderBy {
                 target_pc: insert_label,
                 decrement_by: 1,
             });
+            // A negative LIMIT means no limit, so every row is inserted.
+            program.emit_insn(Insn::IfNeg {
+                reg: limit_reg,
+                target_pc: insert_label,
+            });
             program.emit_insn(Insn::Last {
                 cursor_id: *sort_cursor,
                 pc_if_empty: insert_label,
             });
+            // Compare only the sort keys: the sequence and result column registers
+            // are not yet computed for this row.
             program.emit_insn(Insn::IdxLE {
                 cursor_id: *sort_cursor,
                 start_reg,
-                num_regs: orderby_sorter_column_count,
+                num_regs: order_by_len,
                 target_pc: skip_label,
             });
             program.emit_insn(Insn::Delete {
@@ -518,7 +567,7 @@ impl EmitOrderBy {
         }
 
         // Handle SELECT DISTINCT deduplication
-        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
 
             // For distinctness checking with Insn::Found, we need a contiguous run of registers containing all the result columns.
@@ -668,11 +717,7 @@ pub struct OrderByRemapping {
 /// If we skip a result column, we need to keep track what index in the ORDER BY sorter the result columns have,
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
-    order_by: &[(
-        Box<ast::Expr>,
-        SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
-    )],
+    order_by: &[(Box<ast::Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     result_columns: &[ResultSetColumn],
     has_sequence: bool,
 ) -> Result<Vec<OrderByRemapping>> {

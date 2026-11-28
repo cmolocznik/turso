@@ -199,7 +199,7 @@ docker-cli-run:
 	docker run -it -v ./:/app turso-cli
 
 bench-tpc-c:
-	@cd perf/tpc-c/tpcc-turso && ./run_bench.sh
+	@cd perf/tpc-c && ./run_bench.sh
 .PHONY: bench-tpc-c
 
 merge-pr:
@@ -244,7 +244,7 @@ sim-schema:
 	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
 
 test-shuttle:
-	RUSTFLAGS='--cfg tokio_unstable --cfg shuttle' cargo nextest run --profile shuttle --package turso_core
+	RUSTFLAGS='--cfg tokio_unstable --cfg shuttle' cargo nextest run --profile shuttle --package turso_core --features io_uring
 
 test-loom:
 	RUSTFLAGS='--cfg tokio_unstable --cfg loom' cargo nextest run --profile loom --package turso_core

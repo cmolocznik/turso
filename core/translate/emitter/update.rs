@@ -1,13 +1,14 @@
-use super::gencol::compute_virtual_columns;
+use super::gencol::{compute_generated_columns, emit_row_from_cursor, sets_custom_type_column};
+use super::new_values::{emit_input_conversion, StatementValues};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
-use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
@@ -35,8 +36,7 @@ use crate::{
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
             emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
-            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
-            ParentKeyNewProbeMode,
+            fire_fk_update_actions, ForeignKeyActions, ParentKeyNewProbeMode,
         },
         insert::format_unique_violation_desc,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
@@ -55,7 +55,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext, DmlRowForm},
+        builder::{CursorKey, DmlColumnContext, DmlRowForm},
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -67,7 +67,6 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -106,38 +105,45 @@ pub fn emit_program_for_update(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
     program
         .flags
         .set_has_statement_conflict(plan.or_conflict.is_some());
 
-    // Open an ephemeral table for buffering RETURNING results.
-    // All DML completes before any RETURNING rows are yielded to the caller.
-    let returning_buffer = if plan.returning.as_ref().is_some_and(|r| !r.is_empty()) {
-        let btree_table = plan
-            .target_table
-            .table
-            .btree()
-            .expect("UPDATE target must be a BTree table");
-        let ret_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: ret_cursor_id,
-            is_table: true,
-        });
-        Some(ReturningBufferCtx {
-            cursor_id: ret_cursor_id,
-            num_columns: plan.returning.as_ref().unwrap().len(),
-        })
-    } else {
-        None
-    };
-
     let target_table = Arc::new(plan.target_table.clone());
     let target_tables =
         TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
+
+    // Open an ephemeral table for buffering RETURNING results.
+    // All DML completes before any RETURNING rows are yielded to the caller.
+    let returning_buffer = match plan.returning.as_deref() {
+        Some(returning) if !returning.is_empty() => Some(ReturningBufferCtx::open(
+            program,
+            plan.target_table.table.get_name(),
+            returning,
+            &target_tables,
+        )?),
+        _ => None,
+    };
+
     let write_set_plan = plan.write_set_plan.take();
+    // The write set select reads the FROM tables, which the write phase no
+    // longer has, so the SET expressions are typed against its tables.
+    let tables_read_by_set_expressions = write_set_plan
+        .as_ref()
+        .map_or(&target_tables, |plan| &plan.select.table_references);
+    let target_is_strict = matches!(&target_table.table, Table::BTree(btree) if btree.is_strict);
+    let set_value_sources = if target_is_strict {
+        set_value_sources(
+            target_table.table.columns().len(),
+            tables_read_by_set_expressions,
+            plan.set_clauses.iter().map(|c| (c.column_index, &*c.expr)),
+            resolver,
+        )
+    } else {
+        Vec::new()
+    };
     let temp_cursor_id = match write_set_plan.as_ref() {
         Some(plan) => {
             let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.select.query_destination
@@ -187,6 +193,7 @@ pub fn emit_program_for_update(
                 namespace: NamespaceRef::root_of(MAIN_DB_ID),
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );
@@ -454,6 +461,7 @@ pub fn emit_program_for_update(
         connection,
         &mut write_phase_tables,
         &plan.set_clauses,
+        &set_value_sources,
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
@@ -466,6 +474,7 @@ pub fn emit_program_for_update(
         target_table,
         returning_buffer.as_ref(),
         &mut update_subqueries,
+        &plan.row_checks,
     )?;
 
     // Close the main loop
@@ -488,7 +497,6 @@ pub fn emit_program_for_update(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(write_phase_tables);
@@ -502,14 +510,13 @@ pub fn emit_program_for_update(
 /// register layout (`start` + `layout`) that maps column index → register,
 /// rowid bookkeeping (including whether the UPDATE changes the rowid and
 /// where the new value comes from), the optional partial-index cursor in use,
-/// CDC tracking registers, and the mask of columns actually named in the SET
-/// clause so untouched columns can be copied from the OLD image.
+/// CDC tracking registers, and the mask of columns the UPDATE changes so
+/// untouched columns can be copied from the OLD image.
 struct UpdateColumnCtx<'a> {
     cdc_update_alter_statement: Option<&'a str>,
     target_table: &'a Arc<JoinedTable>,
     target_table_cursor_id: usize,
     start: usize,
-    rowid_reg: usize,
     updates_rowid: bool,
     rowid_set_clause_reg: Option<usize>,
     is_virtual_table: bool,
@@ -517,9 +524,6 @@ struct UpdateColumnCtx<'a> {
     cdc_updates_register: Option<usize>,
     layout: &'a ColumnLayout,
     affected_columns: &'a ColumnMask,
-    /// The columns whose registers hold the user's values until ENCODE runs;
-    /// the other columns hold stored values.
-    user_value_columns: &'a ColumnMask,
 }
 
 impl UpdateColumnCtx<'_> {
@@ -664,7 +668,8 @@ fn update_trigger_context(
 /// keys are enabled — prepares and fires the appropriate FK actions and
 /// child-FK counter decrements. `new_row_registers`, when provided, lets
 /// FK action emission see the incoming NEW image so it can distinguish a
-/// cascading REPLACE from an unrelated delete.
+/// cascading REPLACE from an unrelated delete. `recheck_after_replace_reg`,
+/// when provided, is set to 1 after the delete.
 #[allow(clippy::too_many_arguments)]
 fn emit_replace_delete<'a>(
     program: &mut ProgramBuilder,
@@ -675,6 +680,7 @@ fn emit_replace_delete<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     conflicting_rowid_reg: usize,
     new_row_registers: Option<(usize, usize)>,
+    recheck_after_replace_reg: Option<usize>,
     update_namespace: NamespaceRef,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
@@ -768,6 +774,31 @@ fn emit_replace_delete<'a>(
         }
     }
 
+    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
+            Some(emit_cdc_full_record(
+                program,
+                &t_ctx.resolver,
+                target_table.table.columns(),
+                target_table_cursor_id,
+                conflicting_rowid_reg,
+            )?)
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            &t_ctx.resolver,
+            OperationMode::DELETE,
+            cdc_cursor_id,
+            conflicting_rowid_reg,
+            before_record_reg,
+            None,
+            None,
+            table_name,
+        )?;
+    }
+
     program.emit_insn(Insn::Delete {
         cursor_id: target_table_cursor_id,
         table_name: table_name.to_string(),
@@ -780,6 +811,12 @@ fn emit_replace_delete<'a>(
         connection,
         update_database_id,
     )?;
+    if let Some(recheck_reg) = recheck_after_replace_reg {
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: recheck_reg,
+        });
+    }
 
     Ok(())
 }
@@ -828,21 +865,13 @@ fn emit_update_column_values<'a>(
     for (idx, table_column) in target_table_columns.iter().enumerate() {
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
 
-        // If the column needs to be updated, retrieve its column index, or its expression.
-        // Such a column can be directly updated, in which case `expr` is the right-side of the SET
-        // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
-        // column's expression.
+        if table_column.is_generated() && column_ctx.affected_columns.get(idx) {
+            continue;
+        }
         let update_expr = set_clauses
             .iter()
             .find(|set_clause| set_clause.column_index == idx)
-            .map(UpdateSetClause::emitted_expr)
-            .or_else(|| {
-                if column_ctx.affected_columns.get(idx) {
-                    table_column.generated_expr()
-                } else {
-                    None
-                }
-            });
+            .map(UpdateSetClause::emitted_expr);
 
         if let Some(expr) = update_expr {
             if !skip_set_clauses {
@@ -863,91 +892,91 @@ fn emit_update_column_values<'a>(
                         &t_ctx.resolver,
                     )?;
 
+                    let key_may_be_generated = t_ctx
+                        .resolver
+                        .catalog
+                        .dialect
+                        .generates_integer_primary_keys();
+                    if table_column.is_rowid_alias() && !key_may_be_generated {
+                        emit_notnull_constraint_check(
+                            program,
+                            table_references,
+                            rowid_set_clause_reg,
+                            table_column,
+                            column_ctx.table_name(),
+                            notnull_conflict_resolution(program, table_column),
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
                         target_pc: None,
                     });
+                    if table_column.is_rowid_alias() {
+                        crate::translate::expr::emit_coerce_rowid(
+                            program,
+                            table_column,
+                            rowid_set_clause_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
 
                     program.emit_null(target_reg, None);
                 } else {
-                    let self_table_context = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => Some(SelfTableContext::ForDML {
-                            dml_ctx: DmlColumnContext::layout(
-                                column_ctx.target_table.table.columns(),
-                                column_ctx.start,
-                                column_ctx.rowid_reg,
-                                column_ctx.layout.clone(),
-                                DmlRowForm::StoredExceptUpdated(
-                                    column_ctx.user_value_columns.clone(),
-                                ),
-                            ),
-                            table: column_ctx.target_table.table.require_btree()?,
-                        }),
-                        GeneratedType::NotGenerated => None,
+                    // Save/restore target_union_type so union_value() resolves tags
+                    // against this column's union type. See ProgramBuilder::target_union_type.
+                    let union_td = t_ctx
+                        .resolver
+                        .schema()
+                        .get_type_def_unchecked(&table_column.ty_str)
+                        .filter(|td| td.is_union())
+                        .cloned();
+                    let prev_union = program.target_union_type.take();
+                    program.target_union_type = union_td;
+
+                    // Columns with custom type encode must not have their
+                    // SET expressions hoisted as constants. See the doc
+                    // comment on NoConstantOptReason::CustomTypeEncode.
+                    let has_custom_encode = t_ctx
+                        .resolver
+                        .schema()
+                        .resolve_type_unchecked(&table_column.ty_str)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|r| r.has_encode_or_coerce());
+                    let translate_result = if has_custom_encode {
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                            NoConstantOptReason::CustomTypeEncode,
+                        )
+                    } else {
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                        )
                     };
-
-                    t_ctx.resolver.with_self_table_context(
-                        program,
-                        self_table_context.as_ref(),
-                        |program, _| {
-                            // Save/restore target_union_type so union_value() resolves tags
-                            // against this column's union type. See ProgramBuilder::target_union_type.
-                            let union_td = t_ctx
-                                .resolver
-                                .schema()
-                                .get_type_def_unchecked(&table_column.ty_str)
-                                .filter(|td| td.is_union())
-                                .cloned();
-                            let prev_union = program.target_union_type.take();
-                            program.target_union_type = union_td;
-
-                            // Columns with custom type encode must not have their
-                            // SET expressions hoisted as constants. See the doc
-                            // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = t_ctx
-                                .resolver
-                                .schema()
-                                .resolve_type_unchecked(&table_column.ty_str)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|r| {
-                                    r.chain.iter().any(|td| td.has_encode_or_coerce())
-                                });
-                            let translate_result = if has_custom_encode {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(table_references),
-                                    expr,
-                                    target_reg,
-                                    &t_ctx.resolver,
-                                    NoConstantOptReason::CustomTypeEncode,
-                                )
-                            } else {
-                                translate_expr(
-                                    program,
-                                    Some(table_references),
-                                    expr,
-                                    target_reg,
-                                    &t_ctx.resolver,
-                                )
-                            };
-                            program.target_union_type = prev_union;
-                            translate_result?;
-                            if table_column.notnull() && !skip_notnull_checks {
-                                emit_notnull_constraint_check(
-                                    program,
-                                    table_references,
-                                    target_reg,
-                                    table_column,
-                                    column_ctx.table_name(),
-                                    notnull_conflict_resolution(program, table_column),
-                                    skip_row_label,
-                                    &t_ctx.resolver,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    )?;
+                    program.target_union_type = prev_union;
+                    translate_result?;
+                    if table_column.notnull() && !skip_notnull_checks {
+                        emit_notnull_constraint_check(
+                            program,
+                            table_references,
+                            target_reg,
+                            table_column,
+                            column_ctx.table_name(),
+                            notnull_conflict_resolution(program, table_column),
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                 }
 
                 if let Some(CdcUpdateRegisters {
@@ -976,7 +1005,7 @@ fn emit_update_column_values<'a>(
         } else {
             // Column is not being updated, read it from the table
             match table_column.generated_type() {
-                GeneratedType::NotGenerated => {
+                GeneratedType::NotGenerated | GeneratedType::Stored { .. } => {
                     let column_idx_in_index = column_ctx.index.as_ref().and_then(|(idx, _)| {
                         idx.columns.iter().position(|c| {
                             table_column
@@ -1051,9 +1080,11 @@ fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) 
 /// where they must run later than the first `emit_update_column_values` call:
 /// after BEFORE triggers have fired, or after the STRICT type check.
 ///
-/// The checks run in two passes, as in INSERT: first the columns the SET clauses
+/// The checks run in passes, as in INSERT: first the columns the SET clauses
 /// change, because OR REPLACE puts a column's DEFAULT in place of a NULL there,
 /// then the generated columns, once they are computed again from those values.
+/// When a SET column has a custom type, the virtual columns are checked after
+/// ENCODE instead, once they are computed from the encoded row.
 /// `include_column` picks the columns of the pass.
 fn emit_deferred_notnull_checks<'a>(
     program: &mut ProgramBuilder,
@@ -1086,27 +1117,24 @@ fn emit_deferred_notnull_checks<'a>(
     Ok(())
 }
 
-/// Check the new values of the SET columns against their declared types, before
-/// custom type encoding.
-fn emit_input_type_check(
-    program: &mut ProgramBuilder,
-    btree: &Arc<BTreeTable>,
-    start: usize,
-    layout: &ColumnLayout,
-    updated_column_indices: &ColumnMask,
+/// The source of the new value of each column of a table with `column_count`
+/// columns. `set_values` gives the column index and the expression of each
+/// SET item, and `table_references` has the tables the expressions read.
+pub(crate) fn set_value_sources<'e>(
+    column_count: usize,
+    table_references: &TableReferences,
+    set_values: impl Iterator<Item = (usize, &'e ast::Expr)>,
     resolver: &Resolver,
-) -> crate::Result<()> {
-    program.emit_insn(Insn::TypeCheck {
-        start_reg: start,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::input_type_check_table_ref(
-            btree,
-            resolver.schema(),
-            Some(updated_column_indices),
-        )?,
-    });
-    Ok(())
+) -> Vec<crate::dialect::CastSource> {
+    let env = crate::translate::expr::expr_type::TypeEnv::new(Some(table_references), resolver);
+    let mut sources = vec![crate::dialect::CastSource::Unnamed; column_count];
+    for (column_index, expr) in set_values {
+        if let Some(source) = sources.get_mut(column_index) {
+            *source =
+                crate::translate::expr::expr_type::cast_source_of(expr, &env, resolver.schema());
+        }
+    }
+    sources
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -1125,6 +1153,7 @@ fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     set_clauses: &[UpdateSetClause],
+    set_value_sources: &[crate::dialect::CastSource],
     cdc_update_alter_statement: Option<&str>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
@@ -1137,6 +1166,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+    row_checks: &[crate::translate::row_security::RowCheck],
 ) -> crate::Result<()> {
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
@@ -1351,9 +1381,11 @@ fn emit_update_insns<'a>(
         )?,
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks
-        .iter()
-        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
+    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
+        t_ctx
+            .resolver
+            .fk_counts_children_of_old_parent_key(&fk.fk, fk.fk.on_update)
+    });
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,
@@ -1365,7 +1397,6 @@ fn emit_update_insns<'a>(
         target_table: &target_table,
         target_table_cursor_id,
         start,
-        rowid_reg: beg,
         updates_rowid,
         rowid_set_clause_reg,
         is_virtual_table,
@@ -1373,7 +1404,6 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
-        user_value_columns: &user_value_columns,
     };
     let skip_set_clauses = false;
 
@@ -1402,7 +1432,13 @@ fn emit_update_insns<'a>(
     // columns, so on such a table a wrong type wins over a NOT NULL violation.
     let notnull_checks_follow_type_check = !has_before_triggers
         && target_table.table.btree().is_some_and(|btree| {
-            btree.is_strict && btree.columns().iter().any(|c| c.is_generated())
+            btree.is_strict
+                && (btree.columns().iter().any(|c| c.is_generated())
+                    || t_ctx
+                        .resolver
+                        .catalog
+                        .dialect
+                        .converts_values_before_not_null())
         });
 
     let table_column_was_read = emit_update_column_values(
@@ -1459,21 +1495,18 @@ fn emit_update_insns<'a>(
             // Only read OLD row values when triggers or FK cascades need them
             let columns = target_table.table.columns();
             let old_registers: Option<Vec<usize>> = if needs_old_registers {
-                let mut regs = Vec::with_capacity(col_len + 1);
-                for (i, column) in columns.iter().enumerate() {
-                    let reg = program.alloc_register();
-                    emit_table_column(
-                        program,
-                        target_table_cursor_id,
-                        internal_id,
-                        table_references,
-                        column,
-                        i,
-                        reg,
-                        &t_ctx.resolver,
-                    )?;
-                    regs.push(reg);
-                }
+                // A virtual column allocates more registers to compute its value, so
+                // allocate the registers of all columns first. The foreign key actions
+                // read the OLD row as one register for each column, in declaration order.
+                let first_reg = program.alloc_registers(col_len);
+                let mut regs: Vec<usize> = (first_reg..first_reg + col_len).collect();
+                emit_row_from_cursor(
+                    program,
+                    &btree_table,
+                    target_table_cursor_id,
+                    &regs,
+                    &t_ctx.resolver,
+                )?;
                 regs.push(beg);
                 Some(regs)
             } else {
@@ -1485,23 +1518,21 @@ fn emit_update_insns<'a>(
                     old_registers.expect("old_registers allocated when has_before_triggers");
                 // SQLite rejects a wrong type before firing the triggers, so they
                 // never see it.
-                if btree_table.is_strict {
-                    emit_input_type_check(
-                        program,
-                        &btree_table,
-                        start,
-                        &layout,
-                        &user_value_columns,
-                        &t_ctx.resolver,
-                    )?;
-                }
+                emit_input_conversion(
+                    program,
+                    &t_ctx.resolver,
+                    &btree_table,
+                    start,
+                    &layout,
+                    StatementValues::Only(&user_value_columns),
+                    set_value_sources,
+                )?;
                 // NEW row values are already in 'start' registers.
                 // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
                 // use the new rowid register; otherwise use the current rowid (beg).
                 let new_rowid_reg = effective_rowid_reg;
 
                 // Compute virtual columns for NEW values
-                //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
                     let new_ctx = DmlColumnContext::layout(
                         columns,
@@ -1510,7 +1541,7 @@ fn emit_update_insns<'a>(
                         layout.clone(),
                         DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
                     );
-                    compute_virtual_columns(
+                    compute_generated_columns(
                         program,
                         &btree.columns_topo_sort()?,
                         &new_ctx,
@@ -1623,26 +1654,8 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
-            |column| !column.is_virtual_generated(),
+            |column| !column.is_generated(),
         )?;
-    }
-
-    // Build a complete NEW row image for FK code now, while the old cursor is
-    // still positioned. This is only data preparation. FK counters must not be
-    // touched yet because later CHECK/PK/UNIQUE conflict handling may still
-    // decide that `ON CONFLICT IGNORE` makes this row a no-op.
-    if connection.foreign_keys_enabled() {
-        let rowid_new_reg = effective_rowid_reg;
-        if let Some(table_btree) = target_table.table.btree() {
-            stabilize_new_row_for_fk(
-                program,
-                &table_btree,
-                &updated_column_indices,
-                target_table_cursor_id,
-                start,
-                rowid_new_reg,
-            )?;
-        }
     }
 
     // Populate register-to-affinity map for expression index evaluation.
@@ -1669,17 +1682,15 @@ fn emit_update_insns<'a>(
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
-        if btree.is_strict {
-            // pre-encode typecheck for updated columns
-            emit_input_type_check(
-                program,
-                btree,
-                start,
-                &layout,
-                &user_value_columns,
-                &t_ctx.resolver,
-            )?;
-        }
+        emit_input_conversion(
+            program,
+            &t_ctx.resolver,
+            btree,
+            start,
+            &layout,
+            StatementValues::Only(&user_value_columns),
+            set_value_sources,
+        )?;
         if notnull_checks_follow_type_check {
             // Before the generated columns are computed again below, so that
             // they read the DEFAULT that OR REPLACE put in place of a NULL.
@@ -1690,7 +1701,7 @@ fn emit_update_insns<'a>(
                 &column_ctx,
                 skip_row_label,
                 t_ctx,
-                |column| !column.is_virtual_generated(),
+                |column| !column.is_generated(),
             )?;
         }
         let has_check_constraints = !btree.check_constraints.is_empty();
@@ -1725,6 +1736,7 @@ fn emit_update_insns<'a>(
             || has_returning
             || has_check_constraints
             || index_references_virtual_column
+            || cols.iter().any(Column::is_stored_generated)
         {
             let dml_ctx = DmlColumnContext::layout(
                 cols,
@@ -1733,7 +1745,7 @@ fn emit_update_insns<'a>(
                 layout.clone(),
                 DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
             );
-            compute_virtual_columns(
+            compute_generated_columns(
                 program,
                 &btree.columns_topo_sort()?,
                 &dml_ctx,
@@ -1743,19 +1755,24 @@ fn emit_update_insns<'a>(
         }
     }
 
-    if has_before_triggers || notnull_checks_follow_type_check {
-        // The generated columns were computed again above, from the values the
-        // deferred checks may have replaced with a DEFAULT.
-        emit_deferred_notnull_checks(
-            program,
-            table_references,
-            &target_table,
-            &column_ctx,
-            skip_row_label,
-            t_ctx,
-            Column::is_virtual_generated,
-        )?;
-    }
+    // When a SET column has a custom type, the generated columns are computed again
+    // after ENCODE, below, and their NOT NULL checks wait for these values.
+    let computes_generated_columns_after_encode = target_table.table.btree().is_some_and(|btree| {
+        btree.is_strict && sets_custom_type_column(&btree, &user_value_columns, &t_ctx.resolver)
+    });
+
+    // The generated columns were computed again above, from the values the
+    // deferred checks may have replaced with a DEFAULT.
+    emit_deferred_notnull_checks(
+        program,
+        table_references,
+        &target_table,
+        &column_ctx,
+        skip_row_label,
+        t_ctx,
+        |column| column.is_generated() && !computes_generated_columns_after_encode,
+    )?;
+    emit_cdc_updates_of_generated_columns(program, &target_table, &column_ctx);
 
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
     // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
@@ -1794,40 +1811,13 @@ fn emit_update_insns<'a>(
             }
             _ => {
                 // ABORT/FAIL/ROLLBACK behavior
-                let raw_desc = if let Some(idx) = rowid_alias_index {
-                    String::from(table_name)
-                        + "."
-                        + target_table
-                            .table
-                            .columns()
-                            .get(idx)
-                            .unwrap()
-                            .name
-                            .as_ref()
-                            .map_or("", |v| v)
-                } else {
-                    String::from(table_name) + ".rowid"
-                };
-                program.emit_insn(Insn::Halt {
-                    constraint_info: Some(Box::new(ConstraintInfo::primary_key(
-                        table_name,
-                        target_table
-                            .table
-                            .btree()
-                            .unwrap()
-                            .primary_key_constraint_name
-                            .clone(),
-                        vec![rowid_alias_index.map_or_else(
-                            || "rowid".to_string(),
-                            |idx| target_table.table.columns()[idx].name.clone().unwrap(),
-                        )],
-                        vec![target_reg],
-                    ))),
-                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description: raw_desc,
-                    on_error: program.constraint_halt_on_error(effective_rowid_alias_conflict),
-                    description_reg: None,
-                });
+                emit_rowid_conflict_halt(
+                    program,
+                    &target_table,
+                    rowid_alias_index,
+                    target_reg,
+                    effective_rowid_alias_conflict,
+                );
             }
         }
 
@@ -1861,6 +1851,26 @@ fn emit_update_insns<'a>(
                 &layout,
             )?;
 
+            // The generated columns were computed from the SET values before ENCODE. When a
+            // SET column has a custom type, a read of the row can give other values, so
+            // compute them again from the encoded row, as a read of the row gives them.
+            if computes_generated_columns_after_encode {
+                let dml_ctx = DmlColumnContext::layout(
+                    btree_table.columns(),
+                    start,
+                    effective_rowid_reg,
+                    layout.clone(),
+                    DmlRowForm::Stored,
+                );
+                compute_generated_columns(
+                    program,
+                    &btree_table.columns_topo_sort()?,
+                    &dml_ctx,
+                    &t_ctx.resolver,
+                    &btree_table,
+                )?;
+            }
+
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
@@ -1872,7 +1882,36 @@ fn emit_update_insns<'a>(
                     t_ctx.resolver.schema(),
                 ),
             });
+
+            if computes_generated_columns_after_encode {
+                emit_deferred_notnull_checks(
+                    program,
+                    table_references,
+                    &target_table,
+                    &column_ctx,
+                    skip_row_label,
+                    t_ctx,
+                    Column::is_generated,
+                )?;
+            }
         }
+
+        // Rows that row-level security does not let the role write fail
+        // before the CHECK constraints, as in PostgreSQL.
+        crate::translate::row_security::emit_row_checks(
+            program,
+            &mut t_ctx.resolver,
+            row_checks,
+            &TableReferences::new(vec![target_table.as_ref().clone()], vec![]),
+            effective_rowid_reg,
+            btree_table.columns().iter().enumerate().map(|(idx, col)| {
+                if col.is_rowid_alias() {
+                    (col, effective_rowid_reg)
+                } else {
+                    (col, layout.to_register(start, idx))
+                }
+            }),
+        )?;
 
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
@@ -1949,6 +1988,56 @@ fn emit_update_insns<'a>(
     }
 
     let mut idx_phase_ctxs: Vec<IndexUpdatePhaseCtx> = Vec::with_capacity(indexes_to_update.len());
+
+    let any_replace = target_table.table.btree().is_some_and(|table_btree| {
+        any_effective_replace(
+            program.flags.has_statement_conflict(),
+            or_conflict,
+            table_btree.rowid_alias_conflict_clause,
+            indexes_to_update.iter().map(|idx| idx.on_conflict),
+        )
+    });
+    let recheck_after_replace_reg = (any_replace
+        && connection.foreign_keys_enabled()
+        && t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.has_child_fks(update_namespace.id, table_name)
+                || s.any_resolved_fks_referencing(update_namespace.id, table_name)
+        }))
+    .then(|| {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg,
+        });
+        reg
+    });
+
+    // A rowid REPLACE runs before the UNIQUE index checks, unless the REPLACE
+    // comes from the table definition and not from the statement. Then it runs
+    // after them, so that the indexes' own ABORT, FAIL or IGNORE take effect
+    // before the delete. This is SQLite's order.
+    let rowid_replace = target_table.table.btree().is_some()
+        && updates_rowid
+        && matches!(effective_rowid_alias_conflict, ResolveType::Replace);
+    let defer_rowid_replace = !program.flags.has_statement_conflict();
+    if rowid_replace && !defer_rowid_replace {
+        emit_rowid_replace(
+            program,
+            connection,
+            table_references,
+            &target_table,
+            target_table_cursor_id,
+            all_index_cursors,
+            rowid_set_clause_reg.expect("rowid_set_clause_reg must be set"),
+            beg,
+            check_rowid_not_exists_label
+                .expect("check_rowid_not_exists_label must be set when rowid is updated"),
+            (start, effective_rowid_reg),
+            recheck_after_replace_reg,
+            update_namespace,
+            t_ctx,
+        )?;
+    }
 
     // ---- Phase 1: Constraint checks + new key build ----
     let mut seen_replace = false;
@@ -2151,43 +2240,33 @@ fn emit_update_insns<'a>(
                         all_index_cursors,
                         idx_rowid_reg,
                         Some((start, effective_rowid_reg)),
+                        recheck_after_replace_reg,
                         update_namespace,
                         t_ctx,
                     )?;
 
                     program.preassign_label_to_next_insn(after_delete_label);
 
-                    // Seek back to the original row we're updating
-                    let continue_label = program.allocate_label();
+                    // Seek back to the original row we're updating. A foreign
+                    // key action run by the delete may have deleted it; then
+                    // skip it, like SQLite.
                     program.emit_insn(Insn::SeekRowid {
                         cursor_id: target_table_cursor_id,
                         src_reg: original_rowid_reg,
-                        target_pc: continue_label, // Should always succeed
+                        target_pc: skip_row_label,
                     });
-                    program.preassign_label_to_next_insn(continue_label);
                 }
                 _ => {
                     // ABORT/FAIL/ROLLBACK behavior
-                    let btree_table = target_table.table.require_btree()?;
-                    let mut constraint_info = ConstraintInfo::unique_index(
-                        &btree_table,
-                        index,
-                        (idx_start_reg..idx_start_reg + num_cols).collect(),
-                    );
-                    emit_constraint_values_decode(
+                    emit_unique_conflict_halt(
                         program,
                         &t_ctx.resolver,
-                        &btree_table,
-                        &mut constraint_info,
+                        &*target_table.table.require_btree()?,
+                        index,
+                        idx_start_reg,
+                        num_cols,
+                        idx_conflict,
                     )?;
-                    let err_code = constraint_info.kind.sqlite_extended_result_code();
-                    program.emit_insn(Insn::Halt {
-                        constraint_info: Some(Box::new(constraint_info)),
-                        err_code,
-                        description: format_unique_violation_desc(&btree_table, index),
-                        on_error: program.constraint_halt_on_error(idx_conflict),
-                        description_reg: None,
-                    });
                 }
             }
 
@@ -2210,54 +2289,108 @@ fn emit_update_insns<'a>(
         "idx_phase_ctxs.len() != indexes_to_update.len()"
     );
 
-    // PK REPLACE: when the new rowid conflicts with an existing row, delete it.
-    // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
-    // constraints fire before this deletion, matching SQLite's ordering.
-    if target_table.table.btree().is_some()
-        && updates_rowid
-        && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
-    {
-        let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
-        let no_rowid_conflict_label = program.allocate_label();
-        let row_not_found_label = check_rowid_not_exists_label
-            .expect("check_rowid_not_exists_label must be set when rowid is updated");
-
-        // If the new rowid equals the old rowid, no conflict.
-        program.emit_insn(Insn::Eq {
-            lhs: target_reg,
-            rhs: beg,
-            target_pc: no_rowid_conflict_label,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
-        });
-
-        // If a row with the new rowid doesn't exist, no conflict.
-        program.emit_insn(Insn::NotExists {
-            cursor: target_table_cursor_id,
-            rowid_reg: target_reg,
-            target_pc: no_rowid_conflict_label,
-        });
-
-        emit_replace_delete(
+    if rowid_replace && defer_rowid_replace {
+        emit_rowid_replace(
             program,
             connection,
             table_references,
             &target_table,
             target_table_cursor_id,
             all_index_cursors,
-            target_reg,
-            Some((start, effective_rowid_reg)),
+            rowid_set_clause_reg.expect("rowid_set_clause_reg must be set"),
+            beg,
+            check_rowid_not_exists_label
+                .expect("check_rowid_not_exists_label must be set when rowid is updated"),
+            (start, effective_rowid_reg),
+            recheck_after_replace_reg,
             update_namespace,
             t_ctx,
         )?;
+    }
 
-        // Re-seek to the row under update so Phase 2's old-image reads are correct.
-        program.preassign_label_to_next_insn(no_rowid_conflict_label);
-        program.emit_insn(Insn::NotExists {
-            cursor: target_table_cursor_id,
-            rowid_reg: beg,
-            target_pc: row_not_found_label,
+    // Foreign key actions run by a REPLACE delete can insert a row that
+    // conflicts with the new row again. When any REPLACE delete ran, check the
+    // rowid and every UNIQUE index once more, failing with ABORT on a
+    // conflict, like SQLite's `sqlite3GenerateConstraintChecks`.
+    if let Some(recheck_reg) = recheck_after_replace_reg {
+        let recheck_done = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: recheck_reg,
+            target_pc: recheck_done,
+            jump_if_null: true,
         });
+        if let Some(target_reg) = rowid_set_clause_reg {
+            let rowid_ok = program.allocate_label();
+            program.emit_insn(Insn::Eq {
+                lhs: target_reg,
+                rhs: beg,
+                target_pc: rowid_ok,
+                flags: CmpInsFlags::default(),
+                collation: CollationSeq::for_internal_values(),
+            });
+            program.emit_insn(Insn::NotExists {
+                cursor: target_table_cursor_id,
+                rowid_reg: target_reg,
+                target_pc: rowid_ok,
+            });
+            emit_rowid_conflict_halt(
+                program,
+                &target_table,
+                rowid_alias_index,
+                target_reg,
+                ResolveType::Abort,
+            );
+            program.preassign_label_to_next_insn(rowid_ok);
+            // NotExists moved the table cursor off the row under update.
+            program.emit_insn(Insn::NotExists {
+                cursor: target_table_cursor_id,
+                rowid_reg: beg,
+                target_pc: check_rowid_not_exists_label
+                    .expect("check_rowid_not_exists_label must be set when rowid is updated"),
+            });
+        }
+        for (index, ctx) in indexes_to_update.iter().zip(idx_phase_ctxs.iter()) {
+            if !index.unique {
+                continue;
+            }
+            let index_ok = program.allocate_label();
+            if let Some(new_satisfied) = ctx.new_satisfies_where {
+                program.emit_insn(Insn::IfNot {
+                    reg: new_satisfied,
+                    target_pc: index_ok,
+                    jump_if_null: true,
+                });
+            }
+            program.emit_insn(Insn::NoConflict {
+                cursor_id: ctx.idx_cursor_id,
+                target_pc: index_ok,
+                record_reg: ctx.idx_start_reg,
+                num_regs: ctx.num_cols,
+            });
+            let idx_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: ctx.idx_cursor_id,
+                dest: idx_rowid_reg,
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: beg,
+                rhs: idx_rowid_reg,
+                target_pc: index_ok,
+                flags: CmpInsFlags::default(),
+                collation: CollationSeq::for_internal_values(),
+            });
+            emit_unique_conflict_halt(
+                program,
+                &t_ctx.resolver,
+                &*target_table.table.require_btree()?,
+                index,
+                ctx.idx_start_reg,
+                ctx.num_cols,
+                ResolveType::Abort,
+            )?;
+            program.preassign_label_to_next_insn(index_ok);
+        }
+        program.preassign_label_to_next_insn(recheck_done);
     }
 
     // This is the first point where FK counter changes are safe:
@@ -2283,12 +2416,7 @@ fn emit_update_insns<'a>(
             // counter so the statement/transaction can fail later if nothing
             // fixes it.
             if has_parent_fk_checks {
-                let new_key_probe_mode = if any_effective_replace(
-                    program.flags.has_statement_conflict(),
-                    or_conflict,
-                    table_btree.rowid_alias_conflict_clause,
-                    indexes_to_update.iter().map(|idx| idx.on_conflict),
-                ) {
+                let new_key_probe_mode = if any_replace {
                     ParentKeyNewProbeMode::AfterReplace
                 } else {
                     ParentKeyNewProbeMode::BeforeWrite
@@ -2639,7 +2767,6 @@ fn emit_update_insns<'a>(
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
             // This ensures the new parent key exists when cascade actions update child rows
             if has_parent_fk_actions {
-                // OLD column values are stored in preserved_old_registers (contiguous registers)
                 let old_values_start = preserved_old_registers
                     .as_ref()
                     .expect("FK check requires OLD values")[0];
@@ -2649,6 +2776,9 @@ fn emit_update_insns<'a>(
                     table_name,
                     beg, // old_rowid_reg
                     old_values_start,
+                    &ColumnLayout::Identity {
+                        column_count: col_len,
+                    },
                     start, // new_values_start
                     effective_rowid_reg,
                     connection,
@@ -2728,45 +2858,6 @@ fn emit_update_insns<'a>(
                     connection,
                 );
                 if !relevant_triggers.is_empty() {
-                    let columns = target_table.table.columns();
-
-                    // Compute VIRTUAL columns for NEW values
-                    //TODO only emit required virtual columns
-                    let bt = target_table.table.btree().ok_or_else(|| {
-                        crate::LimboError::InternalError(
-                            "UPDATE on virtual table has no btree".into(),
-                        )
-                    })?;
-                    let new_ctx = DmlColumnContext::layout(
-                        columns,
-                        start,
-                        beg,
-                        layout.clone(),
-                        DmlRowForm::Stored,
-                    );
-                    compute_virtual_columns(
-                        program,
-                        &btree_table.columns_topo_sort()?,
-                        &new_ctx,
-                        &t_ctx.resolver,
-                        &bt,
-                    )?;
-
-                    // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
-                    if let Some(ref old_regs) = preserved_old_registers {
-                        let pairs = columns.iter().zip(old_regs.iter().copied());
-                        //TODO only emit required virtual columns
-                        let old_ctx =
-                            DmlColumnContext::from_column_reg_mapping(pairs, DmlRowForm::Stored);
-                        compute_virtual_columns(
-                            program,
-                            &btree_table.columns_topo_sort()?,
-                            &old_ctx,
-                            &t_ctx.resolver,
-                            &bt,
-                        )?;
-                    }
-
                     // Build raw NEW registers. Values are encoded at this point;
                     // fire_trigger will decode them via decode_trigger_registers.
                     let new_registers_after: Vec<usize> = (0..col_len)
@@ -2824,4 +2915,155 @@ fn emit_update_insns<'a>(
 
     t_ctx.resolver.register_columns.clear();
     Ok(())
+}
+
+/// Delete the row that holds the new rowid, if it is not the row under update,
+/// then seek back to the row under update.
+#[allow(clippy::too_many_arguments)]
+fn emit_rowid_replace<'a>(
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    table_references: &mut TableReferences,
+    target_table: &Arc<JoinedTable>,
+    target_table_cursor_id: usize,
+    all_index_cursors: &[(Arc<Index>, usize)],
+    new_rowid_reg: usize,
+    old_rowid_reg: usize,
+    row_not_found_label: BranchOffset,
+    new_row_registers: (usize, usize),
+    recheck_after_replace_reg: Option<usize>,
+    update_namespace: NamespaceRef,
+    t_ctx: &mut TranslateCtx<'a>,
+) -> crate::Result<()> {
+    let no_rowid_conflict_label = program.allocate_label();
+    program.emit_insn(Insn::Eq {
+        lhs: new_rowid_reg,
+        rhs: old_rowid_reg,
+        target_pc: no_rowid_conflict_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor: target_table_cursor_id,
+        rowid_reg: new_rowid_reg,
+        target_pc: no_rowid_conflict_label,
+    });
+    emit_replace_delete(
+        program,
+        connection,
+        table_references,
+        target_table,
+        target_table_cursor_id,
+        all_index_cursors,
+        new_rowid_reg,
+        Some(new_row_registers),
+        recheck_after_replace_reg,
+        update_namespace,
+        t_ctx,
+    )?;
+    program.preassign_label_to_next_insn(no_rowid_conflict_label);
+    program.emit_insn(Insn::NotExists {
+        cursor: target_table_cursor_id,
+        rowid_reg: old_rowid_reg,
+        target_pc: row_not_found_label,
+    });
+    Ok(())
+}
+
+/// Halt with the PRIMARY KEY error for a new rowid that is already taken.
+fn emit_rowid_conflict_halt(
+    program: &mut ProgramBuilder,
+    target_table: &JoinedTable,
+    rowid_alias_index: Option<usize>,
+    target_reg: usize,
+    on_conflict: ResolveType,
+) {
+    let table_name = target_table.table.get_name();
+    let raw_desc = if let Some(idx) = rowid_alias_index {
+        String::from(table_name)
+            + "."
+            + target_table
+                .table
+                .columns()
+                .get(idx)
+                .unwrap()
+                .name
+                .as_ref()
+                .map_or("", |v| v)
+    } else {
+        String::from(table_name) + ".rowid"
+    };
+    program.emit_insn(Insn::Halt {
+        constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+            table_name,
+            target_table
+                .table
+                .btree()
+                .unwrap()
+                .primary_key_constraint_name
+                .clone(),
+            vec![rowid_alias_index.map_or_else(
+                || "rowid".to_string(),
+                |idx| target_table.table.columns()[idx].name.clone().unwrap(),
+            )],
+            vec![target_reg],
+        ))),
+        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+        description: raw_desc,
+        on_error: program.constraint_halt_on_error(on_conflict),
+        description_reg: None,
+    });
+}
+
+/// Halt with the UNIQUE error for the new key in `idx_start_reg..idx_start_reg + num_cols`.
+fn emit_unique_conflict_halt(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    btree_table: &BTreeTable,
+    index: &Index,
+    idx_start_reg: usize,
+    num_cols: usize,
+    on_conflict: ResolveType,
+) -> crate::Result<()> {
+    let mut constraint_info = ConstraintInfo::unique_index(
+        btree_table,
+        index,
+        (idx_start_reg..idx_start_reg + num_cols).collect(),
+    );
+    emit_constraint_values_decode(program, resolver, btree_table, &mut constraint_info)?;
+    let err_code = constraint_info.kind.sqlite_extended_result_code();
+    program.emit_insn(Insn::Halt {
+        constraint_info: Some(Box::new(constraint_info)),
+        err_code,
+        description: format_unique_violation_desc(btree_table, index),
+        on_error: program.constraint_halt_on_error(on_conflict),
+        description_reg: None,
+    });
+    Ok(())
+}
+
+/// Record in CDC the new values of the stored generated columns the UPDATE changes.
+fn emit_cdc_updates_of_generated_columns(
+    program: &mut ProgramBuilder,
+    target_table: &JoinedTable,
+    column_ctx: &UpdateColumnCtx<'_>,
+) {
+    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
+        if !table_column.is_generated() || !column_ctx.affected_columns.get(idx) {
+            continue;
+        }
+        if let Some(CdcUpdateRegisters {
+            change_flag,
+            new_value,
+        }) = column_ctx.cdc_update_registers(idx, table_column)
+        {
+            program.emit_bool(true, change_flag);
+            program.mark_last_insn_constant();
+            program.emit_insn(Insn::Copy {
+                src_reg: column_ctx.layout.to_register(column_ctx.start, idx),
+                dst_reg: new_value,
+                extra_amount: 0,
+            });
+        }
+    }
 }

@@ -150,7 +150,7 @@ change when they are converted to text.
 | SELECT ... NATURAL JOIN   | ✅ Yes     |                                                                                   |
 | UPDATE                    | ✅ Yes     |                                                                                   |
 | VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
-| WITH clause               | 🚧 Partial | WITH RECURSIVE not yet supported.  |
+| WITH clause               | ✅ Yes     | Includes WITH RECURSIVE.           |
 | WINDOW functions             | 🚧 Partial | Aggregate functions, `row_number`, `rank`, `dense_rank`, `first_value`, `last_value`, and `nth_value` work with the default frame. Missing: `percent_rank`, `cume_dist`, `ntile`, `lag`, and `lead`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) are not yet supported. |
 | GENERATED                 | 🚧 Partial      | virtual columns only (partial affinity support). |
 | WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. Effectively **insert-only**: CREATE / INSERT / SELECT work (incl. composite PK), but UPDATE, DELETE, UPSERT, `INSERT OR REPLACE`, secondary UNIQUE constraints, secondary `CREATE INDEX`, `FOREIGN KEY`, CDC, and materialized views are all rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |
@@ -220,7 +220,7 @@ avoid this window.
 | PRAGMA analysis_limit            | ❌ No         |                                              |
 | PRAGMA application_id            | ✅ Yes        |                                              |
 | PRAGMA auto_vacuum               | 🚧 Partial    | Read works; write requires `--experimental-autovacuum` |
-| PRAGMA automatic_index           | ❌ No         |                                              |
+| PRAGMA automatic_index           | ✅ Yes        |                                              |
 | PRAGMA busy_timeout              | ✅ Yes         |                                              |
 | PRAGMA cache_size                | ✅ Yes        |                                              |
 | PRAGMA cache_spill               | 🚧 Partial    | Enabled/Disabled only                        |
@@ -234,10 +234,10 @@ avoid this window.
 | PRAGMA data_version              | ❌ No         |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
 | PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                         |
-| PRAGMA defer_foreign_keys        | ❌ No         |                                              |
+| PRAGMA defer_foreign_keys        | ✅ Yes        |                                              |
 | PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                         |
 | PRAGMA encoding                  | ✅ Yes        |                                              |
-| PRAGMA foreign_key_check         | ❌ No         |                                              |
+| PRAGMA foreign_key_check         | ✅ Yes        |                                              |
 | PRAGMA foreign_key_list          | ✅ Yes        |                                              |
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
@@ -300,8 +300,8 @@ PRAGMAs that exist only in Turso and have no SQLite equivalent. Visible via `PRA
 |-----------------------------------------|--------------------------------------------------------------------------------------------------|
 | PRAGMA capture_data_changes_conn        | Configure per-connection Change Data Capture. Returns `(mode, table, version)`; default `off`.   |
 | PRAGMA unstable_capture_data_changes_conn | Unstable alias of `capture_data_changes_conn`; same shape and behavior, name may change.       |
-| PRAGMA cipher                           | Encryption-at-rest cipher selection (paired with `hexkey`). Read-only without a session key.     |
-| PRAGMA hexkey                           | Encryption-at-rest key for the current session. Returns `"encryption key is not set for this session"` when unset. |
+| PRAGMA cipher                           | Reports the immutable open-time encryption cipher. Assignments are rejected.     |
+| PRAGMA hexkey                           | Reports whether the connection has a key, without returning key material. Assignments are rejected. |
 | PRAGMA data_sync_retry                  | Retry policy for disk sync failures (boolean).                                                   |
 | PRAGMA list_types                       | Introspect Turso's type system. Returns `(type, parent, encode, decode, default, operators)`.    |
 | PRAGMA mvcc_checkpoint_threshold        | MVCC checkpoint tuning. |
@@ -792,7 +792,7 @@ Modifiers:
 | sqlite3_libversion_number | ✅ Yes  | Returns 3050004 |
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
-| sqlite3_complete       | ❌ No      | Stub    |
+| sqlite3_complete       | ✅ Yes     |         |
 | sqlite3_interrupt      | ✅ Yes     |         |
 | sqlite3_sleep          | ❌ No      | Stub    |
 | sqlite3_randomness     | ❌ No      |         |

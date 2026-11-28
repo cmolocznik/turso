@@ -1,0 +1,315 @@
+# The boolean type. It reads text as PostgreSQL does, in a column and in a
+# cast, and it is the type of a comparison and the other conditions.
+#
+# In each row of a result of a test that writes to a column, the text that was
+# written is on the left and the boolean that the column stored is on the
+# right.
+
+@database :memory:
+
+test bool-reads-whole-words {
+    CREATE TABLE t (id int, input text, b boolean);
+    INSERT INTO t VALUES
+        (1, 'true', 'true'), (2, 'false', 'false'), (3, 'yes', 'yes'), (4, 'no', 'no'),
+        (5, 'on', 'on'), (6, 'off', 'off'), (7, '1', '1'), (8, '0', '0');
+    SELECT input, b FROM t ORDER BY id;
+}
+expect {
+    true|t
+    false|f
+    yes|t
+    no|f
+    on|t
+    off|f
+    1|t
+    0|f
+}
+
+# The first letters of true, false, yes or no are enough.
+test bool-reads-first-letters-of-a-word {
+    CREATE TABLE t (id int, input text, b boolean);
+    INSERT INTO t VALUES (1, 'y', 'y'), (2, 'n', 'n'), (3, 'tr', 'tr'), (4, 'fals', 'fals');
+    SELECT input, b FROM t ORDER BY id;
+}
+expect {
+    y|t
+    n|f
+    tr|t
+    fals|f
+}
+
+# off needs two letters, because on starts with o too.
+test bool-reads-of-as-off {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('of');
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test bool-refuses-o {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+# Whitespace around the text and the case of the letters do not count.
+test bool-reads-text-with-whitespace-and-capitals {
+    CREATE TABLE t (id int, input text, b boolean);
+    INSERT INTO t VALUES (1, ' true ', ' true '), (2, 'FALSE', 'FALSE');
+    SELECT '[' || input || ']', b FROM t ORDER BY id;
+}
+expect {
+    [ true ]|t
+    [FALSE]|f
+}
+
+test bool-reads-text-in-update {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true);
+    UPDATE t SET b = 'n';
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test invalid-bool-into-bool-column {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('maybe');
+}
+@sqlstate 22P02
+expect error {}
+
+# Text that goes on after the word is not a boolean.
+test bool-refuses-text-longer-than-the-word {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('truex');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truex"
+}
+
+test bool-refuses-empty-text {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: ""
+}
+
+# A cast to boolean reads a value as a boolean column does.
+
+test bool-literal-casts-true-forms {
+    SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
+}
+expect {
+    t|t|t|t|t|t|t
+}
+
+test bool-literal-casts-false-forms {
+    SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
+}
+expect {
+    f|f|f|f|f
+}
+
+test bool-invalid-literal {
+    SELECT 'maybe'::boolean;
+}
+@sqlstate 22P02
+expect error {}
+
+test cast-as-boolean-form {
+    SELECT CAST('true' AS boolean), CAST(1 AS boolean), CAST(0 AS boolean);
+}
+expect {
+    t|t|f
+}
+
+test jsonb-column-cast-to-boolean {
+    CREATE TABLE j (b jsonb);
+    INSERT INTO j VALUES ('true');
+    SELECT b::boolean FROM j;
+}
+expect {
+    t
+}
+
+# A condition is a boolean wherever it appears.
+test regex-operators-give-boolean {
+    SELECT 'abc' ~ 'b', 'abc' ~* 'B', 'abc' !~ 'b', 'abc' !~* 'B', 'abc' SIMILAR TO '%b%';
+}
+expect {
+    t|t|f|f|t
+}
+
+test array-operators-give-boolean {
+    SELECT ARRAY[1, 2] && ARRAY[2], ARRAY[1, 2] @> ARRAY[2], ARRAY[2] <@ ARRAY[1, 2], 1 = ANY(ARRAY[1, 2]);
+}
+expect {
+    t|t|t|t
+}
+
+test condition-keeps-boolean-in-values {
+    SELECT * FROM (VALUES (1 < 2), (false)) AS v(x);
+}
+expect {
+    t
+    f
+}
+
+test condition-keeps-boolean-in-top-level-values {
+    VALUES (1 < 2), (true);
+}
+expect {
+    t
+    t
+}
+
+test condition-keeps-boolean-in-cte-over-values {
+    WITH c AS (VALUES (1 < 2)) SELECT * FROM c;
+}
+expect {
+    t
+}
+
+test condition-keeps-boolean-in-subquery {
+    SELECT x, y FROM (SELECT 1 < 2 AS x, 'a' ~ 'a' AS y) AS s;
+}
+expect {
+    t|t
+}
+
+test condition-keeps-boolean-in-union {
+    SELECT x FROM (SELECT 'a' ~ 'a' AS x UNION ALL SELECT false) AS s;
+}
+expect {
+    t
+    f
+}
+
+test condition-keeps-boolean-in-case-and-coalesce {
+    SELECT CASE WHEN 1 < 2 THEN 1 < 3 ELSE false END, coalesce(NULL, 1 < 2), nullif(true, false);
+}
+expect {
+    t|t|t
+}
+
+test count-compared-with-zero-is-boolean {
+    SELECT count(*) > 0 FROM (SELECT 1) AS s;
+}
+expect {
+    t
+}
+
+test condition-written-to-boolean-column {
+    CREATE TABLE t (id int PRIMARY KEY, b boolean, d boolean DEFAULT 1 < 2, g boolean GENERATED ALWAYS AS (id > 1) STORED);
+    INSERT INTO t (id, b) VALUES (1, 1 < 2), (2, 'a' ~ 'a'), (3, ARRAY[1] && ARRAY[1]), (4, NULL);
+    UPDATE t SET b = NOT b WHERE id = 1;
+    INSERT INTO t (id, b) SELECT 5, id > 3 FROM t WHERE id = 1;
+    SELECT id, b, d, g FROM t ORDER BY id;
+}
+expect {
+    1|f|t|f
+    2|t|t|t
+    3|t|t|t
+    4||t|t
+    5|f|t|t
+}
+
+test view-over-condition-gives-boolean {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1), (3);
+    CREATE VIEW v AS SELECT id, id > 2 AS big, 'a' ~ 'a' AS m FROM t;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|f|t
+    3|t|t
+}
+
+# A condition has no arithmetic operators, as a boolean column has none.
+test condition-plus-an-integer-errors {
+    SELECT (1 < 2) + 1;
+}
+expect error {
+    operator does not exist: boolean \+ integer
+}
+
+test negated-condition-errors {
+    SELECT -(1 < 2);
+}
+expect error {
+    operator does not exist: - boolean
+}
+
+test condition-from-a-subquery-plus-an-integer-errors {
+    SELECT x + 1 FROM (SELECT 'a' ~ 'a' AS x) AS s;
+}
+expect error {
+    operator does not exist: boolean \+ integer
+}
+
+test date-plus-a-condition-errors {
+    CREATE TABLE t (d date);
+    INSERT INTO t VALUES ('2024-01-05');
+    SELECT d + (1 < 2) FROM t;
+}
+expect error {
+    operator does not exist: date \+ boolean
+}
+
+test condition-cast-to-integer-has-arithmetic {
+    SELECT (1 < 2)::int + 1, -(2 < 1)::int;
+}
+expect {
+    2|0
+}
+
+# A comparison and the other conditions give a boolean.
+
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test is-true-is-not-true-on-bool-col {
+    SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
+}
+expect {
+    1|t|f
+    2|f|t
+    3|f|t
+    4|f|t
+}
+
+test in-with-null-three-valued {
+    SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
+}
+expect {
+    t||
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test boolean-comparison-output {
+    SELECT id < 2, n IS NULL FROM t WHERE id = 1;
+}
+expect {
+    t|f
+}
+
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test exists-subquery-output {
+    SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
+}
+expect {
+    t
+}

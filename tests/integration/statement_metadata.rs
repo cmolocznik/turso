@@ -10,13 +10,15 @@
 //!   name, array depth, custom-type kind, resolved primitive) and computed
 //!   expressions (inferred affinity primitive). Gated behind the experimental
 //!   custom-types feature.
+//! - `Statement::get_column_origin`: the table column a result column reads,
+//!   as SQLite's `sqlite3_column_origin_name()` and its siblings give it.
 //! - Function-name aliases: `chr` resolves to the same scalar function as
 //!   `char`, and `strpos` resolves to the same scalar function as `instr`.
 
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
-    use turso_core::{ColumnTypeInfo, ColumnTypeKind, Statement};
+    use turso_core::{ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement};
 
     /// Helper: open a fresh DB with custom types + STRICT support enabled.
     /// Array, struct, union and domain columns require STRICT mode and the
@@ -543,25 +545,24 @@ mod tests {
         assert_eq!(expect_info(&stmt, 1).declared_name, "INTEGER");
     }
 
-    /// Expressions whose primitive can't be determined statically — function
-    /// calls without a declared return affinity, BLOB literals, NULL literals
-    /// — yield `Ok(None)`. Callers fall through to their own default (TEXT
-    /// is the typical wire-protocol choice).
+    /// An expression that always gives a blob reports BLOB.
+    #[test]
+    fn type_info_blob_for_blob_expressions() {
+        let db = fresh_db_with_custom_types("type_info_blob.db");
+        let conn = db.connect_limbo();
+        for sql in ["SELECT randomblob(8)", "SELECT x'AB'"] {
+            let stmt = conn.prepare(sql).unwrap();
+            assert_eq!(expect_info(&stmt, 0).declared_name, "BLOB", "{sql}");
+        }
+    }
+
+    /// A NULL literal's type can't be determined statically, so it yields
+    /// `Ok(None)`. Callers fall through to their own default (TEXT is the
+    /// typical wire-protocol choice).
     #[test]
     fn type_info_none_for_indeterminate_expressions() {
         let db = fresh_db_with_custom_types("type_info_indet.db");
         let conn = db.connect_limbo();
-
-        // `randomblob(N)` returns a BLOB — no useful wire primitive to
-        // report. Use any function call with no declared return affinity.
-        let blob = conn.prepare("SELECT randomblob(8)").unwrap();
-        assert!(blob.get_column_type_info(0).unwrap().is_none());
-
-        // Blob literals carry a concrete value type but no useful primitive
-        // to expose in wire-protocol terms (clients consuming BYTEA already
-        // get an exact byte stream; there's nothing to "report").
-        let blob_lit = conn.prepare("SELECT x'AB'").unwrap();
-        assert!(blob_lit.get_column_type_info(0).unwrap().is_none());
 
         // NULL literal: type is genuinely indeterminate at compile time.
         let null_lit = conn.prepare("SELECT NULL").unwrap();
@@ -729,5 +730,108 @@ mod tests {
         stmt.run_ignore_rows().unwrap();
         let copied: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM dst ORDER BY a");
         assert_eq!(copied, vec![(1, "x".to_string()), (2, "y".to_string())]);
+    }
+
+    fn origins(stmt: &Statement) -> Vec<Option<ColumnOrigin>> {
+        (0..stmt.num_columns())
+            .map(|i| stmt.get_column_origin(i))
+            .collect()
+    }
+
+    fn origin(database: &str, table: &str, column: &str, ty: Option<&str>) -> Option<ColumnOrigin> {
+        Some(ColumnOrigin {
+            database: database.to_string(),
+            table: table.to_string(),
+            column: column.to_string(),
+            declared_type: ty.map(str::to_string),
+        })
+    }
+
+    /// The origins SQLite gives for the same statements.
+    #[test]
+    fn column_origin_follows_subqueries_views_and_ctes() {
+        let db = TempDatabase::builder()
+            .with_opts(
+                turso_core::DatabaseOpts::new()
+                    .with_attach(true)
+                    .with_views(true),
+            )
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40), note)")
+            .unwrap();
+        conn.execute("CREATE TABLE posts (title text)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT name AS n, id * 2 AS dbl FROM users")
+            .unwrap();
+        conn.execute("ATTACH ':memory:' AS aux").unwrap();
+        conn.execute("CREATE TABLE aux.t (a DECIMAL(10,2))")
+            .unwrap();
+        conn.execute("CREATE TEMP TABLE tt (z INT)").unwrap();
+
+        let users_name = origin("main", "users", "name", Some("VARCHAR(40)"));
+        let cases = [
+            (
+                "SELECT id, name AS display, note, id + 1 FROM users",
+                vec![
+                    origin("main", "users", "id", Some("INTEGER")),
+                    users_name.clone(),
+                    origin("main", "users", "note", None),
+                    None,
+                ],
+            ),
+            (
+                "SELECT x FROM (SELECT name AS x FROM users)",
+                vec![users_name.clone()],
+            ),
+            ("SELECT (name) FROM users", vec![users_name.clone()]),
+            ("SELECT n, dbl FROM v", vec![users_name.clone(), None]),
+            (
+                "WITH c AS (SELECT name AS n FROM users) SELECT n FROM c",
+                vec![users_name.clone()],
+            ),
+            (
+                "SELECT name FROM users UNION SELECT title FROM posts",
+                vec![users_name.clone()],
+            ),
+            (
+                "SELECT x FROM (SELECT name AS x FROM users UNION SELECT title FROM posts)",
+                vec![origin("main", "posts", "title", Some("TEXT"))],
+            ),
+            (
+                "SELECT a FROM aux.t",
+                vec![origin("aux", "t", "a", Some("DECIMAL(10,2)"))],
+            ),
+            (
+                "SELECT rowid FROM posts",
+                vec![origin("main", "posts", "rowid", Some("INTEGER"))],
+            ),
+            (
+                "SELECT z FROM tt",
+                vec![origin("temp", "tt", "z", Some("INT"))],
+            ),
+            (
+                "SELECT value FROM json_each('[1]')",
+                vec![origin("main", "json_each", "value", None)],
+            ),
+            ("EXPLAIN SELECT name FROM users", vec![None; 8]),
+        ];
+        for (sql, expected) in cases {
+            let stmt = conn.prepare(sql).unwrap();
+            assert_eq!(origins(&stmt), expected, "{sql}");
+            for (i, origin) in expected.iter().enumerate() {
+                assert_eq!(
+                    stmt.get_column_table_name(i).as_deref(),
+                    origin.as_ref().map(|o| o.table.as_str()),
+                    "{sql}"
+                );
+                if origin.is_some() {
+                    assert_eq!(
+                        stmt.get_column_decltype(i),
+                        origin.as_ref().and_then(|o| o.declared_type.clone()),
+                        "{sql}"
+                    );
+                }
+            }
+        }
     }
 }

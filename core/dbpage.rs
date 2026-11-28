@@ -1,8 +1,9 @@
+use crate::ast;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::util::IOExt;
-use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+use crate::vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
@@ -30,8 +31,25 @@ impl InternalVirtualTable for DbPageTable {
         DBPAGE_TABLE_NAME.to_string()
     }
 
-    fn sql(&self) -> String {
-        "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)".to_string()
+    fn columns(&self) -> Vec<ast::ColumnDefinition> {
+        let mut pgno = column_definition("pgno", "INTEGER");
+        pgno.constraints.push(ast::NamedColumnConstraint {
+            name: None,
+            constraint: ast::ColumnConstraint::PrimaryKey {
+                order: None,
+                conflict_clause: None,
+                auto_increment: false,
+            },
+        });
+        vec![
+            pgno,
+            column_definition("data", "BLOB"),
+            column_definition("schema", "HIDDEN"),
+        ]
+    }
+
+    fn superuser_only(&self) -> bool {
+        true
     }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {

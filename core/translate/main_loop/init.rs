@@ -15,7 +15,7 @@ pub fn init_distinct(
             ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
         })
         .collect::<Result<Vec<_>>>()?;
-    DistinctCtx::new(program, collations)
+    DistinctCtx::new(program, collations, plan.distinctness.is_ordered())
 }
 
 /// First step of Loop emission, opens cursors for all tables and initializes distinct aggregate
@@ -89,20 +89,22 @@ impl InitLoop {
             );
             let collations =
                 vec![ExprContext::new(Some(tables), &t_ctx.resolver).expr_collation(&agg.args[0])?];
-            let ctx = DistinctCtx::new(program, collations)?;
-            let hash_table_id = ctx.hash_table_id;
-            agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };
-            // DISTINCT aggregate hash tables live in ProgramState, so a correlated
-            // subquery can re-enter with rows from the previous invocation still
-            // recorded unless we clear the seen-set here.
-            program.emit_insn(Insn::HashClear { hash_table_id });
-            emit_explain!(
-                program,
-                false,
-                crate::translate::eqp::EqpDetail::DistinctAggregate {
-                    function: agg.func.to_string(),
-                }
-            );
+            let ordered = agg.distinctness.is_ordered();
+            let ctx = DistinctCtx::new(program, collations, ordered)?;
+            ctx.emit_reset(program);
+            agg.distinctness = Distinctness::Distinct {
+                ctx: Some(ctx),
+                ordered,
+            };
+            if !ordered {
+                emit_explain!(
+                    program,
+                    false,
+                    crate::translate::eqp::EqpDetail::DistinctAggregate {
+                        function: agg.func.to_string(),
+                    }
+                );
+            }
         }
         let mut required_tables: TableMask = join_order
             .iter()
@@ -641,16 +643,16 @@ fn emit_percentile_fraction_check(
     resolver: &Resolver,
     agg: &mut crate::translate::plan::Aggregate,
 ) -> Result<()> {
-    use turso_parser::ast::Expr;
+    use crate::ast::Expr;
     // The fraction must be constant w.r.t. the aggregated rows. Outer
     // (correlated) columns are constant for the inner aggregate and allowed;
     // a subquery may hide an input-column reference, so reject conservatively.
     // This must run before we emit the expression — at this point the cursors
-    // for this query's tables aren't open yet, so a local Column read would
+    // for this query's tables aren't open yet, so a local Column or RowId read would
     // panic in translate_expr.
     walk_expr(&agg.args[1], &mut |e: &Expr| -> Result<WalkControl> {
         let invalid = match e {
-            Expr::Column { table, .. } => {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 matches!(tables.find_table_by_internal_id(*table), Some((false, _)))
             }
             Expr::Subquery(_) | Expr::Exists(_) | Expr::SubqueryResult { .. } => true,

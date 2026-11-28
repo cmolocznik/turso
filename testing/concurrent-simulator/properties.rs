@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail};
 use turso_core::{LimboError, Value};
 
 use crate::elle::{ElleEventType, ElleOp};
-use crate::operations::{OpResult, Operation};
+use crate::operations::{OpResult, Operation, TxMode};
 use crate::{AUTOINC_TABLE_NAME, PersistedSequenceState, SequenceParams};
 
 /// A property that can be validated during simulation.
@@ -947,7 +947,8 @@ pub struct SequenceCorrectnessProperty {
     ///     the engine's disk state will reflect exactly V (plus any
     ///     subsequent nextval advances from V).
     ///
-    /// Rolled-back nextval/setval values are deliberately NOT included.
+    /// Rolled-back nextval/setval values are deliberately NOT included,
+    /// except nextval values from BEGIN CONCURRENT (see `concurrent_txns`).
     /// The engine bundles the sequence backing-table write with the user's
     /// tx (see core/schema.rs Sequence design block for the rationale), so
     /// a rolled-back op is reverted from disk and may legitimately be
@@ -1064,6 +1065,11 @@ pub struct SequenceCorrectnessProperty {
     /// scoped to fresh emissions because CYCLE re-emission is allowed
     /// and `all_values` is wrap-aware.
     seqs_with_seq_default_ever: HashSet<String>,
+    /// Transactions opened with BEGIN CONCURRENT. Under MVCC, nextval inside
+    /// such a transaction writes the sequence in its own inner transaction
+    /// that commits before nextval returns, so the value stays used even if
+    /// the outer transaction rolls back (see `create-sequence.mdx`).
+    concurrent_txns: HashSet<u64>,
 }
 
 impl Default for SequenceCorrectnessProperty {
@@ -1117,6 +1123,7 @@ impl SequenceCorrectnessProperty {
             seqs_with_seq_default_ever: HashSet::new(),
             pending_setval_re_emission: HashMap::new(),
             seq_default_tables: HashMap::new(),
+            concurrent_txns: HashSet::new(),
         }
     }
 
@@ -1329,6 +1336,13 @@ impl Property for SequenceCorrectnessProperty {
         };
 
         match op {
+            Operation::Begin {
+                mode: TxMode::Concurrent,
+            } => {
+                if let Some(txn_id) = txn_id {
+                    self.concurrent_txns.insert(txn_id);
+                }
+            }
             Operation::CreateSequence {
                 seq_name,
                 start,
@@ -1464,6 +1478,11 @@ impl Property for SequenceCorrectnessProperty {
                 let Some(params) = self.params.get(seq_name) else {
                     return Ok(());
                 };
+                // Outside a transaction and inside BEGIN CONCURRENT, the
+                // value is committed before nextval returns. Inside other
+                // transactions it is committed only by COMMIT.
+                let committed_at_emit =
+                    txn_id.is_none_or(|txn_id| self.concurrent_txns.contains(&txn_id));
 
                 if value < params.min_value || value > params.max_value {
                     bail!(
@@ -1516,8 +1535,8 @@ impl Property for SequenceCorrectnessProperty {
                     setval_overlapped || any_pending_setval || in_flight_setval_overlapped;
 
                 // Duplicate-value check: only run against the committed
-                // emission set when this nextval is autocommitted. Values
-                // emitted inside an explicit transaction sit in
+                // emission set when this nextval's value is already
+                // committed. Values emitted inside other transactions sit in
                 // `pending_txn_values` until that transaction commits;
                 // they are checked against `all_values` at Commit time
                 // (see `Operation::Commit` branch). Two concurrent
@@ -1528,7 +1547,7 @@ impl Property for SequenceCorrectnessProperty {
                 // Flagging the second emission at observation time
                 // misreports a transient state that the engine will
                 // resolve correctly.
-                if txn_id.is_none() {
+                if committed_at_emit {
                     // The pending re-emission allowance: a setval that
                     // touched this seq recorded one or more target
                     // values the next observed nextvals may emit
@@ -1683,7 +1702,7 @@ impl Property for SequenceCorrectnessProperty {
                 // so post-setval duplicates still fire there.
                 let skip_monotonicity = self.seqs_with_setval_ever.contains(seq_name)
                     || self.seqs_with_seq_default_ever.contains(seq_name);
-                if txn_id.is_none() && !setval_could_have_raced && !skip_monotonicity {
+                if committed_at_emit && !setval_could_have_raced && !skip_monotonicity {
                     if let Some(&(wm, wm_eid)) = self.watermark.get(seq_name) {
                         if wm_eid < start_exec_id && !is_cycle_wrap(params, value, wm) {
                             if params.increment > 0 && value <= wm {
@@ -1707,8 +1726,8 @@ impl Property for SequenceCorrectnessProperty {
                         }
                     }
                 }
-                // Only autocommit emissions update the cross-fiber
-                // watermark immediately. In-tx emissions defer their
+                // Only already-committed emissions update the cross-fiber
+                // watermark immediately. Other in-tx emissions defer their
                 // watermark update to the Operation::Commit branch —
                 // until that point we cannot tell whether the emission
                 // will actually survive (it may be aborted by an MVCC
@@ -1716,7 +1735,7 @@ impl Property for SequenceCorrectnessProperty {
                 // and polluting the shared watermark with a possibly-
                 // dead emission causes spurious wrong-direction failures
                 // in the OTHER racing tx.
-                if txn_id.is_none() {
+                if committed_at_emit {
                     self.watermark
                         .insert(seq_name.clone(), (value, end_exec_id));
                 }
@@ -1752,18 +1771,21 @@ impl Property for SequenceCorrectnessProperty {
                     .in_flight_nextval_baselines
                     .remove(&(fiber_id, seq_name.clone()))
                     .unwrap_or_else(|| self.committed_watermark.get(seq_name).copied());
-                if let Some(txn_id) = txn_id {
-                    // Defer committed_watermark update until COMMIT — see
-                    // the field doc on committed_watermark for why we never
-                    // promote rolled-back values.
-                    self.pending_txn_values.entry(txn_id).or_default().push((
-                        seq_name.clone(),
-                        value,
-                        baseline,
-                    ));
-                } else {
-                    // Autocommit succeeded — value is durable on disk.
-                    self.promote_committed(seq_name, value);
+                match txn_id {
+                    Some(txn_id) if !committed_at_emit => {
+                        // Defer committed_watermark update until COMMIT — see
+                        // the field doc on committed_watermark for why we never
+                        // promote rolled-back values.
+                        self.pending_txn_values.entry(txn_id).or_default().push((
+                            seq_name.clone(),
+                            value,
+                            baseline,
+                        ));
+                    }
+                    _ => {
+                        // The value is already committed and durable on disk.
+                        self.promote_committed(seq_name, value);
+                    }
                 }
             }
             Operation::CreateTableWithSeqDefault {
@@ -1789,6 +1811,7 @@ impl Property for SequenceCorrectnessProperty {
             }
             Operation::Rollback => {
                 if let Some(txn_id) = txn_id {
+                    self.concurrent_txns.remove(&txn_id);
                     // Pending values were never promoted into `all_values`
                     // (the duplicate check is deferred to Commit). Just
                     // drop them from the pending map; nothing else to undo.
@@ -1805,6 +1828,7 @@ impl Property for SequenceCorrectnessProperty {
             }
             Operation::Commit => {
                 if let Some(txn_id) = txn_id {
+                    self.concurrent_txns.remove(&txn_id);
                     // Promote each nextval value made in this tx into
                     // committed_watermark — they're now durable on disk.
                     // Deferred duplicate check: only at commit time can we
@@ -1955,6 +1979,7 @@ impl Property for SequenceCorrectnessProperty {
 
     fn abort_fiber(&mut self, fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
         if let Some(txn_id) = txn_id {
+            self.concurrent_txns.remove(&txn_id);
             // Pending values were never promoted into `all_values` (the
             // duplicate check is deferred to Commit). Just drop them.
             self.pending_txn_values.remove(&txn_id);
@@ -1995,6 +2020,7 @@ impl Property for SequenceCorrectnessProperty {
         // Drop any nextval values left in pending_txn_values — they were
         // emitted by txs that never committed before the restart.
         self.pending_txn_values.clear();
+        self.concurrent_txns.clear();
         self.fiber_last_nextval.clear();
         self.last_setval_exec_id.clear();
         self.pending_setval_watermarks.clear();
@@ -2315,6 +2341,276 @@ mod tests {
             ElleEventType::Invoke
         ));
         assert!(matches!(recorder.events[1].event_type, ElleEventType::Info));
+    }
+
+    #[test]
+    fn sequence_values_from_rolled_back_concurrent_tx_stay_used() {
+        // MAXVALUE 16 with INCREMENT 5 allows 1, 6, 11, 16 before wrapping.
+        let mut tester = SequenceTester::new(16);
+        for value in [1, 6, 11] {
+            tester.nextval(None, value).unwrap();
+        }
+        tester.begin(TxMode::Concurrent, 1);
+        // Wraps from 16 back to 1 inside the transaction.
+        tester.nextval(Some(1), 16).unwrap();
+        tester.nextval(Some(1), 1).unwrap();
+        tester.rollback(1);
+        // The values above stay used, so the next value continues after the
+        // wrap and is lower than 11.
+        tester.nextval(None, 6).unwrap();
+    }
+
+    #[test]
+    fn sequence_values_from_rolled_back_immediate_tx_can_be_reused() {
+        let mut tester = SequenceTester::new(76);
+        tester.begin(TxMode::Immediate, 1);
+        tester.nextval(Some(1), 1).unwrap();
+        tester.nextval(Some(1), 6).unwrap();
+        tester.rollback(1);
+        tester.nextval(None, 1).unwrap();
+        tester.nextval(None, 6).unwrap();
+        assert!(tester.nextval(None, 6).is_err());
+    }
+
+    /// Feeds operations on the sequence `s` (START 1, INCREMENT 5, CYCLE)
+    /// to a `SequenceCorrectnessProperty`, all on fiber 0.
+    struct SequenceTester {
+        property: SequenceCorrectnessProperty,
+        exec_id: u64,
+    }
+
+    impl SequenceTester {
+        fn new(max_value: i64) -> Self {
+            let mut tester = Self {
+                property: SequenceCorrectnessProperty::new(),
+                exec_id: 0,
+            };
+            tester
+                .run(
+                    None,
+                    Operation::CreateSequence {
+                        seq_name: "s".to_string(),
+                        start: 1,
+                        increment: 5,
+                        min_value: 1,
+                        max_value,
+                        cycle: true,
+                    },
+                    vec![],
+                )
+                .unwrap();
+            tester
+        }
+
+        fn begin(&mut self, mode: TxMode, txn_id: u64) {
+            self.run(Some(txn_id), Operation::Begin { mode }, vec![])
+                .unwrap();
+        }
+
+        fn rollback(&mut self, txn_id: u64) {
+            self.run(Some(txn_id), Operation::Rollback, vec![]).unwrap();
+        }
+
+        fn nextval(&mut self, txn_id: Option<u64>, value: i64) -> anyhow::Result<()> {
+            self.run(
+                txn_id,
+                Operation::NextVal {
+                    seq_name: "s".to_string(),
+                },
+                vec![vec![Value::from_i64(value)]],
+            )
+        }
+
+        fn run(
+            &mut self,
+            txn_id: Option<u64>,
+            op: Operation,
+            rows: Vec<Vec<Value>>,
+        ) -> anyhow::Result<()> {
+            self.exec_id += 1;
+            let exec_id = self.exec_id;
+            self.property.init_op(0, 0, txn_id, exec_id, &op)?;
+            self.property
+                .finish_op(0, 0, txn_id, exec_id, exec_id, &op, &Ok(rows))
+        }
+    }
+
+    #[test]
+    fn rolled_back_key_is_visible_only_to_the_transaction_that_inserts_it_again() {
+        let mut property = RolledBackInsertsNotVisible::new();
+        let insert = Operation::SimpleInsert {
+            table_name: "t".to_string(),
+            key: "k".to_string(),
+            value_length: 1,
+        };
+        let select = Operation::SimpleSelect {
+            table_name: "t".to_string(),
+            key: "k".to_string(),
+        };
+        let done = Ok(vec![]);
+        let row = Ok(vec![vec![Value::build_text("k"), Value::from_i64(1)]]);
+        // Transaction 1 inserts k, then rolls back.
+        property
+            .finish_op(1, 0, Some(1), 1, 1, &insert, &done)
+            .unwrap();
+        property
+            .finish_op(2, 0, Some(1), 2, 2, &Operation::Rollback, &done)
+            .unwrap();
+        // Transaction 2 inserts k again, then reads it.
+        property
+            .finish_op(3, 0, Some(2), 3, 3, &insert, &done)
+            .unwrap();
+        property
+            .finish_op(4, 0, Some(2), 4, 4, &select, &row)
+            .unwrap();
+        // Transaction 2 did not commit, so k must stay invisible to transaction 3.
+        let error = property
+            .finish_op(5, 1, Some(3), 5, 5, &select, &row)
+            .unwrap_err();
+        assert!(error.to_string().contains("isolation violation"));
+    }
+
+    #[test]
+    fn rolled_back_key_is_visible_to_other_transactions_while_a_commit_is_in_progress() {
+        let mut tester = RolledBackInsertsTester::new();
+        // Transaction 1 on fiber 0 inserts k and k2, then rolls back.
+        tester.insert(0, Some(1), "k");
+        tester.insert(0, Some(1), "k2");
+        tester.rollback(0, 1);
+        // Transaction 2 on fiber 1 inserts k again and starts COMMIT. The engine
+        // publishes the commit, then the COMMIT statement waits for the I/O of
+        // the auto-checkpoint.
+        tester.insert(1, Some(2), "k");
+        tester.start_commit(1, 2);
+        // Fiber 2 reads k in autocommit mode before the COMMIT returns.
+        tester.select(2, None, "k").unwrap();
+        // Transaction 2 did not insert k2, so k2 must stay invisible.
+        let error = tester.select(2, None, "k2").unwrap_err();
+        assert!(error.to_string().contains("isolation violation"));
+        tester.end_commit(1, 2, Ok(vec![])).unwrap();
+        tester.select(2, None, "k").unwrap();
+    }
+
+    #[test]
+    fn keys_of_a_failed_commit_count_as_committed() {
+        assert_keys_of_unknown_commit_count_as_committed(|tester| {
+            let failed = Err(LimboError::CheckpointFailed("I/O error".to_string()));
+            tester.end_commit(1, 2, failed)
+        });
+    }
+
+    #[test]
+    fn keys_of_a_commit_aborted_before_it_returns_count_as_committed() {
+        assert_keys_of_unknown_commit_count_as_committed(|tester| {
+            tester.property.abort_fiber(1, Some(2))
+        });
+    }
+
+    /// Starts a COMMIT of transaction 2 on fiber 1, and lets
+    /// `end_with_unknown_result` end it. Then makes sure that the property
+    /// treats the key of transaction 2 as committed.
+    fn assert_keys_of_unknown_commit_count_as_committed(
+        end_with_unknown_result: impl FnOnce(&mut RolledBackInsertsTester) -> anyhow::Result<()>,
+    ) {
+        let mut tester = RolledBackInsertsTester::new();
+        // Transaction 1 on fiber 0 inserts k, then rolls back.
+        tester.insert(0, Some(1), "k");
+        tester.rollback(0, 1);
+        // Transaction 2 on fiber 1 inserts k again, then COMMIT starts and ends.
+        tester.insert(1, Some(2), "k");
+        tester.start_commit(1, 2);
+        end_with_unknown_result(&mut tester).unwrap();
+        // The engine can publish the commit before the COMMIT ends, so k can
+        // be visible.
+        tester.select(2, None, "k").unwrap();
+        // Transaction 3 replaces k, then rolls back. If transaction 2
+        // committed, its row of k stays visible.
+        tester.insert(0, Some(3), "k");
+        tester.rollback(0, 3);
+        tester.select(2, None, "k").unwrap();
+    }
+
+    /// Sends operations on keys of the table `t` to a
+    /// `RolledBackInsertsNotVisible`.
+    struct RolledBackInsertsTester {
+        property: RolledBackInsertsNotVisible,
+        exec_id: u64,
+    }
+
+    impl RolledBackInsertsTester {
+        fn new() -> Self {
+            Self {
+                property: RolledBackInsertsNotVisible::new(),
+                exec_id: 0,
+            }
+        }
+
+        fn insert(&mut self, fiber_id: usize, txn_id: Option<u64>, key: &str) {
+            let op = Operation::SimpleInsert {
+                table_name: "t".to_string(),
+                key: key.to_string(),
+                value_length: 1,
+            };
+            self.run(fiber_id, txn_id, op, Ok(vec![])).unwrap();
+        }
+
+        fn rollback(&mut self, fiber_id: usize, txn_id: u64) {
+            self.run(fiber_id, Some(txn_id), Operation::Rollback, Ok(vec![]))
+                .unwrap();
+        }
+
+        /// Reads `key`, and gets the row of `key`.
+        fn select(
+            &mut self,
+            fiber_id: usize,
+            txn_id: Option<u64>,
+            key: &str,
+        ) -> anyhow::Result<()> {
+            let op = Operation::SimpleSelect {
+                table_name: "t".to_string(),
+                key: key.to_string(),
+            };
+            let row = vec![Value::build_text(key.to_string()), Value::from_i64(1)];
+            self.run(fiber_id, txn_id, op, Ok(vec![row]))
+        }
+
+        /// Starts a COMMIT, but does not end it.
+        fn start_commit(&mut self, fiber_id: usize, txn_id: u64) {
+            self.exec_id += 1;
+            self.property
+                .init_op(0, fiber_id, Some(txn_id), self.exec_id, &Operation::Commit)
+                .unwrap();
+        }
+
+        /// Ends the COMMIT that `start_commit` started.
+        fn end_commit(
+            &mut self,
+            fiber_id: usize,
+            txn_id: u64,
+            result: OpResult,
+        ) -> anyhow::Result<()> {
+            self.exec_id += 1;
+            let exec_id = self.exec_id;
+            let op = Operation::Commit;
+            self.property
+                .finish_op(0, fiber_id, Some(txn_id), exec_id, exec_id, &op, &result)
+        }
+
+        /// Sends `op` through `init_op` and `finish_op`, with no other
+        /// operation between them.
+        fn run(
+            &mut self,
+            fiber_id: usize,
+            txn_id: Option<u64>,
+            op: Operation,
+            result: OpResult,
+        ) -> anyhow::Result<()> {
+            self.exec_id += 1;
+            let exec_id = self.exec_id;
+            self.property.init_op(0, fiber_id, txn_id, exec_id, &op)?;
+            self.property
+                .finish_op(0, fiber_id, txn_id, exec_id, exec_id, &op, &result)
+        }
     }
 }
 
@@ -2773,17 +3069,28 @@ impl Property for SnapshotStabilityProperty {
 ///
 /// Tracks (table, key) pairs through their lifecycle:
 /// - In-flight: inserted by an active explicit transaction.
-/// - Committed: promoted from in-flight on Commit, or inserted by an autocommit op.
+/// - Committed: promoted from in-flight when a COMMIT ends (see `commit_keys`),
+///   or inserted by an autocommit op.
 /// - Rolled-back: moved from in-flight on Rollback, only if never committed by any txn.
 ///
-/// A SimpleSelect returning rows for a rolled-back key is a violation.
+/// A SimpleSelect returning rows for a rolled-back key is a violation, unless
+/// the reading transaction inserted the key again, or a transaction that
+/// inserted the key again is in COMMIT.
 pub struct RolledBackInsertsNotVisible {
     /// Per txn_id: keys inserted by SimpleInsert in that explicit tx.
     in_flight: HashMap<u64, HashSet<(String, String)>>,
-    /// Keys that have been committed at any point by any connection.
+    /// Txns whose COMMIT started but did not end. The engine publishes a
+    /// commit before COMMIT returns. In WAL mode, the auto-checkpoint runs
+    /// after the publish. In MVCC mode, the rewrite of the row versions and
+    /// the auto-checkpoint run after the txn gets the committed state. These
+    /// steps can wait for I/O, and other fibers can then read the in-flight
+    /// keys of the txn.
+    committing: HashSet<u64>,
+    /// Keys that a connection committed, or possibly committed, at any point.
     committed: HashSet<(String, String)>,
     /// Keys from rolled-back txns that have never been committed — must not be
-    /// visible to any subsequent SimpleSelect.
+    /// visible to a subsequent SimpleSelect, except in a txn that inserted the
+    /// key again, or while a txn that inserted the key again is in COMMIT.
     rolled_back: HashSet<(String, String)>,
 }
 
@@ -2797,6 +3104,7 @@ impl RolledBackInsertsNotVisible {
     pub fn new() -> Self {
         Self {
             in_flight: HashMap::new(),
+            committing: HashSet::new(),
             committed: HashSet::new(),
             rolled_back: HashSet::new(),
         }
@@ -2804,6 +3112,22 @@ impl RolledBackInsertsNotVisible {
 }
 
 impl Property for RolledBackInsertsNotVisible {
+    fn init_op(
+        &mut self,
+        _step: usize,
+        _fiber_id: usize,
+        txn_id: Option<u64>,
+        _exec_id: u64,
+        op: &Operation,
+    ) -> anyhow::Result<()> {
+        // The engine can publish the commit before COMMIT returns, so the txn
+        // is committing from the start of COMMIT.
+        if let (Operation::Commit, Some(t)) = (op, txn_id) {
+            self.committing.insert(t);
+        }
+        Ok(())
+    }
+
     fn finish_op(
         &mut self,
         _step: usize,
@@ -2815,6 +3139,15 @@ impl Property for RolledBackInsertsNotVisible {
         result: &OpResult,
     ) -> anyhow::Result<()> {
         let Ok(_) = result else {
+            // A COMMIT can fail after the commit is durable: an I/O error in
+            // the auto-checkpoint fails the statement with CheckpointFailed
+            // (see `finish_pending_io` in core/vdbe/mod.rs). This property
+            // does not decode errors, so the keys of a failed COMMIT count as
+            // committed. This removes checks for these keys, but it cannot
+            // cause a false report.
+            if let (Operation::Commit, Some(t)) = (op, txn_id) {
+                self.commit_keys(t);
+            }
             return Ok(());
         };
 
@@ -2836,18 +3169,11 @@ impl Property for RolledBackInsertsNotVisible {
             }
             Operation::Commit => {
                 let t = txn_id.expect("Commit must have a txn_id");
-                for pair in self.in_flight.remove(&t).unwrap_or_default() {
-                    self.rolled_back.remove(&pair);
-                    self.committed.insert(pair);
-                }
+                self.commit_keys(t);
             }
             Operation::Rollback => {
                 let t = txn_id.expect("Rollback must have a txn_id");
-                for pair in self.in_flight.remove(&t).unwrap_or_default() {
-                    if !self.committed.contains(&pair) {
-                        self.rolled_back.insert(pair);
-                    }
-                }
+                self.roll_back_keys(t);
             }
             Operation::Delete { .. } | Operation::Update { .. } | Operation::Insert { .. } => {
                 // Unstructured SQL might delete or overwrite any committed key.
@@ -2860,7 +3186,23 @@ impl Property for RolledBackInsertsNotVisible {
             Operation::SimpleSelect { table_name, key } => {
                 let rows = result.as_ref().unwrap();
                 let pair = (table_name.clone(), key.clone());
-                if !rows.is_empty() && self.rolled_back.contains(&pair) {
+                // A transaction sees its own writes, so a rolled-back key that
+                // the reading transaction inserted again is visible to it.
+                let inserted_by_reader = txn_id
+                    .and_then(|t| self.in_flight.get(&t))
+                    .is_some_and(|keys| keys.contains(&pair));
+                // The engine can publish the keys of a txn before its COMMIT
+                // returns, so other transactions can see them.
+                let inserted_by_committing_txn = self
+                    .committing
+                    .iter()
+                    .filter_map(|t| self.in_flight.get(t))
+                    .any(|keys| keys.contains(&pair));
+                if !rows.is_empty()
+                    && self.rolled_back.contains(&pair)
+                    && !inserted_by_reader
+                    && !inserted_by_committing_txn
+                {
                     return Err(anyhow!(
                         "isolation violation: table={table_name}, key={key} \
                          was written by a rolled-back transaction but is still visible"
@@ -2874,13 +3216,8 @@ impl Property for RolledBackInsertsNotVisible {
     }
 
     fn abort_fiber(&mut self, _fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
-        // An aborted fiber's in-flight writes are effectively rolled back.
         if let Some(t) = txn_id {
-            for pair in self.in_flight.remove(&t).unwrap_or_default() {
-                if !self.committed.contains(&pair) {
-                    self.rolled_back.insert(pair);
-                }
-            }
+            self.end_stopped_txn(t);
         }
         Ok(())
     }
@@ -2889,16 +3226,53 @@ impl Property for RolledBackInsertsNotVisible {
         &mut self,
         _persisted_sequences: &HashMap<String, PersistedSequenceState>,
     ) -> anyhow::Result<()> {
-        // After a full restart, all in-flight writes are gone (rolled back by the
-        // engine). Promote any in-flight state to rolled-back, then carry
-        // committed forward — committed data must survive a reopen.
-        for (_, keys) in self.in_flight.drain() {
-            for pair in keys {
-                if !self.committed.contains(&pair) {
-                    self.rolled_back.insert(pair);
-                }
+        // After a full restart, the in-flight writes are gone (rolled back by
+        // the engine), except the writes of a COMMIT that did not end, which
+        // can be durable. Committed keys stay: committed data must survive a
+        // reopen.
+        let txn_ids: Vec<u64> = self.in_flight.keys().copied().collect();
+        for t in txn_ids {
+            self.end_stopped_txn(t);
+        }
+        self.committing.clear();
+        Ok(())
+    }
+}
+
+impl RolledBackInsertsNotVisible {
+    /// Ends txn `t` when its fiber stops, or the database restarts, before
+    /// the txn commits or rolls back.
+    fn end_stopped_txn(&mut self, t: u64) {
+        if self.committing.contains(&t) {
+            // The COMMIT did not return, so its result is unknown: the engine
+            // can publish the commit before the fiber stops. Thus the keys
+            // count as committed. This removes checks for these keys, but it
+            // cannot cause a false report.
+            self.commit_keys(t);
+        } else {
+            // The engine rolls back the writes of a txn that did not start
+            // COMMIT.
+            self.roll_back_keys(t);
+        }
+    }
+
+    /// Ends the COMMIT of txn `t`, and moves the in-flight keys of `t` to
+    /// `committed`.
+    fn commit_keys(&mut self, t: u64) {
+        self.committing.remove(&t);
+        for pair in self.in_flight.remove(&t).unwrap_or_default() {
+            self.rolled_back.remove(&pair);
+            self.committed.insert(pair);
+        }
+    }
+
+    /// Moves the in-flight keys of txn `t` to `rolled_back`, except the keys
+    /// in `committed`.
+    fn roll_back_keys(&mut self, t: u64) {
+        for pair in self.in_flight.remove(&t).unwrap_or_default() {
+            if !self.committed.contains(&pair) {
+                self.rolled_back.insert(pair);
             }
         }
-        Ok(())
     }
 }

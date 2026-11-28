@@ -1,16 +1,23 @@
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
 use rustc_hash::FxHashMap as HashMap;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
+use crate::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_virtual_columns;
-use crate::alloc::TursoIteratorExt;
+use super::emitter::gencol::{
+    compute_generated_columns, emit_row_from_cursor, sets_custom_type_column,
+};
+use super::emitter::new_values::{emit_input_conversion, StatementValues};
+use super::insert::column_default_expr;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::schema::{
+    BTreeTable, Column, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -18,14 +25,16 @@ use crate::translate::fkeys::{
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
-    emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
+    emit_remember_written_rowid, emit_returning_subqueries, expr_contains_subquery,
+    format_unique_violation_desc, InsertEmitCtx,
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::row_security::{emit_row_checks, UpsertRowChecks};
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
-use crate::translate::update::rowid_name_column_index;
+use crate::translate::update::{rowid_name_column_index, split_update_set_values};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
 use crate::{
     bail_parse_error,
@@ -37,15 +46,22 @@ use crate::{
         },
         expr::{
             emit_constraint_values_decode, emit_returning_results, emit_table_column,
-            expr_type::column_custom_type_names, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, NoConstantOptReason,
+            expr_type::column_custom_type_names, process_returning_clause,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
-        plan::{ResultSetColumn, TableReferences},
+        plan::{
+            ColumnUsedMask, EvalAt, OuterQueryReference, ResultSetColumn, SubqueryOrigin,
+            TableReferences,
+        },
+        subquery::{
+            emit_non_from_clause_subquery, plan_subqueries_from_returning,
+            plan_subqueries_from_upsert_do_update,
+        },
     },
     util::{exprs_are_equivalent, normalize_ident},
     vdbe::{
-        affinity::Affinity,
         builder::{DmlColumnContext, DmlRowForm, ProgramBuilder},
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
@@ -192,8 +208,12 @@ fn upsert_index_is_affected(
         return Ok(true);
     }
 
+    let changed_cols = match table.btree() {
+        Some(btree) => btree.columns_affected_by_update(directly_changed_cols.iter())?,
+        None => directly_changed_cols.try_clone()?,
+    };
     for c in referenced_index_cols(idx, table)? {
-        if directly_changed_cols.get(c) {
+        if changed_cols.get(c) {
             return Ok(true);
         }
     }
@@ -201,8 +221,7 @@ fn upsert_index_is_affected(
 }
 
 /// Collect the set of columns referenced by the partial WHERE (empty if none), or
-/// by the expression of any IndexColumn on the index. Virtual-column references
-/// are expanded to their transitive stored-column dependencies.
+/// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask> {
     let mut referenced_cols = ColumnMask::default();
 
@@ -216,10 +235,7 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> crate::Result<ColumnMask
             referenced_cols.set(ic.pos_in_table)?;
         }
     }
-    match table.btree() {
-        Some(btree) => btree.dependencies_of_columns(referenced_cols),
-        None => Ok(referenced_cols),
-    }
+    Ok(referenced_cols)
 }
 
 /// Columns referenced by any expression index columns on the index.
@@ -468,7 +484,9 @@ pub fn resolve_upsert_target(
 /// 4. Enforce NOT NULL constraints and (if STRICT) type checks on NEW.
 /// 5. Rebuild indexes (delete keys using BEFORE, insert keys using NEW).
 /// 6. Rewrite the table row payload at the same rowid with NEW.
-/// 7. Emit CDC rows and RETURNING output if requested.
+/// 7. Emit CDC rows and RETURNING output if requested. When the RETURNING
+///    clause has subqueries, `returning_with_subqueries` holds it as written,
+///    and it is planned again here instead of using `returning`.
 /// 8. Jump to `row_done_label`.
 ///
 /// Semantics reference: https://sqlite.org/lang_upsert.html
@@ -480,14 +498,16 @@ pub fn emit_upsert(
     table: &Table,
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
-    set_pairs: &mut [(usize, Box<ast::Expr>)],
+    sets: &mut [ast::Set],
     set_column_names: &[ast::Name],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
+    returning_with_subqueries: Option<&[ast::ResultColumn]>,
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
+    row_checks: &UpsertRowChecks,
 ) -> crate::Result<()> {
     let constraint_on_error = do_update_constraint_on_error(program);
 
@@ -523,20 +543,10 @@ pub fn emit_upsert(
         .expect("upsert must have a target table")
         .internal_id;
     let current_start = program.alloc_registers(num_cols);
-    for i in 0..num_cols {
-        let col = &table.columns()[i];
-        let reg = layout.to_register(current_start, i);
-        emit_table_column(
-            program,
-            ctx.cursor_id,
-            table_ref_id,
-            table_references,
-            col,
-            i,
-            reg,
-            resolver,
-        )?;
-    }
+    let current_regs: Vec<usize> = (0..num_cols)
+        .map(|i| layout.to_register(current_start, i))
+        .collect();
+    emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &current_regs, resolver)?;
 
     // BEFORE for index maintenance / CDC
     let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
@@ -628,8 +638,9 @@ pub fn emit_upsert(
     // case-insensitively), so record both per register for the conflicting
     // row image and its rowid. The excluded (insertion) registers are
     // already recorded by the enclosing INSERT translation, except for the
-    // decoded copies made for STRICT custom-type tables. Cleared wholesale
-    // at the end of the enclosing INSERT translation.
+    // decoded copies made for STRICT custom-type tables. A decoded copy
+    // compares by the kind of value DECODE gives, not by how it is stored.
+    // Cleared wholesale at the end of the enclosing INSERT translation.
     let is_strict = table.btree().is_some_and(|bt| bt.is_strict);
     for (idx, col) in table.columns().iter().enumerate() {
         if col.is_rowid_alias() {
@@ -637,15 +648,21 @@ pub fn emit_upsert(
             // the image register for the alias column is never referenced.
             continue;
         }
-        let register_column = RegisterColumn::table_column(col, is_strict, resolver.schema());
-        let reg = layout.to_register(expr_current_start, idx);
+        let decoded_column =
+            RegisterColumn::decoded_table_column(col, is_strict, resolver.schema());
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
                 .register_columns
-                .insert(excluded_reg, register_column.clone());
+                .insert(excluded_reg, decoded_column.clone());
         }
-        resolver.register_columns.insert(reg, register_column);
+        let current_column = match decoded_current_start {
+            Some(_) => decoded_column,
+            None => RegisterColumn::table_column(col, is_strict, resolver.schema()),
+        };
+        resolver
+            .register_columns
+            .insert(layout.to_register(expr_current_start, idx), current_column);
     }
     resolver
         .register_columns
@@ -671,6 +688,20 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
+        emit_do_update_subqueries(
+            program,
+            resolver,
+            connection,
+            table_references,
+            table_alias,
+            insertion,
+            excluded_decoded_start,
+            std::iter::once(pred.as_mut()),
+            SubqueryOrigin::DmlWhere,
+            current_start,
+            ctx.conflict_rowid_reg,
+            &layout,
+        )?;
         let pr = program.alloc_register();
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
@@ -680,11 +711,29 @@ pub fn emit_upsert(
         });
     }
 
-    // Apply SET; capture rowid change if any
-    let mut new_rowid_reg: Option<usize> = None;
-    for (col_idx, expr) in set_pairs.iter_mut() {
+    // The conflicting row must be one the role may update, or the statement
+    // fails, after the WHERE above, as in PostgreSQL.
+    emit_row_checks(
+        program,
+        resolver,
+        &row_checks.conflicting_row,
+        table_references,
+        ctx.conflict_rowid_reg,
+        table.columns().iter().enumerate().map(|(idx, col)| {
+            if col.is_rowid_alias() {
+                (col, ctx.conflict_rowid_reg)
+            } else {
+                (col, layout.to_register(current_start, idx))
+            }
+        }),
+    )?;
+
+    // Apply SET; capture rowid change if any. As in UPDATE, the subqueries are
+    // planned before the SET clauses are split, so that `SET (a, b) = (SELECT ...)`
+    // knows how many values the subquery gives.
+    for set in sets.iter_mut() {
         rewrite_expr_to_registers(
-            expr,
+            &mut set.expr,
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
@@ -696,6 +745,27 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
+    }
+    emit_do_update_subqueries(
+        program,
+        resolver,
+        connection,
+        table_references,
+        table_alias,
+        insertion,
+        excluded_decoded_start,
+        sets.iter_mut().map(|set| set.expr.as_mut()),
+        SubqueryOrigin::DmlSet,
+        current_start,
+        ctx.conflict_rowid_reg,
+        &layout,
+    )?;
+    let set_pairs = &collect_set_clauses_for_upsert(table, sets, resolver)?;
+    let converts_values_before_not_null =
+        resolver.catalog.dialect.converts_values_before_not_null();
+    let key_may_be_generated = resolver.catalog.dialect.generates_integer_primary_keys();
+    let mut new_rowid_reg: Option<usize> = None;
+    for (col_idx, expr) in set_pairs {
         if *col_idx == ROWID_SENTINEL {
             let r = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -723,24 +793,28 @@ pub fn emit_upsert(
             .cloned();
         let prev_union = program.target_union_type.take();
         program.target_union_type = union_td;
+        let set_value_reg = layout.to_register(new_start, *col_idx);
         let translate_result = translate_expr_no_constant_opt(
             program,
             None,
             expr,
-            layout.to_register(new_start, *col_idx),
+            set_value_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
         );
         program.target_union_type = prev_union;
         translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                constraint_info: None,
-                target_reg: layout.to_register(new_start, *col_idx),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-                on_error: constraint_on_error,
-            });
+        // A key is checked here in every dialect: the rowid is read from this
+        // register right below, and a NULL must fail as a NULL.
+        if !converts_values_before_not_null || col.is_rowid_alias() {
+            emit_set_value_notnull_check(
+                program,
+                table,
+                col,
+                set_value_reg,
+                key_may_be_generated,
+                constraint_on_error,
+            );
         }
         if col.is_rowid_alias() {
             // Must be integer; remember the NEW rowid value
@@ -754,31 +828,52 @@ pub fn emit_upsert(
                 reg: r,
                 target_pc: None,
             });
+            crate::translate::expr::emit_coerce_rowid(program, col, r, resolver)?;
             new_rowid_reg = Some(r);
         }
     }
 
     if let Some(bt) = table.btree() {
-        if bt.is_strict {
-            // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
-            // We need to do this before regenerating virtual columns, because TypeCheck applies
-            // affinity in-place to its registers, which could affect virtual columns.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    &bt,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
+        let sources = match bt.is_strict {
+            true => crate::translate::emitter::update::set_value_sources(
+                bt.columns().len(),
+                table_references,
+                set_pairs.iter().map(|(col_idx, expr)| (*col_idx, &**expr)),
+                resolver,
+            ),
+            false => Vec::new(),
+        };
+        emit_input_conversion(
+            program,
+            resolver,
+            &bt,
+            new_start,
+            &layout,
+            StatementValues::of_insert(program),
+            &sources,
+        )?;
+    }
+    if converts_values_before_not_null {
+        for (col_idx, _) in set_pairs.iter().filter(|(idx, _)| *idx != ROWID_SENTINEL) {
+            let col = &table.columns()[*col_idx];
+            if col.is_rowid_alias() {
+                continue;
+            }
+            let set_value_reg = layout.to_register(new_start, *col_idx);
+            emit_set_value_notnull_check(
+                program,
+                table,
+                col,
+                set_value_reg,
+                key_may_be_generated,
+                constraint_on_error,
+            );
         }
     }
 
-    // Recompute virtual columns for the new row after SET clauses have modified base columns.
+    // Recompute generated columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
-    compute_new_row_virtual_columns(
+    compute_new_row_generated_columns(
         program,
         ctx,
         new_start,
@@ -787,6 +882,23 @@ pub fn emit_upsert(
         DmlRowForm::UserFacing,
         resolver,
     )?;
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    // When a SET column has a custom type, the generated columns are computed again
+    // after ENCODE, below, and their NOT NULL checks wait for these values.
+    let computes_generated_columns_after_encode = table.btree().is_some_and(|bt| {
+        bt.is_strict && sets_custom_type_column(&bt, &updated_positions, resolver)
+    });
+    emit_generated_column_notnull_checks(
+        program,
+        ctx,
+        new_start,
+        &layout,
+        constraint_on_error,
+        |_| !computes_generated_columns_after_encode,
+    );
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -803,6 +915,26 @@ pub fn emit_upsert(
                 &layout,
             )?;
 
+            // The generated columns were computed from the SET values. When a SET column
+            // has a custom type, a read of the row can give other values, so compute
+            // them again from the encoded row, as a read of the row gives them.
+            if computes_generated_columns_after_encode {
+                let dml_ctx = DmlColumnContext::layout(
+                    bt.columns(),
+                    new_start,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    layout.clone(),
+                    DmlRowForm::Stored,
+                );
+                compute_generated_columns(
+                    program,
+                    &bt.columns_topo_sort()?,
+                    &dml_ctx,
+                    resolver,
+                    &bt,
+                )?;
+            }
+
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
@@ -810,26 +942,36 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
 
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
+            if computes_generated_columns_after_encode {
+                emit_generated_column_notnull_checks(
+                    program,
+                    ctx,
+                    new_start,
+                    &layout,
+                    constraint_on_error,
+                    Column::is_generated,
+                );
             }
         }
+
+        // Rows that row-level security does not let the role write fail
+        // before the CHECK constraints, as in PostgreSQL.
+        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        emit_row_checks(
+            program,
+            resolver,
+            &row_checks.updated_row,
+            table_references,
+            rowid_reg,
+            bt.columns().iter().enumerate().map(|(idx, col)| {
+                if col.is_rowid_alias() {
+                    (col, rowid_reg)
+                } else {
+                    (col, layout.to_register(new_start, idx))
+                }
+            }),
+        )?;
 
         // Evaluate CHECK constraints on the new values
         emit_check_constraints(
@@ -855,10 +997,6 @@ pub fn emit_upsert(
     // Fire BEFORE UPDATE triggers
     let upsert_namespace: NamespaceRef = ctx.namespace;
     let upsert_database_id = upsert_namespace.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -866,12 +1004,9 @@ pub fn emit_upsert(
         }
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            ast::RefAct::NoAction | ast::RefAct::Restrict
-        )
-    });
+    let has_parent_fk_checks = affected_parent_fks
+        .iter()
+        .any(|fk| resolver.fk_counts_children_of_old_parent_key(&fk.fk, fk.fk.on_update));
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,
@@ -936,18 +1071,10 @@ pub fn emit_upsert(
             // index deletion must use the row as it is on disk now, or the
             // trigger's index entries are left behind (#8744).
             if let Some(before) = before_start {
-                for (i, column) in table.columns().iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        ctx.cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column,
-                        i,
-                        layout.to_register(before, i),
-                        resolver,
-                    )?;
-                }
+                let before_regs: Vec<usize> = (0..num_cols)
+                    .map(|i| layout.to_register(before, i))
+                    .collect();
+                emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &before_regs, resolver)?;
             }
 
             // Same for the NEW image: like SQLite, columns not in the SET list
@@ -969,7 +1096,7 @@ pub fn emit_upsert(
                     resolver,
                 )?;
             }
-            compute_new_row_virtual_columns(
+            compute_new_row_generated_columns(
                 program,
                 ctx,
                 new_start,
@@ -978,6 +1105,14 @@ pub fn emit_upsert(
                 DmlRowForm::Stored,
                 resolver,
             )?;
+            emit_generated_column_notnull_checks(
+                program,
+                ctx,
+                new_start,
+                &layout,
+                constraint_on_error,
+                |_| true,
+            );
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
@@ -1388,7 +1523,12 @@ pub fn emit_upsert(
         }
     }
 
-    // Build NEW table payload
+    // Build NEW table payload. An INTEGER PRIMARY KEY is stored only as the
+    // rowid, with NULL in its record slot, as UPDATE writes it. From here on
+    // the new rowid is read from `new_rowid`, not from this register.
+    if let Some(alias_idx) = rowid_alias_idx {
+        program.emit_null(layout.to_register(new_start, alias_idx), None);
+    }
     let record_reg = program.alloc_register();
     emit_make_record(program, table.columns().iter(), new_start, record_reg);
 
@@ -1575,13 +1715,59 @@ pub fn emit_upsert(
                 bt.name.as_str(),
                 ctx.conflict_rowid_reg, // old_rowid_reg
                 current_start,          // old_values_start
-                new_start,              // new_values_start
+                &layout,
+                new_start,                                       // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
                 upsert_namespace,
                 &affected_parent_fks,
             )?;
         }
+    }
+
+    // RETURNING from NEW image + final rowid. It reads the row before the
+    // AFTER triggers run, as in SQLite, so a subquery in it does not see what
+    // a trigger writes.
+    if !returning.is_empty() {
+        let final_rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        let upsert_returning_columns;
+        let returning: &[ResultSetColumn] = match returning_with_subqueries {
+            Some(returning_with_subqueries) => {
+                let mut returning_ast = returning_with_subqueries.to_vec();
+                let mut returning_subqueries = vec![];
+                plan_subqueries_from_returning(
+                    program,
+                    &mut returning_subqueries,
+                    table_references,
+                    &mut returning_ast,
+                    resolver,
+                    connection,
+                )?;
+                upsert_returning_columns =
+                    process_returning_clause(&mut returning_ast, table_references, resolver)?;
+                emit_returning_subqueries(
+                    program,
+                    resolver,
+                    table_references,
+                    &mut returning_subqueries,
+                    new_start,
+                    final_rowid_reg,
+                    &layout,
+                )?;
+                &upsert_returning_columns
+            }
+            None => &*returning,
+        };
+        emit_returning_results(
+            program,
+            table_references,
+            returning,
+            new_start,
+            final_rowid_reg,
+            resolver,
+            ctx.returning_buffer.as_ref(),
+            &layout,
+        )?;
     }
 
     // Fire AFTER UPDATE triggers
@@ -1613,8 +1799,7 @@ pub fn emit_upsert(
             )
             .with_override_conflict(ast::ResolveType::Abort);
 
-            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-            // not skip post-row work (RETURNING).
+            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body.
             let after_trigger_done = program.allocate_label();
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1631,37 +1816,135 @@ pub fn emit_upsert(
         }
     }
 
-    // Compute virtual columns for RETURNING (if any virtual columns exist)
-    if !returning.is_empty() {
-        compute_new_row_virtual_columns(
-            program,
-            ctx,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            &layout,
-            DmlRowForm::Stored,
-            resolver,
-        )?;
-    }
-
-    // RETURNING from NEW image + final rowid
-    if !returning.is_empty() {
-        emit_returning_results(
-            program,
-            table_references,
-            returning,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &layout,
-        )?;
-    }
-
     program.emit_insn(Insn::Goto {
         target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
+}
+
+/// Plans and emits the subqueries in DO UPDATE SET values or in its WHERE
+/// clause, leaving each expression to read the results from registers. A
+/// subquery sees the conflicting row as it was before the update. As in SQLite,
+/// a subquery that reads that row or `excluded` runs for every conflicting row,
+/// and any other runs once, at the first conflict.
+#[allow(clippy::too_many_arguments)]
+fn emit_do_update_subqueries<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<Connection>,
+    table_references: &TableReferences,
+    table_alias: Option<&str>,
+    insertion: &Insertion,
+    excluded_decoded_start: Option<usize>,
+    exprs: impl Iterator<Item = &'a mut ast::Expr>,
+    origin: SubqueryOrigin,
+    current_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<()> {
+    let exprs: Vec<&mut ast::Expr> = exprs.filter(|e| expr_contains_subquery(e)).collect();
+    if exprs.is_empty() {
+        return Ok(());
+    }
+    // DO UPDATE names the target by its alias when the INSERT gives one, where
+    // RETURNING names it by the table's name.
+    let mut table_references = table_references.clone();
+    let target = &mut table_references.joined_tables_mut()[0];
+    if let Some(alias) = table_alias {
+        target.identifier = normalize_ident(alias);
+        target.has_alias = true;
+    }
+    // `excluded` is a table of the scope around the target's, as in SQLite, so
+    // the target's columns come first for an unqualified name, a table the
+    // subquery calls `excluded` hides it, and a subquery that reads it at any
+    // depth is correlated.
+    let excluded = OuterQueryReference {
+        identifier: "excluded".to_string(),
+        has_alias: true,
+        internal_id: program.table_reference_counter.next(),
+        table: target.table.clone(),
+        namespace: target.namespace,
+        join_info: None,
+        col_used_mask: ColumnUsedMask::default(),
+        cte_select: None,
+        cte_explicit_columns: Vec::new(),
+        cte_id: None,
+        cte_definition_only: false,
+        rowid_referenced: false,
+        outer_join_may_null_extend: false,
+        scope_depth: 0,
+    };
+    let excluded_id = excluded.internal_id;
+    table_references.add_outer_query_reference(excluded);
+
+    let mut subqueries = vec![];
+    plan_subqueries_from_upsert_do_update(
+        program,
+        &mut subqueries,
+        &mut table_references,
+        exprs.into_iter(),
+        origin,
+        resolver,
+        connection,
+    )?;
+
+    // Only a correlated subquery reads the conflicting row or `excluded`.
+    let cache_state = if subqueries.iter().any(|subquery| subquery.correlated) {
+        let cache_state = seed_returning_row_image_in_cache(
+            program,
+            &table_references,
+            current_start,
+            rowid_reg,
+            resolver,
+            layout,
+        )?;
+        let excluded_start =
+            excluded_decoded_start.unwrap_or_else(|| insertion.first_col_register());
+        resolver.cache_expr_reg(
+            Cow::Owned(ast::Expr::RowId {
+                database: None,
+                table: excluded_id,
+            }),
+            insertion.key_register(),
+            false,
+        );
+        for (i, column) in table_references.joined_tables()[0]
+            .columns()
+            .iter()
+            .enumerate()
+        {
+            let reg = if column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                layout.to_register(excluded_start, i)
+            };
+            let expr = ast::Expr::Column {
+                database: None,
+                table: excluded_id,
+                column: i,
+                is_rowid_alias: column.is_rowid_alias(),
+            };
+            resolver.cache_expr_reg(Cow::Owned(expr), reg, false);
+        }
+        Some(cache_state)
+    } else {
+        None
+    };
+    let result = subqueries.iter_mut().try_for_each(|subquery| {
+        let plan = subquery.consume_plan(EvalAt::Loop(0));
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )
+        .map(|_| ())
+    });
+    if let Some(cache_state) = cache_state {
+        restore_returning_row_image_in_cache(resolver, cache_state);
+    }
+    result
 }
 
 /// The resolve type a constraint Halt in the DO UPDATE arm carries. SQLite
@@ -1677,7 +1960,26 @@ fn do_update_constraint_on_error(program: &ProgramBuilder) -> Option<ast::Resolv
     }
 }
 
-fn compute_new_row_virtual_columns(
+fn emit_set_value_notnull_check(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    column: &Column,
+    set_value_reg: usize,
+    key_may_be_generated: bool,
+    on_error: Option<ast::ResolveType>,
+) {
+    if column.notnull() && (!column.is_rowid_alias() || !key_may_be_generated) {
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
+            target_reg: set_value_reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: String::from(table.get_name()) + "." + column.name.as_ref().unwrap(),
+            on_error,
+        });
+    }
+}
+
+fn compute_new_row_generated_columns(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
     new_start: usize,
@@ -1686,7 +1988,7 @@ fn compute_new_row_virtual_columns(
     form: DmlRowForm,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    if !ctx.table.has_virtual_columns {
+    if !ctx.table.has_generated_columns() {
         return Ok(());
     }
     let dml_ctx = DmlColumnContext::layout(
@@ -1696,7 +1998,7 @@ fn compute_new_row_virtual_columns(
         layout.clone(),
         form,
     );
-    compute_virtual_columns(
+    compute_generated_columns(
         program,
         &ctx.table.columns_topo_sort()?,
         &dml_ctx,
@@ -1705,14 +2007,42 @@ fn compute_new_row_virtual_columns(
     )
 }
 
+fn emit_generated_column_notnull_checks(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    new_start: usize,
+    layout: &ColumnLayout,
+    on_error: Option<ast::ResolveType>,
+    include_column: impl Fn(&Column) -> bool,
+) {
+    for (idx, column) in ctx.table.columns().iter().enumerate() {
+        if !column.is_generated() || !column.notnull() || !include_column(column) {
+            continue;
+        }
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
+            target_reg: layout.to_register(new_start, idx),
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!(
+                "{}.{}",
+                ctx.table.name,
+                column.name.as_deref().expect("table columns have names")
+            ),
+            on_error,
+        });
+    }
+}
+
 /// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.
 ///
-/// Supports multi-target row-value SETs: `SET (a, b) = (expr1, expr2)`.
+/// Supports multi-target row-value SETs: `SET (a, b) = (expr1, expr2)` and
+/// `SET (a, b) = (SELECT ...)`, whose subquery is planned already.
 /// Enforces same number of column names and RHS values.
 /// If the same column is assigned multiple times, the last assignment wins.
-pub fn collect_set_clauses_for_upsert(
+fn collect_set_clauses_for_upsert(
     table: &Table,
-    set_items: &mut [ast::Set],
+    set_items: &[ast::Set],
+    resolver: &Resolver,
 ) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
     let lookup: HashMap<String, usize> = table
         .columns()
@@ -1724,23 +2054,18 @@ pub fn collect_set_clauses_for_upsert(
     let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];
 
     for set in set_items {
-        let values: Vec<Box<ast::Expr>> = match set.expr.as_ref() {
-            ast::Expr::Parenthesized(v) => v.clone(),
-            e => vec![e.clone().into()],
-        };
-        if set.col_names.len() != values.len() {
-            bail_parse_error!(
-                "{} columns assigned {} values",
-                set.col_names.len(),
-                values.len()
-            );
-        }
-        for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
+        let values = split_update_set_values(set.expr.as_ref().clone(), set.col_names.len())?;
+        for (cn, e) in set.col_names.iter().zip(values) {
+            let mut e = Box::new(e);
             let ident = normalize_ident(cn.as_str());
             let idx = match lookup.get(&ident) {
                 Some(idx) => {
-                    // cannot upsert generated column
-                    table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
+                    let col = &table.columns()[*idx];
+                    col.ensure_not_generated("UPDATE", cn.as_str())?;
+                    col.ensure_update_value_allowed(&e, cn.as_str())?;
+                    if matches!(e.as_ref(), ast::Expr::Default) {
+                        e = column_default_expr(col, table.is_strict(), resolver);
+                    }
                     *idx
                 }
                 None => match rowid_name_column_index(table, &ident) {
@@ -1897,6 +2222,10 @@ fn rewrite_expr_to_registers(
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
                                 *expr = Expr::register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
+                                if cm.column.is_rowid_alias() {
+                                    *expr = Expr::register(ins.key_register());
+                                    return Ok(WalkControl::Continue);
+                                }
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
                                 if let Some(decoded_start) = excluded_decoded_start {

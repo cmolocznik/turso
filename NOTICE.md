@@ -8,6 +8,15 @@ Please visit our GitHub for more information:
 Dependencies
 ============
 
+This project depends on rustls, rustls-native-certs, and tokio-rustls, distributed by the rustls project:
+
+* License: licenses/bindings/rust/rustls-mit-license.md (MIT License)
+* License: licenses/bindings/rust/rustls-native-certs-mit-license.md (MIT License)
+* License: licenses/bindings/rust/tokio-rustls-mit-license.md (MIT License)
+* Homepage: https://github.com/rustls/rustls
+* Homepage: https://github.com/rustls/rustls-native-certs
+* Homepage: https://github.com/rustls/tokio-rustls
+
 This product depends on Error Prone, distributed by the Error Prone project:
 
 * License: licenses/bindings/java/assertj-license.md (Apache License v2.0)
@@ -90,6 +99,12 @@ The PostgreSQL frontend depends on Chumsky, distributed by the Chumsky authors:
 * License: licenses/chumsky-mit-license.md (MIT License)
 * Homepage: https://codeberg.org/zesterer/chumsky
 
+The generator of the PostgreSQL catalog tables uses prettyplease, distributed
+by David Tolnay:
+
+* License: licenses/prettyplease-mit-license.md (MIT License)
+* Homepage: https://github.com/dtolnay/prettyplease
+
 The PostgreSQL dump fuzzer uses Hegel, distributed by Antithesis, LLC:
 
 * License: licenses/testing/hegeltest-mit-license.md (MIT License)
@@ -99,6 +114,13 @@ The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
 
 * License: licenses/testing/comfy-table-mit-license.md (MIT License)
 * Homepage: https://github.com/nukesor/comfy-table
+
+postgres/catalog/upstream/postgres.bki is the file that PostgreSQL's genbki.pl
+generates from the catalog data files of the PostgreSQL source tree, and
+postgres/catalog/src/generated.rs is generated from that file:
+
+* License: licenses/postgres-license.md (PostgreSQL License)
+* Homepage: https://www.postgresql.org/
 
 The PostgreSQL frontend vendors the default bool, integer, float, and bytea
 text-formatting routines from pgwire 0.36.3 in

@@ -1,3 +1,4 @@
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::storage::btree::BTreeCursor;
@@ -6,7 +7,7 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::util::IOExt;
-use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+use crate::vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
@@ -32,8 +33,15 @@ impl InternalVirtualTable for BtreeDumpTable {
         "btree_dump".to_string()
     }
 
-    fn sql(&self) -> String {
-        "CREATE TABLE btree_dump(record BLOB, name TEXT HIDDEN)".to_string()
+    fn columns(&self) -> Vec<ast::ColumnDefinition> {
+        vec![
+            column_definition("record", "BLOB"),
+            column_definition("name", "TEXT HIDDEN"),
+        ]
+    }
+
+    fn superuser_only(&self) -> bool {
+        true
     }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {

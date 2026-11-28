@@ -10,6 +10,7 @@ pub fn to_u32(v: usize) -> u32 {
 }
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::ast::{ResolveType, SortOrder};
 use crate::function::AccumulatorFunc;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
@@ -24,7 +25,6 @@ use crate::{
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
-use turso_parser::ast::{ResolveType, SortOrder};
 
 /// The program run by an `Insn::Program` instruction.
 ///
@@ -296,7 +296,7 @@ pub struct AlterColumnData {
     pub namespace: NamespaceId,
     pub table: String,
     pub column_index: usize,
-    pub definition: turso_parser::ast::ColumnDefinition,
+    pub definition: crate::ast::ColumnDefinition,
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
     pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
@@ -331,11 +331,8 @@ pub struct SorterOpenData {
     pub cursor_id: CursorID, // P1
     pub columns: usize,      // P2
     /// Combined order, collation, and nulls ordering per column.
-    pub order_collations_nulls: crate::alloc::Vec<(
-        SortOrder,
-        CollationSeq,
-        Option<turso_parser::ast::NullsOrder>,
-    )>,
+    pub order_collations_nulls:
+        crate::alloc::Vec<(SortOrder, CollationSeq, Option<crate::ast::NullsOrder>)>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -348,6 +345,11 @@ pub struct AggStepData {
     /// The collation MIN, MAX, mode and percentile compare the argument with.
     /// BINARY for the aggregates that do not compare values.
     pub collation: CollationSeq,
+    /// For MIN and MAX: a register that the step sets to 1 when the row keeps
+    /// the minimum or maximum of an earlier row, and to 0 otherwise. Bare
+    /// columns of the query take their values from the rows where it is 0,
+    /// as SQLite's OP_CollSeq register does. None for the other aggregates.
+    pub minmax_keeps_best_reg: Option<usize>,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
@@ -411,10 +413,40 @@ pub struct IvmSumFinalizeData {
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
     pub reg: usize,
-    pub element_affinity: Affinity,
+    /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
-    pub table_name: Arc<str>,
-    pub col_name: Arc<str>,
+    pub element_kind: crate::types::StrictType,
+    /// The number of dimensions of the array: 2 for INTEGER[][].
+    pub dimensions: u32,
+    pub target: ArrayEncodeTarget,
+}
+
+/// Where the array an ArrayEncode builds goes, which its error for a value
+/// that is not an array names.
+#[derive(Debug, Clone)]
+pub enum ArrayEncodeTarget {
+    /// Column `col_name` of table `table_name`.
+    Column {
+        table_name: Arc<str>,
+        col_name: Arc<str>,
+    },
+    /// The result of a CAST to an array type.
+    Cast,
+    /// The key of an index lookup on an array column.
+    IndexKey,
+}
+
+impl std::fmt::Display for ArrayEncodeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column {
+                table_name,
+                col_name,
+            } => write!(f, "column {table_name}.{col_name}"),
+            Self::Cast => write!(f, "a cast"),
+            Self::IndexKey => write!(f, "an index key"),
+        }
+    }
 }
 
 /// Data for HashDistinct instruction (boxed to keep Insn small).
@@ -976,6 +1008,27 @@ pub enum Insn {
         table_reference: Arc<BTreeTable>, // P4
     },
 
+    /// Converts the value in `reg` as a STRICT column storing `storage_class`
+    /// does, and fails with "cannot store <kind> value <description>" when it
+    /// can't: '5' becomes 5 for INTEGER, 'abc' is an error. NULL is left as it is.
+    ConvertToType {
+        reg: usize,
+        storage_class: crate::types::StorageClass,
+        description: String,
+    },
+
+    /// Replaces the value in `reg` with what `function` gives for it and for
+    /// the `param_count` values that start at `params_reg`. NULL is left as it
+    /// is. `function` is the ENCODE, COERCE or DECODE of a type that is written
+    /// in Rust, and `description` names the type and the conversion.
+    TypeConversion {
+        function: crate::types::ConversionFn,
+        reg: usize,
+        params_reg: usize,
+        param_count: usize,
+        description: String,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -1015,14 +1068,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Create an array from contiguous registers (dynamic count).
-    /// Like MakeArray but count is read from count_reg at runtime.
-    MakeArrayDynamic {
-        start_reg: usize,
-        count_reg: usize,
-        dest: usize,
-    },
-
     /// Extract a field from a struct blob by field index.
     /// If src_reg is NULL, dest = NULL.
     StructField {
@@ -1056,16 +1101,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Copy a register value to a dynamically-computed destination.
-    /// ```text
-    /// dest = registers[base + registers[offset_reg]]
-    /// registers[base + registers[offset_reg]] = registers[src]
-    /// ```
-    RegCopyOffset {
-        src: usize,
-        base: usize,
-        offset_reg: usize,
-    },
     /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
     /// of the cursor's current table row into `dest` (as a blob), following overflow
     /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
@@ -1161,6 +1196,12 @@ pub enum Insn {
         err_code: usize,     // p1
         /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>, // p2
+    },
+
+    /// Fail the statement because a row it writes fails a condition of a
+    /// row-level security policy.
+    RowSecurityViolation {
+        denial: Box<crate::security::permission::PermissionDenied>,
     },
 
     /// Start a transaction.
@@ -1924,13 +1965,15 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
-    /// Add a role to the in-memory role catalog after its row was inserted
-    AddRole {
+    /// Make the change `apply` to the dialect's state in the in-memory
+    /// schema of database `db`, after the statement wrote the same change to
+    /// the dialect's own tables. `value_regs` name the registers whose
+    /// values `apply` gets, such as the id a created relation was stored
+    /// under.
+    CatalogApply {
         db: usize,
-        /// Register holding the rowid of the role in the roles table
-        id_reg: usize,
-        name: String,
-        superuser: bool,
+        apply: Arc<dyn crate::dialect::CatalogApply>,
+        value_regs: Vec<usize>,
     },
 
     /// Close a cursor.
@@ -2476,17 +2519,17 @@ impl InsnVariants {
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::ConvertToType => execute::op_convert_to_type,
+            InsnVariants::TypeConversion => execute::op_type_conversion,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
-            InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
             InsnVariants::StructField => execute::op_struct_field,
             InsnVariants::UnionPack => execute::op_union_pack,
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
-            InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::BlobRead => execute::op_blob_read,
             InsnVariants::BlobWrite => execute::op_blob_write,
             InsnVariants::BlobLen => execute::op_blob_len,
@@ -2499,6 +2542,7 @@ impl InsnVariants {
             InsnVariants::Prev => execute::op_prev,
             InsnVariants::Halt => execute::op_halt,
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
+            InsnVariants::RowSecurityViolation => execute::op_row_security_violation,
             InsnVariants::Transaction => execute::op_transaction,
             InsnVariants::AutoCommit => execute::op_auto_commit,
             InsnVariants::Savepoint => execute::op_savepoint,
@@ -2588,7 +2632,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
-            InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::CatalogApply => execute::op_catalog_apply,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2659,7 +2703,7 @@ impl InsnVariants {
 
 impl Insn {
     /// The collations this instruction compares values with.
-    #[cfg(test)]
+    #[cfg(feature = "test_helper")]
     pub(crate) fn collations(&self) -> Vec<CollationSeq> {
         match self {
             Insn::Eq { collation, .. }
@@ -2736,7 +2780,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
-            | Self::AddRole { .. }
+            | Self::CatalogApply { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }
@@ -2755,6 +2799,21 @@ impl Insn {
             },
             _ => true,
         }
+    }
+
+    /// Returns true if this opcode reads or writes a database file. These are
+    /// the opcodes that set SQLite's `Vdbe.bIsReader`.
+    pub fn reads_database_file(&self) -> bool {
+        matches!(
+            self,
+            Self::Transaction { .. }
+                | Self::AutoCommit { .. }
+                | Self::Savepoint { .. }
+                | Self::Checkpoint { .. }
+                | Self::JournalMode { .. }
+                | Self::Vacuum { .. }
+                | Self::VacuumInto { .. }
+        )
     }
 }
 

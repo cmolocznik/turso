@@ -178,3 +178,131 @@ test real-affinity-in-list-preserves-integer {
 expect {
 0
 }
+
+# An IN list on an indexed column of a custom type gets the comparison
+# affinity before the type's ENCODE, as the scan does: 1.0 becomes 1, which
+# boolean accepts, and 1, 1.0 and '1' give one seek key, so the row is read once.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test in-list-on-indexed-boolean-applies-affinity-before-encode {
+    CREATE TABLE t(b boolean) STRICT;
+    INSERT INTO t VALUES (1), (0);
+    CREATE INDEX t_b ON t(b);
+    SELECT
+        (SELECT count(*) FROM t WHERE b IN (1.0)),
+        (SELECT count(*) FROM t WHERE b IN (1, 1.0, '1', 1e0)),
+        (SELECT count(*) FROM t WHERE b = 1.0 OR b = 0.0),
+        (SELECT count(*) FROM t NOT INDEXED WHERE b IN (1, 1.0, '1', 1e0));
+}
+expect {
+1|1|2|1
+}
+
+# A text in the list is read as a boolean, as in PostgreSQL, so a text that
+# is not a boolean is an error with and without the index.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test in-list-on-indexed-boolean-text-that-is-not-a-boolean-is-an-error {
+    CREATE TABLE t(b boolean) STRICT;
+    INSERT INTO t VALUES (1), (0);
+    CREATE INDEX t_b ON t(b);
+    SELECT count(*) FROM t WHERE b IN (1, '1.0');
+}
+expect error {
+invalid input for type boolean
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test in-list-on-boolean-scan-text-that-is-not-a-boolean-is-an-error {
+    CREATE TABLE t(b boolean) STRICT;
+    INSERT INTO t VALUES (1), (0);
+    SELECT count(*) FROM t WHERE b IN (1, '1.0');
+}
+expect error {
+invalid input for type boolean
+}
+
+# A CAST to a registered type compares by the affinity of the type, as a column
+# of the type does, so an index on the column serves the comparison. The
+# affinity came from the spelling of the type name, and `uuid` and `date` are
+# NUMERIC by SQLite's rules for names, so the index was not used.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test cast-to-uuid-is-served-by-the-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u uuid) STRICT;
+    INSERT INTO t VALUES (1, '11111111-1111-1111-1111-111111111111'), (2, '22222222-2222-2222-2222-222222222222');
+    CREATE INDEX t_u ON t(u);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE u = CAST('11111111-1111-1111-1111-111111111111' AS uuid);
+}
+expect pattern {
+    SEARCH t USING COVERING INDEX t_u \(u=\?\)
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test cast-to-uuid-reads-the-same-rows-with-and-without-the-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u uuid) STRICT;
+    INSERT INTO t VALUES (1, '11111111-1111-1111-1111-111111111111'), (2, '22222222-2222-2222-2222-222222222222');
+    CREATE INDEX t_u ON t(u);
+    SELECT
+        (SELECT group_concat(id) FROM t WHERE u = CAST('22222222-2222-2222-2222-222222222222' AS uuid)),
+        (SELECT group_concat(id) FROM t NOT INDEXED WHERE u = CAST('22222222-2222-2222-2222-222222222222' AS uuid)),
+        (SELECT count(*) FROM t WHERE u = CAST('33333333-3333-3333-3333-333333333333' AS uuid));
+}
+expect {
+    2|2|0
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test cast-to-date-is-served-by-the-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2020-01-01'), (2, '2021-06-15');
+    CREATE INDEX t_d ON t(d);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE d = CAST('2020-01-01' AS date);
+}
+expect pattern {
+    SEARCH t USING COVERING INDEX t_d \(d=\?\)
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test cast-to-date-reads-the-same-rows-with-and-without-the-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2020-01-01'), (2, '2021-06-15');
+    CREATE INDEX t_d ON t(d);
+    SELECT
+        (SELECT group_concat(id) FROM t WHERE d = CAST('2021-06-15' AS date)),
+        (SELECT group_concat(id) FROM t NOT INDEXED WHERE d = CAST('2021-06-15' AS date)),
+        (SELECT count(*) FROM t WHERE d = CAST('1999-01-01' AS date));
+}
+expect {
+    2|2|0
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test cast-to-bytea-is-served-by-the-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b bytea) STRICT;
+    INSERT INTO t VALUES (1, x'01'), (2, x'0200');
+    CREATE INDEX t_b ON t(b);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE b = CAST(x'01' AS bytea);
+}
+expect pattern {
+    SEARCH t USING COVERING INDEX t_b \(b=\?\)
+}
+
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test cast-to-a-text-type-compares-the-same-through-a-subquery {
+    CREATE TYPE pint BASE text;
+    SELECT
+        CAST('01' AS pint) = 1,
+        (SELECT c FROM (SELECT CAST('01' AS pint) AS c)) = 1,
+        (SELECT count(*) FROM (SELECT CAST('01' AS pint) AS c) WHERE c = 1);
+}
+expect {
+    0|0|0
+}

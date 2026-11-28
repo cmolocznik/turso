@@ -19,14 +19,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use turso_core::{ConnectOpts, Database, SqliteDialect};
-use turso_parser::ast::{
+use turso_core::ast::{
     Cmd, Expr, InsertBody, Literal, OneSelect, ResultColumn, Select, SelectTable, Stmt,
 };
+use turso_core::{ConnectOpts, Database};
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 use crate::memory::MemorySimIO;
 use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};
+use turso_core::SessionRole;
 
 /// Upper bound on candidate executions per shrink, so a pathological
 /// statement cannot stall a fuzzing loop.
@@ -100,7 +102,7 @@ impl EnginePair {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso = turso_db.connect(ConnectOpts::new())?;
+        let turso = turso_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
             let stmt = stmt.trim();
@@ -399,7 +401,7 @@ enum ClauseDrop {
 enum Site<'a> {
     Core(&'a mut OneSelect),
     Outer(&'a mut Select),
-    Update(&'a mut turso_parser::ast::Update),
+    Update(&'a mut turso_core::ast::Update),
     Delete {
         where_clause: &'a mut Option<Box<Expr>>,
         returning: &'a mut Vec<ResultColumn>,
@@ -632,7 +634,7 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
 }
 
 fn walk_limit(
-    limit: &mut Option<turso_parser::ast::Limit>,
+    limit: &mut Option<turso_core::ast::Limit>,
     f: &mut dyn FnMut(&mut Expr) -> bool,
 ) -> bool {
     if let Some(limit) = limit {
@@ -732,10 +734,7 @@ fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) ->
     }
 }
 
-fn walk_from(
-    from: &mut turso_parser::ast::FromClause,
-    f: &mut dyn FnMut(&mut Expr) -> bool,
-) -> bool {
+fn walk_from(from: &mut turso_core::ast::FromClause, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
     if walk_select_table(&mut from.select, f) {
         return true;
     }
@@ -743,7 +742,7 @@ fn walk_from(
         if walk_select_table(&mut join.table, f) {
             return true;
         }
-        if let Some(turso_parser::ast::JoinConstraint::On(e)) = &mut join.constraint {
+        if let Some(turso_core::ast::JoinConstraint::On(e)) = &mut join.constraint {
             if walk_expr(e, f) {
                 return true;
             }
@@ -875,7 +874,7 @@ fn walk_select_sites(select: &mut Select, f: &mut dyn FnMut(&mut Site<'_>) -> bo
 }
 
 fn walk_from_sites(
-    from: &mut turso_parser::ast::FromClause,
+    from: &mut turso_core::ast::FromClause,
     f: &mut dyn FnMut(&mut Site<'_>) -> bool,
 ) -> bool {
     if let SelectTable::Select { select, .. } = &mut *from.select {

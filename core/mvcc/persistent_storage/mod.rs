@@ -72,8 +72,10 @@ pub trait DurableStorage: Send + Sync + Debug {
     ) -> Result<(Completion, u64)>;
 
     /// If `m` needs a logical-log header upgrade before it can be appended,
-    /// start that write and return its completion. Callers must wait for this
-    /// completion and then call `log_tx`.
+    /// start that write and return its completion. While a header write or a
+    /// truncate of the log is in flight, return its completion instead.
+    /// Callers must wait for this completion and call this again; once it
+    /// returns `None`, they call `log_tx`.
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>>;
 
     /// The most bytes `m`'s frame takes once [`Self::log_tx`] writes it, not
@@ -115,11 +117,17 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// above the boundary (uncheckpointed concurrent commits) are preserved.
     ///
     /// Returns whether the log was actually truncated ([`LogicalLogTruncateOutcome::Truncated`])
-    /// or left intact ([`LogicalLogTruncateOutcome::Retained`]).
+    /// or left intact ([`LogicalLogTruncateOutcome::Retained`]). Callers wait for
+    /// the completion and then call `finish_truncate`.
     fn truncate(
         &self,
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, LogicalLogTruncateOutcome)>;
+
+    /// Applies a finished truncate started by `truncate`: if it succeeded, the
+    /// log is empty and `logical_log_offset` returns 0; if it failed, the log
+    /// keeps its frames and offset.
+    fn finish_truncate(&self);
 
     /// Reset the logical log to a fresh header-only file.
     ///
@@ -260,7 +268,7 @@ impl Storage {
         io: Arc<dyn crate::IO>,
         encryption_ctx: Option<EncryptionContext>,
     ) -> Self {
-        Self::with_log(LogicalLog::new(file, io, encryption_ctx))
+        Self::from_log(LogicalLog::new(file, io, encryption_ctx))
     }
 
     /// A log that rolls through the files `base`, `base.1` and on, `file` being `base`'s, opened
@@ -272,7 +280,7 @@ impl Storage {
         base: String,
         flags: crate::OpenFlags,
     ) -> Result<Self> {
-        Ok(Self::with_log(LogicalLog::new_rolling(
+        Ok(Self::from_log(LogicalLog::new_rolling(
             file,
             io,
             encryption_ctx,
@@ -281,7 +289,7 @@ impl Storage {
         )?))
     }
 
-    fn with_log(log: LogicalLog) -> Self {
+    fn from_log(log: LogicalLog) -> Self {
         Self {
             logical_log: RwLock::new(log),
             log_offset: AtomicU64::new(0),
@@ -306,6 +314,18 @@ impl Storage {
     #[inline(always)]
     fn shadow_offset_advance(&self, bytes: u64) {
         self.log_offset.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Runs `f` with the log locked for writing, then copies the log's offset
+    /// to the shadow offset. Every write access goes through here because the
+    /// offset can change in any of them: a truncate that finished after its
+    /// call returned resets the offset to 0 the next time the log is used.
+    fn with_log<R>(&self, f: impl FnOnce(&mut LogicalLog) -> R) -> R {
+        let mut log = self.logical_log.write();
+        let result = f(&mut log);
+        // The log's absolute end, past the files it rolled out of.
+        self.shadow_offset_store(log.segment_start() + log.offset);
+        result
     }
 }
 
@@ -350,13 +370,11 @@ impl DurableStorage for Storage {
         m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.logical_log
-            .write()
-            .log_tx_deferred_offset(m, on_serialization_complete)
+        self.with_log(|log| log.log_tx_deferred_offset(m, on_serialization_complete))
     }
 
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
-        self.logical_log.write().upgrade_header_for_log_tx(m)
+        self.with_log(|log| log.upgrade_header_for_log_tx(m))
     }
 
     fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
@@ -365,7 +383,7 @@ impl DurableStorage for Storage {
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         let started = std::time::Instant::now();
-        let completion = self.logical_log.write().sync(sync_type);
+        let completion = self.with_log(|log| log.sync(sync_type));
         let micros = started.elapsed().as_micros() as u64;
         LOG_SYNCS.fetch_add(1, Ordering::Relaxed);
         LOG_SYNC_MICROS.fetch_add(micros, Ordering::Relaxed);
@@ -397,7 +415,7 @@ impl DurableStorage for Storage {
     }
 
     fn update_header(&self) -> Result<Completion> {
-        self.logical_log.write().update_header()
+        self.with_log(|log| log.update_header())
     }
 
     #[aristo::intent("after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)", id = "aristos:logical_log_shadow_offset_matches_durable", verify = "full")]
@@ -405,21 +423,15 @@ impl DurableStorage for Storage {
         &self,
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
-        let mut log = self.logical_log.write();
-        let (c, outcome) = log.truncate(checkpointed_through_ts)?;
-        // Shadow the log's actual offset: 0 if it truncated, unchanged if it
-        // skipped (uncheckpointed frames remain) or rolled, so should_checkpoint()
-        // stays accurate.
-        let new_offset = log.segment_start() + log.offset;
-        drop(log);
-        self.shadow_offset_store(new_offset);
-        Ok((c, outcome))
+        self.with_log(|log| log.truncate(checkpointed_through_ts))
+    }
+
+    fn finish_truncate(&self) {
+        self.with_log(|log| log.publish_finished_header_change());
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {
-        let c = self.logical_log.write().reset_to_fresh_header()?;
-        self.shadow_offset_store(0);
-        Ok(c)
+        self.with_log(|log| log.reset_to_fresh_header())
     }
 
     fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -462,27 +474,24 @@ impl DurableStorage for Storage {
     }
 
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
-        self.logical_log.write().advance_offset_after_success(bytes);
-        self.shadow_offset_advance(bytes);
+        self.with_log(|log| log.advance_offset_after_success(bytes));
         Ok(())
     }
 
     fn discard_pending_log_write(&self) -> Result<()> {
-        self.logical_log.write().discard_pending_write();
+        self.with_log(|log| log.discard_pending_write());
         Ok(())
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
-        let mut log = self.logical_log.write();
-        log.offset = offset;
-        log.running_crc = running_crc;
-        let end = log.segment_start() + offset;
-        drop(log);
-        self.shadow_offset_store(end);
+        self.with_log(|log| {
+            log.offset = offset;
+            log.running_crc = running_crc;
+        });
     }
 
     fn set_header(&self, header: logical_log::LogHeader) {
-        self.logical_log.write().set_header(header);
+        self.with_log(|log| log.set_header(header));
     }
 
     fn log_files(&self) -> Vec<(usize, Arc<dyn File>)> {

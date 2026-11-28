@@ -125,6 +125,7 @@ sqlite+turso:///db.db?isolation_level=IMMEDIATE
 
 Query parameters:
 - `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `timeout` - Seconds to wait for a database locked by another connection before raising `OperationalError` (default: 5.0, like `sqlite3.connect`)
 - `experimental_features` - Comma-separated feature flags
 
 ### Async Local Dialect (`sqlite+aioturso://`)
@@ -137,6 +138,7 @@ sqlite+aioturso:///db.db?isolation_level=IMMEDIATE
 
 Query parameters:
 - `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `timeout` - Seconds to wait for a database locked by another connection before raising `OperationalError` (default: 5.0, like `sqlite3.connect`)
 - `experimental_features` - Comma-separated feature flags
 
 ### Sync Dialect (`sqlite+turso_sync://`)
@@ -152,6 +154,7 @@ Query parameters:
 - `long_poll_timeout_ms` - Long poll timeout in milliseconds
 - `bootstrap_if_empty` - Bootstrap from remote if local empty (default: true)
 - `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
+- `timeout` - Seconds to wait for a database locked by another connection before raising `OperationalError` (default: 5.0, like `sqlite3.connect`)
 - `experimental_features` - Comma-separated feature flags
 
 URL validation:
@@ -205,6 +208,7 @@ The sync dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related o
 | `paramstyle = "qmark"` | Provided |
 | `sqlite_version` | Provided |
 | `sqlite_version_info` | Provided |
+| `Binary` type constructor | Provided |
 | `connect()` function | Provided |
 | `Connection` class | Provided |
 | `Cursor` class | Provided |
@@ -212,7 +216,7 @@ The sync dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related o
 
 Both `turso` and `turso.sync` modules expose the full DB-API 2.0 interface including exception hierarchy (`Warning`, `Error`, `InterfaceError`, `DatabaseError`, `DataError`, `OperationalError`, `IntegrityError`, `InternalError`, `ProgrammingError`, `NotSupportedError`).
 
-`turso.aio` exposes coroutine connection and cursor APIs, but it does not expose the DB-API module metadata and exception hierarchy directly. `sqlite+aioturso://` uses an internal adapter to mirror those DB-API module attributes from `turso` and to provide SQLite constants such as `PARSE_DECLTYPES`, `PARSE_COLNAMES`, and `Binary`.
+`turso.aio` exposes coroutine connection and cursor APIs, but it does not expose the DB-API module metadata and exception hierarchy directly. `sqlite+aioturso://` uses an internal adapter to mirror those DB-API module attributes, including `Binary`, from `turso` and to provide SQLite constants such as `PARSE_DECLTYPES` and `PARSE_COLNAMES`.
 
 ## Dialect Overrides
 

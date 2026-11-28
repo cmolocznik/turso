@@ -209,6 +209,18 @@ snapshot-eqp not-in-subquery {
     );
 }
 
+# A value missing from the IN list checks only the first list row for NULL,
+# not the whole list once per outer row.
+@setup schema
+snapshot in-subquery-miss-checks-only-the-first-row-for-null {
+    SELECT count(*) FROM products WHERE stock IN (SELECT parent_id FROM categories);
+}
+
+@setup schema
+snapshot not-in-subquery-miss-checks-only-the-first-row-for-null {
+    SELECT count(*) FROM products WHERE stock NOT IN (SELECT parent_id FROM categories);
+}
+
 # =============================================================================
 # CORRELATED SUBQUERIES
 # =============================================================================
@@ -499,6 +511,63 @@ snapshot cte-in-subquery-and-main {
     WHERE p.price > (
         SELECT max(avg_price) FROM category_avg
     ) * 0.8;
+}
+
+# A CTE that is stored once shows its body under MATERIALIZE <name>, as in
+# SQLite, so that its steps are not mistaken for steps of the main loop.
+@setup schema
+snapshot-eqp cte-materialized-hint-read-twice {
+    WITH spenders AS MATERIALIZED (
+        SELECT customer_id, sum(total_amount) AS total FROM orders GROUP BY customer_id
+    )
+    SELECT c.name, s1.total
+    FROM customers c
+    JOIN spenders s1 ON s1.customer_id = c.id
+    JOIN spenders s2 ON s2.customer_id = c.id + 1;
+}
+
+@setup schema
+snapshot-eqp cte-materialized-hint-read-once {
+    WITH big AS MATERIALIZED (SELECT * FROM orders WHERE total_amount > 100)
+    SELECT * FROM big;
+}
+
+@setup schema
+snapshot-eqp cte-materialized-inside-in-subquery {
+    WITH big AS MATERIALIZED (SELECT customer_id FROM orders WHERE total_amount > 100)
+    SELECT name FROM customers
+    WHERE id IN (SELECT customer_id FROM big)
+      AND id + 1 IN (SELECT customer_id FROM big);
+}
+
+# A CTE that is filled again for each reader, because its body is correlated
+# or reads a column of an outer query, also shows MATERIALIZE <name>.
+@setup schema
+snapshot-eqp cte-materialized-hint-correlated-body {
+    WITH named AS MATERIALIZED (
+        SELECT (SELECT name FROM customers WHERE customers.id = o.customer_id) AS name
+        FROM orders o
+    )
+    SELECT * FROM named;
+}
+
+@setup schema
+snapshot-eqp cte-materialized-hint-reads-outer-column {
+    SELECT name, (
+        WITH own AS MATERIALIZED (SELECT id FROM orders WHERE customer_id = customers.id)
+        SELECT count(*) FROM own
+    )
+    FROM customers;
+}
+
+@setup schema
+snapshot-eqp recursive-cte-read-twice {
+    WITH RECURSIVE chain(id) AS (
+        SELECT id FROM employees WHERE manager_id IS NULL
+        UNION ALL
+        SELECT e.id FROM employees e JOIN chain ON e.manager_id = chain.id
+    )
+    SELECT a.id, b.id FROM chain a JOIN chain b ON a.id < b.id;
 }
 
 # =============================================================================
@@ -924,4 +993,108 @@ snapshot-eqp cte-materialized-order-outer-beyond-cte {
         SELECT * FROM t ORDER BY a ASC
     )
     SELECT * FROM ordered ORDER BY a ASC, b ASC;
+}
+
+# =============================================================================
+# FROM-CLAUSE SUBQUERY IN AN INNER LOOP
+# =============================================================================
+
+# A FROM-clause subquery that an outer join, a CROSS JOIN or an earlier
+# subquery keeps in an inner loop is stored in a table once, as SQLite does,
+# instead of running as a coroutine again for each outer row.
+
+setup watchlist_schema {
+    CREATE TABLE watchlist (type_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE history_txt (type_id VARCHAR, price REAL);
+}
+
+# The INTEGER = TEXT comparison cannot seek an index on the subquery.
+@setup watchlist_schema
+snapshot left-join-subquery-without-seek-index-materialized {
+    SELECT count(*), sum(h.avgp)
+    FROM watchlist w
+    LEFT JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.type_id = h.type_id;
+}
+
+@setup watchlist_schema
+snapshot left-join-subquery-non-equality-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    LEFT JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.name > h.avgp;
+}
+
+@setup watchlist_schema
+snapshot cross-join-subquery-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    CROSS JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h
+    WHERE w.name > h.avgp;
+}
+
+# An earlier LEFT JOIN keeps the subquery after watchlist.
+@setup watchlist_schema
+snapshot subquery-after-left-join-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    LEFT JOIN history_txt t ON t.price = w.type_id
+    JOIN (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    ) h ON w.name > h.avgp;
+}
+
+# The second subquery comes after another subquery, so it is stored in a table.
+# The first one is the outer loop and stays a coroutine.
+@setup watchlist_schema
+snapshot subquery-after-subquery-materialized {
+    SELECT count(*)
+    FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) a,
+         (SELECT type_id, max(price) AS maxp FROM history_txt GROUP BY type_id) b
+    WHERE a.avgp + b.maxp > 3;
+}
+
+@setup watchlist_schema
+snapshot left-join-cte-materialized {
+    WITH h AS (
+        SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id
+    )
+    SELECT count(*) FROM watchlist w LEFT JOIN h ON w.name > h.avgp;
+}
+
+# EXISTS becomes a semi join, which keeps the subquery after watchlist.
+@setup watchlist_schema
+snapshot exists-subquery-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    WHERE EXISTS (
+        SELECT 1
+        FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h
+        WHERE w.name > h.avgp
+    );
+}
+
+# NOT EXISTS becomes an anti join, which keeps the subquery after watchlist.
+@setup watchlist_schema
+snapshot not-exists-subquery-materialized {
+    SELECT count(*)
+    FROM watchlist w
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM (SELECT type_id, avg(price) AS avgp FROM history_txt GROUP BY type_id) h
+        WHERE w.name > h.avgp
+    );
+}
+
+# SQLite flattens a subquery without aggregates into the outer query, so it
+# runs once per outer row, and Turso keeps the coroutine.
+@setup watchlist_schema
+snapshot left-join-flattenable-subquery-coroutine {
+    SELECT w.type_id, h.price
+    FROM watchlist w
+    LEFT JOIN (SELECT type_id, price FROM history_txt WHERE price > 10) h ON w.type_id + h.price > 20;
 }

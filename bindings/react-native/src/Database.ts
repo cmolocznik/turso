@@ -31,7 +31,7 @@ import { drainSyncIo } from './internal/ioProcessor';
  * Check if config has sync properties (url field)
  */
 function isSyncConfig(opts: DatabaseOpts): boolean {
-  return opts.url !== undefined && opts.url !== null;
+  return opts.localEncryptionKey != null || (opts.url !== undefined && opts.url !== null);
 }
 
 /**
@@ -78,6 +78,8 @@ export class Database {
   private _connected = false;
   private _closed = false;
   private _execLock: AsyncLock;
+  // The sync engine runs one operation at a time, so push/pull/stats/checkpoint calls take turns
+  private _syncLock: AsyncLock;
   private _extraIo?: () => Promise<void>;
   private _ioContext?: {
     authToken?: string | (() => string | Promise<string> | null);
@@ -93,6 +95,7 @@ export class Database {
     this._opts = opts;
     this._isSync = isSyncConfig(opts);
     this._execLock = new AsyncLock();
+    this._syncLock = new AsyncLock();
   }
 
   /**
@@ -153,10 +156,16 @@ export class Database {
       url = this._opts.url;
     }
 
+    if (this._opts.localEncryptionKey != null && this._opts.remoteEncryption == null) {
+      throw new Error('localEncryptionKey requires remoteEncryption.cipher');
+    }
     // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
       async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
+      experimental_features: this._opts.experimental?.join(',') || undefined,
+      encryption_cipher: this._opts.localEncryptionKey != null ? this._opts.remoteEncryption?.cipher : undefined,
+      encryption_hexkey: this._opts.localEncryptionKey,
     };
 
     // Calculate reserved bytes from cipher
@@ -167,7 +176,7 @@ export class Database {
       remoteUrl: url,
       clientName: this._opts.clientName || 'turso-sync-react-native',
       longPollTimeoutMs: this._opts.longPollTimeoutMs,
-      bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? true,
+      bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? (this._opts.localEncryptionKey == null || url != null),
       reservedBytes: reservedBytes,
       // Remote encryption options (key is passed to sync engine for HTTP headers)
       remoteEncryptionKey: this._opts.remoteEncryption?.key,
@@ -348,8 +357,13 @@ export class Database {
       throw new Error('push() is only available for sync databases');
     }
 
-    const operation = this._nativeSyncDb.pushChanges();
-    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      const operation = this._nativeSyncDb.pushChanges();
+      await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    } finally {
+      this._syncLock.release();
+    }
   }
 
   /**
@@ -362,20 +376,25 @@ export class Database {
       throw new Error('pull() is only available for sync databases');
     }
 
-    // Wait for changes
-    const waitOperation = this._nativeSyncDb.waitChanges();
-    const changes = await driveChangesOperation(waitOperation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      // Wait for changes
+      const waitOperation = this._nativeSyncDb.waitChanges();
+      const changes = await driveChangesOperation(waitOperation, this._nativeSyncDb, this._ioContext);
 
-    // If no changes, return false
-    if (!changes) {
-      return false;
+      // If no changes, return false
+      if (!changes) {
+        return false;
+      }
+
+      // Apply changes
+      const applyOperation = this._nativeSyncDb.applyChanges(changes);
+      await driveVoidOperation(applyOperation, this._nativeSyncDb, this._ioContext);
+
+      return true;
+    } finally {
+      this._syncLock.release();
     }
-
-    // Apply changes
-    const applyOperation = this._nativeSyncDb.applyChanges(changes);
-    await driveVoidOperation(applyOperation, this._nativeSyncDb, this._ioContext);
-
-    return true;
   }
 
   /**
@@ -388,8 +407,13 @@ export class Database {
       throw new Error('stats() is only available for sync databases');
     }
 
-    const operation = this._nativeSyncDb.stats();
-    return driveStatsOperation(operation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      const operation = this._nativeSyncDb.stats();
+      return await driveStatsOperation(operation, this._nativeSyncDb, this._ioContext);
+    } finally {
+      this._syncLock.release();
+    }
   }
 
   /**
@@ -400,8 +424,13 @@ export class Database {
       throw new Error('checkpoint() is only available for sync databases');
     }
 
-    const operation = this._nativeSyncDb.checkpoint();
-    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      const operation = this._nativeSyncDb.checkpoint();
+      await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    } finally {
+      this._syncLock.release();
+    }
   }
 
   /**

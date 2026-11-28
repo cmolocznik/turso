@@ -24,14 +24,17 @@
 //! completion (or before an in-statement view read), or inside the CREATE
 //! MATERIALIZED VIEW statement for initial population.
 
+use crate::alloc::StatementAllocationSite;
+use crate::ast;
 use crate::namespace::NamespaceRef;
 use rustc_hash::FxHashMap;
-use turso_parser::ast;
 
 use crate::incremental::dag;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
+use crate::translate::{build_program, new_program_builder};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::{PreparedProgram, Program};
 use crate::{Connection, LimboError, QueryMode, Result};
@@ -144,7 +147,7 @@ pub(crate) fn compile_maintenance_program(
         input,
     };
     if let Some(prepared) = connection.maintenance_program_cache.get(&key, connection) {
-        return Ok(prepared.bind(connection.clone()));
+        return Ok(Program::from_prepared(prepared));
     }
     let plan = build_plan_for_connection(view_name, select, schema, connection)?;
     let program = compile_maintenance_plan(
@@ -171,16 +174,20 @@ fn compile_maintenance_plan(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 13,
-            approx_num_insns: 128 + 64 * num_view_columns,
-            approx_num_labels: 48,
-        },
-        connection.mvcc_enabled(),
-    );
+    let mut program =
+        new_program_builder(connection, StatementAllocationSite::ProgramBuilder, || {
+            ProgramBuilder::new_for_subprogram(
+                QueryMode::Normal,
+                None,
+                ProgramBuilderOpts {
+                    num_cursors: 13,
+                    approx_num_insns: 128 + 64 * num_view_columns,
+                    approx_num_labels: 48,
+                },
+                connection.mvcc_enabled(),
+                0,
+            )
+        })?;
     program.prologue();
     emit_plan_to_sink(
         &mut program,
@@ -195,8 +202,9 @@ fn compile_maintenance_plan(
         connection,
     )?;
     program.epilogue(schema);
-    program.build(
-        connection.clone(),
+    build_program(
+        program,
+        connection,
         false,
         "materialized view DAG maintenance",
     )
@@ -254,8 +262,10 @@ fn build_plan_for_connection(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
     // names the same way CREATE did: within the view's own database, never

@@ -16,7 +16,10 @@ Three things keep that work honest:
 - **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
   that CI runs against the front-end and against a real PostgreSQL server
   (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
-  behavior have `@skip-if postgres "reason"`.
+  behavior have `@skip-if postgres "reason"`. Tests for SQL that the SQLite
+  frontend also runs are in
+  [`testing/shared-sqltests/`](../testing/shared-sqltests/), which CI runs on
+  every backend.
 
 ## Verification workflow
 
@@ -25,13 +28,33 @@ When changing the parser, translator, or query behavior:
 1. Check the relevant page of the PostgreSQL documentation.
 2. Confirm the behavior against a real PostgreSQL server.
 3. Encode the observed behavior in a test — an upstream regression script that
-   now passes, a `.sqltest` in `conformance/pg-sqltests/`, or a Rust test (see
-   below) — so it can't regress.
+   now passes, a `.sqltest` in `conformance/pg-sqltests/` (or in
+   `testing/shared-sqltests/` when the SQLite frontend must give the same
+   result), or a Rust test (see below) — so it can't regress.
 
 If Turso intentionally diverges from PostgreSQL, document that in
 [`COMPAT.md`](COMPAT.md). Pay particular attention to clauses that parse but
 are silently ignored: the parser accepts the full PostgreSQL grammar, so a
 feature the translator drops produces wrong results, not an error.
+
+## Known gaps
+
+A known gap is a case where tursopg gives a different result than PostgreSQL. Each gap is a test with an ID, for example `E-19`.
+
+- Gap tests are in [`conformance/pg-sqltests/gaps/`](conformance/pg-sqltests/gaps/), one file per category: `params-casts` (A), `operators-functions` (B), `output-formats` (C), `errors` (D), `ddl-catalog` (E).
+- A test name is a short title in lower case, for example `int4-overflow-literal-cast`. The comment line above it gives the gap ID and the title, for example `# A-07: int4 overflow literal cast`.
+- Tests that share setup statements use a named `setup` block and `@setup`.
+- The default `expect` block is the PostgreSQL result. `make -C postgres/conformance run-postgres` checks it.
+- A gap test has a `@compat-gap "<kind>:<object>"` label and an `expect @tursopg` block with the current tursopg result. `make -C postgres/conformance run` checks it. The label names the PostgreSQL function, type, operator, cast or syntax form that the fix changes, for example `function:age`, `type:int4`, `operator:jsonb @> jsonb`, `cast:timestamptz -> date` or `syntax:on-conflict`. [`testing/sqltest/docs/dsl-spec.md`](../testing/sqltest/docs/dsl-spec.md) gives the rules.
+- For errors, give the SQLSTATE with `@sqlstate <code>`. The default `expect error` block may give the PostgreSQL message. The `expect @tursopg` error block of a gap test may give the tursopg message, and the tursopg run compares it. tursopg fixes an error gap when it returns the PostgreSQL SQLSTATE, whatever its message.
+- When tursopg gives the PostgreSQL result, the tursopg run fails with "gap fixed". Delete `@compat-gap` and the `expect @tursopg` block in the same change. When tursopg returns the PostgreSQL SQLSTATE with another message, keep the `expect @tursopg` error block with that SQLSTATE and the tursopg message.
+- Keep the test when you fix a gap. CI fails when a gap test is deleted, renamed, or loses its gap with other SQL, setups, PostgreSQL answer, or skip, backend or requires modifiers. A reviewer decides whether a change that must delete a gap test merges with that check failing.
+- An `expect @tursopg` block without `@compat-gap` may only change the error message of an error with the same SQLSTATE.
+- `make -C postgres/conformance gaps` prints the gap counts by kind, label and class.
+- Use `@skip "<gap id>: reason"` when the tursopg result is not stable for another reason.
+- A test without an `@tursopg` block matches PostgreSQL. It is a regression test.
+- `run-postgres` needs a server with the `en_US.UTF-8` locale, which is the default of the Docker image. B-12, B-74, B-94 and B-95 give different results with the `C` locale or an ICU locale.
+- Cases that need bound parameters, a database reopen, two commands in one prepared statement, MVCC, or a query after a failed statement are in [`tests/integration/postgres/gaps.rs`](tests/integration/postgres/gaps.rs), named `gap_<id>_<short_title>`. A test of a gap that matches PostgreSQL asserts the PostgreSQL result. A test of an open gap is named `gap_<id>_tursopg_returns_wrong_result_<short_title>` and asserts the current wrong tursopg result, with the PostgreSQL result in a comment above it. When you fix the gap, its test fails: change the assert to the PostgreSQL result and remove `tursopg_returns_wrong_result` from the name. Run them with `cargo test -p turso_pg_tests --test integration_tests gaps::`.
 
 ## Running the upstream regression suite
 
@@ -63,8 +86,9 @@ into fresh PostgreSQL and Turso databases, and compare their `pg_dump` output.
 It compares PostgreSQL ASTs and decoded COPY rows rather than dump bytes.
 
 Install PostgreSQL clients that support `pg_dump --restrict-key`. Use Docker,
-or set `PG_DSN` to a disposable PostgreSQL 18 server using a `turso` role with
-LOGIN and CREATEDB. Matching role names avoids default-privilege differences:
+or set `PG_DSN` to a disposable PostgreSQL 18 server (the version in
+`postgres/version`), using a `turso` role with LOGIN and CREATEDB. Matching
+role names avoids default-privilege differences:
 
 ```bash
 make -C postgres/conformance test-pgdump

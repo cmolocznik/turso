@@ -1,8 +1,7 @@
-use crate::error::sqlstate_error;
 use crate::functions::{invalid_json, pg_scalar_function, unsupported_unicode_escape, Uuid};
+use crate::pg_type::canonical_uuid;
 use turso_core::native_ext::FunctionArity;
 use turso_core::{Connection, OpenOptions, Result};
-use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
@@ -10,8 +9,8 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "auth.uid",
             FunctionArity::Exact(0),
             false,
-            |connection, _| {
-                claim(connection, "request.jwt.claim.sub", "sub")?
+            |context, _| {
+                claim(context.connection, "request.jwt.claim.sub", "sub")?
                     .map(|sub| canonical_uuid(&sub).map(Uuid))
                     .transpose()
             },
@@ -20,13 +19,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "auth.email",
             FunctionArity::Exact(0),
             false,
-            |connection, _| claim(connection, "request.jwt.claim.email", "email"),
+            |context, _| claim(context.connection, "request.jwt.claim.email", "email"),
         ))
         .extension_function(pg_scalar_function(
             "auth.jwt",
             FunctionArity::Exact(0),
             false,
-            |connection, _| jwt(connection),
+            |context, _| jwt(context.connection),
         ))
 }
 
@@ -42,17 +41,6 @@ fn claim(conn: &Connection, setting_name: &str, claim_name: &str) -> Result<Opti
         Some(serde_json::Value::String(value)) => Some(value.clone()),
         Some(value) => Some(value.to_string()),
     })
-}
-
-fn canonical_uuid(text: &str) -> Result<String> {
-    uuid::Uuid::parse_str(text)
-        .map(|uuid| uuid.hyphenated().to_string())
-        .map_err(|_| {
-            sqlstate_error(
-                SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                format!("invalid input syntax for type uuid: \"{text}\""),
-            )
-        })
 }
 
 fn jwt(conn: &Connection) -> Result<Option<String>> {

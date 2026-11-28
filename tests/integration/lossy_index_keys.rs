@@ -44,7 +44,7 @@
 //!
 //! ```text
 //! - core/translate/index.rs                CREATE INDEX (index_* forms)
-//! - core/translate/schema.rs               UNIQUE and PRIMARY KEY in CREATE TABLE
+//! - core/translate/schema/mod.rs           UNIQUE and PRIMARY KEY in CREATE TABLE
 //!                                          (col_*, tbl_* forms)
 //! - core/schema.rs                         automatic_from_primary_key/unique, and
 //!                                          loading an index from the schema table
@@ -87,9 +87,10 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenFlags, SqliteDialect,
+    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenFlags, SessionRole,
     Value, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -119,7 +120,9 @@ struct TypeSpec {
     /// CREATE INDEX on the type is refused today with "type does not declare
     /// OPERATOR '<'" (it has a DECODE but no OPERATOR '<').
     index_needs_operator: bool,
-    /// COLLATE on the type is refused today with this message.
+    /// COLLATE on the type is refused with this message. Built-in types take a
+    /// COLLATE as in SQLite; a custom type takes one only if it is stored as
+    /// text, and an array never does.
     collation_error: Option<&'static str>,
     is_domain: bool,
     /// SQL literals. For lossy types the first two are equal after DECODE but
@@ -206,7 +209,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Lossy,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type round_t"),
             is_domain: false,
             pool: &["1.2", "1.4", "2.6", "3.0", "2.4"],
             probes: &["1.0", "3.0", "2.5"],
@@ -219,7 +222,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Lossy,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type case_t"),
             is_domain: false,
             pool: &["-5", "-1", "0", "3", "7"],
             probes: &["0", "-9", "3"],
@@ -232,7 +235,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Lossy,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type abs_t"),
             is_domain: false,
             pool: &["-3", "3", "2", "-2", "5"],
             probes: &["3", "2", "4"],
@@ -247,7 +250,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Lossy,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type neg_t"),
             is_domain: false,
             pool: &["1", "2", "3", "4", "5"],
             probes: &["2", "4", "9"],
@@ -317,7 +320,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Allowed,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type uuid"),
             is_domain: false,
             pool: UUID_POOL,
             probes: UUID_PROBES,
@@ -396,7 +399,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Allowed,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type dom_positive"),
             is_domain: true,
             pool: &["1", "2", "3", "10", "4"],
             probes: &["2", "3", "99"],
@@ -409,7 +412,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Allowed,
             sortable: true,
             index_needs_operator: false,
-            collation_error: None,
+            collation_error: Some("collations are not supported by type dom_uuid"),
             is_domain: true,
             pool: UUID_POOL,
             probes: UUID_PROBES,
@@ -423,7 +426,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Allowed,
             sortable: true,
             index_needs_operator: false,
-            collation_error: Some("collations are not supported by type array"),
+            collation_error: Some("collations are not supported by type integer[]"),
             is_domain: false,
             pool: &["'{1,2}'", "'{1,3}'", "'{2}'", "'{1,2}'"],
             probes: &["'{1,2}'", "'{2}'", "'{9}'"],
@@ -436,7 +439,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Lossy,
             sortable: true,
             index_needs_operator: false,
-            collation_error: Some("collations are not supported by type text_array"),
+            collation_error: Some("collations are not supported by type ci[]"),
             is_domain: false,
             pool: &["'{A}'", "'{a}'", "'{b}'", "'{B}'", "'{c}'"],
             probes: &["'{a}'", "'{b}'", "'{z}'"],
@@ -451,7 +454,7 @@ fn types() -> Vec<TypeSpec> {
             kind: Kind::Lossy,
             sortable: true,
             index_needs_operator: false,
-            collation_error: Some("collations are not supported by type text_array"),
+            collation_error: Some("collations are not supported by type dom_ci[]"),
             is_domain: true,
             pool: &["'{A}'", "'{a}'", "'{b}'", "'{B}'", "'{c}'"],
             probes: &["'{a}'", "'{b}'", "'{z}'"],
@@ -858,7 +861,7 @@ fn expectation(form: Form, ty: &TypeSpec, generated: Generated) -> Expect {
             "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".into(),
         ),
         Form::UpsertTarget => Expect::Allow,
-        // Arrays take no COLLATE. This is checked before any key rule.
+        // This is checked before any key rule.
         Form::IndexCollate | Form::ColUniqueCollate if ty.collation_error.is_some() => {
             Expect::RefuseExisting(ty.collation_error.unwrap().into())
         }
@@ -1001,7 +1004,7 @@ fn source_only_types() -> Vec<TypeSpec> {
             kind: Kind::Allowed,
             sortable: true,
             index_needs_operator: false,
-            collation_error: Some("collations are not supported by type text_array"),
+            collation_error: Some("collations are not supported by type text[]"),
             is_domain: false,
             pool: &["'{A}'", "'{a}'", "'{b}'", "'{B}'", "'{c}'"],
             probes: &["'{a}'", "'{b}'", "'{z}'"],
@@ -1085,7 +1088,9 @@ fn open() -> Db {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     Db { _db: db, conn }
 }
 

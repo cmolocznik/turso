@@ -1,7 +1,7 @@
+use crate::ast::SortOrder;
 use crate::types::IOResultOr;
 use crate::{turso_assert, turso_assert_eq};
 use branches::mark_unlikely;
-use turso_parser::ast::SortOrder;
 
 use crate::sync::RwLock;
 use crate::sync::{atomic, Arc};
@@ -16,7 +16,7 @@ use crate::io::TempFile;
 use crate::types::{cmp_in_column, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, CompletionGroup, File, IO},
+    io::{start_in_group, Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, KeyInfo, RecordBuf, ValueRef},
@@ -56,10 +56,10 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
             // NULL last, matching the reversed comparison.
             let rank_high = match (key.nulls_order, key.sort_order) {
                 (None, _) => false,
-                (Some(turso_parser::ast::NullsOrder::First), SortOrder::Asc) => false,
-                (Some(turso_parser::ast::NullsOrder::First), SortOrder::Desc) => true,
-                (Some(turso_parser::ast::NullsOrder::Last), SortOrder::Asc) => true,
-                (Some(turso_parser::ast::NullsOrder::Last), SortOrder::Desc) => false,
+                (Some(crate::ast::NullsOrder::First), SortOrder::Asc) => false,
+                (Some(crate::ast::NullsOrder::First), SortOrder::Desc) => true,
+                (Some(crate::ast::NullsOrder::Last), SortOrder::Asc) => true,
+                (Some(crate::ast::NullsOrder::Last), SortOrder::Desc) => false,
             };
             (
                 if rank_high {
@@ -193,7 +193,7 @@ impl Sorter {
     pub fn new(
         order: &[SortOrder],
         collations: Vec<CollationSeq>,
-        nulls_orders: Vec<Option<turso_parser::ast::NullsOrder>>,
+        nulls_orders: Vec<Option<crate::ast::NullsOrder>>,
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
@@ -808,13 +808,9 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let c = self.file.pread(
-            self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64,
-            c,
-        )?;
+        let offset =
+            self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64;
+        let c = start_in_group(group, c, |c| self.file.pread(offset, c))?;
         Ok(Some(c))
     }
 
@@ -1130,8 +1126,8 @@ mod tests {
 
     #[test]
     fn fuzz_normalized_key_invariant() {
+        use crate::ast::NullsOrder;
         use crate::types::AsValueRef;
-        use turso_parser::ast::NullsOrder;
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -1501,7 +1497,7 @@ mod tests {
 
     fn assert_secondary_key_sort(
         second_order: SortOrder,
-        second_nulls: Option<turso_parser::ast::NullsOrder>,
+        second_nulls: Option<crate::ast::NullsOrder>,
         seconds: &[Value],
         expected: &[ValueRef],
     ) {
@@ -1599,7 +1595,7 @@ mod tests {
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
             try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
-            try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
+            try_vec![None, Some(crate::ast::NullsOrder::Last)].unwrap(),
             256,
             64,
             io.clone(),
@@ -1688,7 +1684,7 @@ mod tests {
         .unwrap();
         assert_secondary_key_sort(
             SortOrder::Desc,
-            Some(turso_parser::ast::NullsOrder::Last),
+            Some(crate::ast::NullsOrder::Last),
             &seconds,
             &[
                 ValueRef::from_i64(20),

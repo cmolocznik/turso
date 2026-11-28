@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
+use crate::ast::{self, SortOrder};
 use crate::types::IOResultOr;
-use turso_parser::ast::{self, SortOrder};
 
 use crate::numeric::Numeric;
 use crate::{
@@ -317,6 +317,7 @@ pub struct VectorSparseInvertedIndexMethodCursor {
 impl IndexMethod for VectorSparseInvertedIndexMethod {
     fn attach(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         let query_pattern1 = format!(
@@ -329,7 +330,7 @@ impl IndexMethod for VectorSparseInvertedIndexMethod {
         );
         Ok(Arc::new(VectorSparseInvertedIndexMethodAttachment {
             configuration: configuration.clone(),
-            patterns: parse_patterns(&[&query_pattern1, &query_pattern2])?,
+            patterns: parse_patterns(dialect, &[&query_pattern1, &query_pattern2])?,
         }))
     }
 }

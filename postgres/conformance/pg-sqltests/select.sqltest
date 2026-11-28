@@ -135,6 +135,26 @@ expect {
     3|4
 }
 
+test values-rows-of-different-lengths-errors {
+    VALUES (1), (1, 2);
+}
+@sqlstate 42601
+expect error {
+}
+
+test values-in-from-rows-of-different-lengths-errors {
+    SELECT * FROM (VALUES (1, 2), (1)) AS v;
+}
+@sqlstate 42601
+expect error {
+}
+
+test values-in-union-rows-of-different-lengths-errors {
+    VALUES (1), (1, 2) UNION VALUES (3);
+}
+expect error {
+}
+
 test column-alias-list-longer-than-subquery-errors {
     SELECT * FROM (SELECT 1, 2) AS s(a, b, c);
 }
@@ -266,7 +286,195 @@ test select-cast-to-enum-rejects-unknown-label {
 }
 @sqlstate 22P02
 expect error {
-    invalid input value for enum mood
+    invalid input value for enum mood: "xyz"
+}
+
+test select-insert-rejects-unknown-enum-label {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (m mood);
+    INSERT INTO t VALUES ('nope');
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum mood: "nope"
+}
+
+test select-cast-null-to-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (m mood[]);
+    INSERT INTO t VALUES ('{sad,NULL}');
+    SELECT CASE WHEN NULL::mood IS NULL THEN 'null' END, m FROM t;
+}
+expect {
+    null|{sad,NULL}
+}
+
+test select-enum-label-with-quote {
+    CREATE TYPE q AS ENUM ('it''s', 'b');
+    SELECT 'it''s'::q;
+}
+expect {
+    it's
+}
+
+test select-create-enum-rejects-duplicate-label {
+    CREATE TYPE mood AS ENUM ('x', 'y', 'x');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint "pg_enum_typid_label_index"
+}
+
+# PostgreSQL creates the type before its labels, so a taken name is reported
+# before a repeated or too long label.
+test select-create-enum-with-taken-name-and-duplicate-label {
+    CREATE TYPE mood AS ENUM ('x');
+    CREATE TYPE mood AS ENUM ('x', 'x');
+}
+expect error {
+    type "?mood"? already exists
+}
+
+test select-create-enum-with-taken-name-and-long-label {
+    CREATE TYPE mood AS ENUM ('x');
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+expect error {
+    type "?mood"? already exists
+}
+
+# EnumValuesCreate checks every label's length before pg_enum's unique index
+# sees a repeated label.
+test select-create-enum-checks-label-length-before-duplicates {
+    CREATE TYPE mood AS ENUM ('x', 'x', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+@sqlstate 42602
+expect error {
+    invalid enum label "a{64}"
+}
+
+test select-create-enum-rejects-label-over-63-bytes {
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+}
+@sqlstate 42602
+expect error {
+    invalid enum label "a{64}"
+}
+
+test select-create-enum-accepts-63-byte-label {
+    CREATE TYPE mood AS ENUM ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::mood::text);
+}
+expect {
+    63
+}
+
+test select-empty-enum-rejects-every-value {
+    CREATE TYPE e AS ENUM ();
+    SELECT 'a'::e;
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum e: "a"
+}
+
+test select-cast-null-to-empty-enum {
+    CREATE TYPE e AS ENUM ();
+    SELECT CASE WHEN NULL::e IS NULL THEN 'null' END;
+}
+expect {
+    null
+}
+
+test select-cast-null-to-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    SELECT CAST(NULL AS dm);
+}
+expect error {
+    domain dm does not allow null values
+}
+
+# Each element of a column of type dm[] is a value of domain dm; the array
+# itself is not, so it may be NULL.
+test select-insert-null-element-into-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (a dm[]);
+    INSERT INTO t VALUES ('{sad,NULL}');
+}
+expect error {
+    domain dm does not allow null values
+}
+
+test select-update-null-element-into-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (a dm[]);
+    INSERT INTO t VALUES ('{ok}');
+    UPDATE t SET a = '{NULL}';
+}
+expect error {
+    domain dm does not allow null values
+}
+
+test select-insert-null-array-of-not-null-domain-over-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'ok');
+    CREATE DOMAIN dm AS mood NOT NULL;
+    CREATE TABLE t (id int, a dm[]);
+    INSERT INTO t VALUES (1, NULL), (2, '{sad,ok}');
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|
+    2|{sad,ok}
+}
+
+test select-insert-array-of-domain-checks-each-element {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t (a pos[]);
+    INSERT INTO t VALUES ('{1,2}');
+    INSERT INTO t VALUES ('{3,-1}');
+}
+expect error {
+    value for domain pos violates check constraint "pos_(0|check)"
+}
+
+test select-insert-array-of-domain-keeps-valid-elements {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t (a pos[]);
+    INSERT INTO t VALUES ('{1,2}');
+    SELECT a FROM t;
+}
+expect {
+    {1,2}
+}
+
+test select-cast-to-enum-quotes-mixed-case-type-name {
+    CREATE TYPE "Up" AS ENUM ('a');
+    SELECT 'b'::"Up";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "Up": "b"
+}
+
+test select-cast-to-enum-quotes-keyword-type-name {
+    CREATE TYPE "select" AS ENUM ('a');
+    SELECT 'b'::"select";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "select": "b"
+}
+
+test select-cast-to-enum-quotes-type-name-with-quotes {
+    CREATE TYPE "it's ""x""" AS ENUM ('a');
+    SELECT 'b'::"it's ""x""";
+}
+@sqlstate 22P02
+expect error {
+    invalid input value for enum "it's ""x""": "b"
 }
 
 test select-cast-to-domain {
@@ -283,6 +491,13 @@ test select-cast-to-domain-checks-constraint {
 }
 @sqlstate 23514
 expect error {}
+
+test select-cast-function-integer-to-boolean {
+    SELECT bool(5), bool(0);
+}
+expect {
+    t|f
+}
 
 test select-cast-integer-to-domain-over-boolean {
     CREATE DOMAIN db AS boolean;
@@ -304,11 +519,16 @@ test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
 }
 expect error {}
 
+@compat-gap "type:time"
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
 expect {
     2024-01-15|10:30:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 test select-cast-text-to-timestamp {
@@ -329,6 +549,227 @@ test select-cast-invalid-text-to-timestamp {
 }
 @sqlstate 22007
 expect error {}
+
+test select-cast-int8-accepts-its-smallest-and-largest-values {
+    SELECT 9223372036854775807::int8, (-9223372036854775808)::bigint, int8(-9223372036854775808);
+}
+expect {
+    9223372036854775807|-9223372036854775808|-9223372036854775808
+}
+
+test select-cast-int8-rejects-literal-above-its-range {
+    SELECT 9223372036854775808::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-literal-below-its-range {
+    SELECT (-9223372036854775809)::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-int8-function-rejects-literal-above-its-range {
+    SELECT int8(9223372036854775808);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rounds-decimal-literals-before-checking-the-range {
+    SELECT 9223372036854775807.4::int8, (-9223372036854775808.4)::int8, 9.223372036854775807e18::int8;
+}
+expect {
+    9223372036854775807|-9223372036854775808|9223372036854775807
+}
+
+test select-cast-int8-rejects-decimal-literal-that-rounds-above-its-range {
+    SELECT 9223372036854775807.5::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-decimal-literal-that-rounds-below-its-range {
+    SELECT (-9223372036854775808.5)::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-exponent-literal-above-its-range {
+    SELECT 1e19::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-literal-with-underscores-above-its-range {
+    SELECT 9_223_372_036_854_775_808::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-accepts-zero-with-a-large-exponent {
+    SELECT 0e100::int8, 0.0e25::int8;
+}
+expect {
+    0|0
+}
+
+test select-cast-int8-accepts-largest-hex-literal {
+    SELECT 0x7fffffffffffffff::int8;
+}
+expect {
+    9223372036854775807
+}
+
+test select-cast-int8-rejects-hex-literal-above-its-range {
+    SELECT 0x8000000000000000::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-hex-literal-above-float8-range {
+    SELECT 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-negative-hex-literal-below-its-range {
+    SELECT (-0x8000000000000001)::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-octal-and-binary-literals-above-its-range {
+    SELECT 0o1000000000000000000000::int8, 0b1000000000000000000000000000000000000000000000000000000000000000::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-octal-and-binary-literals-above-int4-range {
+    SELECT 0o20000000000, 0b11111111111111111111111111111111, 0o777777777777777777777::int8, -0o20000000000;
+}
+expect {
+    2147483648|4294967295|9223372036854775807|-2147483648
+}
+
+test select-hex-literals-above-int8-range-do-not-wrap {
+    SELECT -0x8000000000000000 WHERE 0x8000000000000000 = 9223372036854775808 AND 0xFFFFFFFFFFFFFFFF > 0;
+}
+expect {
+    -9223372036854775808
+}
+
+test select-sequence-start-from-octal-literal-above-int4-range {
+    CREATE SEQUENCE octal_start_seq START 0o20000000000;
+    SELECT nextval('octal_start_seq');
+}
+expect {
+    2147483648
+}
+
+test select-cast-int8-out-of-range-literal-in-unused-column-default {
+    CREATE TABLE int8_default(a int8 DEFAULT 9223372036854775808::int8, b int);
+    INSERT INTO int8_default VALUES (5, 1);
+    SELECT * FROM int8_default;
+}
+expect {
+    5|1
+}
+
+test select-cast-int8-out-of-range-literal-in-used-column-default {
+    CREATE TABLE int8_default_used(a int8 DEFAULT CAST(9223372036854775808 AS bigint), b int);
+    INSERT INTO int8_default_used(b) VALUES (1);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-check-constraint {
+    CREATE TABLE int8_check(a int8 CHECK (a < int8(9223372036854775808)));
+    INSERT INTO int8_check VALUES (5);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-as-bigint-rejects-literal-above-its-range {
+    SELECT CAST(9223372036854775808 AS bigint);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-after-true-or-in-where {
+    SELECT 1 WHERE true OR 9223372036854775808::int8 = 1;
+}
+expect {
+    1
+}
+
+test select-cast-int8-out-of-range-literal-after-false-and-in-where {
+    SELECT 1 WHERE false AND 9223372036854775808::int8 = 1;
+}
+expect {}
+
+test select-cast-int8-out-of-range-literal-after-matching-column-in-where {
+    SELECT x FROM (SELECT 1 AS x) t WHERE x = 1 OR 9223372036854775808::int8 = 1;
+}
+expect {
+    1
+}
+
+test select-cast-int8-out-of-range-literal-checked-for-each-row-in-where {
+    SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) t WHERE x = 1 OR 9223372036854775808::int8 = 1;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-internal-int8-out-of-range-function-is-not-callable {
+    SELECT int8_out_of_range();
+}
+@sqlstate 42883
+expect error {}
+
+test select-cast-int8-rejects-signed-literal-above-its-range {
+    SELECT CAST(+9223372036854775808 AS int8);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-branch-that-never-runs {
+    SELECT coalesce(CASE WHEN false THEN 9223372036854775808::int8 END, 7);
+}
+expect {
+    7
+}
 
 test select-case-expression {
     SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
@@ -427,6 +868,7 @@ test exists-subquery-with-empty-select-list-rejects-group-by-position {
 expect error {
 }
 
+@compat-gap "type:timetz"
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
@@ -435,6 +877,10 @@ test select-current-data-and-time {
 }
 expect {
     ok
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "timetz" is not supported
 }
 
 setup comma_and_join {
@@ -733,7 +1179,8 @@ expect {
     2
 }
 
-@skip "ARRAY subqueries cannot yet read aggregates computed by an outer query"
+# ARRAY subqueries cannot yet read aggregates computed by an outer query.
+@compat-gap "syntax:array-subquery"
 test array-subquery-compound-outer-aggregate {
     CREATE TABLE t(g INTEGER, x INTEGER);
     INSERT INTO t VALUES (1,10), (1,20), (2,7);
@@ -745,6 +1192,9 @@ expect {
     1|{30,0}
     2|{7,0}
     {37,0}
+}
+@sqlstate 42803
+expect @tursopg error {
 }
 
 setup having_t {
@@ -775,22 +1225,26 @@ expect {
     0|
 }
 
+@compat-gap "syntax:having"
 test having-without-group-by-or-aggregate-errors-instead-of-ignoring-having {
     SELECT 1 HAVING 1 = 0;
 }
 expect {
 }
+@sqlstate 42601
 expect @tursopg error {
     HAVING clause on a non-aggregate query
 }
 
 @setup having_t
+@compat-gap "syntax:having"
 test having-in-subquery-with-only-an-outer-aggregate-errors-instead-of-ignoring-having {
     SELECT (SELECT max(t1.y) FROM t AS t2 HAVING max(t1.y) > 0 LIMIT 1) FROM t AS t1;
 }
 expect {
     200
 }
+@sqlstate 42601
 expect @tursopg error {
     HAVING clause on a non-aggregate query
 }
@@ -1062,21 +1516,22 @@ expect {
 }
 
 @setup like_strings
-@skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
-test like-with-computed-pattern-in-index-errors {
-    CREATE INDEX t_like_computed ON t (id) WHERE s LIKE 'a' || '%';
+test like-with-computed-pattern-in-index {
+    CREATE INDEX t_like_computed ON t (id) WHERE s LIKE 'Ab' || '%';
+    SELECT id FROM t WHERE s LIKE 'Ab' || '%' ORDER BY id;
 }
-expect error {
-    CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern
+expect {
+    2
 }
 
 @setup like_strings
-@skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
+@skip-if postgres "Turso does not support LIKE with ESCAPE in an index"
 test like-with-escape-clause-in-index-errors {
     CREATE INDEX t_like_escape ON t (id) WHERE s LIKE 'a#_c' ESCAPE '#';
 }
+@sqlstate 0A000
 expect error {
-    CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern
+    CREATE INDEX does not support LIKE with ESCAPE
 }
 
 test ilike-pattern-ending-with-escape-errors {
@@ -1111,6 +1566,72 @@ expect {
     1
     1
     0
+}
+
+test like-computed-pattern-matches-multibyte-characters {
+    SELECT 'héllo' LIKE 'h_llo' || '';
+    SELECT 'héllo' LIKE 'h__llo' || '';
+    SELECT 'aéb€c' LIKE '%' || '€c';
+    SELECT 'aéb€c' LIKE 'a%\€_' || '';
+    SELECT '€€x' LIKE '%€' || 'x';
+    SELECT 'xé' LIKE '%' || '_';
+    SELECT 'é€' LIKE '%' || '_é';
+}
+expect {
+    t
+    f
+    t
+    t
+    t
+    t
+    f
+}
+
+test like-computed-pattern-with-wildcards-after-percent {
+    SELECT 'abc' LIKE '%%' || '';
+    SELECT 'abc' LIKE 'a%%c' || '';
+    SELECT '' LIKE '%%' || '';
+    SELECT 'ab' LIKE '%_%_%' || '';
+    SELECT 'a' LIKE '%_%_%' || '';
+    SELECT 'abcab' LIKE '%ab' || '';
+    SELECT 'aab' LIKE '%_ab' || '';
+    SELECT '' LIKE '%\' || '';
+    SELECT 'b' LIKE 'a\' || '';
+}
+expect {
+    t
+    t
+    t
+    t
+    f
+    t
+    t
+    f
+    f
+}
+
+test like-computed-pattern-ending-with-escape-after-percent-errors {
+    SELECT 'x' LIKE '%\' || '';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test like-computed-pattern-ending-with-escape-after-text-runs-out-errors {
+    SELECT 'a' LIKE '%_\' || '';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test like-escape-ending-with-escape-after-text-runs-out-errors {
+    SELECT 'ab' LIKE 'a%_#' ESCAPE '#';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
 }
 
 test like-escape-longer-than-one-character-errors {
@@ -1416,6 +1937,196 @@ expect {
     3
 }
 
+test recursive-cte-limit-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-fetch-first-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 FETCH FIRST 2 ROWS ONLY) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-limit-all-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT ALL) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-offset-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 OFFSET 3) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    OFFSET in a recursive query is not implemented
+}
+
+test recursive-cte-limit-and-offset-reports-offset {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 10 OFFSET 1) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    OFFSET in a recursive query is not implemented
+}
+
+test recursive-cte-offset-null-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 5 OFFSET NULL) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    OFFSET in a recursive query is not implemented
+}
+
+test recursive-cte-order-by-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 ORDER BY 1 DESC) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test recursive-cte-order-by-with-self-reference-only-in-order-by {
+    WITH RECURSIVE x(n) AS (SELECT 0 UNION SELECT 1 ORDER BY (SELECT n FROM x)) SELECT * FROM x;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test recursive-cte-intersect-with-limit-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT n FROM r LIMIT 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-except-with-order-by-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 EXCEPT SELECT n FROM r ORDER BY 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-intersect-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT n FROM r) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-top-level-except-after-union-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3 EXCEPT SELECT 2 LIMIT 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-without-set-operation-is-not-union {
+    WITH RECURSIVE r(n) AS (SELECT n FROM r LIMIT 1) SELECT n FROM r;
+}
+@sqlstate 42P19
+expect error {
+    recursive query "r" does not have the form non-recursive-term UNION \[ALL\] recursive-term
+}
+
+test recursive-cte-for-update-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 FOR UPDATE) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    FOR UPDATE/SHARE in a recursive query is not implemented
+}
+
+test recursive-cte-limit-is-reported-before-cycle-clause {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) CYCLE n SET c USING p SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-order-by-non-integer-constant-is-not-implemented {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 ORDER BY 'a') SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test recursive-cte-limit-is-not-implemented-when-no-query-reads-the-cte {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT 1;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-limit-is-not-implemented-when-a-derived-table-has-its-name {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT n FROM (SELECT 5) AS r(n);
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test create-view-with-recursive-cte-limit-is-not-implemented {
+    CREATE VIEW recursive_cte_limit_view AS WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 LIMIT 2) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    LIMIT in a recursive query is not implemented
+}
+
+test recursive-cte-reference-before-inner-cte-of-the-same-name-is-checked {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM (WITH q(n) AS (SELECT n FROM r), r(n) AS (SELECT 5) SELECT n FROM q) s ORDER BY 1) SELECT n FROM r;
+}
+@sqlstate 0A000
+expect error {
+    ORDER BY in a recursive query is not implemented
+}
+
+test with-recursive-cte-reading-inner-cte-of-the-same-name-keeps-limit {
+    WITH RECURSIVE r(n) AS (WITH r(n) AS (SELECT 1) SELECT n FROM r UNION ALL SELECT 2 LIMIT 1) SELECT n FROM r;
+}
+expect {
+    1
+}
+
+test with-recursive-cte-reading-inner-cte-of-the-same-name-in-subquery-keeps-order-by {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM (WITH r(n) AS (SELECT 5) SELECT n FROM r) s ORDER BY 1) SELECT n FROM r;
+}
+expect {
+    1
+    5
+}
+
+test with-recursive-cte-without-self-reference-keeps-limit-and-order-by {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 ORDER BY 1 DESC LIMIT 1) SELECT n FROM r;
+}
+expect {
+    2
+}
+
+test with-recursive-cte-without-self-reference-accepts-limit-all-and-offset-null {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 LIMIT ALL OFFSET NULL) SELECT n FROM r;
+}
+expect {
+    1
+    2
+}
+
 test limit-negative-is-an-error {
     SELECT * FROM generate_series(1, 3) LIMIT -1;
 }
@@ -1567,6 +2278,7 @@ expect error {
     invalid input syntax for type bigint: "abc"
 }
 
+@compat-gap "type:time"
 test where-on-indexed-time-and-date-columns-converts-the-literal {
     CREATE TABLE seek_m(x time PRIMARY KEY);
     INSERT INTO seek_m VALUES ('12:00');
@@ -1581,4 +2293,826 @@ expect {
     1
     1
     0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+@compat-gap "type:time"
+test where-in-on-indexed-columns-returns-a-row-once-for-two-spellings-of-its-value {
+    CREATE TABLE in_spellings(id int, t time, tz timetz, ts timestamp, u uuid, b boolean);
+    INSERT INTO in_spellings VALUES
+        (1, '12:00:00', '12:00:00', '2024-01-01 00:00:00', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
+        (2, '13:00:00', '13:00:00', '2024-01-02 00:00:00', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE INDEX in_spellings_t ON in_spellings (t);
+    CREATE INDEX in_spellings_tz ON in_spellings (tz);
+    CREATE INDEX in_spellings_ts ON in_spellings (ts);
+    CREATE INDEX in_spellings_u ON in_spellings (u);
+    CREATE INDEX in_spellings_b ON in_spellings (b);
+    SELECT t FROM in_spellings WHERE t IN ('12:00:00', '12:00');
+    SELECT count(*) FROM in_spellings WHERE tz IN ('12:00:00', '12:00');
+    SELECT count(*) FROM in_spellings WHERE ts IN ('2024-01-01 00:00:00', '2024-01-01 00:00');
+    SELECT count(*) FROM in_spellings WHERE u IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+    SELECT count(*) FROM in_spellings WHERE b IN ('t', 'true', 'yes');
+    SELECT count(*) FROM in_spellings WHERE u = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' OR u = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT id FROM in_spellings WHERE t IN ('12:00:00', '12:00') OR u IN ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') ORDER BY id;
+}
+expect {
+    12:00:00
+    1
+    1
+    1
+    1
+    1
+    1
+    2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+test window-range-offset-over-bigint-and-numeric {
+    CREATE TABLE range_offsets(b bigint, n numeric(10, 2));
+    INSERT INTO range_offsets VALUES (1, 1), (2, 2.5), (4, 4);
+    SELECT b, count(*) OVER (ORDER BY b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_offsets ORDER BY b;
+    SELECT n, count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND 1.5 FOLLOWING) FROM range_offsets ORDER BY n;
+    DROP TABLE range_offsets;
+}
+expect {
+    1|1
+    2|2
+    4|1
+    1.00|2
+    2.50|2
+    4.00|1
+}
+
+@compat-gap "syntax:window-range-offset"
+test window-range-offset-over-date-is-an-error {
+    CREATE TABLE range_dates(d date);
+    SELECT count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_dates;
+}
+@sqlstate 0A000
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+@sqlstate 42601
+expect @tursopg error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+
+test window-range-decimal-offset-over-bigint-is-an-error {
+    CREATE TABLE range_bigints(b bigint);
+    SELECT count(*) OVER (ORDER BY b RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM range_bigints;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type bigint and offset type numeric
+}
+
+test window-range-string-and-bigint-offsets {
+    CREATE TABLE range_strings(b bigint, i int4);
+    INSERT INTO range_strings VALUES (1, 1), (2, 2), (4, 4);
+    SELECT b, count(*) OVER (ORDER BY b RANGE BETWEEN '1' PRECEDING AND CURRENT ROW) FROM range_strings ORDER BY b;
+    SELECT i, count(*) OVER (ORDER BY i RANGE BETWEEN 1::int8 PRECEDING AND CURRENT ROW) FROM range_strings ORDER BY i;
+    DROP TABLE range_strings;
+}
+expect {
+    1|1
+    2|2
+    4|1
+    1|1
+    2|2
+    4|1
+}
+
+# A text compared with a time or timestamp takes the column's type first:
+# '10:00' is the time 10:00:00. Every query runs before and after the indexes
+# exist, so the expected rows are listed twice.
+@compat-gap "type:time"
+test compare-time-with-text-same-rows-with-and-without-index {
+    CREATE TABLE cmp_time (id int PRIMARY KEY, tm time, ts timestamp);
+    INSERT INTO cmp_time VALUES (1, '09:30', '2024-01-05 09:30'), (2, '10:00', '2024-01-05 10:00'), (3, '23:59:59', '2024-01-06 00:00'), (4, NULL, NULL);
+    SELECT 'eq', id FROM cmp_time WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM cmp_time WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM cmp_time WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM cmp_time WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM cmp_time WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM cmp_time WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM cmp_time WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM cmp_time WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM cmp_time WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM cmp_time WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM cmp_time WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM cmp_time WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM cmp_time WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM cmp_time WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    CREATE INDEX cmp_time_tm ON cmp_time (tm);
+    CREATE INDEX cmp_time_ts ON cmp_time (ts);
+    SELECT 'eq', id FROM cmp_time WHERE tm = '10:00' ORDER BY id;
+    SELECT 'ne', id FROM cmp_time WHERE tm <> '10:00' ORDER BY id;
+    SELECT 'lt', id FROM cmp_time WHERE tm < '10:00' ORDER BY id;
+    SELECT 'le', id FROM cmp_time WHERE tm <= '10:00' ORDER BY id;
+    SELECT 'gt', id FROM cmp_time WHERE tm > '09:30' ORDER BY id;
+    SELECT 'ge', id FROM cmp_time WHERE tm >= '10:00' ORDER BY id;
+    SELECT 'between', id FROM cmp_time WHERE tm BETWEEN '09:30' AND '10:00' ORDER BY id;
+    SELECT 'in', id FROM cmp_time WHERE tm IN ('09:30', '10:00') ORDER BY id;
+    SELECT 'distinct', id FROM cmp_time WHERE tm IS DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'not-distinct', id FROM cmp_time WHERE tm IS NOT DISTINCT FROM '10:00' ORDER BY id;
+    SELECT 'case', id FROM cmp_time WHERE CASE tm WHEN '10:00' THEN 1 ELSE 0 END = 1 ORDER BY id;
+    SELECT 'nullif', id FROM cmp_time WHERE nullif(tm, '10:00') IS NULL ORDER BY id;
+    SELECT 'ts-lt', id FROM cmp_time WHERE ts < '2024-01-05T09:31' ORDER BY id;
+    SELECT 'ts-eq', id FROM cmp_time WHERE ts = '2024-01-05 10:00' ORDER BY id;
+    DROP TABLE cmp_time;
+}
+expect {
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+    eq|2
+    ne|1
+    ne|3
+    lt|1
+    le|1
+    le|2
+    gt|2
+    gt|3
+    ge|2
+    ge|3
+    between|1
+    between|2
+    in|1
+    in|2
+    distinct|1
+    distinct|3
+    distinct|4
+    not-distinct|2
+    case|2
+    nullif|2
+    nullif|4
+    ts-lt|1
+    ts-eq|2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+# x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
+# when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
+# holds for a list and a subquery, correlated or not.
+@compat-gap "type:time"
+test compare-text-on-the-left-of-in-with-time {
+    CREATE TABLE in_left_ev (id int PRIMARY KEY, tm time);
+    INSERT INTO in_left_ev VALUES (1, '09:45:00'), (2, '10:00:00');
+    SELECT 'list', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'list-two', id FROM in_left_ev WHERE '09:45' IN (tm, '10:00') ORDER BY id;
+    SELECT 'not-in', id FROM in_left_ev WHERE '09:45' NOT IN (tm) ORDER BY id;
+    SELECT 'column', id, ('09:45' IN (tm))::int FROM in_left_ev ORDER BY id;
+    SELECT 'subquery', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    SELECT 'correlated', id FROM in_left_ev WHERE '09:45' IN (SELECT e2.tm FROM in_left_ev e2 WHERE e2.id = in_left_ev.id) ORDER BY id;
+    SELECT 'plain', ('a' IN ('a'))::int;
+    CREATE INDEX in_left_ev_tm ON in_left_ev (tm);
+    SELECT 'list-index', id FROM in_left_ev WHERE '09:45' IN (tm) ORDER BY id;
+    SELECT 'subquery-index', id FROM in_left_ev WHERE '09:45' IN (SELECT tm FROM in_left_ev) ORDER BY id;
+    DROP TABLE in_left_ev;
+}
+expect {
+    list|1
+    list-two|1
+    not-in|2
+    column|1|1
+    column|2|0
+    subquery|1
+    subquery|2
+    correlated|1
+    plain|1
+    list-index|1
+    subquery-index|1
+    subquery-index|2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+# DELETE and UPDATE find their rows with the converted text, by a scan and
+# through an index.
+@compat-gap "type:time"
+test compare-time-with-text-delete-and-update {
+    CREATE TABLE cmp_time_a (id int PRIMARY KEY, tm time);
+    CREATE TABLE cmp_time_b (id int PRIMARY KEY, tm time);
+    CREATE INDEX cmp_time_b_tm ON cmp_time_b (tm);
+    INSERT INTO cmp_time_a VALUES (1, '09:30'), (2, '10:00'), (3, '23:59:59'), (4, NULL);
+    INSERT INTO cmp_time_b SELECT * FROM cmp_time_a;
+    DELETE FROM cmp_time_a WHERE tm < '09:45';
+    DELETE FROM cmp_time_b WHERE tm < '09:45';
+    UPDATE cmp_time_a SET id = 20 WHERE tm = '10:00';
+    UPDATE cmp_time_b SET id = 20 WHERE tm = '10:00';
+    SELECT 'a', id, tm FROM cmp_time_a ORDER BY id;
+    SELECT 'b', id, tm FROM cmp_time_b ORDER BY id;
+    DROP TABLE cmp_time_a;
+    DROP TABLE cmp_time_b;
+}
+expect {
+    a|3|23:59:59
+    a|4|
+    a|20|10:00:00
+    b|3|23:59:59
+    b|4|
+    b|20|10:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+setup scalar_subquery {
+    CREATE TABLE scalar_t (a int, b int);
+    INSERT INTO scalar_t VALUES (1, 30), (2, 10), (3, 20);
+    CREATE TABLE scalar_u (a int, b int);
+    INSERT INTO scalar_u VALUES (1, 5), (1, 6), (2, 7);
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-rejected {
+    SELECT (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-read-from-index-rejected {
+    CREATE INDEX ON scalar_t (b);
+    SELECT (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-where-rejected {
+    CREATE INDEX ON scalar_t (b);
+    SELECT 1 WHERE 10 = (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-of-two-rejected {
+    SELECT (SELECT b FROM scalar_t LIMIT 2);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-above-two-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT 5);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-computed-limit-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT 2 + 3);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-limit-all-stops-at-second-row {
+    SELECT (SELECT 1 / (b - 7) FROM scalar_u LIMIT ALL);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-sorted-rows-rejected {
+    SELECT (SELECT b FROM scalar_t ORDER BY b);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-groups-rejected {
+    SELECT (SELECT max(b) FROM scalar_t GROUP BY a);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-distinct-rows-rejected {
+    SELECT (SELECT DISTINCT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+test scalar-subquery-with-several-values-rows-rejected {
+    SELECT (VALUES (1), (2));
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-with-several-rows-rejected {
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a >= scalar_t.a) FROM scalar_t;
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-update-rejected {
+    UPDATE scalar_t SET b = (SELECT b FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-insert-rejected {
+    INSERT INTO scalar_t VALUES ((SELECT a FROM scalar_t), 0);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-in-delete-rejected {
+    DELETE FROM scalar_t WHERE a = (SELECT a FROM scalar_t);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test compound-scalar-subquery-with-several-rows-rejected {
+    SELECT (SELECT b FROM scalar_t WHERE a = 1 UNION SELECT 5);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test compound-scalar-subquery-with-limit-of-two-rejected {
+    SELECT (SELECT b FROM scalar_t UNION ALL SELECT b FROM scalar_u ORDER BY 1 LIMIT 2);
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test compound-scalar-subquery-with-one-row {
+    SELECT (SELECT b FROM scalar_t WHERE a = 1 UNION SELECT 30);
+    SELECT (SELECT b FROM scalar_t UNION SELECT b FROM scalar_u ORDER BY 1 LIMIT 1);
+    SELECT (SELECT b FROM scalar_t EXCEPT SELECT b FROM scalar_t WHERE a < 3);
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a = t.a UNION SELECT 0 ORDER BY 1 DESC LIMIT 1) FROM scalar_t t ORDER BY a;
+    SELECT EXISTS (SELECT b FROM scalar_t WHERE a = 9 UNION SELECT 30);
+    SELECT EXISTS (SELECT b FROM scalar_t EXCEPT SELECT b FROM scalar_t);
+}
+expect {
+    30
+    5
+    20
+    1|30
+    2|10
+    3|20
+    t
+    f
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-one-row {
+    SELECT (SELECT b FROM scalar_t LIMIT 1);
+    SELECT (SELECT b FROM scalar_t ORDER BY b OFFSET 2);
+    SELECT (SELECT b FROM scalar_u ORDER BY b LIMIT 1 + 0);
+    SELECT (SELECT b FROM scalar_u ORDER BY b LIMIT 5 OFFSET 2);
+    SELECT (SELECT max(b) FROM scalar_t);
+    SELECT (SELECT DISTINCT a / 10 FROM scalar_t);
+    SELECT a, (SELECT b FROM scalar_t t2 WHERE t2.a = scalar_t.a) FROM scalar_t ORDER BY a;
+}
+expect {
+    30
+    30
+    5
+    7
+    30
+    0
+    1|30
+    2|10
+    3|20
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-no-rows-is-null {
+    SELECT coalesce((SELECT b FROM scalar_t WHERE b > 100)::text, 'N');
+    SELECT coalesce((SELECT b FROM scalar_t LIMIT 0)::text, 'N');
+}
+expect {
+    N
+    N
+}
+
+@setup scalar_subquery
+test scalar-subquery-with-several-rows-whose-value-is-not-read {
+    SELECT CASE WHEN a = 99 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+    SELECT coalesce(1, (SELECT b FROM scalar_u));
+    SELECT count(*) FROM (SELECT (SELECT b FROM scalar_u) FROM scalar_t WHERE false) s;
+    SELECT count(*) FROM scalar_t WHERE a = 5 AND b = (SELECT b FROM scalar_u);
+    SELECT CASE WHEN EXISTS (SELECT (SELECT b FROM scalar_u)) THEN 'yes' ELSE 'no' END;
+}
+expect {
+    0
+    0
+    0
+    1
+    0
+    0
+    yes
+}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-read-only-for-rows-with-one-match {
+    SELECT a, CASE WHEN a = 2 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+}
+expect {
+    1|0
+    2|7
+    3|0
+}
+
+@setup scalar_subquery
+test correlated-scalar-subquery-read-for-a-row-with-several-matches-rejected {
+    SELECT a, CASE WHEN a = 1 THEN (SELECT b FROM scalar_u WHERE scalar_u.a = scalar_t.a) ELSE 0 END FROM scalar_t ORDER BY a;
+}
+@sqlstate 21000
+expect error {more than one row returned by a subquery used as an expression}
+
+@setup scalar_subquery
+test correlated-aggregate-scalar-subquery {
+    SELECT a, coalesce((SELECT max(b) FROM scalar_u WHERE scalar_u.a = scalar_t.a)::text, 'N') FROM scalar_t ORDER BY a;
+}
+expect {
+    1|6
+    2|7
+    3|N
+}
+
+test row-constructor-comparisons {
+    CREATE TABLE row_values (a int, b int);
+    INSERT INTO row_values VALUES (1, 2), (3, NULL);
+    SELECT CASE WHEN (1, 2) = (1, 2) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN ROW(1, 2) = ROW(1, 2) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) < (1, 3) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) <> (1, 2) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN ((1, NULL) = (1, NULL)) IS NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) IN ((1, 2), (3, 4)) THEN 1 ELSE 0 END;
+    SELECT count(*) FROM row_values WHERE (a, b) = (1, 2);
+    SELECT count(*) FROM row_values WHERE (a, b) IN ((1, 2));
+    SELECT count(*) FROM row_values WHERE ROW(a, b) IN (SELECT 1, 2);
+    SELECT count(*) FROM row_values WHERE (a, b) > (1, 2);
+    SELECT CASE WHEN ROW(1, NULL) IS NOT NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN ROW(1, NULL) IS NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (NULL, NULL) IS NULL THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) IS NOT NULL THEN 1 ELSE 0 END;
+    SELECT count(*) FROM row_values WHERE (a, b) IS NULL;
+    SELECT count(*) FROM row_values WHERE (a, b) IS NOT NULL;
+    SELECT count(*) FROM row_values WHERE NOT (a, b) IS NOT NULL;
+    DROP TABLE row_values;
+}
+expect {
+    1
+    1
+    1
+    0
+    1
+    1
+    1
+    1
+    1
+    1
+    0
+    0
+    1
+    1
+    0
+    1
+    1
+}
+
+test row-constructor-between {
+    CREATE TABLE row_between (a int, b int);
+    INSERT INTO row_between VALUES (1, 2), (1, 5), (2, 0);
+    SELECT CASE WHEN (1, 2) BETWEEN (0, 0) AND (5, 5) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN (1, 2) NOT BETWEEN (1, 3) AND (5, 5) THEN 1 ELSE 0 END;
+    SELECT count(*) FROM row_between WHERE (a, b) BETWEEN (1, 1) AND (1, 3);
+    DROP TABLE row_between;
+}
+expect {
+    1
+    1
+    1
+}
+
+test row-constructor-with-null-in-subquery {
+    CREATE TABLE row_nulls (a int, b int);
+    INSERT INTO row_nulls VALUES (NULL, 1), (1, NULL), (1, 2);
+    SELECT count(*) FROM row_nulls WHERE (a, b) IN (SELECT 1, 2);
+    SELECT count(*) FROM row_nulls WHERE (a, b) NOT IN (SELECT 1, 2);
+    SELECT count(*) FROM row_nulls WHERE ((a, b) IN (SELECT 1, 2)) IS NULL;
+    DROP TABLE row_nulls;
+}
+expect {
+    1
+    1
+    1
+}
+
+test row-constructor-as-inserted-value-errors {
+    CREATE TABLE row_insert (a int, b int);
+    INSERT INTO row_insert VALUES ((7, 8), 3);
+}
+expect error {
+}
+
+test row-constructor-cast-to-integer-errors {
+    SELECT (1, (2, 3)::int) = (1, 2);
+}
+expect error {
+}
+
+@skip-if postgres "PostgreSQL accepts a row value inside a row value"
+test row-constructor-inside-row-constructor-errors {
+    SELECT ((1, 2), 1) = ((1, 3), 1);
+}
+expect error {
+    row value misused
+}
+
+@skip-if postgres "PostgreSQL accepts a row value as a window partition key"
+test row-constructor-as-window-partition-key-errors {
+    CREATE TABLE row_window (a int, b int);
+    SELECT count(*) OVER (PARTITION BY (a, b)) FROM row_window;
+}
+expect error {
+    row value misused
+}
+
+# A text in a row value compared with a time is read as a time, component by
+# component, in a comparison, an IN list and a row subquery.
+@compat-gap "type:time"
+test row-constructor-compares-text-with-time {
+    CREATE TABLE row_time (id int, tm time);
+    INSERT INTO row_time VALUES (1, '09:30'), (2, '10:00');
+    SELECT 'eq', id FROM row_time WHERE (id, tm) = (2, '10:00') ORDER BY id;
+    SELECT 'lt', id FROM row_time WHERE (tm, id) < ('10:00', 5) ORDER BY id;
+    SELECT 'in', id FROM row_time WHERE (id, tm) IN ((1, '09:30'), (2, '09:30')) ORDER BY id;
+    SELECT 'subquery', id FROM row_time WHERE (id, tm) = (SELECT 2, tm FROM row_time WHERE id = 2) ORDER BY id;
+    DROP TABLE row_time;
+}
+expect {
+    eq|2
+    lt|1
+    lt|2
+    in|1
+    subquery|2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+test order-by-expression-reads-the-input-column-not-the-output-name {
+    CREATE TABLE order_names (a int, b int);
+    INSERT INTO order_names VALUES (1, 20), (2, 10);
+    SELECT b AS a FROM order_names ORDER BY a;
+    SELECT b AS a FROM order_names ORDER BY a + 0;
+    SELECT b AS a FROM order_names ORDER BY -a;
+    DROP TABLE order_names;
+}
+expect {
+    10
+    20
+    20
+    10
+    10
+    20
+}
+
+test error-order-by-expression-names-only-an-output-column {
+    SELECT 1 AS z ORDER BY z + 1;
+}
+@sqlstate 42703
+expect error {}
+
+test order-by-name-of-two-different-output-columns-is-ambiguous {
+    CREATE TABLE order_shared_names (a int, b int);
+    INSERT INTO order_shared_names VALUES (1, 10), (2, 5);
+    SELECT a, order_shared_names.a AS a FROM order_shared_names ORDER BY a;
+    SELECT b AS a, a FROM order_shared_names ORDER BY a + 0;
+    SELECT b AS a, a FROM order_shared_names ORDER BY a;
+}
+@sqlstate 42702
+expect error {}
+
+# PostgreSQL sorts by the constant. tursopg would read it as a position.
+@compat-gap "syntax:order-by"
+test order-by-plus-number-is-a-constant-not-a-position {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY +1, a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:order-by"
+test order-by-negated-plus-number-is-a-constant-not-a-position {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY -(+1), a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@compat-gap "syntax:order-by"
+test error-order-by-number-with-a-collation {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY 1 COLLATE "C";
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-order-by-fractional-constant {
+    SELECT 1 AS a ORDER BY 1.5;
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-string-constant {
+    SELECT 1 AS a UNION ALL SELECT 2 ORDER BY 'k';
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-null-constant {
+    SELECT 1 AS a ORDER BY NULL;
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-position-past-the-select-list {
+    SELECT 1 AS a ORDER BY 2;
+}
+@sqlstate 42P10
+expect error {}
+
+test error-order-by-negative-position {
+    SELECT 1 AS a ORDER BY -1;
+}
+@sqlstate 42P10
+expect error {}
+
+test error-order-by-position-past-the-select-list-of-a-union {
+    SELECT 1 AS a UNION ALL SELECT 2 ORDER BY 5;
+}
+@sqlstate 42P10
+expect error {}
+
+test order-by-constant-inside-a-window-is-not-a-position {
+    SELECT sum(x) OVER (ORDER BY 'k') FROM (VALUES (1), (2)) AS v(x);
+}
+expect {
+    3
+    3
+}
+
+setup distinct_rows {
+    CREATE TABLE distinct_rows (a int, b int, c text);
+    INSERT INTO distinct_rows VALUES (2, 10, 'x'), (1, 20, 'y'), (1, 20, 'z'), (2, 30, 'w');
+}
+
+@setup distinct_rows
+test distinct-order-by-terms-that-are-in-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a DESC;
+    SELECT DISTINCT a, b FROM distinct_rows ORDER BY 2 DESC, distinct_rows.a;
+    SELECT DISTINCT a + b AS total FROM distinct_rows ORDER BY total;
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY a + b DESC;
+    SELECT DISTINCT a AS x FROM distinct_rows ORDER BY a;
+    SELECT DISTINCT a, count(*) FROM distinct_rows GROUP BY a ORDER BY count(*), a;
+    SELECT DISTINCT * FROM distinct_rows ORDER BY b, c DESC;
+}
+expect {
+    2
+    1
+    2|30
+    1|20
+    2|10
+    12
+    21
+    32
+    32
+    21
+    12
+    1
+    2
+    1|2
+    2|2
+    2|10|x
+    1|20|z
+    1|20|y
+    2|30|w
+}
+
+@setup distinct_rows
+test error-distinct-order-by-column-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY b;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-over-a-selected-column {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a + 0;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-with-operands-swapped {
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY b + a;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-aggregate-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows GROUP BY a ORDER BY count(*);
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-in-a-subquery-order-by-column-outside-the-select-list {
+    SELECT * FROM (SELECT DISTINCT a FROM distinct_rows ORDER BY b) AS s;
+}
+@sqlstate 42P10
+expect error {}
+
+# tursopg has one collation and cannot tell these expressions apart.
+@setup distinct_rows
+@compat-gap "syntax:order-by"
+test error-distinct-order-by-with-another-collation {
+    SELECT DISTINCT c FROM distinct_rows ORDER BY c COLLATE "C";
+}
+@sqlstate 42P10
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@setup distinct_rows
+test distinct-all-rows-order-by-column-outside-the-select-list {
+    SELECT ALL a FROM distinct_rows ORDER BY b, c;
+}
+expect {
+    2
+    1
+    1
+    2
+}
+
+test bytea-array-elements-print-as-hex {
+    CREATE TABLE bytea_arrays (id int PRIMARY KEY, a bytea[]);
+    INSERT INTO bytea_arrays VALUES (1, ARRAY['ab'::bytea]);
+    SELECT a, a[1] FROM bytea_arrays;
+}
+expect {
+    {"\\\\x6162"}|\\x6162
+}
+
+test bytea-array-literal-elements-print-as-hex {
+    SELECT ARRAY['ab'::bytea, 'c'::bytea], ARRAY[''::bytea], ARRAY[NULL::bytea, 'a"b'::bytea];
+}
+expect {
+    {"\\\\x6162","\\\\x63"}|{"\\\\x"}|{NULL,"\\\\x612262"}
 }

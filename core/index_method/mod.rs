@@ -1,11 +1,11 @@
 use std::sync::{Arc, Weak};
 
+use crate::ast;
 use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
-use turso_parser::ast;
 
 use crate::{
     mvcc::cursor::MvccCursorType,
@@ -54,6 +54,7 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
     /// create attachment of the index method to the specific table with specific method configuration
     fn attach(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>>;
 
@@ -105,6 +106,7 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     /// Returns the attachment to use from now on, or None to keep this one
     fn rename_column(
         &self,
+        _dialect: &dyn crate::dialect::Dialect,
         _from: &str,
         _to: &str,
     ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
@@ -217,7 +219,7 @@ pub enum IndexMethodSnapshotIdentity {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum IndexMethodYieldPoint {
+pub enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -822,11 +824,11 @@ pub(crate) fn open_table_cursor(
         )));
     };
     let root_page = table.get_root_page()?;
-    let cursor = Box::new(BTreeCursor::new_table(
+    let cursor = BTreeCursor::new_table_boxed(
         pager,
         btree_root_page(connection, database_id, root_page),
         table.columns().len(),
-    ));
+    );
     promote_to_mvcc_cursor(
         connection,
         database_id,
@@ -837,11 +839,13 @@ pub(crate) fn open_table_cursor(
 }
 
 /// helper method to parse select patterns for [IndexMethodAttachment::definition] call
-pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
+pub(crate) fn parse_patterns(
+    dialect: &dyn crate::dialect::Dialect,
+    patterns: &[&str],
+) -> Result<Vec<ast::Select>> {
     let mut parsed = Vec::new();
     for pattern in patterns {
-        let mut parser = turso_parser::parser::Parser::new(pattern.as_bytes());
-        let Some(ast) = parser.next() else {
+        let Some(ast) = crate::dialect::parse_statement(dialect, pattern).transpose() else {
             return Err(LimboError::ParseError(format!(
                 "unable to parse pattern statement: {pattern}",
             )));

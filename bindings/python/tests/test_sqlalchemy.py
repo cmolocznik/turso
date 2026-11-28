@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+import threading
 import types
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 # Skip all tests if SQLAlchemy is not installed
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
-from sqlalchemy import Column, Integer, String, create_engine, text  # noqa: E402
+from sqlalchemy import Column, Integer, LargeBinary, MetaData, String, Table, create_engine, select, text  # noqa: E402
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.orm import Session, declarative_base  # noqa: E402
 from turso.sqlalchemy import TursoDialect, TursoSyncDialect, get_sync_connection  # noqa: E402
@@ -127,6 +128,15 @@ class TestTursoDialectURLParsing:
 
         assert kwargs["isolation_level"] is None
 
+    def test_timeout_param(self):
+        """Test timeout query parameter is passed to turso.connect as seconds."""
+        dialect = TursoDialect()
+        url = URL.create("sqlite+turso", database="test.db", query={"timeout": "2.5"})
+
+        args, kwargs = dialect.create_connect_args(url)
+
+        assert kwargs["timeout"] == 2.5
+
 
 class TestTursoSyncDialectURLParsing:
     """Test URL parsing for TursoSyncDialect."""
@@ -171,12 +181,14 @@ class TestTursoSyncDialectURLParsing:
                 "long_poll_timeout_ms": "5000",
                 "bootstrap_if_empty": "false",
                 "isolation_level": "IMMEDIATE",
+                "timeout": "2.5",
             },
         )
 
         args, kwargs = dialect.create_connect_args(url)
 
         assert args == ["test.db", "https://db.turso.io"]
+        assert kwargs["timeout"] == 2.5
         assert kwargs["auth_token"] == "secret"
         assert kwargs["client_name"] == "my-app"
         assert kwargs["long_poll_timeout_ms"] == 5000
@@ -353,6 +365,18 @@ class TestBasicDialectIntegration:
 
             assert rows == [(1, "alice")]
 
+    def test_large_binary_round_trip(self):
+        """LargeBinary values are bound through the DB-API Binary constructor."""
+        table = Table("blobs", MetaData(), Column("id", Integer, primary_key=True), Column("data", LargeBinary))
+        engine = create_engine("sqlite+turso:///:memory:")
+
+        with engine.begin() as conn:
+            table.create(conn)
+            conn.execute(table.insert(), {"id": 1, "data": b"\x00\x01\xff"})
+
+        with engine.connect() as conn:
+            assert conn.execute(select(table.c.data)).scalar() == b"\x00\x01\xff"
+
     def test_orm_usage(self):
         """Test ORM usage with basic dialect."""
         Base = declarative_base()
@@ -398,6 +422,32 @@ class TestBasicDialectIntegration:
             # Verify again
             result = pd.read_sql("SELECT * FROM test_table", conn)
             assert len(result) == 3
+
+    def test_threads_writing_to_one_file_database(self, tmp_path):
+        """Threads writing through one engine wait for each other's write locks."""
+        engine = create_engine(f"sqlite+turso:///{tmp_path / 'threads.db'}")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE test (thread INTEGER, n INTEGER)"))
+
+        errors = []
+
+        def write(thread_id):
+            try:
+                for n in range(20):
+                    with engine.begin() as conn:
+                        conn.execute(text("INSERT INTO test VALUES (:t, :n)"), {"t": thread_id, "n": n})
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM test")).scalar() == 200
 
     def test_reflection_on_simple_table(self):
         """Reflection on a table with no FKs, indexes, or UNIQUE clauses
@@ -925,6 +975,7 @@ class TestDBAPI2ModuleAttributes:
         assert turso.apilevel == "2.0"
         assert turso.paramstyle == "qmark"
         assert turso.threadsafety == 1
+        assert turso.Binary is memoryview
 
     def test_turso_sync_module_attributes(self):
         """turso.sync module has all DB-API 2.0 attributes."""
@@ -933,6 +984,7 @@ class TestDBAPI2ModuleAttributes:
         assert turso.sync.apilevel == "2.0"
         assert turso.sync.paramstyle == "qmark"
         assert turso.sync.threadsafety == 1
+        assert turso.sync.Binary is memoryview
 
     def test_turso_sync_exception_hierarchy(self):
         """Exception classes are properly re-exported in turso.sync."""

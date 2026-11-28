@@ -20,6 +20,7 @@
 #[cfg(not(nightly))]
 use crate::alloc::TursoVecInExt;
 use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
+use crate::ast::{self, Select, SortOrder};
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
@@ -32,14 +33,14 @@ use crate::{
     schema::IndexColumn,
     storage::btree::CursorTrait,
     translate::collate::CollationSeq,
-    turso_assert,
+    turso_assert, turso_debug_assert,
     types::{IOResult, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
     Connection, LimboError, Result, Value,
 };
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::{
     cell::RefCell,
@@ -62,7 +63,6 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
     TantivyDocument, Term, TERMINATED,
 };
-use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
@@ -137,6 +137,16 @@ fn key_info() -> KeyInfo {
 
 /// Memory budget for Tantivy's per-segment writer arena.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Memory budget of the segment writer for each buffered document. A batch of
+/// `BATCH_COMMIT_SIZE` documents gets an initial term table of 2^15 entries,
+/// which holds 16,384 terms before it grows.
+const SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC: usize = 1024;
+
+/// The smallest memory budget of the segment writer. It gives Tantivy's
+/// smallest initial term table (2^10 entries). Tantivy refuses a budget of
+/// 24 KiB or less.
+const MIN_SEGMENT_MEMORY_BUDGET_BYTES: usize = 32 * 1024;
 
 /// Chunk size (512 KiB) for splitting segment files into backing rows.
 pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
@@ -445,8 +455,12 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
 pub struct FtsIndexMethod;
 
 impl IndexMethod for FtsIndexMethod {
-    fn attach(&self, cfg: &IndexMethodConfiguration) -> Result<Arc<dyn IndexMethodAttachment>> {
-        let attachment = FtsIndexAttachment::new(cfg.clone())?;
+    fn attach(
+        &self,
+        dialect: &dyn crate::dialect::Dialect,
+        cfg: &IndexMethodConfiguration,
+    ) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let attachment = FtsIndexAttachment::new(dialect, cfg.clone())?;
         Ok(Arc::new(attachment))
     }
 
@@ -573,8 +587,11 @@ struct FtsRuntimeStats {
 /// look them up; rollback purges them.
 #[derive(Debug, Default)]
 struct SegmentByteCache {
-    /// Least recently used first.
-    entries: Vec<(SegmentId, Arc<SegmentData>)>,
+    /// Least recently used first. When a query looks up its segments in
+    /// the same order as the previous query, each hit is at the front.
+    /// `VecDeque::remove` then moves no other entry, but `Vec::remove`
+    /// moves all of them.
+    entries: VecDeque<(SegmentId, Arc<SegmentData>)>,
 }
 
 impl SegmentByteCache {
@@ -590,9 +607,12 @@ impl SegmentByteCache {
             return None;
         }
         let position = self.entries.iter().position(|(entry, _)| entry == id)?;
-        let entry = self.entries.remove(position);
+        let entry = self
+            .entries
+            .remove(position)
+            .expect("position() returned an index in the cache");
         let data = Arc::clone(&entry.1);
-        self.entries.push(entry);
+        self.entries.push_back(entry);
         Some(data)
     }
 
@@ -602,10 +622,10 @@ impl SegmentByteCache {
             return;
         }
         self.entries.retain(|(entry, _)| *entry != id);
-        self.entries.push((id, data));
+        self.entries.push_back((id, data));
         // Always keep the newest entry; evict older ones to fit the budget.
         while self.entries.len() > 1 && self.total_bytes() > budget {
-            self.entries.remove(0);
+            self.entries.pop_front();
         }
     }
 
@@ -630,7 +650,10 @@ fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
             )
         })
         .collect();
-    key.sort_by_key(|(id, _, _)| id.uuid_string());
+    // `SegmentId` compares the bytes of the UUID. They sort in the same
+    // order as `uuid_string()`, which is lowercase hex, and the sort then
+    // makes no string for each comparison.
+    key.sort_by_key(|(id, _, _)| *id);
     key
 }
 
@@ -871,7 +894,24 @@ impl FtsIndexAttachment {
         verify = "neural",
         id = "fts_with_keys_all_validated_and_consumed"
     )]
-    pub fn new(cfg: IndexMethodConfiguration) -> Result<Self> {
+    pub fn new(
+        dialect: &dyn crate::dialect::Dialect,
+        cfg: IndexMethodConfiguration,
+    ) -> Result<Self> {
+        let pattern_sql = query_pattern_sql(&cfg);
+        let patterns = parse_patterns(
+            dialect,
+            &pattern_sql.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        Self::with_patterns(cfg, patterns)
+    }
+
+    /// Build the attachment with already parsed query patterns, in the
+    /// order of [`query_pattern_sql`].
+    pub(crate) fn with_patterns(
+        cfg: IndexMethodConfiguration,
+        patterns: Vec<Select>,
+    ) -> Result<Self> {
         // Validate WITH clause keys the same way bad values are validated:
         // a typo like `tokenzier` must be an error, not a silently different
         // index. Keys are matched case-insensitively.
@@ -1203,68 +1243,6 @@ impl FtsIndexAttachment {
 
         let schema = schema_builder.build();
 
-        // Build query patterns for FTS
-        // Order matters: more specific patterns should come first
-        let cols = cfg
-            .columns
-            .iter()
-            .filter(|c| !is_value_column(&c.name))
-            .map(|c| crate::util::quote_identifier(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let table = crate::util::quote_identifier(&cfg.table_name);
-
-        // Pattern 0: score with ORDER BY DESC LIMIT
-        let score_pattern = format!(
-            "SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
-        let combined_ordered_limit = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 2: combined + ORDER BY DESC (no LIMIT)
-        let combined_ordered = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC"
-        );
-        // Pattern 3: combined + LIMIT (no ORDER BY)
-        let combined_limit = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) LIMIT ?"
-        );
-        // Pattern 4: combined (no ORDER BY, no LIMIT)
-        let combined = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1)"
-        );
-        // Pattern 5: match + LIMIT
-        let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
-        // Pattern 6: match (no LIMIT)
-        let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
-        // Pattern 7: score over the documents a filter admits, every BM25
-        // statistic counted over that set.
-        let filtered_score = format!(
-            "SELECT fts_filtered_score({cols}, ?1, ?2) as score FROM {table} ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 8: the population a filter admits, one row.
-        let filtered_population =
-            format!("SELECT fts_filtered_population({cols}, ?1) as population FROM {table} ORDER BY population DESC LIMIT ?");
-        // Pattern 9 (inspection builds only): the visible segments, their
-        // tombstones, and whether a term is in any term dictionary.
-        #[cfg(any(test, feature = "fts_inspect"))]
-        let segments_report = format!(
-            "SELECT fts_segments({cols}, ?1) as report FROM {table} ORDER BY report DESC LIMIT ?"
-        );
-        let patterns = parse_patterns(&[
-            &score_pattern,          // 0
-            &combined_ordered_limit, // 1
-            &combined_ordered,       // 2
-            &combined_limit,         // 3
-            &combined,               // 4
-            &match_limit,            // 5
-            &match_pattern,          // 6
-            &filtered_score,         // 7
-            &filtered_population,    // 8
-            #[cfg(any(test, feature = "fts_inspect"))]
-            &segments_report, // 9
-        ])?;
         tokenizer_names.sort();
         tokenizer_names.dedup();
         Ok(Self {
@@ -1286,6 +1264,72 @@ impl FtsIndexAttachment {
             shared: Arc::new(FtsShared::default()),
         })
     }
+}
+
+/// The columns of `cfg` that hold values a query filters or sums by rather than text it
+/// searches: named by `filter_fields`, `interval_field`, `sum_field` or `tie_field`. A parameter
+/// that does not parse names none here; the attachment reports it when it is built.
+fn value_column_names(cfg: &IndexMethodConfiguration) -> HashSet<String> {
+    let mut names = HashSet::default();
+    for (key, value) in &cfg.parameters {
+        let key = UncasedStr::new(key);
+        for parameter in ["filter_fields", "interval_field", "sum_field", "tie_field"] {
+            if key == UncasedStr::new(parameter) {
+                names.extend(
+                    parse_column_list(Some(value), &cfg.columns, parameter).unwrap_or_default(),
+                );
+            }
+        }
+    }
+    names
+}
+
+/// The SQL of the query patterns of an FTS index on `cfg`, more specific
+/// patterns first, over its searched columns.
+fn query_pattern_sql(cfg: &IndexMethodConfiguration) -> Vec<String> {
+    let values = value_column_names(cfg);
+    let cols = cfg
+        .columns
+        .iter()
+        .filter(|c| !values.contains(&c.name))
+        .map(|c| crate::util::quote_identifier(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = crate::util::quote_identifier(&cfg.table_name);
+    let score = format!("fts_score({cols}, ?1) as score FROM {table}");
+    let fts_match = format!("WHERE fts_match({cols}, ?1)");
+    let mut patterns = vec![
+        // 0: score with ORDER BY DESC LIMIT
+        format!("SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"),
+        // 1: combined + ORDER BY DESC + LIMIT (most specific)
+        format!("SELECT {score} {fts_match} ORDER BY score DESC LIMIT ?"),
+        // 2: combined + ORDER BY DESC (no LIMIT)
+        format!("SELECT {score} {fts_match} ORDER BY score DESC"),
+        // 3: combined + LIMIT (no ORDER BY)
+        format!("SELECT {score} {fts_match} LIMIT ?"),
+        // 4: combined (no ORDER BY, no LIMIT)
+        format!("SELECT {score} {fts_match}"),
+        // 5: match + LIMIT
+        format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?"),
+        // 6: match (no LIMIT)
+        format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)"),
+        // 7: score over the documents a filter admits, every BM25 statistic counted over that
+        // set.
+        format!(
+            "SELECT fts_filtered_score({cols}, ?1, ?2) as score FROM {table} ORDER BY score DESC LIMIT ?"
+        ),
+        // 8: the population a filter admits, one row.
+        format!(
+            "SELECT fts_filtered_population({cols}, ?1) as population FROM {table} ORDER BY population DESC LIMIT ?"
+        ),
+    ];
+    // 9 (inspection builds only): the visible segments, their tombstones, and whether a term is
+    // in any term dictionary.
+    #[cfg(any(test, feature = "fts_inspect"))]
+    patterns.push(format!(
+        "SELECT fts_segments({cols}, ?1) as report FROM {table} ORDER BY report DESC LIMIT ?"
+    ));
+    patterns
 }
 
 fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<HashSet<String>> {
@@ -1453,6 +1497,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
 
     fn rename_column(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         from: &str,
         to: &str,
     ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
@@ -1479,7 +1524,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
                 *weights = crate::types::Text::new(renamed_weights);
             }
         }
-        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
+        Ok(Some(Arc::new(FtsIndexAttachment::new(dialect, cfg)?)))
     }
 }
 
@@ -1646,8 +1691,14 @@ enum FtsState {
     /// No control row: rewinding to tell an empty store from one written
     /// by the pre-registry FTS implementation (which is refused).
     ProbeFormat { rewound: bool },
-    /// Range-scanning the visible `(SEGMENT, *)` registry rows.
-    ScanSegments { seeked: bool, advance_pending: bool },
+    /// Range-scanning the visible `(SEGMENT, *)` registry rows. `seen`
+    /// holds the ids that this scan put in `scan_descriptors`, so that a
+    /// duplicate row is found without a search through all of them.
+    ScanSegments {
+        seeked: bool,
+        advance_pending: bool,
+        seen: HashSet<SegmentId>,
+    },
     /// Range-scanning the visible tombstone rows.
     ScanTombs { seeked: bool, advance_pending: bool },
     /// Loading chunk rows for visible segments absent from the byte cache.
@@ -1950,7 +2001,7 @@ impl FtsCursor {
                     // and its base rows must not commit without their index
                     // entries.
                     return Err(LimboError::Raise(
-                        turso_parser::ast::ResolveType::Abort,
+                        crate::ast::ResolveType::Abort,
                         Box::new(LimboError::Constraint(
                             "statement already has an open writer on this FTS index; \
                              a trigger cannot write the FTS-indexed table its firing \
@@ -2894,6 +2945,7 @@ impl FtsCursor {
                     self.state = FtsState::ScanSegments {
                         seeked: false,
                         advance_pending: false,
+                        seen: HashSet::default(),
                     };
                 }
                 FtsState::ProbeFormat { rewound } => {
@@ -2956,11 +3008,16 @@ impl FtsCursor {
                 FtsState::ScanSegments {
                     seeked,
                     advance_pending,
+                    seen,
                 } => {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
                     if !*seeked {
+                        turso_debug_assert!(
+                            self.scan_descriptors.is_empty() && seen.is_empty(),
+                            "FTS registry scan started with descriptors of another scan"
+                        );
                         let seek_key = seek_key_for_path(FTS2_SEGMENT_PREFIX)?;
                         let seek_result = return_if_io!(cursor.seek(
                             SeekKey::IndexKey(seek_key.as_record_ref()),
@@ -3020,11 +3077,7 @@ impl FtsCursor {
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
-                    if self
-                        .scan_descriptors
-                        .iter()
-                        .all(|existing| existing.segment_id != segment_id)
-                    {
+                    if seen.insert(segment_id) {
                         self.scan_descriptors.push(descriptor);
                     } else {
                         let existing = self
@@ -3292,6 +3345,7 @@ impl FtsCursor {
             self.state = FtsState::ScanSegments {
                 seeked: false,
                 advance_pending: false,
+                seen: HashSet::default(),
             };
         }
         self.probe_only = false;
@@ -3426,7 +3480,8 @@ impl FtsCursor {
         self.register_tokenizers(&index);
         let segment_id = self.mint_segment_id();
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
-        let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
+        let memory_budget = Self::segment_memory_budget(self.doc_buffer.len());
+        let mut writer = SegmentWriter::for_segment(memory_budget, segment)
             .map_err(|e| build_dir.write_error(e, "FTS segment writer"))?;
         let identity_base = self.mint_identity_base();
         let mut added = 0u32;
@@ -3469,6 +3524,22 @@ impl FtsCursor {
         );
         let captured = build_dir.captured_files();
         segment_rows_from_files(segment_id, max_doc, captured, identities)
+    }
+
+    /// The memory budget of the segment writer for `doc_count` buffered
+    /// documents.
+    ///
+    /// Tantivy uses the budget only to size the initial hash table of terms:
+    /// the largest power of two from 2^10 to 2^19 entries of 8 bytes that
+    /// is less than a third of the budget. The table grows when it is half
+    /// full, and the writer sorts the terms before it writes them, so the
+    /// size does not change the segment files. Each build fills the table
+    /// and `finalize` reads all of it, so a table that is too large for the
+    /// batch makes the build slow.
+    fn segment_memory_budget(doc_count: usize) -> usize {
+        doc_count
+            .saturating_mul(SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC)
+            .clamp(MIN_SEGMENT_MEMORY_BUDGET_BYTES, DEFAULT_MEMORY_BUDGET_BYTES)
     }
 
     /// Drive the in-flight publication (row deletions, then row inserts,
@@ -3788,12 +3859,19 @@ impl FtsCursor {
             let inverted = segment_reader
                 .inverted_index(self.rowid_field)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
-            let Some(mut postings) = inverted
-                .read_postings(&term, IndexRecordOption::Basic)
+            // This is what `read_postings` does. But `read_postings` returns
+            // `Option<SegmentPostings>`, which is about 2 KB and is moved
+            // also when the segment does not have the rowid. Usually only one
+            // segment has it.
+            let Some(term_info) = inverted
+                .get_term_info(&term)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?
             else {
                 continue;
             };
+            let mut postings = inverted
+                .read_postings_from_terminfo(&term_info, IndexRecordOption::Basic)
+                .map_err(|e| LimboError::InternalError(format!("FTS rowid postings: {e}")))?;
             loop {
                 let doc_id = postings.doc();
                 if doc_id == TERMINATED {
@@ -3810,9 +3888,9 @@ impl FtsCursor {
         Ok(hits)
     }
 
-    fn constant_integer_expression(expr: &turso_parser::ast::Expr) -> Option<i64> {
+    fn constant_integer_expression(expr: &crate::ast::Expr) -> Option<i64> {
         match expr {
-            turso_parser::ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            crate::ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 Self::constant_integer_expression(&expressions[0])
             }
             _ => match crate::util::parse_signed_number(expr).ok()? {

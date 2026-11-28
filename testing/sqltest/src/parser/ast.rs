@@ -321,6 +321,9 @@ pub struct TestCase {
     pub sql: String,
     /// Expected results (with optional backend-specific overrides)
     pub expectations: Expectations,
+    /// The label of a gap test, from `@compat-gap "<kind>:<object>"`. A gap test
+    /// records a known difference between tursopg and PostgreSQL.
+    pub gap: Option<String>,
     /// Common modifiers (setups, skip, backend, requires)
     pub modifiers: CaseModifiers,
 }
@@ -343,6 +346,9 @@ pub enum SkipCondition {
     Sqlite,
     /// Skip when running against a real PostgreSQL server
     Postgres,
+    /// Skip when the test runner is a debug build. The Makefile builds tursodb
+    /// with the same profile as the runner.
+    Debug,
 }
 
 /// What we expect from executing the SQL

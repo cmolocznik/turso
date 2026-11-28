@@ -2,7 +2,7 @@ use rand::{rng, RngCore};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use turso_core::{Clock, ConnectOpts, Database, IO};
+use turso_core::{Clock, ConnectOpts, Database, SessionRole, IO};
 use turso_pg::Connection;
 
 /// Temp directories holding test databases, deleted when the test process exits.
@@ -155,10 +155,7 @@ impl TempDatabaseBuilder {
         let mut opts = self
             .opts
             .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
-        opts = opts
-            .with_vacuum(true)
-            .with_without_rowid(true)
-            .with_custom_types(true);
+        opts = opts.with_without_rowid(true).with_custom_types(true);
 
         if self.enable_views {
             opts = opts.with_views(true);
@@ -205,7 +202,9 @@ impl TempDatabase {
     }
 
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
-        self.db.connect(ConnectOpts::new()).unwrap()
+        self.db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap()
     }
 
     pub fn connect_postgres(&self) -> Connection {

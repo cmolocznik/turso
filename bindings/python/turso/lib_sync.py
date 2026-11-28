@@ -15,6 +15,7 @@ from ._turso import (
     PyTursoAsyncOperationResultKind,
     PyTursoConnection,
     PyTursoDatabaseConfig,
+    PyTursoEncryptionConfig,
     PyTursoPartialSyncOpts,
     PyTursoSyncDatabase,
     PyTursoSyncDatabaseConfig,
@@ -377,52 +378,58 @@ class ConnectionSync(_Connection):
         sync: PyTursoSyncDatabase,
         http_ctx: _HttpContext,
         isolation_level: Optional[str] = "DEFERRED",
+        timeout: float = 5.0,
     ) -> None:
         # Provide extra_io hook so statements can make progress with sync engine (partial sync)
         def _extra_io() -> None:
             _drain_sync_io(sync, http_ctx, current_op=None)
 
-        super().__init__(conn, isolation_level=isolation_level, extra_io=_extra_io)
+        super().__init__(conn, isolation_level=isolation_level, timeout=timeout, extra_io=_extra_io)
         self._sync: PyTursoSyncDatabase = sync
         self._http_ctx: _HttpContext = http_ctx
+        # The sync engine runs one operation at a time, so threads sharing this connection take turns
+        self._sync_lock = threading.Lock()
 
     def pull(self) -> bool:
         """
         Pull remote changes and apply locally.
         Returns True if new updates were pulled; False otherwise.
         """
-        # Wait for changes
-        changes = _run_op(self._sync, self._sync.wait_changes(), self._http_ctx)
-        # determine if empty before applying
-        if changes is None:
-            # Should not happen; treat as no changes
-            return False
-        is_empty = bool(changes.empty())
-        if is_empty:
-            return False
-        # Apply non-empty changes
-        op = self._sync.apply_changes(changes)
-        _run_op(self._sync, op, self._http_ctx)
-        return True
+        with self._sync_lock:
+            # Wait for changes
+            changes = _run_op(self._sync, self._sync.wait_changes(), self._http_ctx)
+            # determine if empty before applying
+            if changes is None:
+                # Should not happen; treat as no changes
+                return False
+            is_empty = bool(changes.empty())
+            if is_empty:
+                return False
+            # Apply non-empty changes
+            op = self._sync.apply_changes(changes)
+            _run_op(self._sync, op, self._http_ctx)
+            return True
 
     def push(self) -> None:
         """
         Push local changes to remote.
         """
-        _run_op(self._sync, self._sync.push_changes(), self._http_ctx)
+        with self._sync_lock:
+            _run_op(self._sync, self._sync.push_changes(), self._http_ctx)
 
     def checkpoint(self) -> None:
         """
         Checkpoint the WAL of the synced database.
         """
-        _run_op(self._sync, self._sync.checkpoint(), self._http_ctx)
+        with self._sync_lock:
+            _run_op(self._sync, self._sync.checkpoint(), self._http_ctx)
 
     def stats(self) -> PyTursoSyncDatabaseStats:
         """
         Collect stats about the synced database.
         """
-        stats = _run_op(self._sync, self._sync.stats(), self._http_ctx)
-        return stats
+        with self._sync_lock:
+            return _run_op(self._sync, self._sync.stats(), self._http_ctx)
 
 
 def connect_sync(
@@ -436,8 +443,10 @@ def connect_sync(
     partial_sync_experimental: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    timeout: float = 5.0,
     remote_encryption_key: Optional[str] = None,
     remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
+    local_encryption_key: Optional[str] = None,
     push_operations_threshold: Optional[int] = None,
     pull_bytes_threshold: Optional[int] = None,
     logical_mvcc_pull: Optional[bool] = None,
@@ -452,9 +461,10 @@ def connect_sync(
     - long_poll_timeout_ms: timeout for long polling during pull
     - bootstrap_if_empty: if True and db empty, bootstrap from remote during create()
     - partial_sync_experimental: EXPERIMENTAL partial sync configuration
-    - experimental_features, isolation_level: passed to underlying connection
+    - experimental_features, isolation_level, timeout: passed to underlying connection
     - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
-    - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
+    - remote_encryption_cipher: shared encryption cipher for the cloud and local replica
+    - local_encryption_key: hex key for local sync files; requires experimental_features="sync_encryption"
     - push_operations_threshold: optional cap on the number of CDC operations packed into a single
       push HTTP batch; push splits on transaction boundaries once the current batch accumulated at
       least this many operations (a single transaction is never split). None (default) sends the
@@ -472,10 +482,19 @@ def connect_sync(
         remote_url = _to_https_url(remote_url)
     http_ctx = _HttpContext(remote_url=remote_url, auth_token=auth_token, client_name=cname)
 
+    local_encryption = None
+    if local_encryption_key is not None:
+        if remote_encryption_cipher is None:
+            raise Misuse("local sync encryption requires a shared cipher")
+        local_encryption = PyTursoEncryptionConfig(
+            cipher=remote_encryption_cipher.cipher_name, hexkey=local_encryption_key
+        )
+
     # Database config: async_io must be True to let Python drive IO
     db_cfg = PyTursoDatabaseConfig(
         path=path,
         experimental_features=experimental_features,
+        encryption=local_encryption,
     )
 
     # Sync config with optional partial bootstrap strategy
@@ -525,4 +544,6 @@ def connect_sync(
         raise Misuse("sync connect did not return a connection")
 
     # Wrap into ConnectionSync that integrates sync IO into DB operations
-    return ConnectionSync(conn_obj, sync=sync_db, http_ctx=http_ctx, isolation_level=isolation_level)
+    return ConnectionSync(
+        conn_obj, sync=sync_db, http_ctx=http_ctx, isolation_level=isolation_level, timeout=timeout
+    )

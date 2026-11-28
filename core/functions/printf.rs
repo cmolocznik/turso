@@ -5,6 +5,7 @@ use std::str::Chars;
 
 use crate::numeric::{format_float, str_to_i64, Numeric};
 use crate::types::Value;
+use crate::vdbe::value::sqlite_text_prefix;
 use crate::vdbe::Register;
 
 #[derive(Default, Clone)]
@@ -185,20 +186,16 @@ fn coerce_to_f64(value: &Value) -> f64 {
     }
 }
 
-/// The part of `s` before the first NUL character. SQLite reads the format
-/// string and string arguments as C strings, so they end at the first NUL.
-fn until_nul(s: &str) -> &str {
-    s.find('\0').map_or(s, |end| &s[..end])
-}
-
 /// Coerce a Value to String for string specifiers.
 fn coerce_to_string(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Numeric(Numeric::Integer(i)) => i.to_string(),
         Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
-        Value::Text(t) => until_nul(t.as_str()).to_string(),
-        Value::Blob(b) => until_nul(&String::from_utf8_lossy(b)).to_string(),
+        // SQLite reads a string argument as a C string, so the string ends at
+        // the first NUL.
+        Value::Text(t) => sqlite_text_prefix(t.as_str()).to_string(),
+        Value::Blob(b) => sqlite_text_prefix(&String::from_utf8_lossy(b)).to_string(),
     }
 }
 
@@ -311,7 +308,9 @@ fn ensure_decimal_strip_zeros(s: &str) -> String {
 /// then `precision` more digits (sqlite3.c:32581-32602 in etEXP path).
 /// Returns (mantissa_string, flag_dp).
 fn build_exp_mantissa(digits: &[u8], precision: usize, flags: &FormatFlags) -> (String, bool) {
-    let mut mantissa = String::new();
+    // The first digit, the point, the digits after the point, and the
+    // exponent that the callers append: "e", a sign and at most 4 digits.
+    let mut mantissa = String::with_capacity(precision + 8);
     mantissa.push((b'0' + digits.first().copied().unwrap_or(0)) as char);
 
     let flag_dp = precision > 0 || flags.alternate || flags.alt_form_2;
@@ -334,16 +333,14 @@ fn build_exp_mantissa(digits: &[u8], precision: usize, flags: &FormatFlags) -> (
 /// point. If `keep_dot_zero` is true (alt_form_2 / `!` flag), a bare "." becomes
 /// ".0"; otherwise the dot is also removed. (sqlite3.c:32604-32613)
 fn strip_trailing_zeros(s: &mut String, keep_dot_zero: bool) {
-    let trimmed = s.trim_end_matches('0');
-    *s = if trimmed.ends_with('.') {
+    s.truncate(s.trim_end_matches('0').len());
+    if s.ends_with('.') {
         if keep_dot_zero {
-            format!("{trimmed}0")
+            s.push('0');
         } else {
-            trimmed.trim_end_matches('.').to_string()
+            s.truncate(s.trim_end_matches('.').len());
         }
-    } else {
-        trimmed.to_string()
-    };
+    }
 }
 
 /// Pad a digit string to at least `min_digits` characters with leading zeros.
@@ -439,14 +436,16 @@ fn fp_decode(r: f64, i_round: i32, max_round: usize) -> (Vec<u8>, i32) {
         (rr[0] as u64).wrapping_add(rr[1] as u64)
     };
 
-    // Extract decimal digits from u64
-    let mut buf = Vec::with_capacity(20);
-    let mut temp = v;
-    while temp > 0 {
-        buf.push((temp % 10) as u8);
-        temp /= 10;
-    }
-    buf.reverse();
+    // The decimal digits of `v` as the values 0 to 9, with no digits for 0.
+    let mut text = [0u8; 20];
+    let digits: &[u8] = if v == 0 {
+        &[]
+    } else {
+        crate::numeric::write_decimal_digits(&mut text, v)
+    };
+    // One more byte for a carry digit that the rounding below can insert.
+    let mut buf = Vec::with_capacity(digits.len() + 1);
+    buf.extend(digits.iter().map(|digit| digit - b'0'));
 
     let n = buf.len();
     let mut dp = n as i32 + exp;
@@ -517,7 +516,8 @@ fn format_fixed_from_digits(abs_f: f64, precision: usize, max_sig: usize) -> Str
     let (digits, dp) = fp_decode(abs_f, i_round, max_sig);
 
     // ── Integer part (sqlite3.c:32581-32588) ───────────────────────
-    let mut result = String::new();
+    // The integer digits, the point and the digits after the point.
+    let mut result = String::with_capacity(dp.max(1) as usize + 1 + precision);
     let mut j: usize = 0;
     if dp <= 0 {
         result.push('0');
@@ -916,9 +916,10 @@ fn format_exponential_inner(output: &mut String, f: f64, spec: &FormatSpec, uppe
         strip_trailing_zeros(&mut mantissa, true);
     }
 
-    let content = format!("{mantissa}{e_char}{exp:+03}");
+    mantissa.push(e_char);
+    write!(mantissa, "{exp:+03}").unwrap();
     let prefix = sign_prefix(negative, &spec.flags);
-    apply_width(output, prefix, &content, spec.width, &spec.flags, false);
+    apply_width(output, prefix, &mantissa, spec.width, &spec.flags, false);
 }
 
 fn format_general(output: &mut String, value: &Value, spec: &FormatSpec, uppercase: bool) {
@@ -976,7 +977,9 @@ fn format_general_inner(output: &mut String, f: f64, spec: &FormatSpec, uppercas
         if flag_rtz && flag_dp {
             strip_trailing_zeros(&mut mantissa, spec.flags.alt_form_2);
         }
-        format!("{mantissa}{e_char}{exp:+03}")
+        mantissa.push(e_char);
+        write!(mantissa, "{exp:+03}").unwrap();
+        mantissa
     } else {
         // ── Fixed-point notation ──────────────────────────────────
         // SQLite: precision = precision - exp (line 32553), giving digits after decimal
@@ -986,8 +989,9 @@ fn format_general_inner(output: &mut String, f: f64, spec: &FormatSpec, uppercas
             0
         };
 
-        // Build fixed-point string from decoded digits
-        let mut s = String::new();
+        // Build fixed-point string from decoded digits: the integer digits,
+        // the point and the digits after the point.
+        let mut s = String::with_capacity(dp.max(1) as usize + 1 + frac_precision);
         let mut j: usize = 0;
 
         // Integer part
@@ -1082,11 +1086,6 @@ fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
             s.chars().next().unwrap_or('\0')
         }
     };
-
-    // NUL character produces no output (matches SQLite behavior)
-    if c == '\0' {
-        return;
-    }
 
     // Precision on %c repeats the character that many times (default 1)
     let repeat = spec.precision.unwrap_or(1).max(1);
@@ -1369,7 +1368,9 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
         }
     };
 
-    let format_str = until_nul(format_str);
+    // SQLite reads the format string as a C string, so it ends at the first
+    // NUL.
+    let format_str = sqlite_text_prefix(format_str);
 
     let mut result = String::new();
     let mut args_index = 0;
@@ -1460,9 +1461,41 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
     Ok(Value::build_text(result))
 }
 
+/// Append `value` as `printf('%.<precision>g', value)` writes it.
+pub(crate) fn push_general_format(output: &mut String, value: &Value, precision: usize) {
+    let spec = FormatSpec {
+        flags: FormatFlags::default(),
+        width: None,
+        precision: Some(precision),
+        spec_type: 'g',
+    };
+    format_general(output, value, &spec, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_general_format_writes_the_text_of_printf() {
+        for f in [
+            0.0,
+            -0.0,
+            2460513.1046875,
+            2460513.104687512,
+            -123.456,
+            1e-300,
+            1.5e300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let value = Value::from_f64(f);
+            let mut text = String::new();
+            push_general_format(&mut text, &value, 16);
+            let printf = exec_printf_values(&Value::build_text("%.16g"), &[&value]).unwrap();
+            assert_eq!(Value::build_text(text), printf);
+        }
+    }
 
     fn text(value: &str) -> Register {
         Register::Value(Value::build_text(value.to_string()))
@@ -1626,12 +1659,11 @@ mod tests {
                 vec![text("character: %c"), float(42.5)],
                 text("character: 4"),
             ),
-            // Empty string → NUL char → no output (matches SQLite)
-            (vec![text("character: %c"), text("")], text("character: ")),
-            // NULL → coerces to empty string → NUL → no output
+            // Empty strings and NULL produce a NUL character.
+            (vec![text("character: %c"), text("")], text("character: \0")),
             (
                 vec![text("character: %c"), Register::Value(Value::Null)],
-                text("character: "),
+                text("character: \0"),
             ),
         ];
         for (input, expected) in test_cases {

@@ -68,8 +68,15 @@ fn emit_row_valued_binary_expr(
 
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_compared_pair(
+        program,
+        referenced_tables,
+        e1,
+        e2,
+        lhs_reg,
+        rhs_reg,
+        resolver,
+    )?;
 
     emit_binary_expr_row_valued(
         program,
@@ -91,10 +98,11 @@ fn emit_row_valued_binary_expr(
 }
 
 /// Function instructions read contiguous registers start_reg..start_reg+arg_count.
-/// When both operands are equivalent the compiler reuses a single shared register,
-/// so copy it into a contiguous pair.
+/// The operands are in registers that [resolve_expr()] chose, which can be one
+/// shared register or two registers that are not next to each other, so copy
+/// them into a contiguous pair then.
 fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> usize {
-    if lhs != rhs {
+    if rhs == lhs + 1 {
         return lhs;
     }
     let regs = program.alloc_registers(2);
@@ -104,7 +112,7 @@ fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> 
         extra_amount: 0,
     });
     program.emit_insn(Insn::Copy {
-        src_reg: lhs,
+        src_reg: rhs,
         dst_reg: regs + 1,
         extra_amount: 0,
     });
@@ -126,8 +134,7 @@ pub(super) fn emit_binary_expr_scalar(
     if exprs_are_equivalent(e1, e2)
         && !expr_contains_nondeterministic_scalar_function(e1, resolver)?
     {
-        let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+        let shared_reg = resolve_expr(program, referenced_tables, e1, resolver)?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -156,11 +163,17 @@ pub(super) fn emit_binary_expr_scalar(
         }
         Ok(target_register)
     } else {
-        let e1_reg = program.alloc_registers(2);
-        let e2_reg = e1_reg + 1;
-
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        let (e1_reg, e2_reg) = if op.is_comparison() {
+            (
+                resolve_compared_value(program, referenced_tables, e1, e2, resolver)?,
+                resolve_compared_value(program, referenced_tables, e2, e1, resolver)?,
+            )
+        } else {
+            (
+                resolve_expr(program, referenced_tables, e1, resolver)?,
+                resolve_expr(program, referenced_tables, e2, resolver)?,
+            )
+        };
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -416,7 +429,7 @@ pub(super) fn row_component_affinity_collation(
 /// row subquery's result, so each component compares with its own type. A
 /// subquery column does not bring its text collation. Any other expression
 /// stands for itself.
-fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
     match unwrap_parens(expr)? {
         Expr::Parenthesized(exprs) if exprs.len() > 1 => {
             Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {
@@ -431,6 +444,7 @@ fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } if *num_regs > 1 && idx < *num_regs => Ok(Cow::Owned(Expr::SubqueryResult {
             subquery_id: *subquery_id,
@@ -439,10 +453,82 @@ fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
             query_type: ast::SubqueryType::RowValue {
                 result_reg_start: result_reg_start + idx,
                 num_regs: 1,
+                row_count_reg: *row_count_reg,
             },
         })),
         _ => Ok(Cow::Borrowed(expr)),
     }
+}
+
+/// Writes the `len` components of the row value `expr` into the registers
+/// starting at `start_reg`. Each component is translated as one value, so a
+/// row value nested inside another is "row value misused", as in SQLite.
+pub(super) fn translate_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &Expr,
+    len: usize,
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for idx in 0..len {
+        let component = row_value_component_expr(expr, idx)?;
+        translate_expr(
+            program,
+            referenced_tables,
+            &component,
+            start_reg + idx,
+            resolver,
+        )?;
+    }
+    Ok(())
+}
+
+/// The number of components [row_value_component_expr] splits `expr` into.
+/// As in SQLite's `sqlite3ExprVectorSize`, only `(a, b)` and a planned row
+/// subquery have more than one; every other expression is one value.
+pub(crate) fn row_value_len(expr: &Expr) -> Result<usize> {
+    Ok(match unwrap_parens(expr)? {
+        Expr::Parenthesized(exprs) => exprs.len(),
+        Expr::SubqueryResult { query_type, .. } => match query_type {
+            ast::SubqueryType::RowValue { num_regs, .. } => *num_regs,
+            ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. } => 1,
+        },
+        // Its width is known once it is planned, when the expression holding
+        // it is checked again.
+        Expr::Subquery(_) => 1,
+        Expr::Between { .. }
+        | Expr::Binary(..)
+        | Expr::Case { .. }
+        | Expr::Cast { .. }
+        | Expr::Collate(..)
+        | Expr::Column { .. }
+        | Expr::Default
+        | Expr::DoublyQualified(..)
+        | Expr::Exists(_)
+        | Expr::FieldAccess { .. }
+        | Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Id(_)
+        | Expr::InList { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::MergedColumn(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Qualified(..)
+        | Expr::Raise(..)
+        | Expr::Register { .. }
+        | Expr::RowId { .. }
+        | Expr::Unary(..)
+        | Expr::Variable(_) => 1,
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -713,19 +799,14 @@ pub(super) fn emit_binary_insn(
             }
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            resolver.require_custom_types("Array features")?;
+            let func = containment_func(op, lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
-            let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
-                _ => unreachable!(),
-            };
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1020,19 +1101,14 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            resolver.require_custom_types("Array features")?;
+            let func = containment_func(op, lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
-            let func = match op {
-                ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
-                ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
-                _ => unreachable!(),
-            };
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
-                    func: Func::Scalar(func),
+                    func,
                     arg_count: 2,
                     collation: CollationSeq::BINARY,
                 },
@@ -1043,6 +1119,38 @@ pub(super) fn emit_binary_condition_insn(
     }
 
     Ok(())
+}
+
+/// The function that runs `lhs @> rhs` or `lhs && rhs`. When neither operand
+/// of `@>` is an array, the function of the dialect runs it, if the dialect
+/// has one: PostgreSQL's `@>` also compares jsonb values. The types of the
+/// operands are known only here, not when the statement is parsed.
+///
+/// FIXME(pg-catalog): This chooses between the pg_operator entries `anyarray @> anyarray` and `jsonb @> jsonb` from whether an operand is an array, because the AST does not carry PostgreSQL types. A lookup in pg_operator by the types of both operands, in an expression tree that carries PostgreSQL types, replaces this.
+fn containment_func(
+    op: &ast::Operator,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Func> {
+    if matches!(op, ast::Operator::ArrayContains)
+        && !is_array(lhs_expr, referenced_tables, resolver)
+        && !is_array(rhs_expr, referenced_tables, resolver)
+    {
+        if let Some(name) = resolver.catalog.dialect.json_contains_function() {
+            let func = resolver.resolve_function(name, 2)?;
+            return Ok(func.unwrap_or_else(|| {
+                panic!("the dialect gives {name}() for @>, but no function has that name")
+            }));
+        }
+    }
+    resolver.require_custom_types("Array features")?;
+    Ok(Func::Scalar(match op {
+        ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
+        ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+        _ => unreachable!("only @> and && run an array function"),
+    }))
 }
 
 fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {

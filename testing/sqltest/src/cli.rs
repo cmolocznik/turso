@@ -1,0 +1,1015 @@
+use crate::gap::GapReport;
+use crate::{
+    BackendError, DefaultDatabaseResolver, FileResult, Format, LoadedTests, OutputFormat,
+    ParseError, RunnerConfig, SnapshotUpdateMode, SqlBackend, TestRunner,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
+    backends::tursopg::TursopgBackend, create_output, find_all_pending_snapshots, load_test_files,
+    summarize, tcl_converter,
+};
+use async_trait::async_trait;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use miette::{NamedSource, Report};
+use owo_colors::OwoColorize;
+use std::process::ExitCode;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+#[derive(Parser)]
+#[command(name = "sqltest")]
+#[command(about = "SQL test runner for Turso/Limbo")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum Commands {
+    /// Run tests
+    Run {
+        /// Test files or directories
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Backend to use. The runner binary sets the help text and the default.
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Path to tursodb binary (only used with --backend cli)
+        #[arg(long, default_value = "tursodb")]
+        binary: PathBuf,
+
+        /// Path to node binary (only used with --backend js)
+        #[arg(long, default_value = "node")]
+        node: PathBuf,
+
+        /// Path to JavaScript runner script (only used with --backend js)
+        #[arg(long)]
+        js_script: Option<PathBuf>,
+
+        /// Filter tests by name pattern
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Number of parallel jobs
+        #[arg(short, long, default_value_t = num_cpus::get())]
+        jobs: usize,
+
+        /// Output format (pretty, json)
+        #[arg(short, long, default_value = "pretty")]
+        output: String,
+
+        /// Timeout per query in seconds (not used with --backend rust)
+        #[arg(long, default_value_t = 90)]
+        timeout: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
+
+        /// Snapshot update mode:
+        /// - auto: 'no' in CI, 'new' otherwise (default)
+        /// - new: write .snap.new files for review
+        /// - always: write directly to .snap files
+        /// - no: don't write any snapshot files
+        #[arg(long, default_value_t = SnapshotUpdateMode::default())]
+        snapshot_mode: SnapshotUpdateMode,
+
+        /// Filter snapshot tests by name pattern
+        #[arg(long)]
+        snapshot_filter: Option<String>,
+
+        /// Path to binary for cross-checking integrity.
+        /// When set, tests annotated with @cross-check-integrity will run
+        /// `PRAGMA integrity_check` using this binary after the test passes.
+        /// :memory: databases are automatically upgraded to temp files for annotated tests.
+        #[arg(long)]
+        cross_check_binary: Option<PathBuf>,
+
+        /// URL of the PostgreSQL server for --backend postgres, for example
+        /// postgres://postgres@127.0.0.1:5432/postgres. Each test gets a new
+        /// database on this server, so the user in the URL must be able to
+        /// create and drop databases.
+        #[arg(long)]
+        postgres_dsn: Option<String>,
+        /// Stop at the first failed test or error
+        #[arg(long)]
+        fail_fast: bool,
+
+        /// Turn on the gap lints, which the PostgreSQL suites need; without
+        /// them a `@compat-gap` test does not parse.
+        #[arg(long)]
+        compat_gaps: bool,
+    },
+
+    /// Print the gap-test counts of test files as Markdown tables, without
+    /// running the tests. The gap lints are on.
+    Gaps {
+        /// Test files or directories
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+
+    /// Fail when a gap test of the base tree is gone from the head tree: deleted,
+    /// renamed, or converted into a plain test with other SQL, setups or
+    /// PostgreSQL answer
+    GapRemovals {
+        /// Test directory in the base tree, for example the target branch
+        #[arg(long)]
+        base: PathBuf,
+
+        /// The same test directory in the head tree
+        #[arg(long)]
+        head: PathBuf,
+    },
+
+    /// Validate test file syntax and check for pending snapshots
+    Check {
+        /// Test files or directories
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Turn on the gap lints, which the PostgreSQL suites need; without
+        /// them a `@compat-gap` test does not parse.
+        #[arg(long)]
+        compat_gaps: bool,
+    },
+
+    /// Convert Tcl .test files to .sqltest format
+    Convert {
+        /// Tcl test files to convert
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Output directory (default: write next to source files)
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+
+        /// Print to stdout instead of writing files
+        #[arg(long)]
+        stdout: bool,
+
+        /// Show verbose warnings
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// [DEBUG ONLY] Generate test databases and save them to a directory.
+    /// This is intended for debugging purposes only - to inspect the database
+    /// files that the test runner generates for tests using :default: databases.
+    GenerateDb {
+        /// Output directory to save the generated databases
+        #[arg(required = true)]
+        output_dir: PathBuf,
+
+        /// Number of users to generate (default: 10000)
+        #[arg(long, default_value_t = 10000)]
+        user_count: usize,
+
+        /// Seed for reproducible random generation (default: 42)
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
+    },
+}
+
+/// What differs between the runner binaries: each binary links one SQL
+/// dialect, so the backends and database generators that need a dialect
+/// frontend come from the binary.
+#[async_trait(?Send)]
+pub trait Flavor {
+    /// The name of the runner binary.
+    fn bin_name(&self) -> &'static str;
+
+    /// The backends that only this flavor has.
+    fn extra_backends(&self) -> &'static [&'static str];
+
+    /// The backend that `run` uses without `--backend`.
+    fn default_backend(&self) -> &'static str;
+
+    /// Whether the binary has the `generate-db` command.
+    fn generates_databases(&self) -> bool {
+        false
+    }
+
+    /// Make the databases that the loaded tests name by `:default:` and by
+    /// fixture path, and return the resolver for them.
+    async fn prepare_databases(
+        &self,
+        _loaded: &LoadedTests,
+        _mvcc: bool,
+    ) -> Result<Option<Arc<dyn DefaultDatabaseResolver>>, ExitCode> {
+        Ok(None)
+    }
+
+    /// Run the tests on a backend of this flavor. Returns `None` when the
+    /// flavor has no backend with this name.
+    async fn run_backend(
+        &self,
+        _name: &str,
+        _run: BackendRun<'_>,
+    ) -> Option<Result<Vec<FileResult>, BackendError>> {
+        None
+    }
+
+    /// The `generate-db` debug command.
+    async fn generate_debug_databases(
+        &self,
+        _output_dir: PathBuf,
+        _user_count: usize,
+        _seed: u64,
+        _mvcc: bool,
+    ) -> ExitCode {
+        eprintln!("Error: this runner does not generate databases");
+        ExitCode::from(2)
+    }
+}
+
+/// One run of the loaded tests, ready for a backend.
+pub struct BackendRun<'a> {
+    pub resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
+    pub timeout: Duration,
+    pub mvcc: bool,
+    config: RunnerConfig,
+    loaded: LoadedTests,
+    output: &'a mut Box<dyn OutputFormat>,
+}
+
+impl BackendRun<'_> {
+    pub async fn run<B: SqlBackend + 'static>(
+        self,
+        backend: B,
+    ) -> Result<Vec<FileResult>, BackendError> {
+        let output = self.output;
+        TestRunner::new(backend)
+            .with_config(self.config)
+            .run_loaded_tests(self.loaded, |result| {
+                output.write_test(result);
+                output.flush();
+            })
+            .await
+    }
+}
+
+/// The backends that every runner binary has.
+const COMMON_BACKENDS: &[&str] = &["cli", "js", "tursopg", "postgres"];
+
+fn backend_names(flavor: &dyn Flavor) -> Vec<&'static str> {
+    [flavor.extra_backends(), COMMON_BACKENDS].concat()
+}
+
+fn command_for(flavor: &dyn Flavor) -> clap::Command {
+    let backends = format!(
+        "Backend to use: {} (default: {})",
+        backend_names(flavor).join(", "),
+        flavor.default_backend()
+    );
+    let mut command = Cli::command()
+        .name(flavor.bin_name())
+        .mut_subcommand("run", |run| {
+            run.mut_arg("backend", |arg| arg.help(backends))
+        });
+    if !flavor.generates_databases() {
+        command = command.mut_subcommand("generate-db", |generate| generate.hide(true));
+    }
+    command
+}
+
+pub async fn run(flavor: &dyn Flavor) -> ExitCode {
+    let cli = Cli::from_arg_matches(&command_for(flavor).get_matches())
+        .unwrap_or_else(|error| error.exit());
+
+    match cli.command {
+        Commands::Run {
+            paths,
+            backend,
+            binary,
+            node,
+            js_script,
+            filter,
+            jobs,
+            output,
+            timeout,
+            mvcc,
+            snapshot_mode,
+            snapshot_filter,
+            cross_check_binary,
+            postgres_dsn,
+            fail_fast,
+            compat_gaps,
+        } => {
+            let backend = backend.unwrap_or_else(|| flavor.default_backend().to_string());
+            run_tests(
+                flavor,
+                paths,
+                backend,
+                binary,
+                node,
+                js_script,
+                filter,
+                jobs,
+                output,
+                timeout,
+                mvcc,
+                snapshot_mode,
+                snapshot_filter,
+                cross_check_binary,
+                postgres_dsn,
+                fail_fast,
+                compat_gaps,
+            )
+            .await
+        }
+        Commands::Check { paths, compat_gaps } => check_files(paths, compat_gaps).await,
+        Commands::Gaps { paths } => print_gaps(paths).await,
+        Commands::GapRemovals { base, head } => check_gap_removals(base, head).await,
+        Commands::Convert {
+            paths,
+            output_dir,
+            stdout,
+            verbose,
+        } => convert_files(paths, output_dir, stdout, verbose),
+        Commands::GenerateDb {
+            output_dir,
+            user_count,
+            seed,
+            mvcc,
+        } => {
+            flavor
+                .generate_debug_databases(output_dir, user_count, seed, mvcc)
+                .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tests(
+    flavor: &dyn Flavor,
+    paths: Vec<PathBuf>,
+    backend_type: String,
+    binary: PathBuf,
+    node: PathBuf,
+    js_script: Option<PathBuf>,
+    filter: Option<String>,
+    jobs: usize,
+    output_format: String,
+    timeout: u64,
+    mvcc: bool,
+    snapshot_mode: SnapshotUpdateMode,
+    snapshot_filter: Option<String>,
+    cross_check_binary: Option<PathBuf>,
+    postgres_dsn: Option<String>,
+    fail_fast: bool,
+    compat_gaps: bool,
+) -> ExitCode {
+    match (&postgres_dsn, backend_type.as_str()) {
+        (None, "postgres") => {
+            eprintln!("Error: --backend postgres needs --postgres-dsn");
+            eprintln!("postgres/conformance/with-postgres.sh starts a server in Docker");
+            return ExitCode::from(2);
+        }
+        (Some(_), backend) if backend != "postgres" => {
+            eprintln!("Error: --postgres-dsn works only with --backend postgres");
+            return ExitCode::from(2);
+        }
+        _ => {}
+    }
+    if mvcc && backend_type == "tursopg-embedded" {
+        eprintln!("Error: --mvcc does not work with --backend tursopg-embedded");
+        return ExitCode::from(2);
+    }
+
+    // Resolve paths, trying to add .sqltest extension if missing
+    let mut resolved_paths = Vec::new();
+    let mut missing = Vec::new();
+
+    for path in paths {
+        if path.exists() {
+            resolved_paths.push(path);
+        } else {
+            // Try adding .sqltest extension
+            let with_ext = path.with_extension("sqltest");
+            if with_ext.exists() {
+                resolved_paths.push(with_ext);
+            } else {
+                missing.push(path);
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        eprintln!("Error: the following paths do not exist:");
+        for path in missing {
+            eprintln!("  - {}", path.display());
+        }
+        return ExitCode::from(1);
+    }
+
+    let paths = resolved_paths;
+
+    // Parse output format
+    let format: Format = match output_format.parse() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Load and parse test files
+    let loaded = match load_test_files(&paths, &crate::gap::lint(compat_gaps)).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let gap_report = if compat_gaps {
+        GapReport::from_files(
+            loaded
+                .files
+                .iter()
+                .map(|(path, file)| (path.as_path(), file)),
+        )
+    } else {
+        GapReport::default()
+    };
+
+    let resolver = match flavor.prepare_databases(&loaded, mvcc).await {
+        Ok(resolver) => resolver,
+        Err(code) => return code,
+    };
+
+    // Create runner config
+    let mut config = RunnerConfig::default()
+        .with_max_jobs(jobs)
+        .with_mvcc(mvcc)
+        .with_snapshot_update_mode(snapshot_mode)
+        .with_fail_fast(fail_fast);
+    if let Some(f) = filter {
+        config = config.with_filter(f);
+    }
+    if let Some(f) = snapshot_filter {
+        config = config.with_snapshot_filter(f);
+    }
+    if let Some(binary) = cross_check_binary {
+        config = config.with_cross_check_binary(binary);
+    }
+
+    // Create output formatter
+    let mut output: Box<dyn OutputFormat> = create_output(format);
+    let start = Instant::now();
+
+    // Run tests based on backend selection
+    let results = match backend_type.as_str() {
+        "cli" => {
+            let mut backend = CliBackend::new(&binary)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "js" => {
+            // Default: script is in the bindings/javascript directory
+            let js_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bindings/javascript");
+
+            // Determine script path - use provided or default to bundled script
+            let script_path = js_script.unwrap_or_else(|| js_dir.join("turso-sql-runner.mjs"));
+
+            if !script_path.exists() {
+                eprintln!(
+                    "Error: JavaScript runner script not found at {}",
+                    script_path.display()
+                );
+                eprintln!("Use --js-script to specify a custom script path");
+                return ExitCode::from(2);
+            }
+
+            // Check that native bindings are built
+            let native_dir = js_dir.join("packages/native");
+            let has_native_bindings = native_dir
+                .read_dir()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "node"))
+                })
+                .unwrap_or(false);
+
+            if !has_native_bindings {
+                eprintln!("Error: JavaScript native bindings not found");
+                eprintln!("Expected .node file in {}", native_dir.display());
+                eprintln!();
+                eprintln!("Build the bindings first:");
+                eprintln!("  make -C testing/runner build-js-bindings");
+                eprintln!();
+                eprintln!("Or manually:");
+                eprintln!("  cd bindings/javascript");
+                eprintln!("  yarn install");
+                eprintln!("  yarn workspace @tursodatabase/database-common build");
+                eprintln!("  yarn workspace @tursodatabase/database build");
+                return ExitCode::from(2);
+            }
+
+            let mut backend = JsBackend::new(&node, &script_path)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "tursopg" => {
+            // --binary defaults to tursodb for the cli backend; for tursopg the
+            // server binary is tursopg, so rewrite an untouched default.
+            let binary = if binary == PathBuf::from("tursodb") {
+                PathBuf::from("tursopg")
+            } else {
+                binary
+            };
+            let mut backend =
+                TursopgBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "postgres" => {
+            let dsn = postgres_dsn.expect("--postgres-dsn is checked above");
+            let backend = match PostgresBackend::connect(&dsn, Duration::from_secs(timeout)).await {
+                Ok(backend) => backend,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let role_cleanup = backend.role_cleanup();
+            let runner = TestRunner::new(backend).with_config(config);
+            let results = runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await;
+            if let Err(e) = role_cleanup.drop_roles_created_by_the_run().await {
+                eprintln!("Error: cannot drop the roles that the tests created: {e}");
+                return ExitCode::from(2);
+            }
+            results
+        }
+        other => {
+            let run = BackendRun {
+                resolver,
+                timeout: Duration::from_secs(timeout),
+                mvcc,
+                config,
+                loaded,
+                output: &mut output,
+            };
+            match flavor.run_backend(other, run).await {
+                Some(results) => results,
+                None => {
+                    eprintln!(
+                        "Error: unknown backend '{other}'. Use one of: {}",
+                        backend_names(flavor).join(", ")
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+
+    let results = match results {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error running tests: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Write summary
+    let summary = summarize(start, &results);
+    output.write_summary(&summary);
+    output.flush();
+
+    if output_format == "pretty" && !gap_report.is_empty() {
+        println!();
+        println!("{}", gap_report.to_markdown());
+    }
+    // Return appropriate exit code
+    if summary.is_success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Prints the gap report of the test files as Markdown, for the `gaps`
+/// command. The tests are parsed but not run.
+async fn print_gaps(paths: Vec<PathBuf>) -> ExitCode {
+    let loaded = match load_test_files(&paths, &crate::gap::lint(true)).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // A file that does not parse would be left out of the counts, so the
+    // command fails instead of printing counts that are too low.
+    if !loaded.errors.is_empty() {
+        for error in &loaded.errors {
+            eprintln!(
+                "Error: {} does not parse; run `sqltest check` on it",
+                error.file.display()
+            );
+        }
+        return ExitCode::from(1);
+    }
+    let report = GapReport::from_files(
+        loaded
+            .files
+            .iter()
+            .map(|(path, file)| (path.as_path(), file)),
+    );
+    println!("{}", report.to_markdown());
+    ExitCode::SUCCESS
+}
+
+/// Checks that the head tree keeps every gap test of the base tree, for the
+/// `gap-removals` command.
+async fn check_gap_removals(base: PathBuf, head: PathBuf) -> ExitCode {
+    let mut trees = Vec::new();
+    for (root, is_base) in [(&base, true), (&head, false)] {
+        match crate::gap_removals::load_tree(root, is_base).await {
+            Ok(files) => trees.push(files),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let errors = crate::gap_removals::removed_gaps(&trees[0], &trees[1]);
+    for error in &errors {
+        eprintln!("{} {error}", "Removed gap:".red().bold());
+    }
+    if errors.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+async fn check_files(paths: Vec<PathBuf>, compat_gaps: bool) -> ExitCode {
+    let lint = crate::gap::lint(compat_gaps);
+    let mut has_errors = false;
+
+    // Check for pending snapshot files
+    let mut pending_files = Vec::new();
+    for path in &paths {
+        let search_dir = if path.is_file() {
+            path.parent().unwrap_or(Path::new("."))
+        } else {
+            path.as_path()
+        };
+        let found = find_all_pending_snapshots(search_dir).await;
+        pending_files.extend(found);
+    }
+
+    if !pending_files.is_empty() {
+        eprintln!(
+            "{}",
+            "Error: Found pending snapshot files (.snap.new)"
+                .red()
+                .bold()
+        );
+        eprintln!("These files indicate uncommitted snapshot changes:");
+        for file in &pending_files {
+            eprintln!("  - {}", file.display());
+        }
+        eprintln!();
+        eprintln!("To resolve:");
+        eprintln!("  - Accept with: --snapshot-mode=always");
+        eprintln!("  - Or review with cargo-insta: https://insta.rs/docs/cli/");
+        eprintln!("  - Or delete the .snap.new files");
+        has_errors = true;
+    }
+
+    // Check test file syntax
+    for path in &paths {
+        if path.is_dir() {
+            // Glob for .sqltest files
+            let pattern = path.join("**/*.sqltest");
+            let pattern_str = pattern.to_string_lossy();
+
+            match glob::glob(&pattern_str) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(file_path) => {
+                                if !check_single_file(&file_path, &lint) {
+                                    has_errors = true;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error: {e}");
+                                has_errors = true;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: invalid glob pattern: {e}");
+                    has_errors = true;
+                }
+            }
+        } else if path.is_file() {
+            if !check_single_file(path, &lint) {
+                has_errors = true;
+            }
+        } else {
+            eprintln!("Error: {} does not exist", path.display());
+            has_errors = true;
+        }
+    }
+
+    if has_errors {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn check_single_file(path: &PathBuf, lint: crate::parser::TestLint<'_>) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match crate::parser::parse_with_lint(&content, lint) {
+            Ok(file) => {
+                let snapshots_str = if file.snapshots.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} snapshots", file.snapshots.len())
+                };
+                println!(
+                    "{} - OK ({} databases, {} setups, {} tests{})",
+                    path.display(),
+                    file.databases.len(),
+                    file.setups.len(),
+                    file.tests.len(),
+                    snapshots_str
+                );
+                true
+            }
+            Err(e) => {
+                print_parse_error(path, &content, e);
+                false
+            }
+        },
+        Err(e) => {
+            eprintln!("{} - ERROR: {}", path.display(), e);
+            false
+        }
+    }
+}
+
+fn print_parse_error(path: &Path, content: &str, error: ParseError) {
+    // Use miette for nice error display with source context
+    let report = Report::from(error).with_source_code(NamedSource::new(
+        path.display().to_string(),
+        content.to_string(),
+    ));
+    eprintln!("{report:?}");
+}
+
+fn convert_files(
+    paths: Vec<PathBuf>,
+    output_dir: Option<PathBuf>,
+    to_stdout: bool,
+    verbose: bool,
+) -> ExitCode {
+    let mut total_tests = 0;
+    let mut total_warnings = 0;
+    let mut files_processed = 0;
+
+    for path in &paths {
+        if path.is_dir() {
+            // Glob for .test files
+            let pattern = path.join("*.test");
+            let pattern_str = pattern.to_string_lossy();
+
+            match glob::glob(&pattern_str) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(file_path) => {
+                                let (tests, warnings) = convert_single_file(
+                                    &file_path,
+                                    &output_dir,
+                                    to_stdout,
+                                    verbose,
+                                );
+                                total_tests += tests;
+                                total_warnings += warnings;
+                                files_processed += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("{}: {}", "Error".red().bold(), e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{}: invalid glob pattern: {}", "Error".red().bold(), e);
+                }
+            }
+        } else if path.is_file() {
+            let (tests, warnings) = convert_single_file(path, &output_dir, to_stdout, verbose);
+            total_tests += tests;
+            total_warnings += warnings;
+            files_processed += 1;
+        } else {
+            eprintln!(
+                "{}: {} does not exist",
+                "Error".red().bold(),
+                path.display()
+            );
+        }
+    }
+
+    // Print summary
+    println!();
+    println!(
+        "{}: {} files processed, {} tests converted, {} warnings",
+        "Summary".cyan().bold(),
+        files_processed,
+        total_tests,
+        total_warnings
+    );
+
+    if total_warnings > 0 {
+        println!(
+            "{}",
+            "Some tests require manual conversion. See warnings above.".yellow()
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn convert_single_file(
+    path: &PathBuf,
+    output_dir: &Option<PathBuf>,
+    to_stdout: bool,
+    _verbose: bool,
+) -> (usize, usize) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("{} - {}: {}", path.display(), "ERROR".red().bold(), e);
+            return (0, 0);
+        }
+    };
+
+    let path_display = Rc::new(path.display().to_string());
+
+    let source_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let result = tcl_converter::convert(&content, &source_name);
+
+    let test_count = result.tests.len();
+    let warning_count = result.warnings.len();
+
+    // Print file header
+    println!(
+        "{} - {} tests, {} warnings",
+        path_display.cyan(),
+        test_count,
+        warning_count
+    );
+
+    // Print warnings using miette
+    for warning in &result.warnings {
+        let report = warning.to_report(&path_display, content.clone());
+        // Use debug format {:?} to get full miette diagnostic with source snippets
+        eprintln!("{report:?}");
+    }
+
+    if test_count == 0 {
+        println!("  {} No tests found to convert", "INFO".blue());
+        return (0, warning_count);
+    }
+
+    // Generate output - may produce multiple files per database type
+    let generated = tcl_converter::generate_sqltest(&result);
+
+    if to_stdout {
+        for (key, file) in &generated.files {
+            println!(
+                "\n{} ({} tests)",
+                format!("--- {key} tests ---").green().bold(),
+                file.test_count
+            );
+            println!("{}", file.content);
+        }
+        println!("{}", "--- End ---".green().bold());
+    } else {
+        let file_stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let num_files = generated.files.len();
+
+        // Determine base output path
+        let base_dir = output_dir.clone().unwrap_or_else(|| {
+            path.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        });
+
+        // If multiple files, create a subdirectory
+        let (output_base, use_subdir) = if num_files > 1 {
+            let subdir = base_dir.join(file_stem.as_ref());
+            if !subdir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&subdir) {
+                    eprintln!(
+                        "  {} Failed to create directory {}: {}",
+                        "ERROR".red().bold(),
+                        subdir.display(),
+                        e
+                    );
+                    return (0, warning_count);
+                }
+            }
+            (subdir, true)
+        } else {
+            // Ensure base dir exists
+            if !base_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&base_dir) {
+                    eprintln!(
+                        "  {} Failed to create directory {}: {}",
+                        "ERROR".red().bold(),
+                        base_dir.display(),
+                        e
+                    );
+                    return (0, warning_count);
+                }
+            }
+            (base_dir, false)
+        };
+
+        // Write each file
+        for (key, file) in &generated.files {
+            let output_path = if use_subdir {
+                // In subdirectory: use key as filename
+                output_base.join(format!("{key}.sqltest"))
+            } else {
+                // Single file: use original name
+                output_base.join(format!("{file_stem}.sqltest"))
+            };
+
+            match std::fs::write(&output_path, &file.content) {
+                Ok(_) => {
+                    println!(
+                        "  {} Written to {}",
+                        "OK".green().bold(),
+                        output_path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  {} Failed to write {}: {}",
+                        "ERROR".red().bold(),
+                        output_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    (test_count, warning_count)
+}

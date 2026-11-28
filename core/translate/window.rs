@@ -1,12 +1,17 @@
 use crate::alloc::TursoSliceExt;
+use crate::ast::Name;
+use crate::ast::{Expr, FrameBound, Literal, Over, SortOrder, TableInternalId};
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
+use crate::schema::{RangeOffsets, TypeDef};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::expr_type::{type_of, ExprType};
+use crate::translate::expr::expr_type::{
+    type_of, without_domain, without_wrappers, BuiltinType, ExprType, TypeEnv,
+};
 use crate::translate::expr::{
     custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -32,15 +37,13 @@ use crate::Connection;
 use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
-use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, FrameBound, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 const SUBQUERY_NAMESPACE: NamespaceRef = NamespaceRef::root_of(SUBQUERY_DATABASE_ID);
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
+    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<crate::ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -119,6 +122,13 @@ pub fn plan_windows(
     prepare_window_subquery(program, plan, resolver, connection, windows, 0)
 }
 
+/// Plans the subquery of the first window in `windows`, and the subqueries of
+/// the windows after it, which nest in one another.
+///
+/// This function is on the stack one time for each window. The work before
+/// and after the planning of the next window is in functions that are not
+/// inlined, and the plan of the subquery is in a [Box], so that the frame
+/// stays small.
 fn prepare_window_subquery(
     program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,
@@ -136,6 +146,49 @@ fn prepare_window_subquery(
         return Ok(());
     }
 
+    let (current_window, mut inner_plan, subquery_id) = split_window_layer(
+        program,
+        outer_plan,
+        resolver,
+        windows,
+        processed_window_count,
+    )?;
+
+    // Each window adds one level of subquery, so it counts as a nested query.
+    let nested_query = resolver.enter_nested_query()?;
+    prepare_window_subquery(
+        program,
+        &mut inner_plan,
+        resolver,
+        connection,
+        windows,
+        processed_window_count + 1,
+    )?;
+    drop(nested_query);
+
+    add_window_subquery(
+        outer_plan,
+        current_window,
+        inner_plan,
+        subquery_id,
+        processed_window_count,
+        resolver,
+    )
+}
+
+/// Takes the first window of `windows`, and moves the FROM clause, the WHERE
+/// clause, the GROUP BY clause and the aggregates of `outer_plan` into a new
+/// inner plan. The inner plan returns the rows in the order of the window.
+/// Rewrites the expressions of `outer_plan` to read the columns of the inner
+/// plan. Returns the window, the inner plan and the ID of its subquery.
+#[inline(never)]
+fn split_window_layer(
+    program: &mut ProgramBuilder,
+    outer_plan: &mut SelectPlan,
+    resolver: &Resolver,
+    windows: &mut Vec<Window>,
+    processed_window_count: usize,
+) -> crate::Result<(Box<Window>, Box<SelectPlan>, TableInternalId)> {
     // Layer windows in their declaration order: the first-declared window
     // becomes the outermost subquery (its PARTITION/ORDER drives the
     // user-visible row order), and later-declared windows nest deeper. Each
@@ -203,6 +256,14 @@ fn prepare_window_subquery(
         )?;
     }
 
+    // An outer layer pushes each call of this window into its subquery as a
+    // whole expression and reuses one column for equivalent calls, as SQLite's
+    // `selectWindowRewriteExprCb` does. `link_with_window` keeps one entry per
+    // occurrence for calls with nondeterministic functions such as `random()`
+    // or `date()`, so the entries of the calls that were merged into an earlier
+    // equivalent call match no expression in this layer and compute nothing.
+    current_window.functions.retain(|f| f.rewritten.is_some());
+
     // When there is no ORDER BY or PARTITION BY clause, the window function takes zero arguments,
     // and no other columns are selected (e.g., "SELECT count() OVER () FROM products"),
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
@@ -212,6 +273,7 @@ fn prepare_window_subquery(
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
 
@@ -225,7 +287,7 @@ fn prepare_window_subquery(
         outer_plan.table_references.outer_query_refs().to_vec(),
     );
 
-    let mut inner_plan = SelectPlan {
+    let inner_plan = Box::new(SelectPlan {
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
         table_references: mem::replace(&mut outer_plan.table_references, new_table_references),
         result_columns: subquery_result_columns,
@@ -245,20 +307,23 @@ fn prepare_window_subquery(
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-    };
+    });
+    Ok((Box::new(current_window), inner_plan, subquery_id))
+}
 
-    prepare_window_subquery(
-        program,
-        &mut inner_plan,
-        resolver,
-        connection,
-        windows,
-        processed_window_count + 1,
-    )?;
-
+/// Adds the subquery of a window, with its planned inner plan, to `outer_plan`.
+#[inline(never)]
+fn add_window_subquery(
+    outer_plan: &mut SelectPlan,
+    current_window: Box<Window>,
+    inner_plan: Box<SelectPlan>,
+    subquery_id: TableInternalId,
+    processed_window_count: usize,
+    resolver: &Resolver,
+) -> crate::Result<()> {
     let subquery = JoinedTable::new_subquery(
         format!("window_subquery_{processed_window_count}"),
-        inner_plan,
+        *inner_plan,
         None,
         subquery_id,
         resolver,
@@ -283,7 +348,7 @@ fn append_order_by(
     plan: &mut SelectPlan,
     expr: &mut Expr,
     sort_order: &SortOrder,
-    nulls_order: Option<turso_parser::ast::NullsOrder>,
+    nulls_order: Option<crate::ast::NullsOrder>,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     // Deduplicate: if an equivalent expression already exists in the subquery ORDER BY,
@@ -571,6 +636,7 @@ fn push_new_subquery_column(
         alias: None,
         implicit_column_name: None,
         contains_aggregates,
+        values_condition_type: None,
     });
 }
 
@@ -960,10 +1026,11 @@ fn emit_frame_offset(
     resolver: &Resolver,
     expr: &Expr,
     reg: usize,
-    mode: turso_parser::ast::FrameMode,
+    mode: crate::ast::FrameMode,
     pos: FrameBoundPosition,
 ) -> Result<()> {
-    if is_constant_frame_offset(expr, resolver)? {
+    let is_constant = is_constant_frame_offset(expr, resolver)?;
+    if is_constant {
         translate_expr_no_constant_opt(
             program,
             Some(&plan.table_references),
@@ -978,7 +1045,18 @@ fn emit_frame_offset(
             dest_end: None,
         });
     }
-    emit_window_check_offset(program, reg, mode, pos);
+    let integer_only = match mode {
+        crate::ast::FrameMode::Range => {
+            let window = plan.window.as_ref().expect("missing window");
+            let [(order_expr, ..)] = window.order_by.as_slice() else {
+                unreachable!("RANGE offsets require exactly one ORDER BY expression");
+            };
+            let context = ExprContext::new(Some(&plan.table_references), resolver);
+            check_range_offset_type(order_expr, is_constant.then_some(expr), &context.type_env())?
+        }
+        crate::ast::FrameMode::Rows | crate::ast::FrameMode::Groups => true,
+    };
+    emit_window_check_offset(program, reg, integer_only, pos);
     Ok(())
 }
 
@@ -1012,20 +1090,19 @@ fn is_constant_frame_offset(expr: &Expr, resolver: &Resolver<'_>) -> Result<bool
 }
 
 /// Emit a runtime check that the frame-offset register holds a
-/// non-negative integer, halting the program with the standard SQLite
-/// error message on failure. Mirrors `windowCheckValue` at
-/// `window.c:1482-1523`.
+/// non-negative integer, or with `integer_only` false a non-negative number,
+/// halting the program with the standard SQLite error message on failure.
+/// Mirrors `windowCheckValue` at `window.c:1482-1523`.
 fn emit_window_check_offset(
     program: &mut ProgramBuilder,
     offset_reg: usize,
-    mode: turso_parser::ast::FrameMode,
+    integer_only: bool,
     pos: FrameBoundPosition,
 ) {
-    use turso_parser::ast::FrameMode;
     let label_halt = program.allocate_label();
     let label_ok = program.allocate_label();
     let reg_zero = program.alloc_register();
-    if mode == FrameMode::Range {
+    if !integer_only {
         // A RANGE offset has to be a number. This checks that indirectly:
         // comparing with NUMERIC affinity turns a number (or numeric-looking
         // text) into a number, and in SQLite's type ordering numbers sort
@@ -1048,10 +1125,10 @@ fn emit_window_check_offset(
             collation: CollationSeq::for_internal_values(),
         });
     } else {
-        // A ROWS / GROUPS offset has to be an integer. MustBeInt converts
-        // it, or jumps to our own Halt if it can't — so the user gets
-        // SQLite's specific frame-offset error rather than a generic
-        // "datatype mismatch".
+        // A ROWS / GROUPS offset, or a RANGE offset over smallint or bigint,
+        // has to be an integer. MustBeInt converts it, or jumps to our own
+        // Halt if it can't — so the user gets SQLite's specific frame-offset
+        // error rather than a generic "datatype mismatch".
         program.emit_insn(Insn::MustBeInt {
             reg: offset_reg,
             target_pc: Some(label_halt),
@@ -1070,15 +1147,11 @@ fn emit_window_check_offset(
         collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(label_halt);
-    let msg = match (mode, pos) {
-        (FrameMode::Range, FrameBoundPosition::Start) => {
-            "frame starting offset must be a non-negative number"
-        }
-        (FrameMode::Range, FrameBoundPosition::End) => {
-            "frame ending offset must be a non-negative number"
-        }
-        (_, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
-        (_, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
+    let msg = match (integer_only, pos) {
+        (false, FrameBoundPosition::Start) => "frame starting offset must be a non-negative number",
+        (false, FrameBoundPosition::End) => "frame ending offset must be a non-negative number",
+        (true, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
+        (true, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
     };
     program.emit_insn(Insn::Halt {
         constraint_info: None,
@@ -1098,7 +1171,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
+        order_by: &'a [(Box<Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -1267,7 +1340,7 @@ impl EmitWindow {
             );
         }
 
-        t_ctx.meta_window = Some(WindowMetadata {
+        t_ctx.meta_window = Some(Box::new(WindowMetadata {
             labels: WindowLabels {
                 flush_buffer: program.allocate_label(),
                 row_output: program.allocate_label(),
@@ -1291,13 +1364,13 @@ impl EmitWindow {
                 // see if they are peers, so all of these stay `None`.
                 // Mirrors SQLite's `regPeer` allocation gate at
                 // window.c:2892-2896.
-                source_peer_values: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+                source_peer_values: if window.frame.mode != crate::ast::FrameMode::Rows {
                     alloc_optional_registers(program, order_by_len)
                 } else {
                     None
                 },
                 cursor_peer_values: {
-                    let is_peer_tracked = window.frame.mode != turso_parser::ast::FrameMode::Rows;
+                    let is_peer_tracked = window.frame.mode != crate::ast::FrameMode::Rows;
                     // Order matters: this allocates registers, so keep it
                     // Start / Current / End to match `FrameCursor`.
                     CursorPeerValues([
@@ -1342,7 +1415,7 @@ impl EmitWindow {
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
             minmax,
-        });
+        }));
 
         Ok(())
     }
@@ -1541,7 +1614,7 @@ impl EmitWindow {
         // branch — SQLite gets that re-entry for free because its
         // first-row test is `rowid == 1` and ResetSorter restarts the
         // rowids.
-        let same_kind_bounded = window.frame.mode != turso_parser::ast::FrameMode::Range
+        let same_kind_bounded = window.frame.mode != crate::ast::FrameMode::Range
             && matches!(
                 (&window.frame.start, &window.frame.end),
                 (FrameBound::Preceding(_), FrameBound::Preceding(_))
@@ -1607,7 +1680,7 @@ impl EmitWindow {
         // start count is set to the difference of the two offsets
         // (window.c:2962-2965).
         if matches!(window.frame.start, FrameBound::Following(_))
-            && window.frame.mode != turso_parser::ast::FrameMode::Range
+            && window.frame.mode != crate::ast::FrameMode::Range
         {
             if let (Some(start_offset_reg), Some(end_offset_reg)) =
                 (registers.start_offset_reg, registers.end_offset_reg)
@@ -1664,7 +1737,7 @@ impl EmitWindow {
         // waits and the end-of-partition flush does the work. Mirrors
         // SQLite's `windowIfNewPeer` call at window.c:2984-2986 (an
         // unconditional jump when there's no ORDER BY, window.c:2076).
-        if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+        if window.frame.mode != crate::ast::FrameMode::Rows {
             program.add_comment(
                 program.offset(),
                 "peer of previous row: buffer only, handle at group end",
@@ -1683,7 +1756,7 @@ impl EmitWindow {
         // Pick the order to run the three operations in, based on the
         // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
         // cases (window.c:2987-3037).
-        let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
+        let is_range = window.frame.mode == crate::ast::FrameMode::Range;
         let end_is_unbounded = matches!(window.frame.end, FrameBound::UnboundedFollowing);
         if matches!(window.frame.start, FrameBound::Following(_)) {
             // Pattern A — the frame starts after the current row (`<expr>
@@ -1930,7 +2003,7 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<crate::ast::NullsOrder>)],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
@@ -2141,7 +2214,7 @@ enum WindowOp {
 ///   first_value / nth_value: only rows that have already left the frame
 ///   are deleted, and those functions only ever look up rows still in it.
 fn window_delete_op(window: &Window) -> Option<WindowOp> {
-    let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
+    let is_range = window.frame.mode == crate::ast::FrameMode::Range;
     match &window.frame.start {
         FrameBound::Following(expr) => {
             (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::ReturnRow)
@@ -2191,7 +2264,7 @@ fn window_cache_frame(window: &Window) -> bool {
 /// changes results. Mirrors SQLite's `windowExprGtZero`
 /// (window.c:2439-2449).
 fn window_expr_gt_zero(expr: &Expr) -> bool {
-    if let Expr::Literal(turso_parser::ast::Literal::Numeric(s)) = expr {
+    if let Expr::Literal(crate::ast::Literal::Numeric(s)) = expr {
         if let Ok(n) = s.parse::<i64>() {
             return n > 0;
         }
@@ -2320,7 +2393,7 @@ fn emit_window_full_scan(
 
     let compare_peers = matches!(
         exclude,
-        turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties
+        crate::ast::FrameExclude::Group | crate::ast::FrameExclude::Ties
     );
     let order_by_len = window.order_by.len();
     let current_peer =
@@ -2373,8 +2446,8 @@ fn emit_window_full_scan(
     });
 
     match exclude {
-        turso_parser::ast::FrameExclude::NoOthers => {}
-        turso_parser::ast::FrameExclude::CurrentRow => {
+        crate::ast::FrameExclude::NoOthers => {}
+        crate::ast::FrameExclude::CurrentRow => {
             program.emit_insn(Insn::Eq {
                 lhs: current_rowid,
                 rhs: scan_rowid,
@@ -2383,8 +2456,8 @@ fn emit_window_full_scan(
                 collation: CollationSeq::for_internal_values(),
             });
         }
-        turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties => {
-            if matches!(exclude, turso_parser::ast::FrameExclude::Ties) {
+        crate::ast::FrameExclude::Group | crate::ast::FrameExclude::Ties => {
+            if matches!(exclude, crate::ast::FrameExclude::Ties) {
                 program.emit_insn(Insn::Eq {
                     lhs: current_rowid,
                     rhs: scan_rowid,
@@ -2558,38 +2631,28 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
-    // the value's type as in any other arithmetic: numeric adds exactly, and
-    // a date moves by days. None means SQLite's operator runs.
     let offset_expr = frame_offset_expr(&window.frame, offset_bound);
+    let context = ExprContext::new(Some(&plan.table_references), resolver);
+    let env = context.type_env();
+    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
+    // the value's type as in any other arithmetic: numeric adds exactly.
+    // None means SQLite's operator runs.
     let operator = if subtract {
-        turso_parser::ast::Operator::Subtract
+        crate::ast::Operator::Subtract
     } else {
-        turso_parser::ast::Operator::Add
+        crate::ast::Operator::Add
     };
     let arithmetic = Expr::Binary(
         Box::new(order_expr.clone()),
         operator,
         Box::new(offset_expr.clone()),
     );
-    let context = ExprContext::new(Some(&plan.table_references), resolver);
-    let env = context.type_env();
     let type_arithmetic = custom_operator_call(&arithmetic, &env)?;
-    // A type with its own order but no `+` or `-` has no distance to add. A
-    // NULL offset is rejected before any arithmetic, so it needs no call.
     let collation = context.expr_collation(order_expr)?;
-    if let CollationSeq::Type(ordering) = collation {
-        if type_arithmetic.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
-            crate::bail_parse_error!(
-                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
-                ordering.name()
-            )
-        }
-    }
     let big_null = matches!(
         (sort_order, nulls_order),
-        (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
-            | (SortOrder::Desc, Some(turso_parser::ast::NullsOrder::First))
+        (SortOrder::Asc, Some(crate::ast::NullsOrder::Last))
+            | (SortOrder::Desc, Some(crate::ast::NullsOrder::First))
     );
     let label_done = program.allocate_label();
 
@@ -2690,6 +2753,145 @@ fn emit_window_range_test(
     Ok(())
 }
 
+/// Fails unless a RANGE frame ordered by `order_expr` may have the offset
+/// `offset`. A custom type takes the offsets its RangeOffsets kind takes, as
+/// PostgreSQL's `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works
+/// over a bigint, but not over a date, a uuid or a type made with CREATE
+/// TYPE. Arrays take none, and neither do values whose type nothing declares,
+/// since they may be custom-type values. Other values sort with SQLite's
+/// comparison. They take any offset of a SQLite type, checked when the
+/// statement runs as in SQLite, and smallint and bigint offsets, which are
+/// plain integers. Other custom types are refused there: `x + CAST(1 AS
+/// numeric(5,2))` is a numeric, which doesn't compare with x's numbers.
+///
+/// A domain is checked as the type it is based on, on either side.
+///
+/// A parameter or a string is read as the column's type when the statement
+/// runs, as PostgreSQL does. Returns whether the column takes only integer
+/// offsets: the offset must then be made an integer when the statement runs,
+/// so that '1' is 1 and '1.5' is an error.
+///
+/// `offset` is None when it is not a constant: the frame then reads it as
+/// NULL, as SQLite does.
+fn check_range_offset_type(
+    order_expr: &Expr,
+    offset: Option<&Expr>,
+    env: &TypeEnv,
+) -> Result<bool> {
+    let schema = env.schema();
+    let order_type = without_domain(type_of(order_expr, env), schema);
+    let offset_type = match offset.map(without_wrappers) {
+        // A parameter's type comes from where it is used, as a string's does,
+        // though `type_of` gives it SQLite's ANY.
+        Some(Expr::Variable(variable)) if variable.custom_type.is_none() => ExprType::Untyped,
+        Some(offset) => without_domain(type_of(offset, env), schema),
+        None => ExprType::Null,
+    };
+    let column = range_type(&order_type);
+    match (column, range_type(&offset_type)) {
+        (RangeType::Custom(RangeOffsets::None), _) => crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {order_type}"
+        ),
+        (
+            RangeType::ReadWhenRun | RangeType::Sqlite(_),
+            RangeType::ReadWhenRun
+            | RangeType::Sqlite(_)
+            | RangeType::Custom(RangeOffsets::Integer),
+        ) => {}
+        (
+            RangeType::ReadWhenRun | RangeType::Sqlite(_),
+            RangeType::Custom(RangeOffsets::None | RangeOffsets::Numeric),
+        ) => {
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
+                 {offset_type} over a value without a custom type; cast the offset to \
+                 integer or real"
+            )
+        }
+        (
+            RangeType::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
+            RangeType::ReadWhenRun,
+        ) => {}
+        (
+            RangeType::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
+            RangeType::Sqlite(RangeOffsets::None),
+        ) => {
+            let ExprType::Builtin(builtin) = offset_type else {
+                unreachable!("an offset of a SQLite type has a built-in type")
+            };
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                 {order_type} and an offset of SQLite type {}; cast the offset to integer",
+                builtin.sqlite_name()
+            )
+        }
+        (
+            RangeType::Custom(offsets @ (RangeOffsets::Integer | RangeOffsets::Numeric)),
+            RangeType::Sqlite(kind @ (RangeOffsets::Integer | RangeOffsets::Numeric))
+            | RangeType::Custom(kind),
+        ) => {
+            if !offsets.takes(kind) {
+                crate::bail_parse_error!(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                     {order_type} and offset type {offset_type}; cast the offset to integer"
+                );
+            }
+        }
+    }
+    Ok(column == RangeType::Custom(RangeOffsets::Integer))
+}
+
+/// A type as the RANGE offset check sees it, as the ORDER BY value or as the
+/// offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeType {
+    /// NULL, a string or a parameter. As an offset over a custom type, its value
+    /// is read as that type when the statement runs, as PostgreSQL does, and a
+    /// NULL fails there as any other NULL offset. As the ORDER BY value it sorts
+    /// with SQLite's comparison.
+    ReadWhenRun,
+    /// A SQLite type, which is this kind of number. The ORDER BY value sorts
+    /// with SQLite's comparison, so the frame takes any number, checked when
+    /// the statement runs, as in SQLite.
+    Sqlite(RangeOffsets),
+    /// A custom type, or a value that may be one, which is this kind of number.
+    Custom(RangeOffsets),
+}
+
+/// `ty` is not a domain. An integer written in the statement is an integer
+/// and a decimal such as 1.5 is a numeric, as in PostgreSQL. A real is
+/// inexact, and SQLite's `CAST(x AS numeric)` may give one. SQLite's ANY, such
+/// as a CASE that mixes SQLite types, may hold a real too. An array, or a value
+/// whose type nothing declares or isn't known yet, such as the result of `+`
+/// on an array, may be a custom type's value, so it takes no offsets and is no
+/// offset; neither is a row value such as `(a, b)`.
+fn range_type(ty: &ExprType) -> RangeType {
+    match ty {
+        ExprType::Null | ExprType::Untyped => RangeType::ReadWhenRun,
+        ExprType::Builtin(BuiltinType::Integer | BuiltinType::Boolean) => {
+            RangeType::Sqlite(RangeOffsets::Integer)
+        }
+        ExprType::Builtin(BuiltinType::Decimal) => RangeType::Sqlite(RangeOffsets::Numeric),
+        ExprType::Builtin(
+            BuiltinType::Real
+            | BuiltinType::Numeric
+            | BuiltinType::Text
+            | BuiltinType::Blob
+            | BuiltinType::Any,
+        ) => RangeType::Sqlite(RangeOffsets::None),
+        ExprType::Custom { type_def, .. } => RangeType::Custom(declared_range_offsets(type_def)),
+        ExprType::Array { .. } | ExprType::Unknown | ExprType::NotKnownYet | ExprType::RowValue => {
+            RangeType::Custom(RangeOffsets::None)
+        }
+    }
+}
+
+fn declared_range_offsets(type_def: &TypeDef) -> RangeOffsets {
+    type_def
+        .range_offsets
+        .expect("a type that is not a domain declares its RANGE offsets")
+}
+
 /// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.
 fn frame_offset_expr(frame: &crate::translate::plan::Frame, bound: FrameBoundPosition) -> &Expr {
     let bound = match bound {
@@ -2740,7 +2942,7 @@ fn emit_window_op(
     // equal ORDER BY values (a peer group); with no ORDER BY every row
     // counts as equal, so it runs to the end of the partition. Mirrors
     // SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test (window.c:2247).
-    let b_peer = frame_mode != turso_parser::ast::FrameMode::Rows;
+    let b_peer = frame_mode != crate::ast::FrameMode::Rows;
 
     // AGGINVERSE does nothing when the frame starts at UNBOUNDED
     // PRECEDING: no row ever leaves the frame. Mirrors SQLite's early
@@ -2781,7 +2983,7 @@ fn emit_window_op(
     // ORDER BY values and loop back after each peer group until the cursor
     // reaches the value boundary.
     let range_loop_start = if let Some(reg) = countdown_reg {
-        if frame_mode == turso_parser::ast::FrameMode::Range {
+        if frame_mode == crate::ast::FrameMode::Range {
             let label = program.allocate_label();
             program.preassign_label_to_next_insn(label);
             match op {
@@ -2853,7 +3055,7 @@ fn emit_window_op(
     // the frame-end cursor. While the source is still producing rows, also
     // keep csr_end at or before the newest buffered row. During flush SQLite
     // clears its source-rowid register, disabling the latter guard.
-    let same_kind_range_offsets = frame_mode == turso_parser::ast::FrameMode::Range
+    let same_kind_range_offsets = frame_mode == crate::ast::FrameMode::Range
         && countdown_reg.is_some()
         && matches!(
             (&window.frame.start, &window.frame.end),
@@ -3280,6 +3482,7 @@ fn emit_function_step(
                         acc_reg,
                         &t_ctx.resolver,
                         None,
+                        None,
                     )?;
 
                     if let Some(label) = filter_skip_label {
@@ -3297,6 +3500,7 @@ fn emit_function_step(
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
                         collation: CollationSeq::BINARY,
+                        minmax_keeps_best_reg: None,
                     }),
                 });
             }
@@ -3827,7 +4031,7 @@ fn emit_row_output_subroutine(
 
     program.preassign_label_to_next_insn(label_skip_returning_row);
 
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
@@ -3923,7 +4127,7 @@ pub fn emit_window_flush(
             None,
             true,
         )?;
-        let inverse_before_return = window.frame.mode == turso_parser::ast::FrameMode::Range
+        let inverse_before_return = window.frame.mode == crate::ast::FrameMode::Range
             && matches!(window.frame.start, FrameBound::Preceding(_));
         if inverse_before_return {
             emit_window_op(
@@ -3964,7 +4168,7 @@ pub fn emit_window_flush(
         // rows that remain, with the totals now final.
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
         let (return_row_countdown, agg_inverse_countdown) =
-            if window.frame.mode == turso_parser::ast::FrameMode::Range {
+            if window.frame.mode == crate::ast::FrameMode::Range {
                 (None, registers.start_offset_reg)
             } else if matches!(window.frame.end, FrameBound::UnboundedFollowing) {
                 (registers.start_offset_reg, None)
@@ -3974,7 +4178,7 @@ pub fn emit_window_flush(
         let label_after_inverse_eof = program.allocate_label();
         let label_loop_1 = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_1);
-        if window.frame.mode == turso_parser::ast::FrameMode::Range {
+        if window.frame.mode == crate::ast::FrameMode::Range {
             emit_window_op(
                 program,
                 t_ctx,

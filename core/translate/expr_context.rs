@@ -1,6 +1,10 @@
-use turso_parser::ast::{Expr, TableInternalId};
+use crate::ast::{Expr, TableInternalId};
 
-use crate::{schema::Schema, vdbe::affinity::Affinity, LimboError, Result};
+use crate::{
+    schema::{BTreeTable, Schema},
+    vdbe::affinity::Affinity,
+    LimboError, Result,
+};
 
 use super::{
     catalog::CatalogContext,
@@ -26,12 +30,27 @@ pub(crate) trait ExprProperties<
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
     fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
+    /// The comparison affinity of a CAST to `ty` when `ty` is a registered
+    /// type, which is that of a column of the type. None when `ty` is not
+    /// registered, or when the context has no schema to look it up in.
+    fn cast_affinity(&self, ty: &crate::ast::Type) -> Option<Affinity>;
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExprContext<'a, 'schema> {
     tables: TableMetadata<'a>,
     resolver: &'a Resolver<'schema>,
+    /// Set for an expression stored in the schema: its columns are those of
+    /// this table, in place of a statement's tables.
+    schema_table: Option<SchemaTable<'a>>,
+}
+
+/// The table that an expression stored in the schema reads, and whether a
+/// comparison of a timestamp with a timestamptz is refused there.
+#[derive(Clone, Copy)]
+struct SchemaTable<'a> {
+    table: &'a BTreeTable,
+    refuse_timestamp_with_timestamptz: bool,
 }
 
 impl<'a, 'schema> ExprContext<'a, 'schema> {
@@ -42,7 +61,38 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
         Self {
             tables: TableMetadata::new(tables),
             resolver,
+            schema_table: None,
         }
+    }
+
+    /// The context of an expression stored in the schema, such as a generated
+    /// column or an index expression of `table`, whose columns are resolved
+    /// as [crate::schema::resolve_gencol_expr_columns] does.
+    pub(crate) fn over_schema_table(
+        table: &'a BTreeTable,
+        resolver: &'a Resolver<'schema>,
+        refuse_timestamp_with_timestamptz: bool,
+    ) -> Self {
+        Self {
+            tables: TableMetadata::new(None),
+            resolver,
+            schema_table: Some(SchemaTable {
+                table,
+                refuse_timestamp_with_timestamptz,
+            }),
+        }
+    }
+
+    /// Whether this expression may compare a timestamp with a timestamptz.
+    pub(crate) fn compares_timestamp_with_timestamptz(&self) -> bool {
+        !self
+            .schema_table
+            .is_some_and(|schema| schema.refuse_timestamp_with_timestamptz)
+            && self
+                .resolver
+                .catalog
+                .dialect
+                .compares_timestamp_with_timestamptz()
     }
 
     pub(crate) fn expr_collation(&self, expr: &Expr) -> Result<CollationSeq> {
@@ -52,6 +102,13 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
     /// What `type_of` needs to know the type of an expression here, such as
     /// the custom type of a column.
     pub(crate) fn type_env(&self) -> TypeEnv<'_> {
+        if let Some(schema) = &self.schema_table {
+            return TypeEnv::over_table(
+                schema.table,
+                self.resolver.schema(),
+                self.resolver.catalog.symbol_table,
+            );
+        }
         TypeEnv::new(self.tables.tables, self.resolver)
     }
 
@@ -59,7 +116,7 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
         &self.resolver.catalog
     }
 
-    pub(crate) fn schema(&self) -> &Schema {
+    pub(crate) fn schema(&self) -> &'a Schema {
         self.resolver.schema()
     }
 }
@@ -118,6 +175,23 @@ impl ExprProperties for ExprContext<'_, '_> {
         let subquery = self.resolver.row_value_subqueries.get(query)?;
         Some(subquery.column(result_reg)?.affinity)
     }
+
+    fn cast_affinity(&self, ty: &crate::ast::Type) -> Option<Affinity> {
+        if ty.array_dimensions > 0 {
+            return None;
+        }
+        let schema = self.resolver.schema();
+        let name = crate::util::dequote(&ty.name);
+        if super::expr::is_sqlite_cast_to(schema.get_type_def_unchecked(&name)?, ty) {
+            return None;
+        }
+        Some(
+            schema
+                .resolve_type_unchecked(&name)
+                .ok()??
+                .comparison_affinity(),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -134,7 +208,9 @@ impl<'a> TableMetadata<'a> {
 impl ExprProperties for TableMetadata<'_> {
     fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         let (_, table) = self.tables?.find_table_by_internal_id(source)?;
-        table.get_column_at(column).map(|column| column.affinity())
+        table
+            .get_column_at(column)
+            .map(|column| column.comparison_affinity())
     }
 
     fn column_collation(
@@ -197,5 +273,9 @@ impl ExprProperties for TableMetadata<'_> {
 
     fn subquery_affinity(&self, query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
         self.tables?.scalar_subquery_affinity(query)
+    }
+
+    fn cast_affinity(&self, _ty: &crate::ast::Type) -> Option<Affinity> {
+        None
     }
 }

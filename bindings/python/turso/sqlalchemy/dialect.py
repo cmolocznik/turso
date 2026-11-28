@@ -114,6 +114,7 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
         Query parameters supported:
             - isolation_level: Transaction isolation level
+            - timeout: Seconds to wait for a locked database (default: 5.0)
             - experimental_features: Comma-separated feature flags
         """
         opts = url.translate_connect_args()
@@ -139,6 +140,11 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
                 kwargs["isolation_level"] = None
             else:
                 kwargs["isolation_level"] = isolation_level
+
+        # Handle timeout (busy timeout in seconds, as in sqlite3.connect)
+        timeout = query_params.pop("timeout", None)
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
 
         # Handle experimental_features
         experimental_features = query_params.pop("experimental_features", None)
@@ -200,13 +206,14 @@ class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
             "threadsafety",
             "sqlite_version",
             "sqlite_version_info",
+            "Binary",
         ):
             setattr(self, name, getattr(self.turso, name))
 
-        # Preserve sqlite constants/types expected by SQLite dialect helpers.
+        # Preserve sqlite constants expected by SQLite dialect helpers.
         import sqlite3
 
-        for name in ("PARSE_COLNAMES", "PARSE_DECLTYPES", "Binary"):
+        for name in ("PARSE_COLNAMES", "PARSE_DECLTYPES"):
             setattr(self, name, getattr(sqlite3, name))
 
     def connect(self, *arg: Any, **kw: Any) -> AsyncAdapt_dbapi_connection:
@@ -273,6 +280,7 @@ class AioTursoDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
 
         Query parameters supported:
             - isolation_level: Transaction isolation level
+            - timeout: Seconds to wait for a locked database (default: 5.0)
             - experimental_features: Comma-separated feature flags
         """
         opts = url.translate_connect_args()
@@ -298,6 +306,11 @@ class AioTursoDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
                 kwargs["isolation_level"] = None
             else:
                 kwargs["isolation_level"] = isolation_level
+
+        # Handle timeout (busy timeout in seconds, as in sqlite3.connect)
+        timeout = query_params.pop("timeout", None)
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
 
         # Handle experimental_features
         experimental_features = query_params.pop("experimental_features", None)
@@ -433,6 +446,7 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
             - long_poll_timeout_ms: Long poll timeout in milliseconds
             - bootstrap_if_empty: Bootstrap from remote if local empty (default: true)
             - isolation_level: Transaction isolation level
+            - timeout: Seconds to wait for a locked database (default: 5.0)
             - experimental_features: Comma-separated feature flags
         """
         opts = url.translate_connect_args()
@@ -452,6 +466,11 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
                 kwargs["isolation_level"] = None
             else:
                 kwargs["isolation_level"] = isolation_level
+
+        # Handle timeout (busy timeout in seconds, as in sqlite3.connect)
+        timeout = query_params.pop("timeout", None)
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
 
         # Handle experimental_features
         experimental_features = query_params.pop("experimental_features", None)

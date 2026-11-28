@@ -21,8 +21,9 @@ use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
     DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
     OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
-    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
+    PageLocation, QueryMode, Statement, StepResult, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 use crate::{
     assert_send, assert_sync,
@@ -66,6 +67,7 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+use turso_core::SessionRole;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -396,7 +398,7 @@ impl TursoDatabaseConfig {
                 "custom_types" => opts.with_custom_types(true),
                 "autovacuum" => opts.with_autovacuum(true),
                 "vacuum" => opts.with_vacuum(true),
-                "encryption" => opts.with_encryption(true),
+                "encryption" | "sync_encryption" => opts.with_encryption(true),
                 "attach" => opts.with_attach(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
@@ -777,8 +779,12 @@ fn sync_busy_error() -> TursoError {
     TursoError::Busy("database is locked".to_string())
 }
 
-fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>) -> bool {
-    sync_busy.is_some_and(|gate| gate.is_active())
+/// While a sync operation is active, statements fail with Busy, except on a connection that
+/// holds the WAL write lock. The sync operation needs that lock to change the database, so it
+/// cannot do so before that connection's COMMIT or ROLLBACK, and refusing them would only make
+/// the sync operation wait longer.
+fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>, connection: &Connection) -> bool {
+    sync_busy.is_some_and(|gate| gate.is_active()) && !connection.get_pager().holds_write_lock()
 }
 
 fn map_sync_transient_error(
@@ -1016,6 +1022,12 @@ impl TursoDatabase {
                                 .to_string(),
                         ));
                     }
+                    // Core checks the cipher and the key only in Database::open_async, after the
+                    // file below is opened. Check them first, so that invalid options do not
+                    // leave a new, empty database file.
+                    if let Some(encryption) = &self.config.encryption {
+                        encryption.validate()?;
+                    }
 
                     let mut open_flags = self.config.open_flags;
                     if opts.enable_multiprocess_wal {
@@ -1143,7 +1155,9 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_page_codec(page_codec.clone()),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1152,7 +1166,9 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -1231,7 +1247,7 @@ impl TursoConnection {
     }
 
     fn sync_operation_active(&self) -> bool {
-        sync_operation_active(self.sync_busy.as_ref())
+        sync_operation_active(self.sync_busy.as_ref(), &self.connection)
     }
 
     fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
@@ -1262,6 +1278,16 @@ impl TursoConnection {
     /// active the request is ignored.
     pub fn interrupt(&self) {
         self.connection.interrupt();
+    }
+    /// Invoke `handler` approximately every `ops` virtual machine instructions
+    /// while a statement runs on this connection. A handler that returns
+    /// `true` interrupts the statement. `None` or `ops == 0` removes it.
+    pub fn set_progress_handler(
+        &self,
+        ops: u64,
+        handler: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    ) {
+        self.connection.set_progress_handler(ops, handler);
     }
     /// Set the maximum wall-clock duration a single statement is allowed to run
     /// before it is interrupted. `Duration::ZERO` disables the timeout.
@@ -1431,12 +1457,14 @@ impl TursoConnection {
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
             if cached.program.is_compatible_with(&self.connection) {
-                let program = turso_core::Program::from_prepared(
-                    cached.program.clone(),
+                let program = turso_core::Program::from_prepared(cached.program.clone());
+                let statement = Statement::new(
+                    program,
                     self.connection.clone(),
-                );
-                let statement =
-                    Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
+                    self.connection.get_pager(),
+                    cached.query_mode,
+                    0,
+                )?;
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {
@@ -1783,15 +1811,15 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
-        if sync_operation_active(self.sync_busy.as_ref()) {
-            return Err(sync_busy_error());
-        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
+            return Err(sync_busy_error());
+        }
         step_inner(stmt, self.async_io, waker, &mut self.asleep)
             .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
@@ -1800,15 +1828,15 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
-        if sync_operation_active(self.sync_busy.as_ref()) {
-            return Err(sync_busy_error());
-        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
+            return Err(sync_busy_error());
+        }
 
         loop {
             let status = step_inner(stmt, self.async_io, waker, &mut self.asleep)
@@ -1843,13 +1871,13 @@ impl TursoStatement {
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
-        if sync_operation_active(self.sync_busy.as_ref()) {
-            return Err(sync_busy_error());
-        }
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
+            return Err(sync_busy_error());
+        }
         let Some(row) = stmt.row() else {
             return Err(TursoError::Misuse("statement holds no row".to_string()));
         };
@@ -3546,5 +3574,51 @@ mod tests {
 
         assert_eq!(count_rows(&holder), Value::from_i64(3));
         assert!(writer.get_auto_commit());
+    }
+
+    // A sync operation that needs the write lock waits for the connection holding it, so that
+    // connection must be able to finish its transaction while the sync operation is active.
+    #[test]
+    fn sync_operation_lets_the_write_lock_holder_finish_its_transaction() {
+        let (_file, holder, other) = open_holder_and_writer();
+        execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
+        let gate = Arc::new(super::SyncBusyGate::default());
+        let config = config_with_features(None);
+        let holder = super::TursoConnection::new_with_sync_busy(
+            &config,
+            holder.connection.clone(),
+            Some(gate.clone()),
+        );
+        let other = super::TursoConnection::new_with_sync_busy(
+            &config,
+            other.connection.clone(),
+            Some(gate.clone()),
+        );
+
+        for (end, rows_in_transaction) in [("COMMIT", 2), ("ROLLBACK", 4)] {
+            execute_sql(&holder, "BEGIN IMMEDIATE");
+            let mut prepared_before_sync =
+                holder.prepare_single("INSERT INTO t VALUES (1)").unwrap();
+            let _sync = super::SyncBusyGuard::new(gate.clone());
+
+            let result = other.prepare_single("SELECT count(*) FROM t");
+            assert!(matches!(result, Err(TursoError::Busy(_))), "{end}");
+
+            assert_eq!(
+                prepared_before_sync.execute(None).unwrap().status,
+                TursoStatusCode::Done
+            );
+            execute_sql(&holder, "INSERT INTO t VALUES (2)");
+            assert_eq!(
+                count_rows(&holder),
+                Value::from_i64(rows_in_transaction),
+                "{end}"
+            );
+            execute_sql(&holder, end);
+
+            let result = holder.prepare_single("SELECT count(*) FROM t");
+            assert!(matches!(result, Err(TursoError::Busy(_))), "{end}");
+        }
+        assert_eq!(count_rows(&other), Value::from_i64(2));
     }
 }

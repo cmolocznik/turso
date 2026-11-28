@@ -1,8 +1,10 @@
 use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
 use super::output::{EmittedNodeOutput, NodeOutputContract};
 use super::stream::{emit_ephemeral_delta_row, open_ephemeral_delta, EphemeralDelta};
+use crate::ast;
 use crate::incremental::dag;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
@@ -13,7 +15,6 @@ use crate::turso_assert;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
 use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_filter(
@@ -45,8 +46,10 @@ pub(super) fn emit_filter(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 
@@ -392,8 +395,10 @@ fn emit_project_rows(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
+        crate::statement::StatementOrigin::InternalHelper,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 

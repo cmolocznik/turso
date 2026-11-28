@@ -9,7 +9,7 @@ import pytest
 # Skip all tests if SQLAlchemy is not installed
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import Column, Integer, LargeBinary, MetaData, Table, select, text  # noqa: E402
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.exc import DatabaseError as SADatabaseError  # noqa: E402
 from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: E402
@@ -99,6 +99,16 @@ def test_autocommit_isolation_level():
     assert kwargs["isolation_level"] is None
 
 
+def test_timeout_param():
+    """The async dialect passes the timeout query parameter as seconds."""
+    dialect = AioTursoDialect()
+    url = URL.create("sqlite+aioturso", database="test.db", query={"timeout": "2.5"})
+
+    _, kwargs = dialect.create_connect_args(url)
+
+    assert kwargs["timeout"] == 2.5
+
+
 def test_memory_uses_static_pool():
     """Async :memory: databases use StaticPool."""
     from sqlalchemy import pool
@@ -141,6 +151,23 @@ async def test_local_async_core_crud():
     async with engine.connect() as conn:
         result = await conn.execute(text("SELECT name FROM items"))
         assert result.scalar() == "alice"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_local_async_large_binary_round_trip():
+    """LargeBinary values are bound through the DB-API Binary constructor."""
+    table = Table("blobs", MetaData(), Column("id", Integer, primary_key=True), Column("data", LargeBinary))
+    engine = create_async_engine("sqlite+aioturso:///:memory:")
+
+    async with engine.begin() as conn:
+        await conn.run_sync(table.create)
+        await conn.execute(table.insert(), {"id": 1, "data": b"\x00\x01\xff"})
+
+    async with engine.connect() as conn:
+        result = await conn.execute(select(table.c.data))
+        assert result.scalar() == b"\x00\x01\xff"
 
     await engine.dispose()
 

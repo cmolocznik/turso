@@ -1,10 +1,11 @@
+use crate::ast::{self, Expr};
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
-        aggregation::emit_ungrouped_aggregation,
+        aggregation::{columns_read_after_ungrouped_aggregation, emit_ungrouped_aggregation},
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -16,10 +17,10 @@ use crate::{
         optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
-            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
-            TableReferences,
+            BitSet, DistinctOnRegisters, Distinctness, EphemeralRowidMode, EvalAt,
+            IndexMethodQuery, JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination,
+            Scan, Search, SeekKeyComponent, SelectPlan, SimpleAggregate, SubqueryEvalPhase,
+            SubqueryOrigin, SubqueryState, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -31,12 +32,11 @@ use crate::{
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
-    vdbe::insn::Insn,
+    vdbe::{insn::Insn, BranchOffset},
     HashMap, HashSet, Result,
 };
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{self, Expr};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(
@@ -64,12 +64,12 @@ fn emit_program_for_select_with_inputs(
 ) -> Result<()> {
     let result_cols_start = program.with_scoped_result_cols_start(|program| {
         // Boxed to keep ~960 B off the prepare-path stack; see TranslateCtx size.
-        let mut t_ctx = Box::new(TranslateCtx::new(
+        let mut t_ctx = TranslateCtx::new_boxed(
             program,
             resolver.fork_with_expr_cache(),
             plan.table_references.joined_tables().len(),
             false,
-        ));
+        );
         t_ctx.materialized_build_inputs = materialized_build_inputs;
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
@@ -80,6 +80,12 @@ fn emit_program_for_select_with_inputs(
     Ok(())
 }
 
+/// Emits a SELECT query.
+///
+/// This function is on the stack one time for each level of nested FROM
+/// clause subqueries. The work after the subqueries is in [emit_query_loops],
+/// which is not inlined, so that its values are not in this frame while the
+/// subqueries are emitted.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_query<'a>(
     program: &mut ProgramBuilder,
@@ -103,30 +109,74 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
-        init_limit(
-            program,
-            t_ctx,
-            &plan.limit,
-            &plan.offset,
-            after_main_loop_label,
-        )?;
-        let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
-        program.preassign_label_to_next_insn(after_main_loop_label);
-        return Ok(reg_result_cols_start);
+        return emit_values_query(program, plan, t_ctx, after_main_loop_label);
     }
 
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
+    emit_query_loops(program, plan, t_ctx, after_main_loop_label)
+}
+
+/// Emits a query that has a VALUES clause.
+#[inline(never)]
+fn emit_values_query<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a mut SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    after_main_loop_label: BranchOffset,
+) -> Result<usize> {
+    init_limit(
+        program,
+        t_ctx,
+        &plan.limit,
+        &plan.offset,
+        after_main_loop_label,
+    )?;
+    let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
+    program.preassign_label_to_next_insn(after_main_loop_label);
+    Ok(reg_result_cols_start)
+}
+
+/// Emits the loops of a query and the work after them, after the FROM clause
+/// subqueries of the query are emitted.
+///
+/// [emit_query] is on the stack one time for each level of nested FROM clause
+/// subqueries. This function is not inlined, so that its values are not in
+/// that frame while the subqueries are emitted.
+#[inline(never)]
+fn emit_query_loops<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a mut SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    after_main_loop_label: BranchOffset,
+) -> Result<usize> {
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    let is_ungrouped_aggregation = !plan.aggregates.is_empty() && !has_group_by_exprs;
+    if is_ungrouped_aggregation {
+        let columns = columns_read_after_ungrouped_aggregation(plan)?;
+        if !columns.is_empty() {
+            // NULL at the start of each run, so that a run where no row
+            // reaches the aggregates does not read an earlier run's values.
+            let start_reg = program.alloc_registers_and_init_w_null(columns.len());
+            t_ctx.ungrouped_agg_bare_columns = columns.into_iter().zip(start_reg..).collect();
+        }
+    }
+
     // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
+    // we need to ensure non-aggregate columns are only emitted once, or once
+    // per new minimum or maximum (see `BareColumnRowCheck`).
+    // This flag tracks whether we've already emitted these columns and saved
+    // the columns that are read after the loop.
     // It also tells whether any row reached the aggregate, which a correlated
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
+    let has_ungrouped_nonagg_cols = is_ungrouped_aggregation
         && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || !t_ctx.ungrouped_agg_bare_columns.is_empty()
             || plan
                 .non_from_clause_subqueries
                 .iter()
@@ -157,11 +207,6 @@ pub fn emit_query<'a>(
         }
     }
 
-    let has_group_by_exprs = plan
-        .group_by
-        .as_ref()
-        .is_some_and(|gb| !gb.exprs.is_empty());
-
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
         EmitOrderBy::init(
@@ -172,6 +217,7 @@ pub fn emit_query<'a>(
             &plan.table_references,
             has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
+            plan.limit.is_some(),
             &plan.aggregates,
         )?;
     }
@@ -208,14 +254,25 @@ pub fn emit_query<'a>(
     } else {
         None
     };
-    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
-    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
-        program.emit_insn(Insn::HashClear {
-            hash_table_id: ctx.hash_table_id,
-        });
-        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+    if let Distinctness::Distinct { ctx: Some(ctx), .. } = &plan.distinctness {
+        ctx.emit_reset(program);
+        if !ctx.is_ordered() {
+            emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+        }
+    }
+
+    if let Distinctness::DistinctOn { key_count } = plan.distinctness {
+        turso_assert!(
+            plan.order_by.len() >= key_count,
+            "the DISTINCT ON keys are the first ORDER BY terms"
+        );
+    }
+    if let Distinctness::DistinctOnRowsInOrder { keys, registers } = &mut plan.distinctness {
+        *registers = Some(DistinctOnRegisters::alloc(program, keys.len()));
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::DistinctOn);
     }
 
     let end_label = program.allocate_label();
@@ -258,7 +315,7 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
-        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
             program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
         }
@@ -1043,6 +1100,7 @@ fn build_materialized_build_input_plan(
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         }],
         MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
             turso_assert!(
@@ -1056,6 +1114,7 @@ fn build_materialized_build_input_plan(
                     alias: None,
                     implicit_column_name: None,
                     contains_aggregates: false,
+                    values_condition_type: None,
                 });
             }
             for payload in payload_columns.iter() {
@@ -1080,6 +1139,7 @@ fn build_materialized_build_input_plan(
                     alias: None,
                     implicit_column_name: None,
                     contains_aggregates: false,
+                    values_condition_type: None,
                 });
             }
             result_columns

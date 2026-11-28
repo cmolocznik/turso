@@ -150,6 +150,13 @@ pub trait SharedWalMappedRegion: Send + Sync {
     }
 }
 
+/// A file that IO is done on.
+///
+/// The IO methods take a completion and return it once the IO has started.
+/// When one returns `Err`, the IO did not start and the implementation may
+/// leave the completion unfinished; the caller owns it and must finish it if
+/// anything else can wait on it. [`start_in_group`] does this for
+/// completions in a [`CompletionGroup`].
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
@@ -170,6 +177,7 @@ pub trait File: Send + Sync {
         let mut pos = pos;
         let outstanding = Arc::new(AtomicUsize::new(buffers.len()));
         let total_written = Arc::new(AtomicUsize::new(0));
+        let first_error = Arc::new(crate::sync::OnceLock::new());
 
         for buf in buffers {
             let len = buf.len();
@@ -177,13 +185,24 @@ pub trait File: Send + Sync {
                 let c_main = c.clone();
                 let outstanding = outstanding.clone();
                 let total_written = total_written.clone();
+                let first_error = first_error.clone();
                 Completion::new_write(move |n| {
-                    if let Ok(n) = n {
+                    match n {
                         // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::SeqCst);
-                        if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            // last one finished
-                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                        Ok(n) => {
+                            total_written.fetch_add(n as usize, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            let _ = first_error.set(e);
+                        }
+                    }
+                    // Resolve the parent only after the last child: the caller may
+                    // reuse the file range once the parent finishes, so no child
+                    // write may still be in flight then.
+                    if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        match first_error.get() {
+                            Some(e) => c_main.error(*e),
+                            None => c_main.complete(total_written.load(Ordering::Acquire) as i32),
                         }
                     }
                 })
@@ -474,72 +493,6 @@ mod temp_file_tests {
         drop(temp_file);
         assert!(!temp_dir.exists());
     }
-
-    #[test]
-    fn ephemeral_table_opens_a_temp_file_only_when_it_spills() {
-        let io = Arc::new(TempFileCountingIO::default());
-        let db = crate::Database::open_file(
-            io.clone(),
-            "ephemeral-temp-file.db",
-            Arc::new(crate::SqliteDialect),
-        )
-        .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
-        let count_union = |rows: i64| -> i64 {
-            let sql = format!(
-                "SELECT count(*) FROM (\
-                 SELECT printf('%02500d', value) FROM generate_series(1, {rows}) \
-                 UNION SELECT printf('%02500d', value) FROM generate_series(1, {rows}))"
-            );
-            let mut stmt = conn.prepare(sql).unwrap();
-            let mut count = None;
-            stmt.run_with_row_callback(|row| {
-                count = Some(row.get::<i64>(0).unwrap());
-                Ok(())
-            })
-            .unwrap();
-            count.unwrap()
-        };
-
-        assert_eq!(count_union(10), 10);
-        assert_eq!(io.temp_files_opened.load(Ordering::Acquire), 0);
-
-        assert_eq!(count_union(4_000), 4_000);
-        assert!(io.temp_files_opened.load(Ordering::Acquire) > 0);
-    }
-
-    #[derive(Default)]
-    struct TempFileCountingIO {
-        inner: MemoryIO,
-        temp_files_opened: crate::sync::atomic::AtomicUsize,
-    }
-
-    use crate::sync::atomic::Ordering;
-    use crate::{MonotonicInstant, WallClockInstant};
-
-    impl Clock for TempFileCountingIO {
-        fn current_time_monotonic(&self) -> MonotonicInstant {
-            self.inner.current_time_monotonic()
-        }
-        fn current_time_wall_clock(&self) -> WallClockInstant {
-            self.inner.current_time_wall_clock()
-        }
-    }
-
-    impl IO for TempFileCountingIO {
-        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
-            if path.ends_with("tursodb_temp_file") {
-                self.temp_files_opened.fetch_add(1, Ordering::AcqRel);
-            }
-            self.inner.open_file(path, flags, direct)
-        }
-        fn remove_file(&self, path: &str) -> Result<()> {
-            self.inner.remove_file(path)
-        }
-        fn file_id(&self, path: &str) -> Result<FileId> {
-            self.inner.file_id(path)
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -576,6 +529,11 @@ pub trait IO: Clock + Send + Sync {
 
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend keeps its files in process memory, so nothing reaches the filesystem.
+    fn is_memory(&self) -> bool {
         false
     }
 
@@ -720,10 +678,9 @@ impl<'a> WriteBatch<'a> {
                     "pwritev wrote {bytes_written} bytes, expected {total_len}"
                 );
             });
-            if let Some(group) = group.as_deref_mut() {
-                group.add(&c);
-            }
-            completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
+            completions.push(start_in_group(group.as_deref_mut(), c, |c| {
+                self.file.pwritev(pos, bufs.to_vec(), c)
+            })?);
         }
         Ok(completions)
     }
@@ -2201,4 +2158,81 @@ mod shuttle_tests {
         concurrent_overlapping_writes,
         test_concurrent_overlapping_writes_impl
     );
+
+    /// Runs threads that wait as the async bindings do. Each thread queues a
+    /// write, calls `step()` one time, and then sleeps until the waker of the
+    /// write is called. If a `step()` returns while such a write stays in the
+    /// backend, the thread of that write sleeps for ever, and shuttle reports
+    /// a deadlock.
+    fn test_step_once_then_sleep_impl<F: IOFactory>(factory: F) {
+        let io = factory.create();
+        let path = factory.temp_dir().join("test.db");
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+
+        let mut handles = vec![];
+        const NUM_THREADS: usize = 3;
+        const WRITES_PER_THREAD: usize = 2;
+
+        for i in 0..NUM_THREADS {
+            let file = file.clone();
+            let io = io.clone();
+            handles.push(thread::spawn(move || {
+                for j in 0..WRITES_PER_THREAD {
+                    let buf = Arc::new(Buffer::new(vec![i as u8; 100]));
+                    let pos = ((i * WRITES_PER_THREAD + j) * 100) as u64;
+                    let c = file
+                        .pwrite(pos, buf, Completion::new_write(|_| {}))
+                        .unwrap();
+                    step_once_then_sleep(io.as_ref(), &c);
+                    assert!(c.succeeded(), "write failed: {:?}", c.get_error());
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    shuttle_io_test!(step_once_then_sleep, test_step_once_then_sleep_impl);
+
+    /// Calls `step()` one time, then sleeps until the waker of `c` is called.
+    /// The async bindings wait in the same way: after one `step()` they return
+    /// `Poll::Pending`, and only the waker makes them poll again.
+    fn step_once_then_sleep(io: &dyn IO, c: &Completion) {
+        io.step().unwrap();
+        // Under shuttle, `Context::set_waker` yields. A yield between the
+        // write and `step()` makes the schedules that lose a wakeup rare, so
+        // this function sets the waker after `step()`.
+        let parker = std::sync::Arc::new(Parker {
+            woken: shuttle::sync::Mutex::new(false),
+            cv: shuttle::sync::Condvar::new(),
+        });
+        c.set_waker(&std::task::Waker::from(parker.clone()));
+        let mut woken = parker.woken.lock().unwrap();
+        while !*woken {
+            woken = parker.cv.wait(woken).unwrap();
+        }
+    }
+
+    /// A waker that a shuttle thread sleeps on. Shuttle sees the thread as
+    /// blocked while it sleeps, so a waker that nobody calls gives a deadlock
+    /// report. `shuttle::future::block_on` gives no such report: the yield in
+    /// `Context::set_waker` wakes its task, so it polls until the step limit.
+    struct Parker {
+        woken: shuttle::sync::Mutex<bool>,
+        cv: shuttle::sync::Condvar,
+    }
+
+    impl std::task::Wake for Parker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            *self.woken.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
 }

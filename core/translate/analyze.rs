@@ -2,6 +2,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 
+use crate::ast;
 use crate::{
     bail_parse_error,
     function::{Func, FuncCtx, ScalarFunc},
@@ -10,7 +11,7 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+        schema::{emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType},
     },
     util::normalize_ident,
     vdbe::{
@@ -20,7 +21,6 @@ use crate::{
     },
     Result,
 };
-use turso_parser::ast;
 
 /// A table paired with an optional specific index to analyze.
 type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
@@ -216,20 +216,15 @@ pub fn translate_analyze(
         let sql = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
         // The root_page==0 is false, but we don't rely on it, and there's no
         // way to initialize it with a correct value.
-        sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
+        sqlite_stat1_btreetable = Arc::new(BTreeTable::from_stored_sql(
+            resolver.catalog.dialect.as_ref(),
+            sql,
+            0,
+            false,
+        )?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = resolver
-            .with_schema(database_id, |s| {
-                s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            })
-            .unwrap();
-        let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: sqlite_schema_cursor_id,
-            root_page: 1i64.into(),
-            db: database_id,
-        });
+        let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
         // Add the table entry to sqlite_schema
         emit_schema_entry(

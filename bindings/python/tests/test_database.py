@@ -1,7 +1,10 @@
+import array
 import logging
 import os
 import sqlite3
 import sys
+import threading
+import time
 
 import pytest
 import turso
@@ -9,11 +12,11 @@ import turso
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
 
-def connect(provider, database):
+def connect(provider, database, **kwargs):
     if provider == "turso":
-        return turso.connect(database)
+        return turso.connect(database, **kwargs)
     if provider == "sqlite3":
-        return sqlite3.connect(database)
+        return sqlite3.connect(database, **kwargs)
     raise Exception(f"Provider `{provider}` is not supported")
 
 
@@ -207,6 +210,93 @@ def test_first_rollback(provider, tmp_path):
 
     assert users == []
     conn.close()
+
+
+@pytest.mark.parametrize("timeout_kwargs", [{}, {"timeout": 5.0}])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_writer_waits_for_lock_held_by_another_connection(provider, timeout_kwargs, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = connect(provider, db_file, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO t VALUES (1)")
+
+    errors = []
+
+    def write():
+        writer = connect(provider, db_file, isolation_level=None, **timeout_kwargs)
+        try:
+            writer.execute("INSERT INTO t VALUES (2)")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        writer.close()
+
+    writer_thread = threading.Thread(target=write)
+    writer_thread.start()
+    time.sleep(0.3)
+    holder.execute("COMMIT")
+    writer_thread.join()
+
+    assert errors == []
+    assert holder.execute("SELECT x FROM t ORDER BY x").fetchall() == [(1,), (2,)]
+    holder.close()
+
+
+@pytest.mark.parametrize(
+    "timeout, busy_timeout",
+    [
+        (10.0, 10000),
+        (0.0015, 1),
+        (-1, 0),
+        (float("nan"), 0),
+        (float("-inf"), 0),
+    ],
+)
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_timeout_sets_busy_timeout_in_milliseconds(provider, timeout, busy_timeout):
+    conn = connect(provider, ":memory:", timeout=timeout)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(busy_timeout,)]
+    conn.close()
+
+
+# sqlite3 converts these with a C `(int)` cast, which is undefined for values
+# that do not fit: x86-64 gives 0 and arm64 gives 2147483647. Turso always
+# waits as long as an int allows.
+@pytest.mark.parametrize("timeout", [float("inf"), 2e16, 1e30])
+def test_timeout_too_large_for_int_waits_longest_possible(timeout):
+    conn = turso.connect(":memory:", timeout=timeout)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(2147483647,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_timeout_is_second_positional_parameter(provider):
+    module = turso if provider == "turso" else sqlite3
+    conn = module.connect(":memory:", 10.0)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(10000,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 0.2])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_writer_gives_up_after_timeout(provider, timeout, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = connect(provider, db_file, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    writer = connect(provider, db_file, isolation_level=None, timeout=timeout)
+
+    module = turso if provider == "turso" else sqlite3
+    holder.execute("BEGIN IMMEDIATE")
+    start = time.monotonic()
+    with pytest.raises(module.OperationalError, match="database is locked"):
+        writer.execute("INSERT INTO t VALUES (1)")
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= timeout
+    assert elapsed < 3
+    holder.execute("ROLLBACK")
+    writer.close()
+    holder.close()
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
@@ -1242,6 +1332,61 @@ def test_blob_data(provider):
     cursor.execute("SELECT data FROM test")
     row = cursor.fetchone()
     assert row[0] == blob_data
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_binary_constructor(provider):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
+
+    blob_data = b"\x00\x01\x02\x03\x04"
+    binary = module.Binary(blob_data)
+    assert isinstance(binary, memoryview)
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, binary))
+
+    cursor.execute("SELECT data FROM test")
+    row = cursor.fetchone()
+    assert row[0] == blob_data
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_bytearray_and_memoryview_blob_parameters(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
+
+    blob_data = b"\x00\x01\x02\x03\x04"
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, bytearray(blob_data)))
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (2, memoryview(blob_data)))
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (3, memoryview(blob_data)[1:4]))
+
+    cursor.execute("SELECT data, typeof(data) FROM test ORDER BY id")
+    assert cursor.fetchall() == [
+        (blob_data, "blob"),
+        (blob_data, "blob"),
+        (b"\x01\x02\x03", "blob"),
+    ]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_array_blob_parameter(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (data BLOB)")
+
+    values = array.array("i", [1, 2, 3])
+    cursor.execute("INSERT INTO test VALUES (?)", (values,))
+
+    cursor.execute("SELECT data, typeof(data) FROM test")
+    assert cursor.fetchall() == [(values.tobytes(), "blob")]
 
     conn.close()
 

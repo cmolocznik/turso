@@ -7,7 +7,7 @@ This document is a quick helper to get you going.
 <!--toc:start-->
 - [Contributing to Turso](#contributing-to-turso)
   - [Getting Started](#getting-started)
-    - [Configuring `mold` Linker](#configuring-mold-linker)
+    - [Linker](#linker)
     - [Running Tests On Linux](#running-tests-on-linux)
   - [Developing with AI coding agents](#developing-with-ai-coding-agents)
   - [Debugging bugs](#debugging-bugs)
@@ -35,7 +35,10 @@ This document is a quick helper to get you going.
 
 ## Getting Started
 
-Turso is a rewrite of SQLite in Rust. If you are new to SQLite, the following articles and books are a good starting point:
+Turso is an embedded in-process relational database. Initially conceived solely as a rewrite of SQLite in Rust, we eventually leveraged SQLite's bytecode-based architecture
+to implement other database frontends, including Postgres.
+
+If you are new to SQLite, the following articles and books are a good starting point:
 
 * [Architecture of SQLite](https://www.sqlite.org/arch.html)
 * Sibsankar Haldar. [SQLite Database System Design and Implementation (2nd Edition)](https://books.google.com/books/?id=yWzwCwAAQBAJ&redir_esc=y). 2016
@@ -51,6 +54,32 @@ Examples of contributing
 * [How to contribute a SQL function implementation](docs/contributing/contributing_functions.md)
 * [Rickrolling Turso DB](https://avi.im/blag/2025/rickrolling-turso)
 
+
+## Developing with AI coding agents
+
+At Turso we pride ourselves in our Open Source stance. We started our project as an Open Contribution rewrite of SQLite, where all could have a seat at the table and influence the direction of the project,
+and throughout the years we have done just that. Our intention is to be able to double down on Open Source as the world closes its walls as a result of how agents work. However, it is undeniable that AI has
+changed the way Open Source communities ought to work. The volume is just too high for any group of people to handle.
+
+Therefore, we adopt a constantly evolving set of best-practices.
+
+If you are an external contributor, do recommend you do not send fixes to things that are broken, but open issues instead.
+In our experience, most likely you have just asked your coding agent to fix the issue and sent us the result. If this is all you have done, we could have done that with our coding agent just the same.
+An issue that includes a comprehensive set of tests and other relevant information that may help us fix it is as valuable as code and you will be credited by filing the issue in the commit that eventually fixes it.
+
+Developing new features and architecture work is where humans excel, so this is where PRs are welcome the most.
+
+When you do send a PR, we expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
+
+To give your PR the best chance of being merged:
+
+* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
+* **Break it in individual commits.** Make sure each individual commit does one logical self-contained thing.
+* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
+* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
+* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
+
+
 To build and run `tursodb` CLI:
 
 ```shell
@@ -63,11 +92,14 @@ cargo build -p turso_sqlite3 --features capi
 cargo test
 ```
 
-### Configuring `mold` Linker
+### Linker
 
-The `mold` linker (Linux only) can reduce your build time from a minute to just few seconds.
+On x86_64 Linux, `.cargo/config.toml` sets `scripts/link-with-rust-lld.sh` as the linker.
+The script links with the LLD linker that comes with the Rust toolchain, so you do not need
+to install a linker. On a machine with 4 cores, LLD links a debug build of `tursodb` in 1.4
+seconds. GNU ld needs 10 seconds.
 
-First, install `mold`:
+To use the `mold` linker, install it:
 
 ```console
 # Fedora/RHEL
@@ -77,15 +109,13 @@ sudo dnf install mold
 sudo apt install mold
 ```
 
-Then configure Cargo to use mold by creating `.cargo/config.toml`:
+Then add this line to your shell profile:
 
-**For Linux:**
-
-```toml
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```console
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 ```
+
+To use the default linker of your C compiler, set `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc`.
 
 ### Running Tests On Linux
 
@@ -142,21 +172,6 @@ Run benchmarks and generate flamegraphs:
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
-
-## Developing with AI coding agents
-
-You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
-
-We expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
-
-To give your PR the best chance of being merged:
-
-* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
-* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
-* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
-* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
-
-Finally, a well-written bug report with a solid reproducer is often more valuable to maintainers than a sloppy PR. If you're not sure your change is ready, opening an issue is always a great contribution.
 
 ## Debugging bugs
 
@@ -240,8 +255,6 @@ Do not add a trailing period. Conventional Commit prefixes such as
 
 <non-obvious implementation details or tradeoffs, if needed>
 
-Tests: <relevant validation, if useful>
-
 Fixes #1234
 ```
 
@@ -255,14 +268,12 @@ replacement row, leaving stale physical B-tree state after checkpoint.
 
 Keep B-tree-resident delete markers when collapsing adjacent versions.
 
-Tests: added an update/reopen/delete/checkpoint regression test
-
 Fixes #1234
 ```
 
 The body should explain the intent and why the change is needed, rather than
 narrating the diff. Include non-obvious implementation details and tradeoffs
-that will matter to reviewers or future maintainers. The body, test summary,
+that will matter to reviewers or future maintainers. The body,
 and issue reference are optional when they do not add useful information.
 
 To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
@@ -325,6 +336,7 @@ When working on a new feature, please consider adding a test case for it.
 
 The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
 Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
+Tests for SQL that the PostgreSQL frontend also runs go in `testing/shared-sqltests/`.
 
 To run tests:
 
@@ -345,6 +357,10 @@ The `simulator` directory contains a deterministic simulator for testing.
 What this means is that the behavior of a test run is deterministic based on the seed value.
 If the simulator catches a bug, you can always reproduce the exact same sequence of events by passing the same seed.
 The simulator also performs fault injection to discover interesting bugs.
+
+To give each run a different mix of statements, properties, faults, and connections, add `--swarm`.
+The seed also picks these settings, so `--seed 1234` repeats a swarm run.
+See [the simulator README](testing/simulator/README.md#swarm-testing).
 
 ### Whopper
 
@@ -392,6 +408,10 @@ If you need to reproduce a run, just defined the `SEED` environment variable as 
 ```console
 SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
+
+To give each run a different mix of workloads, connections, and fault probabilities, add `--swarm`.
+The seed also picks these settings, so `SEED=1234` repeats a swarm run.
+See [the Whopper README](testing/concurrent-simulator/README.md#swarm-testing).
 
 You can also run Whopper in exploration mode to find more serious bugs:
 

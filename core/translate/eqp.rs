@@ -5,7 +5,7 @@
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
-use turso_parser::ast::SortOrder;
+use crate::ast::SortOrder;
 
 use crate::{
     schema::Index,
@@ -265,6 +265,12 @@ pub enum EqpDetail {
     RightJoin {
         table: EqpTable,
     },
+    /// Fill the in-memory table of a FROM clause subquery or CTE before the
+    /// query reads it. The plan of the subquery's body is below this step.
+    Materialize {
+        cte_id: Option<usize>,
+        name: String,
+    },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
         table: EqpTable,
@@ -272,6 +278,8 @@ pub enum EqpDetail {
     },
     /// De-duplicate result rows with an in-memory hash table.
     Distinct,
+    /// Return only the first of the rows that follow each other with equal DISTINCT ON keys.
+    DistinctOn,
     /// De-duplicate one aggregate's input, e.g. count(DISTINCT x).
     DistinctAggregate {
         function: String,
@@ -368,12 +376,14 @@ impl Display for EqpDetail {
             Self::IndexMethod { method, .. } => write!(f, "QUERY INDEX METHOD {method}"),
             Self::HashJoin { table, .. } => write!(f, "HASH JOIN {}", table.name_with_alias()),
             Self::RightJoin { table } => write!(f, "RIGHT-JOIN {}", table.identifier()),
+            Self::Materialize { name, .. } => write!(f, "MATERIALIZE {name}"),
             Self::HashBuild { table, .. } => write!(
                 f,
                 "MATERIALIZE hash build input for {}",
                 table.name_with_alias()
             ),
             Self::Distinct => write!(f, "USE HASH TABLE FOR DISTINCT"),
+            Self::DistinctOn => write!(f, "KEEP FIRST ROW PER DISTINCT ON KEY"),
             Self::DistinctAggregate { function } => {
                 write!(f, "USE HASH TABLE FOR {function}(DISTINCT)")
             }
@@ -827,12 +837,20 @@ impl EqpDetail {
                 obj.str("type", "right_join");
                 Self::write_table_fields(&mut obj, table, None, None);
             }
+            Self::Materialize { cte_id, name } => {
+                obj.str("type", "materialize");
+                if let Some(cte_id) = cte_id {
+                    obj.num("cte_id", *cte_id);
+                }
+                obj.str("name", name);
+            }
             Self::HashBuild { table, estimate } => {
                 obj.str("type", "hash_build");
                 Self::write_table_fields(&mut obj, table, None, None);
                 Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::Distinct => obj.str("type", "distinct"),
+            Self::DistinctOn => obj.str("type", "distinct_on"),
             Self::DistinctAggregate { function } => {
                 obj.str("type", "distinct_aggregate");
                 obj.str("function", function);

@@ -30,6 +30,7 @@ public class TursoConnection : DbConnection
     private bool _readUncommitted;
     private bool _remoteTransactionActive;
     private System.Runtime.ExceptionServices.ExceptionDispatchInfo? _remoteTransactionFailure;
+    private ITursoPageCodec? _pageCodec;
 
     [AllowNull]
     public override string ConnectionString
@@ -62,6 +63,23 @@ public class TursoConnection : DbConnection
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
+    /// <summary>
+    /// A codec that transforms every page of a local database on its way to and from storage, for
+    /// example to encrypt it. Set it before <see cref="Open"/>; a connection string cannot carry it.
+    /// It cannot be combined with <c>Encryption Cipher</c>, nor used with remote or replica connections.
+    /// </summary>
+    public ITursoPageCodec? PageCodec
+    {
+        get => _pageCodec;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("PageCodec cannot be set while the connection is open.");
+
+            _pageCodec = value;
+        }
+    }
+
     public TursoConnection() : this("")
     {
     }
@@ -89,12 +107,24 @@ public class TursoConnection : DbConnection
         var cipher = _connectionOptions.GetEncryptionCipher();
         var hexkey = _connectionOptions["Encryption Key"];
 
-        if (cipher.HasValue)
+        if (_pageCodec is not null)
+        {
+            if (cipher.HasValue || !string.IsNullOrWhiteSpace(hexkey))
+                throw new InvalidOperationException("PageCodec cannot be combined with Encryption Cipher or Encryption Key.");
+
+            _turso = TursoBindings.OpenDatabaseWithPageCodec(filename, _pageCodec);
+        }
+        else if (cipher.HasValue)
         {
             if (string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
 
             _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey);
+        }
+        else if (!string.IsNullOrWhiteSpace(hexkey))
+        {
+            // Without a cipher, the key would be ignored and the database opened without encryption.
+            throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
         }
         else
         {
@@ -460,6 +490,7 @@ public class TursoConnection : DbConnection
 
     private void OpenRemote()
     {
+        ThrowIfPageCodecIsSet();
         if (_connectionOptions.IsReplica)
         {
             OpenReplica();
@@ -525,6 +556,7 @@ public class TursoConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_turso is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
+        ThrowIfPageCodecIsSet();
 
         var lease = await TursoReplicaRegistry
             .AcquireAsync(
@@ -559,8 +591,9 @@ public class TursoConnection : DbConnection
             || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
         {
             throw new InvalidOperationException(
-                "Encryption Cipher and Encryption Key are local database options. "
-                + "Use Remote Encryption Cipher and Remote Encryption Key for embedded replicas.");
+                "Encryption Cipher and Encryption Key are standalone database options. "
+                + "Use Remote Encryption Cipher for the shared cipher, Local Encryption Key for the local replica, "
+                + "and Remote Encryption Key for the cloud database.");
         }
 
         TursoPartialSyncOptions? partialSync = null;
@@ -595,6 +628,7 @@ public class TursoConnection : DbConnection
             BootstrapIfEmpty = _connectionOptions.BootstrapIfEmpty,
             PartialSync = partialSync,
             RemoteEncryption = _connectionOptions.GetRemoteEncryption(),
+            LocalEncryptionKey = _connectionOptions["Local Encryption Key"],
             PushOperationsThreshold = _connectionOptions.PushOperationsThreshold == 0
                 ? null
                 : _connectionOptions.PushOperationsThreshold,
@@ -645,6 +679,12 @@ public class TursoConnection : DbConnection
         }
 
         QueueAutomaticSyncStatusChanged(handlers, args.Status, generation);
+    }
+
+    private void ThrowIfPageCodecIsSet()
+    {
+        if (_pageCodec is not null)
+            throw new InvalidOperationException("PageCodec is a local database option and cannot be used with remote Turso URLs or embedded replicas.");
     }
 
     private void ValidateLocalOnlyOptions()

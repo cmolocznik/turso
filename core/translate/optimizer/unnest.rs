@@ -118,11 +118,9 @@
 //! - Neumann and Kemper, Unnesting Arbitrary Queries: <https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf>
 //! - Neumann, A Formalization of Top-Down Unnesting: <https://arxiv.org/abs/2412.04294>
 
+use crate::ast::{self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator};
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use turso_parser::ast::{
-    self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
-};
 
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::Plan;
@@ -603,6 +601,7 @@ fn try_rewrite_single_value_aggregate(
             alias: Some(format!("correlation_key_{index}")),
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
     let column_count = group_columns.len();

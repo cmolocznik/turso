@@ -132,7 +132,7 @@ public partial class SqliteConnection : DbConnection
         set => _readUncommitted = value;
     }
 
-    // The SQLite version Turso tracks (SQLITE_VERSION in core/dialect/sqlite.rs).
+    // The SQLite version Turso tracks (SQLITE_VERSION in core/dialect/engine.rs).
     public override string ServerVersion => "3.50.4";
 
     public override ConnectionState State => _managedConnection?.State
@@ -163,6 +163,8 @@ public partial class SqliteConnection : DbConnection
 
         if (_database is not null)
             throw new InvalidOperationException("The connection is already open.");
+        if (_connectionOptions.ShouldSerialize("Local Encryption Key"))
+            throw new InvalidOperationException("Local Encryption Key requires a remote Data Source and Replica Path.");
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 

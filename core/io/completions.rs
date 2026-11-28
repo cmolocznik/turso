@@ -47,7 +47,7 @@ impl Future for Completion {
 
 #[derive(Debug, Default)]
 struct ContextInner {
-    /// A waker for each task waiting on the completion. Finishing the completion wakes them all.
+    /// A waker for each task waiting on the completion. Waking the completion wakes them all.
     wakers: SmallVec<[Waker; 1]>,
     // TODO: add abort signal
 }
@@ -59,14 +59,11 @@ pub struct Context {
 
 impl ContextInner {
     pub fn new() -> Self {
-        Self {
-            wakers: SmallVec::new(),
-        }
+        Self::default()
     }
 
-    /// Registers `waker` unless a waker of the same task is registered already. Another task's
-    /// waker stays registered beside it, so each task waiting on the completion is woken when it
-    /// finishes, and registering wakes no task.
+    /// Registers `waker` unless a waker of the same task is registered already. Registering
+    /// wakes no task: each waiting task keeps its waker until the completion wakes.
     pub fn set_waker(&mut self, waker: &Waker) {
         if !self.wakers.iter().any(|w| w.will_wake(waker)) {
             self.wakers.push(waker.clone());
@@ -87,8 +84,8 @@ impl Context {
         }
     }
 
-    /// Takes the wakers under the lock and wakes them once the lock is free: a waker may register
-    /// again on the same completion from its wake.
+    /// Takes the wakers under the lock and wakes them after releasing it, because a waker may
+    /// register again on the same completion from its wake.
     pub fn wake(&self) {
         let wakers = std::mem::take(&mut self.inner.lock().wakers);
         for waker in wakers {
@@ -98,8 +95,8 @@ impl Context {
 
     /// Registers `waker` beside the wakers of the other tasks waiting on the completion.
     pub fn set_waker(&self, waker: &Waker) {
-        // Shuttle cannot see the std `OnceLock` holding a completion's result, so yield here to
-        // let it run a completion between a test of that result and this store.
+        // Shuttle cannot see the std `OnceLock` that holds a completion's result, so yield here
+        // to let it finish a completion between a test of that result and this store.
         #[cfg(shuttle)]
         crate::thread::yield_now();
         self.inner.lock().set_waker(waker);
@@ -177,10 +174,13 @@ impl CompletionGroup {
         }
     }
 
-    /// Add a child. Call this before the child is submitted to the IO
-    /// backend. The child's own callback is what counts it into the group,
-    /// so the link has to be there before the child can finish.
-    pub fn add(&mut self, c: &Completion) {
+    /// Add a child. The child's own callback is what counts it into the
+    /// group, so the link has to be there before the child can finish.
+    ///
+    /// Private so that children join a group only through
+    /// [`start_in_group`], which also finishes a child whose IO failed to
+    /// start.
+    fn add(&mut self, c: &Completion) {
         self.completions.push(c.clone());
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
         let mut parent = c.get_inner().parent.lock();
@@ -220,6 +220,30 @@ impl CompletionGroup {
         self.completion.group_one_done(None);
         self.completion
     }
+}
+
+/// Adds `c` to `group`, when given, then starts its IO with `start`.
+///
+/// `c` joins the group before `start` because the IO can finish inside
+/// `start`. If `start` returns `Err`, the IO did not start and nothing else
+/// will finish `c` (see the contract on [`crate::io::File`]), so `c` is
+/// aborted here; otherwise anything waiting on the group would wait forever.
+/// Aborting only marks `c` finished with [`CompletionError::Aborted`] and runs
+/// its callback; it does not stop an IO that did start.
+pub fn start_in_group(
+    group: Option<&mut CompletionGroup>,
+    c: Completion,
+    start: impl FnOnce(Completion) -> crate::Result<Completion>,
+) -> crate::Result<Completion> {
+    let Some(group) = group else {
+        return start(c);
+    };
+    group.add(&c);
+    start(c.clone()).inspect_err(|_| {
+        if !c.finished() {
+            c.abort();
+        }
+    })
 }
 
 pub struct GroupCompletion {
@@ -445,8 +469,8 @@ impl Completion {
         }
     }
 
-    /// Registers the waker before testing for completion: a completion finished on another thread
-    /// between a test and the registration would otherwise wake no one.
+    /// Registers the waker before testing whether the completion finished: a completion that
+    /// finishes on another thread between the test and the registration would wake no one.
     pub fn set_waker(&self, waker: &Waker) {
         match &self.inner {
             None => waker.wake_by_ref(),
@@ -1412,33 +1436,24 @@ mod tests {
         assert!(c.failed());
     }
 
-    /// A waker registered while another thread completes the completion must be woken, in every
-    /// interleaving of the two, including a completion that finishes after `set_waker` tested it
-    /// and before the waker was stored.
+    /// A waker registered while another thread completes the completion is woken in every
+    /// interleaving, including a completion that finishes after `set_waker` tested it and before
+    /// the waker was stored.
     #[cfg(shuttle)]
     #[test]
     fn shuttle_set_waker_racing_complete_always_wakes() {
-        use std::task::Wake;
-
-        struct Count(AtomicUsize);
-        impl Wake for Count {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
         shuttle::check_dfs(
             || {
                 let c = Completion::new_wait();
-                let count = Arc::new(Count(AtomicUsize::new(0)));
+                let task = PollingTask::new(&c);
                 let completer = {
                     let c = c.clone();
                     crate::thread::spawn(move || c.complete(0))
                 };
-                c.set_waker(&Waker::from(count.clone()));
+                c.set_waker(&Waker::from(task.clone()));
                 completer.join().unwrap();
                 assert_ne!(
-                    count.0.load(Ordering::SeqCst),
+                    task.wakes(),
                     0,
                     "the completion finished without waking its waker"
                 );
@@ -1447,54 +1462,50 @@ mod tests {
         );
     }
 
-    /// A waker that registers again on its completion from its wake, as polling the completion
-    /// inline does, up to three times.
-    struct Again {
-        completion: Completion,
-        wakes: AtomicUsize,
-    }
-
-    impl std::task::Wake for Again {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            if self.wakes.fetch_add(1, Ordering::SeqCst) < 3 {
-                self.completion.set_waker(&Waker::from(self.clone()));
-            }
-        }
-    }
-
-    /// `set_waker` on a finished completion wakes the waker with the completion's lock free: a
-    /// waker may register again on that completion from its wake, as polling the completion
-    /// inline does.
+    /// A completion keeps the waker of each task that registers, wakes none of them on a later
+    /// registration, and wakes each once when it finishes.
     #[test]
-    fn a_waker_registering_again_from_its_wake_does_not_deadlock() {
-        let (done, waited) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let c = Completion::new_wait();
-            c.complete(0);
-            let again = Arc::new(Again {
-                completion: c.clone(),
-                wakes: AtomicUsize::new(0),
-            });
-            c.set_waker(&Waker::from(again.clone()));
-            let _ = done.send(again.wakes.load(Ordering::SeqCst));
-        });
-        let wakes = waited
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("set_waker deadlocked waking a waker that registers again");
-        assert_eq!(
-            wakes, 4,
-            "each set_waker on the finished completion wakes once"
+    fn each_task_waiting_on_a_completion_is_woken_once_when_it_finishes() {
+        let c = Completion::new_wait();
+        let tasks: Vec<_> = (0..3).map(|_| PollingTask::new(&c)).collect();
+        for task in &tasks {
+            c.set_waker(&Waker::from(task.clone()));
+            // Registering the same task again keeps one waker for it.
+            c.set_waker(&Waker::from(task.clone()));
+        }
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.wakes() == 0 && Arc::strong_count(task) == 2),
+            "a registration woke or dropped another task's waker"
+        );
+        c.complete(0);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.wakes() == 1 && Arc::strong_count(task) == 1),
+            "finishing did not wake each waker once and drop it"
         );
     }
 
-    /// A task that polls its completion from its wake, as an executor polling the task inline
-    /// does: woken for the first time while the completion is pending, it registers again.
+    /// A task that polls its completion from its wake, as an executor that polls the task inline
+    /// does: woken while the completion is pending, it registers again.
     struct PollingTask {
         completion: Completion,
         wakes: AtomicUsize,
+    }
+
+    impl PollingTask {
+        fn new(completion: &Completion) -> Arc<Self> {
+            Arc::new(Self {
+                completion: completion.clone(),
+                wakes: AtomicUsize::new(0),
+            })
+        }
+
+        fn wakes(&self) -> usize {
+            self.wakes.load(Ordering::SeqCst)
+        }
     }
 
     impl std::task::Wake for PollingTask {
@@ -1502,74 +1513,55 @@ mod tests {
             self.wake_by_ref();
         }
         fn wake_by_ref(self: &Arc<Self>) {
-            if self.wakes.fetch_add(1, Ordering::SeqCst) == 0 && !self.completion.finished() {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            if !self.completion.finished() {
                 self.completion.set_waker(&Waker::from(self.clone()));
             }
         }
     }
 
-    /// Two tasks waiting on one completion each keep a waker on it: the second to register wakes
-    /// neither, so they do not wake each other without end, and finishing the completion wakes
-    /// each of them once.
-    #[test]
-    fn two_tasks_waiting_on_one_completion_are_each_woken_once_when_it_finishes() {
+    /// Runs `f` on another thread and returns its result, failing if it takes over 10 seconds:
+    /// a waker woken under the completion's lock deadlocks when it registers again.
+    fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         let (done, waited) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let c = Completion::new_wait();
-            let task = || {
-                Arc::new(PollingTask {
-                    completion: c.clone(),
-                    wakes: AtomicUsize::new(0),
-                })
-            };
-            let (a, b) = (task(), task());
-            let wakes = || [&a, &b].map(|task| task.wakes.load(Ordering::SeqCst));
-            c.set_waker(&Waker::from(a.clone()));
-            c.set_waker(&Waker::from(b.clone()));
-            let registered = wakes();
-            c.complete(0);
-            let _ = done.send((registered, wakes()));
+            let _ = done.send(f());
         });
-        let (registered, finished) = waited
+        waited
             .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("set_waker deadlocked waking a task that polls the completion from its wake");
-        assert_eq!(registered, [0, 0], "the second registration woke a task");
-        assert_eq!(finished, [1, 1], "finishing wakes each task once");
+            .expect("a waker that registers again from its wake deadlocked")
     }
 
-    /// A completion keeps the waker of every task that registers until it wakes, then wakes each
-    /// once and lets them all go, a task that stopped waiting included.
+    /// Two tasks waiting on one completion, each registering again from its wake: the second
+    /// registration wakes neither task, and finishing wakes each once.
     #[test]
-    fn a_completion_lets_its_wakers_go_when_it_wakes() {
-        use std::task::Wake;
+    fn two_tasks_polling_one_completion_from_their_wakes_are_each_woken_once() {
+        let (registered, finished) = run_with_timeout(|| {
+            let c = Completion::new_wait();
+            let (a, b) = (PollingTask::new(&c), PollingTask::new(&c));
+            c.set_waker(&Waker::from(a.clone()));
+            c.set_waker(&Waker::from(b.clone()));
+            let registered = [a.wakes(), b.wakes()];
+            c.complete(0);
+            (registered, [a.wakes(), b.wakes()])
+        });
+        assert_eq!(registered, [0, 0], "the second registration woke a task");
+        assert_eq!(finished, [1, 1], "finishing did not wake each task once");
+    }
 
-        struct Count(AtomicUsize);
-        impl Wake for Count {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let c = Completion::new_wait();
-        let tasks: Vec<_> = (0..3)
-            .map(|_| Arc::new(Count(AtomicUsize::new(0))))
-            .collect();
-        for task in &tasks {
+    /// A progress wake of a pending completion wakes its waker after releasing the completion's
+    /// lock, so the waker can register again, and finishing wakes it once more.
+    #[test]
+    fn a_waker_registering_again_from_a_progress_wake_does_not_deadlock() {
+        let wakes = run_with_timeout(|| {
+            let c = Completion::new_wait();
+            let task = PollingTask::new(&c);
             c.set_waker(&Waker::from(task.clone()));
-        }
-        let wakes = |task: &Arc<Count>| task.0.load(Ordering::SeqCst);
-        assert!(
-            tasks
-                .iter()
-                .all(|task| wakes(task) == 0 && Arc::strong_count(task) == 2),
-            "a registration woke or let go another task's waker"
-        );
-        c.complete(0);
-        assert!(
-            tasks
-                .iter()
-                .all(|task| wakes(task) == 1 && Arc::strong_count(task) == 1),
-            "finishing did not wake each waker once and let it go"
-        );
+            c.wake_progress();
+            let progressed = task.wakes();
+            c.complete(0);
+            (progressed, task.wakes())
+        });
+        assert_eq!(wakes, (1, 2));
     }
 }

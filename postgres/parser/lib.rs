@@ -1,42 +1,249 @@
 pub mod cmdtag;
 pub mod copy;
+mod create_function;
+pub mod datetime_unit;
+pub mod functions;
+mod identifier_list;
+mod names;
+mod policy_condition;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
 
 pub mod sqlstate;
 pub mod translator;
+mod type_name;
+
+/// The frontend function that the translator calls for `timestamp + interval`
+/// and `timestamp - interval` with an interval literal. Its arguments are the
+/// timestamp and the interval's months, days and microseconds.
+pub const TIMESTAMP_PLUS_INTERVAL_FUNCTION: &str = "pg_timestamp_plus_interval";
+
+pub use pg_query_error::PgQueryError;
+
+mod pg_query_error {
+    /// An error of pg_query, such as SQL that PostgreSQL's grammar refuses.
+    /// It is built only from a `pg_query::Error`, so an error of the
+    /// translator cannot take this form and lose its SQLSTATE.
+    #[derive(Debug)]
+    pub struct PgQueryError(String);
+
+    impl From<pg_query::Error> for PgQueryError {
+        fn from(error: pg_query::Error) -> Self {
+            Self(error.to_string())
+        }
+    }
+
+    impl std::fmt::Display for PgQueryError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ParseError {
+    /// An error of pg_query, without a SQLSTATE.
     #[error("{0}")]
-    ParseError(String),
+    PgQuery(PgQueryError),
     /// An error that PostgreSQL reports with this SQLSTATE.
     #[error("{message}")]
     Sqlstate {
         sqlstate: &'static str,
         message: String,
+        /// PostgreSQL's HINT field: how to get the same result in a way
+        /// that is supported. The message does not repeat it.
+        hint: Option<String>,
     },
     /// A schema-qualified name of an object that the translator accepts only
     /// without a schema. If the schema does not exist, PostgreSQL reports the
     /// missing schema. Only a caller with a connection can find that out.
     #[error("a schema-qualified {kind} name is not supported")]
     SchemaQualifiedName { kind: String, schema: String },
+    /// A type of a function's parameter or result that is not built in. It
+    /// is a relation or a custom type, which tursopg does not support in a
+    /// function, or it does not exist. Only a caller with a connection can
+    /// find that out.
+    #[error("{} is not supported", .used_as.unsupported_feature(.full_name))]
+    UnresolvedFunctionType {
+        schema: Option<String>,
+        name: String,
+        /// The type as PostgreSQL writes it in errors, such as `public.t[]`.
+        full_name: String,
+        used_as: FunctionTypeUse,
+    },
 }
+
+impl ParseError {
+    /// An error that PostgreSQL reports with SQLSTATE `sqlstate`.
+    pub(crate) fn sqlstate(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        Self::Sqlstate {
+            sqlstate,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    /// PostgreSQL's error for an option given twice or with options that
+    /// exclude each other.
+    pub(crate) fn conflicting_options() -> Self {
+        Self::syntax_error("conflicting or redundant options")
+    }
+
+    /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
+    pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
+        Self::sqlstate(
+            sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{what} is not supported"),
+        )
+    }
+
+    /// PostgreSQL's `syntax_error`, for SQL that pg_query accepts but
+    /// PostgreSQL refuses in a later step.
+    pub(crate) fn syntax_error(message: impl Into<String>) -> Self {
+        Self::sqlstate(sqlstate::SQLSTATE_SYNTAX_ERROR, message)
+    }
+
+    /// PostgreSQL's `internal_error`, which PostgreSQL reports for an error
+    /// raised without a SQLSTATE.
+    pub(crate) fn internal_error(message: impl Into<String>) -> Self {
+        Self::sqlstate(sqlstate::SQLSTATE_INTERNAL_ERROR, message)
+    }
+
+    /// The error with the HINT `hint`.
+    pub(crate) fn with_hint(self, hint: impl Into<String>) -> Self {
+        match self {
+            Self::Sqlstate {
+                sqlstate, message, ..
+            } => Self::Sqlstate {
+                sqlstate,
+                message,
+                hint: Some(hint.into()),
+            },
+            other => unreachable!("a hint on an error without a SQLSTATE: {other:?}"),
+        }
+    }
+}
+
+/// Where a type appears in the signature of a function.
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionTypeUse {
+    Parameter,
+    Result,
+    SetofResult,
+}
+
+impl FunctionTypeUse {
+    /// PostgreSQL's error when the type does not exist. PostgreSQL quotes
+    /// the name only in the error for a result.
+    pub fn missing_message(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("type {full_name} does not exist"),
+            Self::Result | Self::SetofResult => format!("type \"{full_name}\" does not exist"),
+        }
+    }
+
+    fn unsupported_feature(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("a function parameter of type {full_name}"),
+            Self::Result => format!("a function result of type {full_name}"),
+            Self::SetofResult => format!("a function result of type SETOF {full_name}"),
+        }
+    }
+}
+
+pub use identifier_list::split_identifier_string;
+pub use type_name::{parse_type_name, WrittenTypeName};
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::parse(sql, pg_query::ParserOptions::DEFAULT).map_err(parse_error)
+}
+
+/// Parses a stored table definition without truncating engine relation names.
+pub fn parse_stored_table(sql: &str) -> Result<ParseResult, ParseError> {
+    let mut parsed = parse(sql)?;
+    for raw in &mut parsed.protobuf.stmts {
+        if let Some(node) = raw.stmt.as_mut() {
+            restore_stored_relation_names(sql, node)?;
+        }
+    }
+    Ok(parsed)
+}
+
+fn restore_stored_relation_names(
+    sql: &str,
+    node: &mut pg_query::protobuf::Node,
+) -> Result<(), ParseError> {
+    let (relation, children) = match &mut node.node {
+        Some(NodeEnum::CreateStmt(create)) => {
+            (create.relation.as_mut(), &mut create.table_elts[..])
+        }
+        Some(NodeEnum::ColumnDef(column)) => (None, &mut column.constraints[..]),
+        Some(NodeEnum::Constraint(constraint)) => (constraint.pktable.as_mut(), &mut [][..]),
+        _ => return Ok(()),
+    };
+    if let Some(relation) = relation {
+        // Namespace prefixes are added after PostgreSQL has checked the user
+        // name. Applying its identifier limit again can sever table/index and
+        // foreign-key references when loading a schema.
+        if relation.schemaname.is_empty()
+            && relation.relname.starts_with("__turso_ns")
+            && relation.location >= 0
+        {
+            let start = relation.location as usize;
+            let end = qualified_name_end(sql, start)?;
+            relation.relname = turso_ast::Name::from_string(&sql[start..end])
+                .as_str()
+                .to_string();
+        }
+    }
+    for child in children {
+        restore_stored_relation_names(sql, child)?;
+    }
+    Ok(())
+}
+
+/// The error for SQL that pg_query refuses. pg_query gives only the message
+/// of PostgreSQL's error, not its SQLSTATE, so the errors that PostgreSQL
+/// does not report as syntax errors are recognized by their message.
+fn parse_error(error: pg_query::Error) -> ParseError {
+    match &error {
+        pg_query::Error::Parse(message) if is_reserved_role_name_error(message) => {
+            ParseError::sqlstate(sqlstate::SQLSTATE_RESERVED_NAME, message.clone())
+        }
+        _ => ParseError::PgQuery(error.into()),
+    }
+}
+
+/// Whether the message is PostgreSQL's error for a role name that the
+/// grammar refuses, such as `role name "none" is reserved` or
+/// `CURRENT_USER cannot be used as a role name here`.
+fn is_reserved_role_name_error(message: &str) -> bool {
+    (message.starts_with("role name \"") && message.ends_with("\" is reserved"))
+        || message.ends_with(" cannot be used as a role name here")
 }
 
 /// Whether the first statement in `parsed` sends rows to the client.
 pub fn returns_rows(parsed: &ParseResult) -> bool {
     match first_statement(parsed) {
         Some(NodeEnum::SelectStmt(select)) => select.into_clause.is_none(),
-        Some(NodeEnum::InsertStmt(insert)) => !insert.returning_list.is_empty(),
-        Some(NodeEnum::UpdateStmt(update)) => !update.returning_list.is_empty(),
-        Some(NodeEnum::DeleteStmt(delete)) => !delete.returning_list.is_empty(),
-        Some(NodeEnum::MergeStmt(merge)) => !merge.returning_list.is_empty(),
+        Some(NodeEnum::InsertStmt(insert)) => insert
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::UpdateStmt(update)) => update
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::DeleteStmt(delete)) => delete
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::MergeStmt(merge)) => merge
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
         Some(NodeEnum::ExplainStmt(_) | NodeEnum::VariableShowStmt(_)) => true,
         _ => false,
     }
@@ -47,12 +254,13 @@ fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
 }
 
 /// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// The parser knows that the semicolons in the BEGIN ATOMIC body of CREATE
+/// FUNCTION do not end the statement. Text with a syntax error is an error,
+/// because PostgreSQL runs none of the statements in it.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
-    let parts =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let parts = pg_query::split_with_parser(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
     Ok(parts
         .into_iter()
         .map(|s| s.trim().to_string())
@@ -68,14 +276,18 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
-    pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::normalize(sql).map_err(|e| ParseError::PgQuery(e.into()))
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
-    pg_query::fingerprint(sql)
-        .map(|fp| fp.hex)
-        .map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::fingerprint(
+        sql,
+        pg_query::ParserOptions::DEFAULT,
+        pg_query::FingerprintOptions::DEFAULT,
+    )
+    .map(|fp| fp.hex)
+    .map_err(|e| ParseError::PgQuery(e.into()))
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()
@@ -111,6 +323,93 @@ pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
     sql
 }
 
+/// `sql`, a CREATE TABLE statement, with its serial or identity column
+/// `column` written out with its sequence `sequence`, the name the stored
+/// text gives it. A serial column becomes what `serial` stands for: the
+/// integer type, NOT NULL and a DEFAULT of `nextval` of `sequence`. An
+/// identity column keeps its kind and gets a `SEQUENCE NAME` option. A table
+/// is loaded from its stored text, so the text has to name the sequence when
+/// the sequence is not named `<table>_<column>_seq`.
+pub fn write_out_serial_column(
+    sql: &str,
+    column: &str,
+    sequence: &str,
+) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let parse_result = parse(sql)?;
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateStmt(create), ..)) = nodes.first() else {
+        return Err(ParseError::internal_error("not a CREATE TABLE statement"));
+    };
+    let col_def = create
+        .table_elts
+        .iter()
+        .find_map(|element| match &element.node {
+            Some(Node::ColumnDef(col_def)) if col_def.colname == column => Some(col_def),
+            _ => None,
+        })
+        .ok_or_else(|| ParseError::internal_error(format!("no column \"{column}\"")))?;
+    let identity = col_def
+        .constraints
+        .iter()
+        .find_map(|constraint| match &constraint.node {
+            Some(Node::Constraint(constraint))
+                if constraint.contype == pg_query::protobuf::ConstrType::ConstrIdentity as i32 =>
+            {
+                Some(constraint)
+            }
+            _ => None,
+        });
+    if let Some(identity) = identity {
+        let kind = if identity.generated_when == "a" {
+            "ALWAYS"
+        } else {
+            "BY DEFAULT"
+        };
+        let start = identity.location as usize;
+        let end = identity_constraint_end(sql, start)?;
+        let name = match sequence.split_once('.') {
+            Some((schema, name)) => {
+                format!("{}.{}", quote_identifier(schema), quote_identifier(name))
+            }
+            None => quote_identifier(sequence),
+        };
+        return Ok(format!(
+            "{}GENERATED {kind} AS IDENTITY (SEQUENCE NAME {name}){}",
+            &sql[..start],
+            &sql[end..]
+        ));
+    }
+    let type_name = col_def
+        .type_name
+        .as_ref()
+        .ok_or_else(|| ParseError::internal_error(format!("column \"{column}\" has no type")))?;
+    let type_word = type_name.names.last().and_then(|name| match &name.node {
+        Some(Node::String(word)) => Some(word.sval.to_lowercase()),
+        _ => None,
+    });
+    let integer_type = match type_word.as_deref() {
+        Some("serial" | "serial4") => "integer",
+        Some("bigserial" | "serial8") => "bigint",
+        Some("smallserial" | "serial2") => "smallint",
+        _ => {
+            return Err(ParseError::internal_error(format!(
+                "column \"{column}\" is not a serial or identity column"
+            )))
+        }
+    };
+    let location = type_name.location as usize;
+    let end = qualified_name_end(sql, location)?;
+    let sequence = sequence.replace('\'', "''");
+    Ok(format!(
+        "{}{integer_type} NOT NULL DEFAULT nextval('{sequence}'){}",
+        &sql[..location],
+        &sql[end..]
+    ))
+}
+
 /// `sql`, a CREATE TABLE statement, with its table named `name` and no
 /// schema. `sql` is returned as it is when the table is already called
 /// `name` or when `sql` is not a CREATE TABLE statement.
@@ -138,6 +437,53 @@ pub fn create_table_name(parse_result: &ParseResult) -> Option<(Option<String>, 
         return None;
     };
     let relation = create.relation.as_ref()?;
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// The schema, if the statement names one, and name of the table being
+/// altered, when the statement is `ALTER TABLE t ADD COLUMN`. Returns None
+/// for all other statements.
+pub fn alter_table_add_column_table(
+    parse_result: &ParseResult,
+) -> Option<(Option<String>, String)> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::AlterTableType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::AlterTableStmt(alter), ..) = nodes.first()? else {
+        return None;
+    };
+    let relation = alter.relation.as_ref()?;
+    let cmd = alter.cmds.first()?;
+    let Some(Node::AlterTableCmd(cmd)) = &cmd.node else {
+        return None;
+    };
+    if AlterTableType::try_from(cmd.subtype).ok()? != AlterTableType::AtAddColumn {
+        return None;
+    }
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// Returns the (schema, table) of a positional VALUES INSERT (no explicit column list).
+/// Returns None for any other statement, for INSERT with a column list, or for DEFAULT VALUES.
+pub fn positional_insert_table(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::InsertStmt(insert), ..) = nodes.first()? else {
+        return None;
+    };
+    if !insert.cols.is_empty() || insert.select_stmt.is_none() {
+        return None;
+    }
+    let relation = insert.relation.as_ref()?;
     Some((
         (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
         relation.relname.clone(),
@@ -192,19 +538,275 @@ fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<
     }
 }
 
+/// The reg type that a string constant is cast to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegKind {
+    Class,
+    Type,
+}
+
+impl RegKind {
+    /// The name of the type in lowercase.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            RegKind::Class => "regclass",
+            RegKind::Type => "regtype",
+        }
+    }
+}
+
+/// A string constant that is cast to regclass or regtype: `'t'::regclass`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegConstant {
+    pub kind: RegKind,
+    /// The byte offset of the string constant.
+    pub location: usize,
+    pub text: String,
+}
+
+/// The string constants that a statement stores with the type regclass or
+/// regtype,
+/// in the order they are written. PostgreSQL reads such a constant as an oid
+/// when it analyzes the statement, so a view, a default, a check or an index
+/// keeps the oid and not the name. Other statements are not stored, and give
+/// no constants.
+pub fn reg_constants_to_resolve(parse_result: &ParseResult) -> Vec<RegConstant> {
+    let mut stored = StoredExpressions::default();
+    for stmt in &parse_result.protobuf.stmts {
+        if let Some(node) = stmt.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) {
+            collect_stored_expressions(node, &mut stored);
+        }
+    }
+    let mut constants: Vec<RegConstant> = stored
+        .expressions
+        .iter()
+        .flat_map(|expression| expression.nodes())
+        .filter_map(|(node, ..)| reg_constant(node))
+        .chain(stored.defaults)
+        .collect();
+    constants.sort_by_key(|constant| constant.location);
+    constants
+}
+
+/// What a statement stores: the expressions it keeps, and the string
+/// constants that a column of type regclass takes as its default.
+#[derive(Default)]
+struct StoredExpressions<'a> {
+    expressions: Vec<&'a NodeEnum>,
+    defaults: Vec<RegConstant>,
+}
+
+/// The expressions that `node`, a statement or a part of one, stores.
+fn collect_stored_expressions<'a>(node: &'a NodeEnum, stored: &mut StoredExpressions<'a>) {
+    let nodes = |nodes: &'a [pg_query::protobuf::Node], stored: &mut StoredExpressions<'a>| {
+        for node in nodes {
+            if let Some(node) = &node.node {
+                collect_stored_expressions(node, stored);
+            }
+        }
+    };
+    match node {
+        NodeEnum::ViewStmt(_)
+        | NodeEnum::IndexStmt(_)
+        | NodeEnum::CreatePolicyStmt(_)
+        | NodeEnum::AlterPolicyStmt(_) => stored.expressions.push(node),
+        NodeEnum::CreateTableAsStmt(create) => {
+            if create.objtype == pg_query::protobuf::ObjectType::ObjectMatview as i32 {
+                stored.expressions.push(node);
+            }
+        }
+        NodeEnum::CreateStmt(create) => nodes(&create.table_elts, stored),
+        NodeEnum::AlterTableStmt(alter) => nodes(&alter.cmds, stored),
+        NodeEnum::AlterTableCmd(cmd) => {
+            if let Some(def) = cmd.def.as_deref().and_then(|def| def.node.as_ref()) {
+                collect_stored_expressions(def, stored);
+            }
+        }
+        NodeEnum::ColumnDef(column) => {
+            collect_default_constants(column.type_name.as_ref(), &column.constraints, stored);
+            nodes(&column.constraints, stored);
+        }
+        NodeEnum::CreateDomainStmt(domain) => {
+            collect_default_constants(domain.type_name.as_ref(), &domain.constraints, stored);
+            nodes(&domain.constraints, stored);
+        }
+        NodeEnum::Constraint(constraint) => {
+            if let Some(expr) = constraint.raw_expr.as_deref().and_then(|e| e.node.as_ref()) {
+                stored.expressions.push(expr);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The string constants that `constraints` give as the default of a column or
+/// a domain of type `type_name`. A string constant is read as that type.
+fn collect_default_constants(
+    type_name: Option<&pg_query::protobuf::TypeName>,
+    constraints: &[pg_query::protobuf::Node],
+    stored: &mut StoredExpressions,
+) {
+    let Some(kind) = type_name.and_then(reg_kind) else {
+        return;
+    };
+    for constraint in constraints {
+        let Some(NodeEnum::Constraint(constraint)) = &constraint.node else {
+            continue;
+        };
+        if constraint.contype == pg_query::protobuf::ConstrType::ConstrDefault as i32 {
+            let default = constraint.raw_expr.as_deref().and_then(|e| e.node.as_ref());
+            stored
+                .defaults
+                .extend(default.and_then(|node| string_constant(node, kind)));
+        }
+    }
+}
+
+fn reg_kind(type_name: &pg_query::protobuf::TypeName) -> Option<RegKind> {
+    let names: Vec<&str> = type_name
+        .names
+        .iter()
+        .filter_map(|name| match &name.node {
+            Some(NodeEnum::String(name)) => Some(name.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match names.as_slice() {
+        ["regclass"] | ["pg_catalog", "regclass"] => Some(RegKind::Class),
+        ["regtype"] | ["pg_catalog", "regtype"] => Some(RegKind::Type),
+        _ => None,
+    }
+}
+
+fn string_constant(node: &NodeEnum, kind: RegKind) -> Option<RegConstant> {
+    use pg_query::protobuf::a_const::Val;
+
+    let NodeEnum::AConst(constant) = node else {
+        return None;
+    };
+    let Some(Val::Sval(text)) = constant.val.as_ref() else {
+        return None;
+    };
+    Some(RegConstant {
+        kind,
+        location: usize::try_from(constant.location).ok()?,
+        text: text.sval.clone(),
+    })
+}
+
+/// The constant of `node` when it is a string constant cast to regclass or
+/// regtype.
+fn reg_constant(node: pg_query::NodeRef) -> Option<RegConstant> {
+    let pg_query::NodeRef::TypeCast(cast) = node else {
+        return None;
+    };
+    let kind = reg_kind(cast.type_name.as_ref()?)?;
+    string_constant(cast.arg.as_ref()?.node.as_ref()?, kind)
+}
+
+/// `sql` with the string constant that starts at byte offset `location`
+/// replaced by the constant `text`.
+pub fn replace_string_constant(
+    sql: &str,
+    location: usize,
+    text: &str,
+) -> Result<String, ParseError> {
+    use pg_query::protobuf::Token;
+
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
+    let mut tokens = scan
+        .tokens
+        .iter()
+        .skip_while(|token| (token.start as usize) < location)
+        .peekable();
+    let first = tokens
+        .next()
+        .filter(|token| {
+            token.start as usize == location
+                && (token.token == Token::Sconst as i32 || token.token == Token::Usconst as i32)
+        })
+        .ok_or_else(|| ParseError::internal_error("no string constant at the location"))?;
+    let mut end = first.end as usize;
+    // U&'...' UESCAPE '!' is one constant: the escape character is part of it.
+    if first.token == Token::Usconst as i32
+        && tokens
+            .next_if(|token| token.token == Token::Uescape as i32)
+            .is_some()
+    {
+        let escape = tokens
+            .next_if(|token| token.token == Token::Sconst as i32)
+            .ok_or_else(|| ParseError::internal_error("UESCAPE has no character"))?;
+        end = escape.end as usize;
+    }
+    Ok(format!(
+        "{}'{}'{}",
+        &sql[..location],
+        text.replace('\'', "''"),
+        &sql[end..]
+    ))
+}
+
 /// `sql` with the name that starts at byte offset `location`, which may
 /// have a schema in front of it, replaced by `name` alone.
 pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseError> {
+    let end = qualified_name_end(sql, location)?;
+    Ok(format!(
+        "{}{}{}",
+        &sql[..location],
+        quote_identifier(name),
+        &sql[end..]
+    ))
+}
+
+/// The byte offset just past the identity constraint that starts at byte
+/// offset `location` of `sql`, with the options in parentheses after it.
+fn identity_constraint_end(sql: &str, location: usize) -> Result<usize, ParseError> {
     use pg_query::protobuf::Token;
 
-    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
+    let mut tokens = scan
+        .tokens
+        .iter()
+        .skip_while(|token| (token.start as usize) < location)
+        .skip_while(|token| token.token != Token::IdentityP as i32);
+    let identity = tokens
+        .next()
+        .ok_or_else(|| ParseError::internal_error("no IDENTITY at the location"))?;
+    let mut end = identity.end as usize;
+    let mut rest = tokens.peekable();
+    if rest
+        .peek()
+        .is_some_and(|token| token.token == Token::Ascii40 as i32)
+    {
+        let mut depth = 0;
+        for token in rest {
+            if token.token == Token::Ascii40 as i32 {
+                depth += 1;
+            } else if token.token == Token::Ascii41 as i32 {
+                depth -= 1;
+            }
+            end = token.end as usize;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    Ok(end)
+}
+
+/// The byte offset just past the name that starts at byte offset
+/// `location` of `sql`, with the schema that may be in front of it.
+fn qualified_name_end(sql: &str, location: usize) -> Result<usize, ParseError> {
+    use pg_query::protobuf::Token;
+
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::PgQuery(e.into()))?;
     let mut tokens = scan
         .tokens
         .iter()
         .skip_while(|token| (token.start as usize) < location);
     let first = tokens
         .next()
-        .ok_or_else(|| ParseError::ParseError("no name at the location".to_string()))?;
+        .ok_or_else(|| ParseError::internal_error("no name at the location"))?;
     let mut end = first.end as usize;
     let mut rest = tokens.peekable();
     if rest
@@ -216,12 +818,7 @@ pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseEr
             end = ident.end as usize;
         }
     }
-    Ok(format!(
-        "{}{}{}",
-        &sql[..location],
-        quote_identifier(name),
-        &sql[end..]
-    ))
+    Ok(end)
 }
 
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its
@@ -301,6 +898,83 @@ mod tests {
         assert_eq!(
             name_create_table("CREATE TABLE public.t2(a INT)", "t2").unwrap(),
             "CREATE TABLE t2(a INT)"
+        );
+    }
+
+    #[test]
+    fn reg_constants_to_resolve_are_found_in_the_statements_that_store_them() {
+        let constants = |sql: &str| {
+            reg_constants_to_resolve(&parse(sql).unwrap())
+                .into_iter()
+                .map(|constant| (constant.location, constant.text))
+                .collect::<Vec<_>>()
+        };
+        let view = "CREATE VIEW w AS SELECT 't'::regclass, CAST('app.u' AS regclass), 'x'::text";
+        assert_eq!(
+            constants(view),
+            [
+                (view.find("'t'").unwrap(), "t".to_string()),
+                (view.find("'app.u'").unwrap(), "app.u".to_string()),
+            ]
+        );
+        let check = "CREATE TABLE r (c regclass, CHECK (c <> 't'::regclass))";
+        assert_eq!(
+            constants(check),
+            [(check.find("'t'").unwrap(), "t".to_string())]
+        );
+        let domain = "CREATE DOMAIN d AS regclass DEFAULT 't' CHECK (value <> 'u'::regclass)";
+        assert_eq!(
+            constants(domain),
+            [
+                (domain.find("'t'").unwrap(), "t".to_string()),
+                (domain.find("'u'").unwrap(), "u".to_string()),
+            ]
+        );
+        let default = "CREATE TABLE r (c regclass DEFAULT 't', d text DEFAULT 'u')";
+        assert_eq!(
+            constants(default),
+            [(default.find("'t'").unwrap(), "t".to_string())]
+        );
+        let types = "CREATE VIEW w AS SELECT 'int4'::regtype, 't'::regclass";
+        assert_eq!(
+            reg_constants_to_resolve(&parse(types).unwrap())
+                .into_iter()
+                .map(|constant| constant.kind)
+                .collect::<Vec<_>>(),
+            [RegKind::Type, RegKind::Class]
+        );
+        assert!(constants("SELECT 't'::regclass").is_empty());
+        assert!(constants("CREATE TABLE s AS SELECT 't'::regclass").is_empty());
+    }
+
+    #[test]
+    fn a_unicode_escape_string_constant_is_replaced_with_its_escape() {
+        for sql in [
+            "SELECT U&'pg_class'::regclass, 1",
+            "SELECT U&'pg_class' UESCAPE '!'::regclass, 1",
+        ] {
+            let constants =
+                reg_constants_to_resolve(&parse(&format!("CREATE VIEW v AS {sql}")).unwrap());
+            let sql = format!("CREATE VIEW v AS {sql}");
+            let replaced = replace_string_constant(&sql, constants[0].location, "16384").unwrap();
+            assert_eq!(
+                replaced,
+                sql.replace(
+                    &sql[constants[0].location..sql.find("::").unwrap()],
+                    "'16384'"
+                )
+            );
+            parse(&replaced).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_string_constant_is_replaced_in_place() {
+        let sql = "SELECT 'a''b'::regclass, 1";
+        let location = sql.find("'a").unwrap();
+        assert_eq!(
+            replace_string_constant(sql, location, "16384").unwrap(),
+            "SELECT '16384'::regclass, 1"
         );
     }
 

@@ -1,9 +1,9 @@
 use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
+use crate::ast::{self, ResolveType, SortOrder, TableInternalId};
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -284,6 +284,16 @@ pub struct ProgramBuilder {
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
     pub constant_spans: Vec<(usize, usize)>,
+    /// Constant expressions that `resolve_expr` moved to the init section, with
+    /// the register that holds the value of each. An equal constant reads that
+    /// register instead of loading the value again, as SQLite's
+    /// `sqlite3ExprCodeRunJustOnce()` does.
+    reusable_constants: Vec<(ast::Expr, usize)>,
+    /// The number of [Self::constants_in_place_start] calls that
+    /// [Self::constant_spans_invalidate_after] has not ended. While it is not
+    /// zero, a constant stays where it is emitted, so its register cannot be
+    /// reused.
+    constants_in_place_depth: usize,
     /// Cursors that are referenced by the program. Indexed by [CursorKey].
     /// Certain types of cursors do not need a [CursorKey] (e.g. temp tables, sorter),
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
@@ -294,7 +304,15 @@ pub struct ProgramBuilder {
     /// before* the label's logical "next-insn" anchor. The label resolves to
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
+    /// Only `set_label_anchor` writes an anchor, so that `max_label_anchor`
+    /// stays correct.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
+    /// The largest anchor in `label_to_resolved_offset`. While instructions
+    /// are emitted, a label is only anchored to the last instruction or to the
+    /// anchor of another label, so no anchor is past the last instruction, and
+    /// a label targets the next instruction exactly when this anchor is the
+    /// last instruction.
+    max_label_anchor: Option<InsnReference>,
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
@@ -347,7 +365,8 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
-    /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
+    /// True once any `Insn::Function` or `Insn::TypeConversion` has been
+    /// emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
     free_register_ranges: Vec<Range<usize>>,
@@ -391,6 +410,10 @@ pub struct ProgramBuilder {
     /// `PreparedProgram::has_materialized_views`), so this can't go stale
     /// while the built program runs.
     has_materialized_views: bool,
+    /// Nesting level of this program: 0 for the program of a statement, and one
+    /// more than the level of the parent program for a trigger or foreign key
+    /// action program.
+    subprogram_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -409,6 +432,8 @@ impl ProgramBuilderFlags {
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const READS_STORED_VALUES: u16 = 1 << 9;
     const WRITES_STORED_VALUES: u16 = 1 << 10;
+    const HIDES_CONSTRAINT_VALUES: u16 = 1 << 11;
+    const READS_DATABASE_FILE: u16 = 1 << 12;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -483,6 +508,17 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
+    /// Whether the builder emitted an opcode that reads or writes a database
+    /// file, mirroring SQLite's `Vdbe.bIsReader`.
+    pub const fn reads_database_file(self) -> bool {
+        self.get(Self::READS_DATABASE_FILE)
+    }
+    #[inline]
+    pub const fn set_reads_database_file(&mut self, v: bool) {
+        self.set(Self::READS_DATABASE_FILE, v)
+    }
+
+    #[inline]
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
     pub const fn is_subprogram(self) -> bool {
         self.get(Self::IS_SUBPROGRAM)
@@ -526,6 +562,18 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_reads_stored_values(&mut self, v: bool) {
         self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// When set, the errors of the statement's constraints do not show the
+    /// values of the row that broke them. Set for a statement that writes a
+    /// table for a role that may not read it.
+    pub const fn hides_constraint_values(self) -> bool {
+        self.get(Self::HIDES_CONSTRAINT_VALUES)
+    }
+    #[inline]
+    pub const fn set_hides_constraint_values(&mut self, v: bool) {
+        self.set(Self::HIDES_CONSTRAINT_VALUES, v)
     }
 
     #[inline]
@@ -745,6 +793,9 @@ macro_rules! emit_explain {
 impl ProgramBuilder {
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
+    // Translation registers each variable of a statement two times, and a
+    // multirow INSERT can have thousands of variables.
+    #[inline]
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
         let index = usize::try_from(variable.index.get())
             .expect("u32 variable index must fit into usize")
@@ -784,18 +835,23 @@ impl ProgramBuilder {
             None,
             false,
             false,
+            0,
         )
     }
     /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
     /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
     /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
     /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
+    ///
+    /// `subprogram_depth` is the nesting level of the trigger program: one more
+    /// than the level of the program that fires the trigger.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -804,6 +860,7 @@ impl ProgramBuilder {
             Some(trigger),
             true,
             mvcc_enabled,
+            subprogram_depth,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
@@ -813,11 +870,16 @@ impl ProgramBuilder {
     /// subprogram runs inside the same transaction as its parent statement, so code
     /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
     /// or MVCC-unaware path the parent takes.
+    ///
+    /// `subprogram_depth` is the nesting level of the subprogram: one more than the
+    /// level of the program that executes it, or 0 for a program that no other
+    /// program executes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -826,6 +888,7 @@ impl ProgramBuilder {
             None,
             true,
             mvcc_enabled,
+            subprogram_depth,
         )
     }
 
@@ -838,6 +901,7 @@ impl ProgramBuilder {
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -849,7 +913,10 @@ impl ProgramBuilder {
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
+            reusable_constants: Vec::new(),
+            constants_in_place_depth: 0,
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
+            max_label_anchor: None,
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
@@ -885,6 +952,7 @@ impl ProgramBuilder {
             next_subquery_eqp_id: 1,
             target_union_type: None,
             has_materialized_views: false,
+            subprogram_depth,
         }
     }
 
@@ -1108,6 +1176,31 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
+    /// Nesting level of this program: 0 for the program of a statement, and one
+    /// more than the level of the parent program for a trigger or foreign key
+    /// action program.
+    pub const fn subprogram_depth(&self) -> usize {
+        self.subprogram_depth
+    }
+
+    /// Nesting level of a trigger or foreign key action program that this
+    /// program starts, or `None` when that level is past
+    /// [MAX_TRIGGER_DEPTH](crate::vdbe::MAX_TRIGGER_DEPTH). For `None`, the
+    /// method emits a `Halt` with the error of SQLite instead of the program.
+    /// Thus, as in SQLite, the error occurs only if the statement gets to that
+    /// level.
+    pub fn nested_subprogram_depth(&mut self) -> Option<usize> {
+        let depth = self.subprogram_depth + 1;
+        if depth > crate::vdbe::MAX_TRIGGER_DEPTH {
+            self.emit_halt_err(
+                crate::error::SQLITE_ERROR,
+                crate::vdbe::TRIGGER_DEPTH_ERROR.to_string(),
+            );
+            return None;
+        }
+        Some(depth)
+    }
+
     /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
@@ -1128,10 +1221,35 @@ impl ProgramBuilder {
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
-        self.insns.reserve(opts.approx_num_insns);
+        let needed = self.insns.len() + opts.approx_num_insns;
+        if needed > self.insns.capacity() {
+            // At least double the capacity, as `Vec::reserve` does.
+            self.move_insns_to_capacity(needed.max(2 * self.insns.capacity()));
+        }
         self.cursor_ref.reserve(opts.num_cursors);
         self.label_to_resolved_offset
             .reserve(opts.approx_num_labels);
+    }
+
+    /// Make room for at least `additional` more instructions. The capacity
+    /// grows to a power of two, as repeated doubling of the `Vec` would make
+    /// it, but the instructions are copied only once.
+    pub fn reserve_insns(&mut self, additional: usize) {
+        let needed = self.insns.len() + additional;
+        if needed > self.insns.capacity() {
+            self.move_insns_to_capacity(needed.next_power_of_two());
+        }
+    }
+
+    /// Move the instructions to a new allocation for `capacity` instructions.
+    /// `Vec::reserve` calls `realloc`, which copies all of the old allocation,
+    /// because it does not know which part of it holds instructions. When a
+    /// statement reserves its estimate, only a few of the 32 instructions that
+    /// the builder starts with are in use.
+    fn move_insns_to_capacity(&mut self, capacity: usize) {
+        let mut insns = Vec::with_capacity(capacity);
+        insns.append(&mut self.insns);
+        self.insns = insns;
     }
 
     /// Start a new constant span. The next instruction to be emitted will be the first
@@ -1163,6 +1281,36 @@ impl ProgramBuilder {
         }
     }
 
+    /// Moves the instructions that `emit` emits to the end of the program,
+    /// where Init jumps before the first row is read, so they run once per
+    /// statement. Unlike a constant expression, they do not have to be
+    /// constant: `random()` emitted here is called once and every row sees
+    /// the same value. They must not read a cursor, because none is open yet.
+    pub fn emit_once_per_statement<T>(
+        &mut self,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        turso_assert!(
+            !self.constant_span_is_open(),
+            "code that runs once per statement is emitted outside constant code"
+        );
+        let first_span_of_emit = self.constant_spans.len();
+        let first_insn = self.insns.len();
+        // The code that `emit` emits can branch, so a constant inside it is
+        // not always loaded, and its register cannot be reused.
+        self.constants_in_place_depth += 1;
+        let result = emit(self);
+        self.constants_in_place_depth -= 1;
+        let result = result?;
+        // One span over everything `emit` emitted replaces the spans of the
+        // constant expressions inside it.
+        self.constant_spans.truncate(first_span_of_emit);
+        if self.insns.len() > first_insn {
+            self.constant_spans.push((first_insn, self.insns.len() - 1));
+        }
+        Ok(result)
+    }
+
     /// Check if there is a constant span that is currently open.
     pub fn constant_span_is_open(&self) -> bool {
         self.constant_spans
@@ -1171,9 +1319,15 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
-    /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
+        self.constant_spans.len()
+    }
+
+    /// Starts code whose constant expressions stay where they are emitted,
+    /// and returns the index of the next constant span. The code ends with
+    /// [Self::constant_spans_invalidate_after] called with that index.
+    pub fn constants_in_place_start(&mut self) -> usize {
+        self.constants_in_place_depth += 1;
         self.constant_spans.len()
     }
 
@@ -1181,7 +1335,44 @@ impl ProgramBuilder {
     /// be sure that constant optimization is never used for translating a given expression.
     /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
+        self.constants_in_place_depth -= 1;
         self.constant_spans.truncate(idx);
+    }
+
+    /// Whether the register of a constant can be given to an equal constant.
+    /// A subprogram does not move its constants to an init section (see
+    /// [Self::epilogue]), and [Self::constants_in_place_start] keeps them
+    /// where they are emitted, so in both a constant is not loaded before
+    /// every instruction that would read its register.
+    fn constants_are_reusable(&self) -> bool {
+        !self.flags.is_subprogram() && self.constants_in_place_depth == 0
+    }
+
+    /// The register of a constant equal to `expr` that
+    /// [Self::add_reusable_constant] recorded.
+    pub fn reusable_constant_register(&self, expr: &ast::Expr) -> Option<usize> {
+        if !self.constants_are_reusable() {
+            return None;
+        }
+        self.reusable_constants
+            .iter()
+            .find(|(constant, _)| constant == expr)
+            .map(|(_, reg)| *reg)
+    }
+
+    /// Records that `reg` holds the value of the constant `expr`, which the
+    /// instructions from the start of the constant span `span_idx` to the last
+    /// instruction load. It records nothing unless all of those instructions
+    /// are in that span: only then do they move to the init section, which
+    /// runs before any instruction that can read `reg`.
+    pub fn add_reusable_constant(&mut self, expr: &ast::Expr, reg: usize, span_idx: usize) {
+        if !self.constants_are_reusable() || self.constant_spans.len() != span_idx + 1 {
+            return;
+        }
+        let (start, end) = self.constant_spans[span_idx];
+        if start <= end && end + 1 == self.insns.len() {
+            self.reusable_constants.push((expr.clone(), reg));
+        }
     }
 
     pub fn alloc_register(&mut self) -> usize {
@@ -1365,6 +1556,7 @@ impl ProgramBuilder {
             alias: Some(col_name),
             implicit_column_name: None,
             contains_aggregates: false,
+            values_condition_type: None,
         });
     }
 
@@ -1374,8 +1566,11 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
-        // Any function can raise at runtime; see Self::may_abort.
-        if matches!(insn, Insn::Function { .. }) {
+        self.flags
+            .set_reads_database_file(self.flags.reads_database_file() | insn.reads_database_file());
+        // Any function can raise at runtime, and so can the conversion of a
+        // type; see Self::may_abort.
+        if matches!(insn, Insn::Function { .. } | Insn::TypeConversion { .. }) {
             self.emitted_function_call = true;
         }
         if let Insn::Column {
@@ -1483,7 +1678,12 @@ impl ProgramBuilder {
             return false;
         };
         let last = last as u32;
-        self.label_to_resolved_offset.contains(&Some(last))
+        let targets = self.max_label_anchor == Some(last);
+        crate::turso_debug_assert!(
+            targets == self.label_to_resolved_offset.contains(&Some(last)),
+            "the largest label anchor gives another answer than the labels"
+        );
+        targets
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1546,10 +1746,6 @@ impl ProgramBuilder {
         });
     }
 
-    // no users yet, but I want to avoid someone else in the future
-    // just adding parameters to emit_halt! If you use this, remove the
-    // clippy warning please.
-    #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
             constraint_info: None,
@@ -1591,15 +1787,27 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn with_cte_materialization_eqp<T>(
+    /// Runs `emit`, which fills the table of a FROM clause subquery or CTE,
+    /// under a `MATERIALIZE <name>` step of the query plan. For a CTE, the
+    /// plan steps of the body are also listed in `cte_materializations`.
+    pub fn with_materialization_eqp<T>(
         &mut self,
-        cte_id: usize,
+        cte_id: Option<usize>,
         name: &str,
         emit: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        emit_explain!(
+            self,
+            true,
+            EqpDetail::Materialize {
+                cte_id,
+                name: name.to_string(),
+            }
+        );
         let insns_start = self.insns.len();
         let emitted = emit(self)?;
-        if self.mode.is_explain_query_plan() {
+        self.pop_current_parent_explain();
+        if let (Some(cte_id), true) = (cte_id, self.mode.is_explain_query_plan()) {
             let node_ids: Vec<usize> = (insns_start..self.insns.len())
                 .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
                 .collect();
@@ -1658,33 +1866,39 @@ impl ProgramBuilder {
         // where they are executed once after Init jumps to it.
 
         // Stable partition: non-constant instructions first, then constant.
+        // `extract_if` takes the constant instructions out and moves the other
+        // instructions back in the same buffer, so the instructions before the
+        // first constant one stay where they are, and no second buffer for
+        // the whole program is necessary.
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        let mut non_constant = Vec::with_capacity(self.insns.len());
-        let mut constant = Vec::new();
+        let len = self.insns.len();
+        // The spans are inclusive, so their lengths add up to the number of
+        // constant instructions. A `Vec` that starts empty copies all of its
+        // instructions each time it doubles.
+        let num_constant = self
+            .constant_spans
+            .iter()
+            .map(|&(start, end)| end.saturating_add(1).min(len).saturating_sub(start))
+            .sum::<usize>()
+            .min(len);
+        let mut constant = Vec::with_capacity(num_constant);
+        let spans = &self.constant_spans;
         let mut span_idx = 0;
-
-        for item in self.insns.drain(..) {
-            let idx = item.1;
-
+        constant.extend(self.insns.extract_if(.., |&mut (_, idx)| {
             // Advance past spans we've completely passed
-            while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {
+            while span_idx < spans.len() && spans[span_idx].1 < idx {
                 span_idx += 1;
             }
 
             // Check if current span contains this index
-            let is_constant =
-                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+            span_idx < spans.len() && spans[span_idx].0 <= idx
+        }));
 
-            if is_constant {
-                constant.push(item);
-            } else {
-                non_constant.push(item);
-            }
-        }
-
-        self.insns = non_constant;
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, a full buffer doubles for that push.
+        self.insns.reserve_exact(constant.len() + 1);
         self.insns.extend(constant);
 
         // Build old index -> new position mapping
@@ -1693,9 +1907,13 @@ impl ProgramBuilder {
             old_to_new[*old_idx] = new_pos;
         }
 
-        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some(old_offset) = resolved_offset {
-                *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
+        // A remapped anchor can be smaller than before, so the largest anchor
+        // is found again.
+        self.max_label_anchor = None;
+        for label_index in 0..self.label_to_resolved_offset.len() {
+            if let Some(old_offset) = self.label_to_resolved_offset[label_index] {
+                let new_offset = old_to_new[old_offset as usize] as InsnReference;
+                self.set_label_anchor(label_index, new_offset);
             }
         }
 
@@ -1749,7 +1967,7 @@ impl ProgramBuilder {
             unreachable!("preassign_label_to_next_insn requires a Label, got {label:?}");
         };
         let anchor = self.offset().as_offset_int().saturating_sub(1);
-        self.label_to_resolved_offset[label_number as usize] = Some(anchor);
+        self.set_label_anchor(label_number as usize, anchor);
     }
 
     /// Resolve `dest` so that it ends up pointing at the same final offset as
@@ -1773,7 +1991,15 @@ impl ProgramBuilder {
         };
         let resolution = self.label_to_resolved_offset[anchor_n as usize]
             .expect("anchor label must already be preassigned/resolved");
-        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
+        self.set_label_anchor(dest_n as usize, resolution);
+    }
+
+    /// Anchor the label with index `label_index` at the instruction offset
+    /// `anchor`, and keep `max_label_anchor` the largest anchor.
+    #[inline]
+    fn set_label_anchor(&mut self, label_index: usize, anchor: InsnReference) {
+        self.label_to_resolved_offset[label_index] = Some(anchor);
+        self.max_label_anchor = self.max_label_anchor.max(Some(anchor));
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -1908,6 +2134,9 @@ impl ProgramBuilder {
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
                 }
+                Insn::IfNeg { target_pc, .. } => {
+                    resolve(target_pc, "IfNeg")?;
+                }
                 Insn::Next { pc_if_next, .. } => {
                     resolve(pc_if_next, "Next")?;
                 }
@@ -2021,6 +2250,7 @@ impl ProgramBuilder {
             }
         }
         self.label_to_resolved_offset.clear();
+        self.max_label_anchor = None;
         Ok(())
     }
 
@@ -2544,6 +2774,9 @@ impl ProgramBuilder {
         self.parameters.list.dedup();
 
         self.explain.build_ephemeral_cursors(&self.insns);
+        let destroys_btree = self.insns.iter().any(|(insn, _)| {
+            matches!(insn, Insn::Destroy { .. } | Insn::IndexMethodDestroy { .. })
+        });
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
@@ -2562,6 +2795,7 @@ impl ProgramBuilder {
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
+            reads_database_file: self.flags.reads_database_file(),
             result_columns: self.result_columns,
             result_column_types: self.result_column_types,
             table_references: self.table_references,
@@ -2575,6 +2809,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             is_multi_write: self.flags.is_multi_write(),
+            hides_constraint_values: self.flags.hides_constraint_values(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,
@@ -2583,6 +2818,7 @@ impl ProgramBuilder {
             custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            destroys_btree,
         };
         Ok(prepared)
     }
@@ -2590,18 +2826,18 @@ impl ProgramBuilder {
     #[turso_macros::trace_stack]
     pub fn build(
         self,
-        connection: Arc<Connection>,
+        connection: &Connection,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
-        let prepare_context = PrepareContext::from_connection(&connection);
+        let prepare_context = PrepareContext::from_connection(connection);
         let prepared = self.build_prepared_program(
             prepare_context,
             connection.custom_collations(),
             change_cnt_on,
             sql,
         )?;
-        Ok(Program::from_prepared(Arc::new(prepared), connection))
+        Ok(Program::from_prepared(Arc::new(prepared)))
     }
 }
 

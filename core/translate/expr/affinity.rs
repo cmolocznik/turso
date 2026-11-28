@@ -1,10 +1,10 @@
+use crate::ast;
 use crate::{
     translate::{alter::literal_default_value, expr_context::ExprProperties},
     types::ValueType,
     vdbe::affinity::Affinity,
 };
 use bitflags::bitflags;
-use turso_parser::ast;
 
 bitflags! {
     /// Storage class flags that represent the possible storage classes an expression can yield.
@@ -56,7 +56,9 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                Affinity::of_written_type(&crate::util::dequote(&type_name.name))
+                metadata.cast_affinity(type_name).unwrap_or_else(|| {
+                    Affinity::of_written_type(&crate::util::dequote(&type_name.name))
+                })
             } else {
                 Affinity::None
             }
@@ -85,6 +87,7 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: 1,
+                    ..
                 },
             ..
         } => metadata

@@ -1,3 +1,6 @@
+use crate::ast::{
+    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
+};
 use crate::namespace::NamespaceRef;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt},
@@ -19,12 +22,13 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::KeyInfo,
     types::SeekOp,
     util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
-        insn::{HashDistinctData, Insn},
+        insn::{CmpInsFlags, HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable, MAIN_DB_ID, TEMP_DB_ID,
@@ -32,14 +36,11 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
 
-use turso_parser::ast::TableInternalId;
+use crate::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
+use super::expr::expr_type::{query_column_type, type_ordering, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -51,8 +52,12 @@ use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprT
 ///
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
-fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, &TableMetadata::new(tables))
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Affinity {
+    get_expr_affinity(expr, &ExprContext::new(tables, resolver))
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -65,14 +70,23 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
 /// class.
-pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+pub(super) fn compound_column_affinity(
+    arms: &[&SelectPlan],
+    i: usize,
+    resolver: &Resolver,
+) -> Affinity {
     if arms.is_empty() {
         return Affinity::None;
     }
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
+            .map(|rc| {
+                get_expr_affinity(
+                    &rc.expr,
+                    &ExprContext::new(Some(&arm.table_references), resolver),
+                )
+            })
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
@@ -118,6 +132,9 @@ pub struct ResultSetColumn {
     pub implicit_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
+    /// The type of this column of a VALUES list, when it is the schema's type
+    /// for conditions. `expr` is only a placeholder in a VALUES list.
+    pub(crate) values_condition_type: Option<ExprType>,
 }
 
 impl ResultSetColumn {
@@ -172,8 +189,8 @@ impl ResultSetColumn {
 
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
-    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables))).short_type_name()
+    pub fn declared_type(&self, tables: &TableReferences, resolver: &Resolver) -> &'static str {
+        get_expr_affinity(&self.expr, &ExprContext::new(Some(tables), resolver)).short_type_name()
     }
 }
 
@@ -547,6 +564,18 @@ impl Plan {
         }
     }
 
+    /// Returns a mutable reference to the LIMIT of a SELECT plan. For a compound
+    /// SELECT it is the LIMIT of the whole compound.
+    /// Returns None for Delete/Update plans.
+    pub fn select_limit_mut(&mut self) -> Option<&mut Option<Box<Expr>>> {
+        match self {
+            Plan::Select(select_plan) => Some(&mut select_plan.limit),
+            Plan::CompoundSelect { limit, .. } => Some(limit),
+            Plan::RecursiveCte(plan) => Some(&mut plan.limit),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
     /// Returns the result columns of a SELECT or compound SELECT plan. For a
     /// compound SELECT the columns of the right-most component are returned,
     /// since every component must agree on column count and naming.
@@ -698,9 +727,7 @@ pub enum QueryDestination {
     /// Insert rows produced by a recursive CTE into its work queue.
     RecursiveCteQueue {
         cursor_id: CursorID,
-        index: Arc<Index>,
-        /// Result columns that determine which queued row is read next.
-        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+        queue: RecursiveCteQueue,
         /// Index of rows already produced by a recursive `UNION`.
         seen_rows: Option<(CursorID, Arc<Index>)>,
     },
@@ -715,6 +742,9 @@ pub enum QueryDestination {
         result_reg_start: usize,
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
+        /// The register that counts the stored rows, when a second row is an
+        /// error (see [ast::SubqueryType::RowValue]).
+        row_count_reg: Option<usize>,
     },
     /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
     /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.
@@ -724,6 +754,21 @@ pub enum QueryDestination {
     },
     /// Decision made at some point after query plan construction.
     Unset,
+}
+
+/// The B-tree that holds the work queue of a recursive CTE.
+#[derive(Debug, Clone)]
+pub enum RecursiveCteQueue {
+    /// Without ORDER BY, rows are read in the order they were added, so the
+    /// queue is an ephemeral rowid table, as in SQLite.
+    Fifo { table: Arc<BTreeTable> },
+    /// With ORDER BY, the queue is an ephemeral index keyed on the ORDER BY
+    /// terms, then a sequence number, then the result columns.
+    Ordered {
+        index: Arc<Index>,
+        /// Result columns that determine which queued row is read next.
+        sort_keys: alloc::Vec<RecursiveCteQueueKey>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -763,27 +808,140 @@ pub enum Distinctness {
     NonDistinct,
     /// The column is a DISTINCT column,
     /// and includes a translation context for handling duplicates.
-    Distinct { ctx: Option<DistinctCtx> },
+    Distinct {
+        ctx: Option<DistinctCtx>,
+        /// rows already come sorted by the distinct columns
+        ordered: bool,
+    },
+    /// `DISTINCT ON`: of the rows that follow each other with equal values in the first
+    /// `key_count` ORDER BY terms, only the first is returned.
+    DistinctOn { key_count: usize },
+    /// `DISTINCT ON` of a query whose rows arrive in ORDER BY order without a sort: of the
+    /// rows that follow each other with equal values in `keys`, only the first is returned.
+    DistinctOnRowsInOrder {
+        keys: Vec<ast::Expr>,
+        registers: Option<DistinctOnRegisters>,
+    },
 }
 
 impl Distinctness {
     pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
         match distinctness {
-            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
+            Some(ast::Distinctness::Distinct) => Self::Distinct {
+                ctx: None,
+                ordered: false,
+            },
             Some(ast::Distinctness::All) => Self::NonDistinct,
             None => Self::NonDistinct,
         }
     }
     pub fn is_distinct(&self) -> bool {
-        matches!(self, Distinctness::Distinct { .. })
+        !matches!(self, Distinctness::NonDistinct)
     }
+    pub fn is_distinct_on(&self) -> bool {
+        matches!(
+            self,
+            Distinctness::DistinctOn { .. } | Distinctness::DistinctOnRowsInOrder { .. }
+        )
+    }
+    pub fn is_ordered(&self) -> bool {
+        matches!(self, Distinctness::Distinct { ordered: true, .. })
+    }
+    pub fn set_ordered(&mut self, value: bool) {
+        if let Distinctness::Distinct { ordered, .. } = self {
+            *ordered = value;
+        }
+    }
+}
+
+/// Registers that DISTINCT ON uses to tell whether a row starts a new group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctOnRegisters {
+    /// The key of the last row that was returned.
+    reg_previous_key_start: usize,
+    /// The key of the current row.
+    pub reg_key_start: usize,
+    /// 0 until a row has been returned.
+    reg_has_previous_key: usize,
+    key_count: usize,
+}
+
+impl DistinctOnRegisters {
+    pub fn alloc(program: &mut ProgramBuilder, key_count: usize) -> Self {
+        let registers = Self {
+            // `Insn::Compare` needs its first run of registers to come before its second.
+            reg_previous_key_start: program.alloc_registers(key_count),
+            reg_key_start: program.alloc_registers(key_count),
+            reg_has_previous_key: program.alloc_register(),
+            key_count,
+        };
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: registers.reg_has_previous_key,
+        });
+        registers
+    }
+
+    /// Jumps to `label_skip_row` when the key at `reg_key_start` equals the key of the last
+    /// row that was returned.
+    pub fn emit_skip_unless_first_row_of_group(
+        &self,
+        program: &mut ProgramBuilder,
+        key_collations: Vec<CollationSeq>,
+        label_skip_row: BranchOffset,
+    ) {
+        let label_new_group = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: self.reg_has_previous_key,
+            target_pc: label_new_group,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::Compare {
+            start_reg_a: self.reg_previous_key_start,
+            start_reg_b: self.reg_key_start,
+            count: self.key_count,
+            key_info: key_collations
+                .into_iter()
+                .map(|collation| KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation,
+                    nulls_order: None,
+                })
+                .collect(),
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: label_new_group,
+            target_pc_eq: label_skip_row,
+            target_pc_gt: label_new_group,
+        });
+        program.preassign_label_to_next_insn(label_new_group);
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_has_previous_key,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.reg_key_start,
+            dst_reg: self.reg_previous_key_start,
+            extra_amount: self.key_count - 1,
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DistinctMethod {
+    Hash {
+        hash_table_id: usize,
+    },
+    Ordered {
+        previous_key_reg: usize,
+        has_previous_reg: usize,
+    },
 }
 
 /// Translation context for handling DISTINCT columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistinctCtx {
-    /// Hash table id used to deduplicate results.
-    pub hash_table_id: usize,
+    pub method: DistinctMethod,
     /// Collations for each distinct key column.
     pub collations: Vec<CollationSeq>,
     /// The label for the on conflict branch.
@@ -792,17 +950,52 @@ pub struct DistinctCtx {
 }
 
 impl DistinctCtx {
-    /// A DISTINCT that finds duplicates with a hash table. The values are
-    /// compared with `collations`, so each must be one that can be hashed.
-    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+    pub fn new(
+        program: &mut ProgramBuilder,
+        collations: Vec<CollationSeq>,
+        ordered: bool,
+    ) -> Result<Self> {
         if let Some(collation) = collations.iter().find(|collation| !collation.can_hash()) {
             crate::bail_parse_error!("DISTINCT does not support the custom collation {collation}");
         }
+        let method = if ordered {
+            DistinctMethod::Ordered {
+                previous_key_reg: program.alloc_registers(collations.len()),
+                has_previous_reg: program.alloc_register(),
+            }
+        } else {
+            DistinctMethod::Hash {
+                hash_table_id: program.alloc_hash_table_id(),
+            }
+        };
         Ok(Self {
-            hash_table_id: program.alloc_hash_table_id(),
+            method,
             collations,
             label_on_conflict: program.allocate_label(),
         })
+    }
+
+    pub fn is_ordered(&self) -> bool {
+        matches!(self.method, DistinctMethod::Ordered { .. })
+    }
+
+    // a subquery can run many times, so we reset every time
+    pub fn emit_reset(&self, program: &mut ProgramBuilder) {
+        match &self.method {
+            DistinctMethod::Hash { hash_table_id } => {
+                program.emit_insn(Insn::HashClear {
+                    hash_table_id: *hash_table_id,
+                });
+            }
+            DistinctMethod::Ordered {
+                has_previous_reg, ..
+            } => {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: *has_previous_reg,
+                });
+            }
+        }
     }
 
     pub fn emit_deduplication_insns(
@@ -811,15 +1004,52 @@ impl DistinctCtx {
         num_regs: usize,
         start_reg: usize,
     ) {
-        program.emit_insn(Insn::HashDistinct {
-            data: Box::new(HashDistinctData {
-                hash_table_id: self.hash_table_id,
-                key_start_reg: start_reg,
-                num_keys: num_regs,
-                collations: self.collations.clone(),
-                target_pc: self.label_on_conflict,
-            }),
-        });
+        match &self.method {
+            DistinctMethod::Hash { hash_table_id } => {
+                program.emit_insn(Insn::HashDistinct {
+                    data: Box::new(HashDistinctData {
+                        hash_table_id: *hash_table_id,
+                        key_start_reg: start_reg,
+                        num_keys: num_regs,
+                        collations: self.collations.clone(),
+                        target_pc: self.label_on_conflict,
+                    }),
+                });
+            }
+            DistinctMethod::Ordered {
+                previous_key_reg,
+                has_previous_reg,
+            } => {
+                let new_key = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: *has_previous_reg,
+                    target_pc: new_key,
+                    jump_if_null: true,
+                });
+                for (i, collation) in self.collations.iter().enumerate() {
+                    program.emit_insn(Insn::Ne {
+                        lhs: previous_key_reg + i,
+                        rhs: start_reg + i,
+                        target_pc: new_key,
+                        flags: CmpInsFlags::default().null_eq(),
+                        collation: *collation,
+                    });
+                }
+                program.emit_insn(Insn::Goto {
+                    target_pc: self.label_on_conflict,
+                });
+                program.preassign_label_to_next_insn(new_key);
+                program.emit_insn(Insn::Copy {
+                    src_reg: start_reg,
+                    dst_reg: *previous_key_reg,
+                    extra_amount: num_regs - 1,
+                });
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: *has_previous_reg,
+                });
+            }
+        }
     }
 }
 
@@ -874,10 +1104,14 @@ pub struct SelectPlan {
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
+    // The parser gives these expressions boxed. Unboxing them copies each one.
+    #[allow(clippy::vec_box)]
+    pub values: Vec<Vec<Box<Expr>>>,
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
-    pub window: Option<Window>,
+    /// Boxed because only queries with window functions have a window, and each move of a
+    /// `SelectPlan` would copy its 152 bytes.
+    pub window: Option<Box<Window>>,
     /// Subqueries that appear in any part of the query apart from the FROM clause
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Estimated number of times this SELECT will be invoked by its parent scope.
@@ -898,6 +1132,18 @@ pub struct SelectPlan {
 }
 
 impl SelectPlan {
+    /// The expressions that give result column `column` its values: that of
+    /// every row of a VALUES list, whose result columns hold only
+    /// placeholders, or else the result column's expression.
+    pub fn column_exprs(&self, column: usize) -> impl Iterator<Item = &ast::Expr> + Clone {
+        let values = self.values.iter().map(move |row| row[column].as_ref());
+        let result_column = self
+            .values
+            .is_empty()
+            .then(|| &self.result_columns[column].expr);
+        values.chain(result_column)
+    }
+
     pub fn joined_tables(&self) -> &[JoinedTable] {
         self.table_references.joined_tables()
     }
@@ -1076,13 +1322,15 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// The checks of row-level security that each new row must pass.
+    pub(crate) row_checks: Vec<crate::translate::row_security::RowCheck>,
 }
 
 impl UpdatePlan {
     /// Combine the UPDATE target (always first) and the `FROM`-clause tables
     /// into one `TableReferences` — the read-side scope used for planning
     /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
-    /// back to SQL text via `ToTokens`.
+    /// back to SQL text via `WriteSql`.
     /// The plan stores the two separately because the write-side emitter
     /// treats the target table specially; this helper rejoins them for readers.
     pub fn build_read_scope_tables(&self) -> TableReferences {
@@ -1414,6 +1662,7 @@ fn star_result_column(
         implicit_column_name: None,
         expr,
         contains_aggregates: false,
+        values_condition_type: None,
     }
 }
 
@@ -1579,20 +1828,32 @@ pub fn resolve_unqualified_column(
     tables: &[JoinedTable],
     column_name: &str,
 ) -> Result<Option<ResolvedColumn>> {
+    resolve_unqualified_column_except(tables, column_name, &[])
+}
+
+/// Like [resolve_unqualified_column], but the tables in `excluded` have no columns.
+pub fn resolve_unqualified_column_except(
+    tables: &[JoinedTable],
+    column_name: &str,
+    excluded: &[TableInternalId],
+) -> Result<Option<ResolvedColumn>> {
+    let lookup = |table: &JoinedTable, include_rowid_names: bool| {
+        if excluded.contains(&table.internal_id) {
+            return ColumnLookup::Missing;
+        }
+        lookup_unqualified_column(&table.table, column_name, include_rowid_names)
+    };
     let has_declared_column = crate::translate::planner::ROWID_STRS
         .iter()
         .any(|name| name.eq_ignore_ascii_case(column_name))
-        && tables.iter().any(|table| {
-            !matches!(
-                lookup_unqualified_column(&table.table, column_name, false),
-                ColumnLookup::Missing
-            )
-        });
+        && tables
+            .iter()
+            .any(|table| !matches!(lookup(table, false), ColumnLookup::Missing));
     let found = unqualified_column_sources(
         tables,
         column_name,
         |table| table.join_info.as_ref(),
-        |table| lookup_unqualified_column(&table.table, column_name, !has_declared_column),
+        |table| lookup(table, !has_declared_column),
     );
     if found.ambiguous {
         crate::bail_parse_error!("ambiguous column name: {}", column_name);
@@ -1740,25 +2001,39 @@ pub fn left_using_column_sources<'a, S>(
 pub fn merge_columns<'a>(
     sources: impl IntoIterator<Item = (TableInternalId, &'a Table, usize)>,
 ) -> ResolvedColumn {
-    let mut expressions = Vec::new();
-    let mut source_columns = SmallVec::new();
-    for (table_id, table, column_index) in sources {
-        expressions.push(Box::new(Expr::Column {
+    let column_expr =
+        |table_id: TableInternalId, table: &Table, column_index: usize| Expr::Column {
             database: None,
             table: table_id,
             column: column_index,
             is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
-        }));
+        };
+    let mut sources = sources.into_iter();
+    let (table_id, table, column_index) = sources
+        .next()
+        .expect("a merged column has at least one source");
+    let mut source_columns = SmallVec::new();
+    source_columns.push((table_id, column_index));
+    let first = column_expr(table_id, table, column_index);
+    // Almost all columns have one source, and their value is the plain column.
+    // Return it without the Vec and the Box of a merged column.
+    let Some((table_id, table, column_index)) = sources.next() else {
+        return ResolvedColumn {
+            expr: first,
+            source_columns,
+        };
+    };
+    source_columns.push((table_id, column_index));
+    let mut expressions = vec![
+        Box::new(first),
+        Box::new(column_expr(table_id, table, column_index)),
+    ];
+    for (table_id, table, column_index) in sources {
+        expressions.push(Box::new(column_expr(table_id, table, column_index)));
         source_columns.push((table_id, column_index));
     }
-    assert!(!expressions.is_empty());
-    let expr = if expressions.len() == 1 {
-        *expressions.pop().unwrap()
-    } else {
-        Expr::MergedColumn(expressions)
-    };
     ResolvedColumn {
-        expr,
+        expr: Expr::MergedColumn(expressions),
         source_columns,
     }
 }
@@ -1791,7 +2066,9 @@ pub struct JoinedTable {
     pub op: Operation,
     /// How a RIGHT or FULL JOIN reads unmatched right rows after the main join loop.
     /// SQLite plans this read separately from the main loop. `None` means a default scan.
-    pub unmatched_right_rows_plan: Option<UnmatchedRightRowsPlan>,
+    /// Boxed because only RIGHT and FULL joins have this plan, and each move of a
+    /// `JoinedTable` would copy its 360 bytes.
+    pub unmatched_right_rows_plan: Option<Box<UnmatchedRightRowsPlan>>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1826,6 +2103,11 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
+    /// The condition that row-level security puts on the rows of the table.
+    /// It is checked as soon as the loop reads a row, before any other
+    /// condition, so no expression of the query sees a row it fails.
+    /// Boxed because only tables with row-level security have this condition.
+    pub row_filter: Option<Box<ast::Expr>>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -1869,8 +2151,9 @@ pub struct OuterQueryReference {
     pub col_used_mask: ColumnUsedMask,
     /// Original CTE SELECT AST for re-planning. When a CTE is referenced
     /// multiple times, each reference needs a fresh plan with unique
-    /// internal_ids to avoid cursor key collisions.
-    pub cte_select: Option<ast::Select>,
+    /// internal_ids to avoid cursor key collisions. Shared, because the outer
+    /// query references are copied into the scope of each nested query.
+    pub cte_select: Option<Arc<ast::Select>>,
     /// Explicit column names from WITH t(a, b) AS (...) syntax.
     pub cte_explicit_columns: Vec<String>,
     /// CTE ID if this is a CTE reference. Used to track CTE reference counts
@@ -1950,10 +2233,8 @@ impl Default for TableReferences {
 
 impl TableReferences {
     /// The maximum number of tables that can be joined together in a query.
-    /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
-    /// which can represent up to 128 tables.
-    /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
-    pub const MAX_JOINED_TABLES: usize = 63;
+    /// SQLite has the same limit (BMS, the number of bits in its table bitmask).
+    pub const MAX_JOINED_TABLES: usize = 64;
     pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
@@ -2241,13 +2522,18 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Returns the CTE with the given name from the nearest enclosing scope.
+    /// Within one scope, a query's own WITH clause comes after the references
+    /// it inherits, so the last match wins.
     pub fn find_cte_outer_query_ref_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .rev()
+            .filter(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .min_by_key(|t| t.scope_depth)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -2623,20 +2909,27 @@ impl<T: From<usize>> BitSet<T>
 where
     usize: From<T>,
 {
+    #[inline]
     pub fn set(&mut self, index: T) -> Result<(), alloc::TryReserveError> {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
-        } else {
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if overflow_idx >= overflow.len() {
-                overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
-                overflow.resize(overflow_idx + 1, 0);
-            }
-            overflow[overflow_idx] |= 1 << bit;
+            return Ok(());
         }
+        self.set_overflow_bit(index)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_overflow_bit(&mut self, index: usize) -> Result<(), alloc::TryReserveError> {
+        let overflow_idx = (index - Self::INLINE_BITS) / 64;
+        let bit = (index - Self::INLINE_BITS) % 64;
+        let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if overflow_idx >= overflow.len() {
+            overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
+            overflow.resize(overflow_idx + 1, 0);
+        }
+        overflow[overflow_idx] |= 1 << bit;
         Ok(())
     }
 
@@ -2734,17 +3027,25 @@ where
         }
     }
 
+    #[inline]
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
-        if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if self_ov.len() < other_ov.len() {
-                self_ov.try_reserve(other_ov.len() - self_ov.len())?;
-                self_ov.resize(other_ov.len(), 0);
-            }
-            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
-                *s |= o;
-            }
+        match &other.overflow {
+            None => Ok(()),
+            Some(other_ov) => self.union_overflow_with(other_ov),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn union_overflow_with(&mut self, other_ov: &[u64]) -> Result<(), alloc::TryReserveError> {
+        let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if self_ov.len() < other_ov.len() {
+            self_ov.try_reserve(other_ov.len() - self_ov.len())?;
+            self_ov.resize(other_ov.len(), 0);
+        }
+        for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+            *s |= o;
         }
         Ok(())
     }
@@ -3179,9 +3480,9 @@ pub(super) fn query_output_columns(
                 .or_else(|| result_column.name(table_references).map(String::from));
             let affinity = compound_arms
                 .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index))
+                .map(|arms| compound_column_affinity(arms, column_index, resolver))
                 .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
+                    infer_type_from_expr(&result_column.expr, Some(table_references), resolver)
                 });
             let column_type = affinity.to_type();
             let mut column = Column::new(
@@ -3199,7 +3500,6 @@ pub(super) fn query_output_columns(
         .try_collect::<alloc::Vec<_>>()?;
 
     let context = ExprContext::new(Some(table_references), resolver);
-    let env = context.type_env();
     let mut column_types = alloc::Vec::try_with_capacity_ext(columns.len())?;
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
@@ -3207,10 +3507,12 @@ pub(super) fn query_output_columns(
         // text collation of the leftmost SELECT only, as in SQLite. The
         // compound itself removes duplicates with the collation of
         // `compound_column_collation`, which looks at every SELECT.
-        let result_type = match &compound_arms {
-            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
-            None => type_of(result_expr, &env),
-        };
+        let mut result_type = query_column_type(plan, column_index, resolver);
+        let is_values_list = matches!(plan, Plan::Select(select) if !select.values.is_empty());
+        // A subquery hands its arrays to the outer query as text, which an array-typed column can't read.
+        if is_values_list && result_type.is_array() {
+            result_type = ExprType::Unknown;
+        }
         let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
         let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
@@ -3319,6 +3621,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3372,6 +3675,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3410,6 +3714,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -4419,6 +4724,7 @@ impl SubqueryPosition {
             SubqueryPosition::ResultColumn
                 | SubqueryPosition::Where
                 | SubqueryPosition::GroupBy
+                | SubqueryPosition::Having
                 | SubqueryPosition::OrderBy
         )
     }
@@ -4683,10 +4989,6 @@ pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
     plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
-pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
-    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
-}
-
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
 fn eval_at_for_select_plan(
     plan: &SelectPlan,
@@ -4773,6 +5075,14 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    /// The planner moves and clones joined tables by value, and each move
+    /// copies all the bytes of a `JoinedTable`.
+    #[test]
+    fn joined_table_stays_small() {
+        let size = std::mem::size_of::<JoinedTable>();
+        assert!(size <= 640, "JoinedTable is {size} bytes");
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {

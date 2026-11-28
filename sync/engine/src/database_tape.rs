@@ -16,6 +16,7 @@ use crate::{
     wal_session::WalSession,
     Result,
 };
+use turso_core::SessionRole;
 
 /// Simple wrapper over `turso::Database` which extends its intereface with few methods
 /// to collect changes made to the database and apply/revert arbitrary changes to the database
@@ -25,6 +26,7 @@ pub struct DatabaseTape {
     pragma_query: String,
     cdc_version: std::sync::RwLock<Option<turso_core::CdcVersion>>,
     disable_auto_checkpoint: bool,
+    encryption_key: Option<turso_core::EncryptionKey>,
 }
 
 const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
@@ -159,17 +161,22 @@ impl DatabaseTape {
             pragma_query,
             cdc_version: std::sync::RwLock::new(None),
             disable_auto_checkpoint: opts.disable_auto_checkpoint,
+            encryption_key: None,
         }
     }
+    pub fn with_encryption_key(mut self, key: Option<turso_core::EncryptionKey>) -> Self {
+        self.encryption_key = key;
+        self
+    }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
@@ -230,7 +237,7 @@ impl DatabaseTape {
         opts: DatabaseChangesIteratorOpts,
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
-        let conn = self.inner.connect(ConnectOpts::new())?;
+        let conn = self.inner.connect(self.connect_options())?;
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
@@ -255,6 +262,10 @@ impl DatabaseTape {
             max_change_id_exclusive: opts.max_change_id_exclusive,
         })
     }
+    fn connect_options(&self) -> ConnectOpts {
+        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(self.encryption_key.clone())
+    }
+
     /// Start raw WAL edit session which can append or rollback pages directly in the current WAL
     pub async fn start_wal_session<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DatabaseWalSession> {
         let conn = self.connect(coro).await?;
@@ -1053,8 +1064,8 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_core::{ConnectOpts, SessionRole};
+    use turso_sqlite::SqliteDialect;
 
     use tempfile::NamedTempFile;
 
@@ -1788,7 +1799,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect(ConnectOpts::new())
+        db1.connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -1876,7 +1887,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect(ConnectOpts::new())
+        db1.connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -4173,6 +4184,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(redefine_in_one_refresh, expected);
+    }
+
+    /// A CREATE TABLE replay onto an existing table changes the generated
+    /// column `next`, which `twice` uses, so the replay must drop `twice` and
+    /// add it again at the end. `note` comes after `twice`, so that changes the
+    /// column order. The replay must fail instead.
+    #[test]
+    pub fn test_create_table_replay_keeps_column_order_around_changed_generated_column() {
+        let error = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 1), twice INT AS (next * 2), note TEXT)",
+                "INSERT INTO t (id, a, note) VALUES (1, 10, 'x')",
+            ],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Create {
+                    sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 2), twice INT AS (next * 2), note TEXT)"
+                        .to_string(),
+                },
+            )],
+            "SELECT * FROM t",
+        )
+        .unwrap_err();
+        let crate::errors::Error::DatabaseTapeError(message) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            message.contains(
+                "the generated columns twice of table t use a dropped column, but they are not the last columns of the remote table"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A CREATE TABLE replay onto an existing table changes the generated
+    /// column `next`, which `twice` uses. Both are the last columns, so the
+    /// replay drops `twice` first and adds both again in the same order.
+    #[test]
+    pub fn test_create_table_replay_redefines_generated_column_that_another_uses() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 1), twice INT AS (next * 2))",
+                "INSERT INTO t (id, a) VALUES (1, 10)",
+            ],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Create {
+                    sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, next INT AS (a + 2), twice INT AS (next * 2))"
+                        .to_string(),
+                },
+            )],
+            "SELECT * FROM t",
+        )
+        .unwrap();
+        let int = turso_core::Value::from_i64;
+        assert_eq!(rows, vec![vec![int(1), int(10), int(12), int(24)]]);
     }
 
     #[test]

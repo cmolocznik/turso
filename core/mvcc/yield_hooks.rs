@@ -8,7 +8,7 @@ use crate::types::IOResult;
 use crate::Completion;
 use crate::LimboError;
 
-pub(crate) trait YieldPointMarker: Copy + Debug {
+pub trait YieldPointMarker: Copy + Debug {
     const DOMAIN: YieldDomain;
     const POINT_COUNT: u8;
 

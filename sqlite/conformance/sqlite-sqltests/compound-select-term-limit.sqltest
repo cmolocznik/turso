@@ -1,0 +1,70 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8104
+#
+# A compound with many terms overflowed the stack. SQLite stops at 500 terms
+# (SQLITE_MAX_COMPOUND_SELECT) with "too many terms in compound SELECT", and
+# Turso uses the same limit and the same message.
+
+test compound-select-with-500-terms {
+    SELECT count(*) FROM (SELECT 1{{repeat:499: UNION ALL SELECT 1}});
+}
+expect {
+    500
+}
+
+test compound-select-with-501-terms-is-an-error {
+    SELECT 1{{repeat:500: UNION ALL SELECT 1}};
+}
+expect error {
+    too many terms in compound SELECT
+}
+
+test compound-select-with-501-terms-in-a-subquery-is-an-error {
+    SELECT count(*) FROM (SELECT 1{{repeat:500: UNION SELECT 1}});
+}
+expect error {
+    too many terms in compound SELECT
+}
+
+# A VALUES list is one term, not a compound, so the limit does not apply to it.
+test values-with-600-rows-is-not-a-compound {
+    SELECT count(*) FROM (VALUES (1){{repeat:599:, (1)}});
+}
+expect {
+    600
+}
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/12128
+#
+# Each compound has 450 terms, and each one is the first term of the next, 10
+# levels deep. The code generator emits the first term of a compound before
+# the other terms, so it emitted the nested compound inside the stack frames of
+# the terms of the outer one: the 10 levels needed 4500 frames.
+test union-all-compounds-nested-in-first-terms {
+    SELECT count(*) FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT 1){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}}){{repeat:449: UNION ALL SELECT 1}});
+}
+expect {
+    4491
+}
+
+test union-compounds-nested-in-first-terms {
+    SELECT count(*) FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT 1){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}}){{repeat:449: UNION SELECT 2}});
+}
+expect {
+    2
+}
+
+test intersect-compounds-nested-in-first-terms {
+    SELECT count(*) FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT 1){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}}){{repeat:449: INTERSECT SELECT 1}});
+}
+expect {
+    1
+}
+
+test except-compounds-nested-in-first-terms {
+    SELECT count(*) FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT 1){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}}){{repeat:449: EXCEPT SELECT 2}});
+}
+expect {
+    1
+}

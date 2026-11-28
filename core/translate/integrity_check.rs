@@ -1,4 +1,5 @@
 use crate::alloc::Arc;
+use crate::ast::{self, TableInternalId};
 use crate::namespace::NamespaceRef;
 use crate::schema::Column;
 use crate::translate::collate::CollationSeq;
@@ -20,7 +21,7 @@ use crate::{
     },
     HashSet,
 };
-use turso_parser::ast::{self, TableInternalId};
+use crate::{types::StrictType, Result};
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
@@ -291,6 +292,7 @@ fn translate_integrity_check_for_schema(
                 },
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );
@@ -399,7 +401,7 @@ fn translate_integrity_check_for_schema(
                     type_check_col,
                     col_name,
                     col_reg,
-                );
+                )?;
             }
             if col.notnull() {
                 emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
@@ -727,9 +729,10 @@ fn emit_strict_type_check(
     type_check_col: &Column,
     col_name: &str,
     col_reg: usize,
-) {
-    let Some(value_type) = type_check_col.strict_value_type() else {
-        return;
+) -> Result<()> {
+    let value_type = match type_check_col.strict_type(&btree_table.name)? {
+        StrictType::Stores(storage_class) => storage_class.value_type(),
+        StrictType::Any => return Ok(()),
     };
 
     let type_ok = program.allocate_label();
@@ -749,6 +752,7 @@ fn emit_strict_type_check(
     );
     emit_integrity_result_row(program, registers);
     program.preassign_label_to_next_insn(type_ok);
+    Ok(())
 }
 
 fn emit_notnull_check(

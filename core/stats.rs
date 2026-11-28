@@ -13,7 +13,7 @@ pub const STATS_TABLE: &str = "sqlite_stat1";
 const STATS_QUERY: &str = "SELECT tbl, idx, stat FROM sqlite_stat1";
 
 /// Statistics produced by ANALYZE for a single index.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct IndexStat {
     /// Estimated total number of rows in the table/index when the stat was collected.
     pub total_rows: Option<u64>,
@@ -35,7 +35,7 @@ pub struct IndexStat {
 }
 
 /// Statistics produced by ANALYZE for a single BTree table.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TableStat {
     /// Estimated row count for the table (sqlite_stat1 entry with a NULL index name).
     pub row_count: Option<u64>,
@@ -52,7 +52,7 @@ impl TableStat {
 }
 
 /// Container for ANALYZE statistics across the schema.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AnalyzeStats {
     /// Per-table statistics keyed by namespace and normalized table name.
     pub tables: HashMap<(NamespaceId, String), TableStat>,
@@ -64,6 +64,11 @@ impl AnalyzeStats {
     }
     /// Get the statistics for a table, if present.
     pub fn table_stats(&self, namespace: NamespaceId, table_name: &str) -> Option<&TableStat> {
+        // The lookup needs a normalized copy of the name. Skip it when there
+        // are no statistics.
+        if self.tables.is_empty() {
+            return None;
+        }
         let table_name = normalize_ident(table_name);
         self.tables.get(&(namespace, table_name))
     }
@@ -146,6 +151,25 @@ pub fn refresh_analyze_stats_nonblock(
     conn: &Arc<Connection>,
     st: &mut RefreshAnalyzeStatsState,
 ) -> IOResultOr<()> {
+    refresh_analyze_stats_nonblock_inner(conn, st, true)
+}
+
+/// Like [`refresh_analyze_stats_nonblock`], but updates only `conn.schema` and
+/// leaves `conn.db.schema` untouched. Used by schema reparse so callers that
+/// keep the reparsed schema private (such as `force_reparse_schema_without_publish`
+/// or a read-snapshot reparse) do not mutate or clone the shared schema.
+pub(crate) fn refresh_analyze_stats_connection_only_nonblock(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+) -> IOResultOr<()> {
+    refresh_analyze_stats_nonblock_inner(conn, st, false)
+}
+
+fn refresh_analyze_stats_nonblock_inner(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+    publish_to_shared: bool,
+) -> IOResultOr<()> {
     loop {
         match st {
             RefreshAnalyzeStatsState::Start => {
@@ -163,8 +187,15 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
-                let mut stmt =
-                    conn.prepare_with_origin(STATS_QUERY, StatementOrigin::EngineMetadataRead)?;
+                let mut stmt = match conn
+                    .prepare_with_origin(STATS_QUERY, StatementOrigin::EngineMetadataRead)
+                {
+                    Ok(stmt) => stmt,
+                    Err(e) => {
+                        tracing::warn!("Failed to prepare analyze stats query: {e}");
+                        return Ok(IOResult::Done(()));
+                    }
+                };
                 stmt.set_mv_tx(mv_tx);
                 *st = RefreshAnalyzeStatsState::Running {
                     stmt: Box::new(stmt),
@@ -182,10 +213,21 @@ pub fn refresh_analyze_stats_nonblock(
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let stats = std::mem::take(stats);
-                        if let Err(e) = install_analyze_stats(conn, stats) {
+                        // Drop the statement and `schema_snapshot` before
+                        // installing so a solely-owned connection schema (for
+                        // example during `reparse_schema`) can be updated in
+                        // place without cloning.
+                        *st = RefreshAnalyzeStatsState::Start;
+                        let install = if publish_to_shared {
+                            install_analyze_stats(conn, stats)
+                        } else {
+                            conn.with_schema_mut(|schema| {
+                                schema.analyze_stats = stats;
+                            })
+                        };
+                        if let Err(e) = install {
                             tracing::warn!("Failed to refresh analyze stats: {e}");
                         }
-                        *st = RefreshAnalyzeStatsState::Start;
                         return Ok(IOResult::Done(()));
                     }
                     Err(e) => {
@@ -199,8 +241,9 @@ pub fn refresh_analyze_stats_nonblock(
     }
 }
 
-/// Store freshly gathered stats in the connection's schema and, when the shared
-/// database schema is the same schema version, in the shared schema too.
+/// Store freshly gathered stats in the connection's schema and, when the
+/// connection already shares the database schema object, in the shared
+/// schema too.
 ///
 /// In MVCC mode the commit that wrote `sqlite_stat1` publishes the connection's
 /// schema to the shared schema before the stats are gathered. If only the
@@ -208,15 +251,56 @@ pub fn refresh_analyze_stats_nonblock(
 /// same version, and the next statement would adopt the shared copy and lose
 /// the new stats.
 ///
-/// The connection schema lock is released before the shared schema lock is
-/// taken: other code paths lock them in the opposite order.
+/// When the connection shares the database schema object, the stats go into
+/// the shared schema first and the connection is then pointed at the shared
+/// schema, instead of deep-cloning the whole schema into the connection just
+/// to set the stats. In that case the shared schema is only cloned when the
+/// new stats actually differ from the ones it already has, so a connection
+/// opened after ANALYZE normally pays nothing.
+///
+/// Same schema version is not enough to point a connection at the shared
+/// schema: a reparse or a sync checkpoint can install a private schema at an
+/// unchanged version (see `force_reparse_schema_without_publish`), and
+/// pointing such a connection at the shared schema would discard it. A
+/// connection whose schema is a private copy keeps the old per-connection
+/// install below.
+///
+/// The connection schema lock and the shared schema lock are never held at
+/// the same time. The connection is only pointed at the shared schema while
+/// it still holds the same schema object compared against; if its schema
+/// changed in the meantime, the stats are installed in the connection's own
+/// copy instead.
+///
+/// No prepare-generation bump is needed here: the schema the connection ends
+/// up with differs from its old one only in stats, which the old
+/// per-connection install also left unbumped.
 fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<()> {
+    let connection_schema = conn.schema.read().clone();
+    let mut shared = conn.db.schema.lock();
+    if Arc::ptr_eq(&connection_schema, &shared) {
+        if shared.analyze_stats != stats {
+            Schema::try_make_mut(&mut shared)?.analyze_stats = stats.clone();
+        }
+        let shared_schema = shared.clone();
+        drop(shared);
+        let mut current = conn.schema.write();
+        if Arc::ptr_eq(&*current, &connection_schema) {
+            *current = shared_schema;
+        } else {
+            Schema::try_make_mut(&mut current)?.analyze_stats = stats;
+        }
+        return Ok(());
+    }
+    // The snapshot is not used below; drop it so the per-connection install
+    // can still mutate a solely-owned schema in place instead of cloning it.
+    drop(connection_schema);
+    drop(shared);
     let schema_version = conn.with_schema_mut(|schema| {
         schema.analyze_stats = stats.clone();
         schema.schema_version
     })?;
     let mut shared = conn.db.schema.lock();
-    if shared.schema_version == schema_version {
+    if shared.schema_version == schema_version && shared.analyze_stats != stats {
         Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
     }
     Ok(())
@@ -242,42 +326,39 @@ fn load_sqlite_stat1_row(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    let (namespace, table_name) = schema.demangle_name(row.get::<&str>(0)?);
-    let idx_value = row.get::<&Value>(1)?;
-    let stat_value = row.get::<&Value>(2)?;
-
-    let idx_name = match idx_value {
-        Value::Null => None,
-        Value::Text(s) => Some(s.as_str()),
-        _ => None,
+    // Match SQLite's analysisLoader (sqlite3_exec / sqlite3_column_text):
+    // skip rows with NULL tbl or stat and coerce non-NULL values to text
+    // instead of failing the whole scan on a type mismatch.
+    let Some(tbl_text) = row.get::<&Value>(0)?.cast_text_ref() else {
+        return Ok(());
     };
-    let stat = match stat_value {
-        Value::Text(s) => s.as_str(),
-        _ => return Ok(()),
+    let (namespace, table_name) = schema.demangle_name(&tbl_text);
+    let idx_name = row.get::<&Value>(1)?.cast_text_ref();
+    let Some(stat) = row.get::<&Value>(2)?.cast_text_ref() else {
+        return Ok(());
     };
 
     // Skip if table is not a regular B-tree.
     if schema.get_btree_table(namespace, table_name).is_none() {
         return Ok(());
     }
-    let Some(numbers) = parse_stat_numbers(stat) else {
+    let Some(numbers) = parse_stat_numbers(&stat) else {
         return Ok(());
     };
     if numbers.is_empty() {
         return Ok(());
     }
-    if idx_name.is_none() {
+    // Match SQLite's analysisLoader: if idx is NULL or does not name an index
+    // on this table, record the first number as the table's row count.
+    let idx_name = idx_name
+        .map(|name| normalize_ident(&name))
+        .filter(|name| schema.get_index(namespace, table_name, name).is_some());
+    let Some(idx_name) = idx_name else {
         if let Some(total_rows) = numbers.first().copied() {
             stats.table_stats_mut(namespace, table_name).row_count = Some(total_rows);
         }
         return Ok(());
-    }
-
-    // Index-level entry: only keep if the index exists on this table.
-    let idx_name = normalize_ident(idx_name.unwrap());
-    if schema.get_index(namespace, table_name, &idx_name).is_none() {
-        return Ok(());
-    }
+    };
 
     let total_rows = numbers.first().copied();
     {

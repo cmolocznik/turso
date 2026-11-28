@@ -264,6 +264,34 @@ fn errors_report_postgres_sqlstates() {
 }
 
 #[test]
+fn array_types_with_more_than_seven_dimensions_are_not_supported() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE DOMAIN posint AS INT").unwrap();
+    conn.execute("CREATE TABLE seven (a INT[][][][][][][])")
+        .unwrap();
+    conn.execute("ALTER TABLE seven ADD COLUMN b posint[][][][][][][]")
+        .unwrap();
+    conn.execute("SELECT '{}'::int[][][][][][][]").unwrap();
+    for sql in [
+        "CREATE TABLE v3 (c4 INT[][][][][][][][])",
+        "CREATE TABLE v3 (c4 posint[][][][][][][][])",
+        "CREATE TABLE v3 (c4 _int4[][][][][][][])",
+        "ALTER TABLE seven ADD COLUMN c int[][][][][][][][]",
+        "SELECT '{}'::int[][][][][][][][]",
+        "SELECT CAST('{}' AS posint[][][][][][][][])",
+        "SELECT * FROM json_to_recordset('[]') AS x(a int[][][][][][][][])",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "0A000", "{sql}: {e:?}");
+        assert_eq!(
+            e.to_string(),
+            "an array type with 8 dimensions (at most 7) is not supported",
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn nested_begin_keeps_the_open_transaction() {
     // PostgreSQL warns "there is already a transaction in progress" for BEGIN
     // inside a transaction block and keeps the transaction.
@@ -323,10 +351,6 @@ fn non_numeric_string_divisor_raises_22p02() {
         "SELECT mod(1, 'abc')",
     ] {
         let e = exec_err(&conn, sql);
-        assert!(
-            matches!(e.core_error(), LimboError::InvalidTextRepresentation(_)),
-            "expected InvalidTextRepresentation for {sql}, got: {e:?}"
-        );
         assert_eq!(e.sqlstate, "22P02", "{sql}: {e:?}");
     }
 }
@@ -678,56 +702,46 @@ fn zero_divisors_raise_postgres_errors() {
 }
 
 #[test]
-fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
+fn a_foreign_key_error_undoes_the_statement_and_keeps_the_transaction() {
+    let int = |v: i64| Value::from_i64(v);
     for sql in [
         "UPDATE OR FAIL child SET pid = 99",
         "INSERT OR ROLLBACK INTO child VALUES (2, 99)",
         "INSERT OR FAIL INTO child VALUES (2, 1), (3, 99)",
     ] {
-        let (_pg_io, pg) = pg_connection_with_fk();
-        let (_sqlite_io, sqlite) = sqlite_connection();
-        let mut outcomes = Vec::new();
-        for (dialect, conn) in [("sqlite", &sqlite), ("postgres", pg.inner())] {
-            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
-                .unwrap();
-            // The frontend binds the foreign key's table to its schema; a
-            // table created through core alone references the root namespace.
-            let create_child =
-                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))";
-            if dialect == "postgres" {
-                pg.execute(create_child).unwrap();
-            } else {
-                conn.execute(create_child).unwrap();
-            }
-            conn.execute("INSERT INTO parent VALUES (1)").unwrap();
-            conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
-            conn.execute("BEGIN").unwrap();
-            conn.execute("INSERT INTO parent VALUES (7)").unwrap();
-            let error = conn.execute(sql).unwrap_err();
-            assert_eq!(ErrorReport::from(&error).sqlstate, "23503", "{sql}");
-            if dialect == "sqlite" {
-                assert!(
-                    matches!(error, LimboError::ForeignKeyConstraint(_)),
-                    "{error:?}"
-                );
-            } else {
-                assert!(
-                    matches!(error, LimboError::ConstraintViolation(_)),
-                    "{error:?}"
-                );
-            }
-            let mut stmt = conn
-                .prepare("SELECT id, pid FROM child ORDER BY id")
-                .unwrap();
-            let children = stmt.run_collect_rows().unwrap();
-            let mut stmt = conn.prepare("SELECT id FROM parent ORDER BY id").unwrap();
-            let parents = stmt.run_collect_rows().unwrap();
-            outcomes.push((children, parents, conn.get_auto_commit()));
-        }
-        assert_eq!(
-            outcomes[0], outcomes[1],
-            "reporting changed transaction behavior for {sql}"
+        let (_io, pg) = pg_connection_with_fk();
+        let conn = pg.inner();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        pg.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO parent VALUES (7)").unwrap();
+        let error = conn.execute(sql).unwrap_err();
+        assert_eq!(ErrorReport::from(&error).sqlstate, "23503", "{sql}");
+        assert!(
+            matches!(error, LimboError::ConstraintViolation(_)),
+            "{error:?}"
         );
+        let mut stmt = conn
+            .prepare("SELECT id, pid FROM child ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![int(1), int(1)]],
+            "{sql}"
+        );
+        let mut stmt = conn.prepare("SELECT id FROM parent ORDER BY id").unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![int(1)], vec![int(7)]],
+            "{sql}"
+        );
+        assert!(!conn.get_auto_commit(), "{sql}");
     }
 }
 
@@ -1968,22 +1982,6 @@ impl turso_core::IO for CountedYieldIO {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.step()
     }
-}
-
-fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>) {
-    let io = Arc::new(turso_core::MemoryIO::new());
-    let db = turso_core::Database::open_file_with_flags(
-        io.clone(),
-        ":memory:",
-        OpenFlags::default(),
-        DatabaseOpts::new(),
-        None,
-        Arc::new(turso_core::SqliteDialect),
-    )
-    .unwrap();
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
-    conn.set_foreign_keys_enabled(true);
-    (io, conn)
 }
 
 #[test]

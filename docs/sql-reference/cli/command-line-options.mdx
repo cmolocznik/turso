@@ -17,6 +17,8 @@ tursodb [OPTIONS] [DATABASE] [SQL]
 | `DATABASE` | `:memory:` | Path to a SQLite database file. If omitted, an in-memory database is created |
 | `SQL` | — | SQL statement to execute. If provided, the shell runs the query and exits |
 
+`DATABASE` can also be a `file:` URI, such as `file:data.db?mode=ro`. A path that ends with `?key=value` parameters is also read as a URI. In such a path, all characters before the last `?`, including `%` and `#`, are part of the file name. For a URI, `tursodb` does not use the `--vfs` and `--readonly` options.
+
 ### Examples
 
 ```bash
@@ -119,6 +121,8 @@ tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
 
 Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
 
+The `open_database` tool of the server reads a database name as the `.open` command does, and opens the database with the options given on the command line, such as `--experimental-encryption`. Its messages show the name without the URI parameters, because they can hold the encryption key.
+
 ```bash
 tursodb --mcp mydata.db
 ```
@@ -130,6 +134,46 @@ Start a sync server for database replication, listening at the given address.
 ```bash
 tursodb --sync-server 0.0.0.0:8080 mydata.db
 ```
+
+Bootstrap includes checkpointed database pages, and both plaintext and encrypted
+servers write portable MVCC changes for subsequent pulls. Before serving an
+existing MVCC database with recovery-only log frames, run
+`PRAGMA wal_checkpoint(TRUNCATE)` on it. Enabling portable changes affects new
+transactions; it does not rewrite existing log frames.
+
+### `--sync-encryption-cipher <CIPHER>` and `--sync-encryption-key-file <PATH>`
+
+Serve encrypted databases with the sample sync server. Both options are required
+together and require `--sync-server`. The key file contains the hex-encoded cloud
+database key. Encryption is enabled automatically; use a database path rather
+than a `file:` URI.
+
+```bash
+tursodb --sync-server 127.0.0.1:8080 \
+  --sync-encryption-cipher aes256gcm \
+  --sync-encryption-key-file ./cloud-key.hex mydata.db
+```
+
+Core's AES-GCM and AEGIS ciphers are supported. Clients supply the same cipher and
+the base64 encoding of the cloud key through their remote encryption settings.
+Their local encryption key can differ. Both SQL pipeline and pull requests must
+include a valid `x-turso-encryption-key`. Pull requests also require
+`x-turso-encryption-cipher`; SQL pipeline requests may omit it, using the server's
+configured cipher. A supplied cipher must match that configuration. Missing
+required headers, incorrect credentials, or duplicate headers return HTTP 400
+before opening a database or executing SQL. A plaintext server rejects these
+headers.
+
+This also works with `--sync-dir`: every database uses the configured cipher and
+cloud key, including databases created on demand. Encrypted sync supports full
+page bootstrap, WAL page updates, and portable MVCC logical updates. Filtered
+bootstrap is rejected. The sample server retains its single-generation MVCC
+limitation; it does not provide the production server's retained-generation
+storage or checkpoint transitions.
+
+The sample server speaks HTTP. Use loopback for local tests, or terminate HTTPS
+in front of it when sending encryption credentials over a network. Database
+encryption does not encrypt HTTP requests or responses.
 
 ### `--sync-dir <PATH>`
 
@@ -152,9 +196,21 @@ Names must match `^[a-z0-9_-]+$` and are capped at 128 characters — no upperca
 
 `--readonly`, `--vfs`, and the `--experimental-*` flags apply to every database served this way, the same as they would for a single database.
 
+Up to `--sync-workers` requests are served at a time, so a slow request to one database does not hold up requests to other databases while a worker is free. Requests to one database are served one at a time, because each database has a single connection. A request waiting for its database still takes up a worker, so if every worker is busy or waiting on one database, requests to other databases wait until a worker is free.
+
 <Warning>
-Directory mode handles one request at a time across all databases, so distinct databases do not progress independently. WAL retention follows the same behavior as the single-database sync server. Opened database handles stay cached for the life of the process without eviction, and at most `--sync-max-databases` may be open at once (default 256); beyond that, a request for a database that is not already open is refused with `503 Service Unavailable` until the server restarts. Any client that can reach the port can create a database simply by requesting a new valid name, so disk space and inodes still accumulate without bound. The name restrictions above do not confine a client to the served directory: `VACUUM INTO` can write a copy to any path the server process can reach, and with `--experimental-attach` a client can `ATTACH DATABASE` an arbitrary filesystem path. There is no authentication or multi-tenancy; directory mode is intended for local and development use.
+WAL retention follows the same behavior as the single-database sync server. Opened database handles stay cached for the life of the process without eviction, and at most `--sync-max-databases` may be open at once (default 256); beyond that, a request for a database that is not already open is refused with `503 Service Unavailable` until the server restarts. Any client that can reach the port can create a database simply by requesting a new valid name, so disk space and inodes still accumulate without bound. The name restrictions above do not confine a client to the served directory: `VACUUM INTO` can write a copy to any path the server process can reach, and with `--experimental-attach` a client can `ATTACH DATABASE` an arbitrary filesystem path. There is no authentication or multi-tenancy; directory mode is intended for local and development use.
 </Warning>
+
+### `--sync-workers <N>`
+
+How many sync server requests are handled at once, from 1 to 1024. Requests to different databases are handled in parallel; requests to the same database still run one at a time. Defaults to the number of CPU cores, capped at 16. Requires `--sync-server`.
+
+On Ctrl-C the server stops accepting connections, finishes the requests it has already accepted, and then exits. Reading or writing a request on the socket times out after 30 seconds, but a statement still running inside the database is not interrupted, so shutdown waits until it completes.
+
+```bash
+tursodb --sync-server 127.0.0.1:8080 --sync-dir ./dbs --sync-workers 8
+```
 
 ## Experimental Feature Flags
 

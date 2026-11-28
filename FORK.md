@@ -2251,13 +2251,16 @@ its commit; the first loses the commit and goes on. It failed `an entry to remov
 and does with the claims removed. Its old form, two runs stepped by turns, passed with the claims removed.
 
 ### A wait another thread completes, and a blocking wait that parks on it
-2026-11-28. `core/io/completions.rs`, `core/statement.rs`. A replicator's completion that another thread
-finishes (`Completion::new_remote_wait`, as a log replicator's backpressure, a replicator stopped, or a
-commit replicator's quorum) was waited for by stepping the IO in a loop, which spins a core where a step
-has nothing to deliver. A statement now has `wait_io`, which parks the thread until such a wait is
-completed, stepping the IO between parks, and every blocking run uses it, in its simplest form on this branch's completions.
-Test: `mvcc_log_replicator::a_blocking_commit_that_waits_parks_its_thread` (Linux): a commit held a second
-takes under 30 CPU ticks; stepping in a loop took 100.
+2026-11-28. `core/io/completions.rs`, `core/io/mod.rs`, `core/statement.rs`, `sdk-kit/src/rsapi.rs`. A
+completion that another thread finishes (`Completion::new_remote_wait`: a log replicator's backpressure, a
+replicator stopped, a commit replicator's quorum, and the registry's waits on an open or a close) was waited
+for by stepping the IO in a loop, which spins a core where a step has nothing to deliver. A statement now has
+`wait_io`, which parks the thread until such a wait is completed, stepping the IO between parks. Every
+blocking wait uses it or the same park: `Statement::run_*`, a statement's reset that commits a half-read
+`RETURNING` write, `IO::wait_for_completion` and `drain_completions`, and `sdk-kit`'s blocking `step`.
+Tests: `mvcc_log_replicator::a_blocking_commit_that_waits_parks_its_thread` (Linux): a commit held a second
+takes under 30 CPU ticks; stepping in a loop took 100. Likewise for the reset, the completion waits and the
+blocking `sdk-kit` step (see the tests named in this commit).
 
 ### A COMMIT or ROLLBACK ended on its instruction's re-entry lets its transaction go
 2026-11-28. `core/vdbe/execute.rs`. `op_auto_commit` let a transaction go in two places, and the re-entry
@@ -2274,24 +2277,43 @@ the other let go. It takes it without waiting, and a held one is the misuse it i
 Tests: `a_statement_used_from_two_places_at_once_is_refused_at_once_never_waited_for` and
 `a_step_and_an_execute_poll_met_with_the_statement_held_return_the_misuse_at_once` (`turso` unit tests).
 
-### An open waits while a database of its file closes
-2026-11-28. `core/database.rs`. `Database::drop` took the registry's entry out as the last handle dropped,
-before the database's files closed. A file's lock is the process's (`fcntl`), and closing any descriptor of
-the file, or unlocking it, drops every lock the process holds on it: an open in that window locked the file,
-and the old files' close then unlocked it, so another process could open the database while this one had
-it open. The entry now stays, marked closing, until the database's files have closed, held by its last field,
-and an open waits for it, as it waits for a database being opened; a failed open closes what it opened before
-it takes its own mark out. Upstream has the same code.
-Test: `database::closing_tests::an_open_waits_for_a_closing_database_of_its_file_and_keeps_its_lock`
-(Linux): a close held between its mark and its files, an open of the file waits, and the reopened database
-holds its lock after the old files closed. With the entry removed as before, the open goes ahead.
+### An open waits, on a completion, while another open or a close of its file is under way
+2026-11-28. `core/database.rs`, `core/multiprocess_tests.rs`. `Database::drop` took the registry's entry out
+as the last handle dropped, before the database's files closed. A file's lock is the process's (`fcntl`), and
+closing any descriptor of the file drops every lock the process holds on it: an open in that window locked
+the file, and the old files' close then unlocked it, so another process could open the database while this
+one had it open. The same hole opened between two opens: both found nothing registered, both opened the file,
+and the one that took the other's database closed its descriptor. And an open that waited did so by handing
+back a yield (`Completion::new_yield`), which is finished at once: an executor's task never pended and starved
+the other tasks of its thread, and a blocking open spun a core on the registry's lock until the other end.
+Now each entry carries a completion another thread finishes (`new_remote_wait`): `Opening(done)` while an
+open is under way, `Ready(weak, done)` from registration until the database's files have closed, and a handle
+that no longer upgrades is a database closing. The open's mark (`OpeningMark`, the last field of its state)
+and the database's (`Closed`, the last field of `Database`) drop after what they cover has closed, take their
+entry out if it is still theirs, and finish the completion. An open that finds either waits on it, pending in
+its executor or parked in a blocking open, and looks again. `Database::open` reserves a file that exists, in
+the lookup that finds nothing registered and before it opens (and locks) the file; a failed open lets go of its
+storage before its mark lets another open go. Upstream has the same code. Not covered: a file that does not
+exist yet is keyed only once created, so two opens that create it at once still race, and the Rust binding's
+`TursoDatabase::open` opens its file before it asks the registry (as on the forge's former branch), so a
+reopen through it still waits for a closing database only after taking a lock the close can drop: a change
+to `sdk-kit`'s open, to be decided before it is made.
+Tests (Linux, real files), each seen failing with its part removed:
+`an_open_waits_for_a_closing_database_of_its_file_and_keeps_its_lock` (the entry removed at the last handle's
+drop, as before), `an_async_open_waits_for_a_closing_database_pending_on_its_completion` (a yield handed
+back), `an_open_waits_for_the_open_of_its_file_under_way_and_takes_its_database`,
+`a_blocking_open_waits_for_the_open_of_its_file_under_way_without_opening_it`,
+`an_open_reserves_its_file_before_it_opens_it`, `a_failed_open_closes_its_file_before_it_lets_another_open_go`
+(the lock still held as the mark is let go), and the opening state's drop finishing its completion.
 
 ### io_uring runs completion callbacks without the ring's lock
 2026-11-28. `core/io/io_uring.rs`. `drain_cq` ran every completion's callback while holding the ring
 state's mutex, so a callback that submits more IO, which takes that mutex, waited on itself forever. The
 CQEs are taken under the lock and their callbacks run once it is released; a writev's partial completion is
-still resubmitted under the lock, and its final outcome reported after it. Upstream has the same code.
+still resubmitted under the lock, and its progress wake and its final outcome reported after it. Upstream
+has the same code.
 Test: `io::io_uring::tests::a_callback_may_submit_io`: without the change the callback's write never runs.
+The progress wake outside the lock is not tested: a file never returns the short write that resubmits.
 
 ### A statement that ends owing nothing costs less
 2026-11-28. `core/vdbe/mod.rs`, `core/vdbe/execute.rs`. `Program::abort`, which every reset runs, returns

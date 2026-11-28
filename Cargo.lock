@@ -7402,6 +7402,7 @@ dependencies = [
  "bindgen 0.69.5",
  "env_logger",
  "find-msvc-tools",
+ "libc",
  "parking_lot",
  "tempfile",
  "tracing",

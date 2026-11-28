@@ -496,6 +496,56 @@ fn a_blocking_commit_that_waits_parks_its_thread() {
     assert!(ticks < 30, "the waiting commit took {ticks} ticks of CPU");
 }
 
+/// A statement reset after a row of a `RETURNING` write commits the write, and a commit that waits
+/// on its replicator parks the thread, never spinning it on the IO.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reset_that_commits_a_half_read_write_parks_its_thread() {
+    let (db, recorder) = leader("log_replicator_reset_parks.db");
+    db.connect_limbo()
+        .execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    recorder.hold.store(true, Ordering::SeqCst);
+    let db = Arc::new(db);
+    let (stepped, row) = std::sync::mpsc::channel();
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let conn = db.connect_limbo();
+            let mut stmt = conn
+                .prepare("INSERT INTO things VALUES (1, 'waits') RETURNING id")
+                .unwrap();
+            assert!(matches!(stmt.step().unwrap(), turso_core::StepResult::Row));
+            stepped.send(()).unwrap();
+            let began = thread_cpu_ticks();
+            let waiting = std::time::Instant::now();
+            stmt.reset().unwrap();
+            (thread_cpu_ticks() - began, waiting.elapsed())
+        })
+    };
+    row.recv_timeout(Duration::from_secs(10)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while recorder.held.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the frame never reached the replicator"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    for held in recorder.held.lock().unwrap().drain(..) {
+        held.complete(0);
+    }
+    let (ticks, waited) = writer.join().unwrap();
+    // The commit is not done before its replicator has the frame.
+    assert!(
+        waited >= Duration::from_millis(900),
+        "the reset returned after {waited:?}, before its replicator took the frame"
+    );
+    // A second of waiting: a spinning thread takes about 100 ticks of it.
+    assert!(ticks < 30, "the waiting reset took {ticks} ticks of CPU");
+}
+
 #[test]
 fn a_full_replicator_makes_the_writer_wait() {
     let (db, recorder) = leader("log_replicator_full.db");

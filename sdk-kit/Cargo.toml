@@ -37,6 +37,7 @@ parking_lot = { workspace = true, features = ["send_guard"] } # otherwise, Turso
 tracing-appender = { workspace = true }
 
 [dev-dependencies]
+libc = "0.2.172"
 tempfile = { workspace = true }
 
 [build-dependencies]

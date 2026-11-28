@@ -387,7 +387,10 @@ impl Completion {
     /// # Errors
     ///
     /// If stepping the IO fails. The wait's own error is its statement's to read.
-    pub(crate) fn park_until_finished(&self, io: &dyn crate::io::IO) -> crate::Result<()> {
+    pub(crate) fn park_until_finished<I: crate::io::IO + ?Sized>(
+        &self,
+        io: &I,
+    ) -> crate::Result<()> {
         self.set_waker(&std::task::Waker::from(Arc::new(Unpark(
             std::thread::current(),
         ))));
@@ -661,8 +664,54 @@ impl TruncateCompletion {
 #[cfg(test)]
 mod tests {
     use crate::CompletionError;
+    #[cfg(target_os = "linux")]
+    use crate::IO as _;
 
     use super::*;
+
+    /// The thread's CPU time so far, in clock ticks (`USER_HZ`, 100 a second), as Linux counts it.
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+        let after = &stat[stat.rfind(')').unwrap() + 2..];
+        let fields: Vec<&str> = after.split(' ').collect();
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    }
+
+    /// The ticks of CPU `wait` takes on this thread, for a second of waiting on a completion
+    /// another thread finishes.
+    #[cfg(target_os = "linux")]
+    fn ticks_waiting(wait: impl FnOnce(&crate::MemoryIO, Completion)) -> u64 {
+        let io = crate::MemoryIO::new();
+        let remote = Completion::new_remote_wait();
+        let finisher = std::thread::spawn({
+            let remote = remote.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                remote.complete(0);
+            }
+        });
+        let began = thread_cpu_ticks();
+        wait(&io, remote);
+        let ticks = thread_cpu_ticks() - began;
+        finisher.join().unwrap();
+        ticks
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn waiting_for_a_completion_another_thread_finishes_parks_the_thread() {
+        let ticks = ticks_waiting(|io, c| io.wait_for_completion(c).unwrap());
+        // A second of waiting: a spinning thread takes about 100 ticks of it.
+        assert!(ticks < 30, "the wait took {ticks} ticks of CPU");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn draining_a_completion_another_thread_finishes_parks_the_thread() {
+        let ticks = ticks_waiting(|io, c| io.drain_completions(&[c]).unwrap());
+        assert!(ticks < 30, "the drain took {ticks} ticks of CPU");
+    }
 
     #[test]
     fn group_finishes_when_child_completes_on_another_thread_during_build() {

@@ -182,19 +182,28 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     let key = DatabaseKey::SharedMemory(
         "open-db-async-state-drop-clears-opening-registry-entry".to_string(),
     );
+    let done = crate::Completion::new_remote_wait();
     {
         let mut manager = DATABASE_MANAGER.lock();
-        manager.insert(key.clone(), RegistryEntry::Opening);
+        manager.insert(key.clone(), RegistryEntry::Opening(done.clone()));
     }
 
     let mut state = OpenDbAsyncState::new();
-    state.registry_key = Some(key.clone());
+    state.opening = Some(crate::database::OpeningMark {
+        key: key.clone(),
+        done: done.clone(),
+    });
+    assert!(!done.finished());
     drop(state);
 
     let manager = DATABASE_MANAGER.lock();
     assert!(
         !manager.contains_key(&key),
         "dropping an incomplete async open must clear the Opening sentinel"
+    );
+    assert!(
+        done.finished(),
+        "dropping an incomplete async open must let the opens waiting for it go"
     );
 }
 

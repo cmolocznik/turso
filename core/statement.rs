@@ -1577,8 +1577,13 @@ impl Statement {
                             // halt() is re-entered until it finishes; the
                             // IO loop runs once per attempt, as before the
                             // completion was parked in the state.
-                            drop(self.state.take_suspended_io());
-                            if let Err(e) = self.pager.io.step() {
+                            let io = self.state.take_suspended_io();
+                            let waited = if io.0.is_remote_wait() {
+                                io.0.park_until_finished(self.pager.io.as_ref())
+                            } else {
+                                self.pager.io.step()
+                            };
+                            if let Err(e) = waited {
                                 capture_reset_error(
                                     &mut reset_error,
                                     e,

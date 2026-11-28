@@ -398,28 +398,31 @@ impl RingState {
         self.submit_entry(ring, &entry)
     }
 
-    /// Handle a writev CQE: resubmits the rest of a partial write, or returns how the whole
-    /// write ended, for its callback to run once the lock is released. SAFETY: caller must hold
-    /// the `RingState` Mutex.
+    /// Handle a writev CQE: resubmits the rest of a partial write, and returns what is done once
+    /// the lock is released: how the whole write ended, for its callback to run, or that it
+    /// progressed, for its waiter to be woken. SAFETY: caller must hold the `RingState` Mutex.
     unsafe fn handle_writev_completion(
         &mut self,
         ring: &io_uring::IoUring,
         mut state: WritevState,
         user_data: u64,
         result: i32,
-    ) -> Result<Option<std::result::Result<i32, CompletionError>>> {
+    ) -> Result<Taken> {
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
             tracing::error!("writev failed (user_data: {}): {}", user_data, err);
             state.free_last_iov(&mut self.iov_pool);
-            return Ok(Some(Err(CompletionError::IOError(err.kind(), "pwritev"))));
+            return Ok(Taken::Ended(Err(CompletionError::IOError(
+                err.kind(),
+                "pwritev",
+            ))));
         }
 
         let written = result;
 
         if written == 0 && state.remaining() > 0 {
             state.free_last_iov(&mut self.iov_pool);
-            return Ok(Some(Err(CompletionError::ShortWrite)));
+            return Ok(Taken::Ended(Err(CompletionError::ShortWrite)));
         }
         state.advance(written as u64);
 
@@ -430,7 +433,7 @@ impl RingState {
                     state.total_written
                 );
                 state.free_last_iov(&mut self.iov_pool);
-                return Ok(Some(Ok(state.total_written as i32)));
+                Ok(Taken::Ended(Ok(state.total_written as i32)))
             }
             remaining => {
                 tracing::trace!(
@@ -440,15 +443,13 @@ impl RingState {
                     remaining
                 );
                 self.submit_writev(ring, user_data, state)?;
-                // Progress wake: the future is parked on the parent
-                // completion's waker, but `complete()` only fires on the
-                // final chunk. Without this, intermediate-chunk completions
-                // never wake the future, the resubmitted chunks pile up,
-                // and the task deadlocks.
-                wake_user_data(user_data);
+                // Progress wake, once the lock is released: the future is parked on the
+                // parent completion's waker, but `complete()` only fires on the final
+                // chunk. Without this, intermediate-chunk completions never wake the
+                // future, the resubmitted chunks pile up, and the task deadlocks.
+                Ok(Taken::Progressed)
             }
         }
-        Ok(None)
     }
 }
 
@@ -593,6 +594,14 @@ impl IO for UringIO {
     }
 }
 
+/// What a completion queue entry asks of its completion once the ring's lock is released.
+enum Taken {
+    /// The request ended: its callback runs.
+    Ended(std::result::Result<i32, CompletionError>),
+    /// A partial write was resubmitted: its waiter is woken to see the progress.
+    Progressed,
+}
+
 impl UringIO {
     /// Drain whatever CQEs are currently ready into completion callbacks.
     /// Returns `true` if at least one CQE was processed.
@@ -602,10 +611,11 @@ impl UringIO {
     fn drain_cq(&self) -> Result<bool> {
         let mut finished = Vec::new();
         let taken = self.take_cqes(&mut finished);
-        for (user_data, result) in finished {
-            match result {
-                Ok(n) => completion_from_key(user_data).complete(n),
-                Err(e) => completion_from_key(user_data).error(e),
+        for (user_data, taken) in finished {
+            match taken {
+                Taken::Ended(Ok(n)) => completion_from_key(user_data).complete(n),
+                Taken::Ended(Err(e)) => completion_from_key(user_data).error(e),
+                Taken::Progressed => wake_user_data(user_data),
             }
         }
         taken
@@ -613,10 +623,7 @@ impl UringIO {
 
     /// Takes every ready CQE: a writev's partial completion is handled here, under the lock;
     /// every other one is added to `finished` for its callback to run afterwards.
-    fn take_cqes(
-        &self,
-        finished: &mut Vec<(u64, std::result::Result<i32, CompletionError>)>,
-    ) -> Result<bool> {
+    fn take_cqes(&self, finished: &mut Vec<(u64, Taken)>) -> Result<bool> {
         let mut state = self.state.lock();
         let mut drained_any = false;
         loop {
@@ -639,22 +646,20 @@ impl UringIO {
             if let Some(wstate) = state.writev_states.remove(&user_data) {
                 drop(cq);
                 // SAFETY: still holding `state` Mutex.
-                let ended = unsafe {
+                let taken = unsafe {
                     state.handle_writev_completion(&self.ring, wstate, user_data, result)?
                 };
-                if let Some(ended) = ended {
-                    finished.push((user_data, ended));
-                }
+                finished.push((user_data, taken));
                 continue;
             }
             finished.push((
                 user_data,
-                if result < 0 {
+                Taken::Ended(if result < 0 {
                     let err = std::io::Error::from_raw_os_error(-result);
                     Err(CompletionError::IOError(err.kind(), "io_uring_cqe"))
                 } else {
                     Ok(result)
-                },
+                }),
             ));
         }
     }

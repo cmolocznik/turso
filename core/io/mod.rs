@@ -601,6 +601,10 @@ pub trait IO: Clock + Send + Sync {
     /// (`OnceLock`-backed), so the loop will terminate as soon as every
     /// caller-owned completion has had its CQE processed.
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        // A wait another thread completes parks the thread instead of stepping the IO in a loop.
+        for c in completions.iter().filter(|c| c.is_remote_wait()) {
+            c.park_until_finished(self)?;
+        }
         while completions.iter().any(|c| !c.finished()) {
             self.step()?;
         }
@@ -608,6 +612,9 @@ pub trait IO: Clock + Send + Sync {
     }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        if c.is_remote_wait() {
+            c.park_until_finished(self)?;
+        }
         while !c.finished() {
             self.step()?
         }

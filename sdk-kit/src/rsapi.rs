@@ -1047,12 +1047,25 @@ impl TursoDatabase {
                         .db_opts(opts)
                         .encryption(self.config.encryption.clone())
                         .page_codec(self.config.page_codec.clone());
-                    match Database::open_async(
+                    let opened = match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
                         &options,
-                    )? {
+                    ) {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            // The file this open opened closes before its mark lets another
+                            // open of the file go: closing it after would drop the lock that
+                            // open took. A later `open` starts afresh.
+                            drop(options);
+                            state.db_file = None;
+                            state.open_db_state = OpenDbAsyncState::new();
+                            state.phase = TursoDatabaseOpenPhase::Init;
+                            return Err(error.into());
+                        }
+                    };
+                    match opened {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
                             *inner_db = Some(db);
@@ -1581,7 +1594,7 @@ fn step_inner(
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
-                    stmt._io().step()?;
+                    stmt.wait_io()?;
                     continue;
                 }
             }
@@ -1941,6 +1954,124 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    /// Holds each frame's completion, a wait another thread finishes, while `hold` is set.
+    #[derive(Default)]
+    struct Holding {
+        hold: std::sync::atomic::AtomicBool,
+        held: std::sync::Mutex<Vec<turso_core::Completion>>,
+    }
+
+    impl turso_core::LogReplicator for Holding {
+        fn takes_commits(&self) -> bool {
+            true
+        }
+
+        fn frame_limit(&self) -> usize {
+            usize::MAX
+        }
+
+        fn replicate(&self, _frame: turso_core::ReplicatedFrame) -> turso_core::Completion {
+            if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+                let waiting = turso_core::Completion::new_remote_wait();
+                self.held.lock().unwrap().push(waiting.clone());
+                return waiting;
+            }
+            turso_core::Completion::new_yield()
+        }
+
+        fn checkpoint_cut(&self, newest: u64) -> u64 {
+            newest
+        }
+    }
+
+    /// The thread's CPU time so far, in clock ticks (`USER_HZ`, 100 a second), as Linux counts it.
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+        let after = &stat[stat.rfind(')').unwrap() + 2..];
+        let fields: Vec<&str> = after.split(' ').collect();
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    }
+
+    /// A blocking statement whose commit waits on its replicator, a wait another thread
+    /// finishes, parks its thread for it, never spinning it on the IO.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_blocking_step_that_waits_on_a_replicator_parks_its_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_features(Some(
+            "mvcc,mvcc_passive_checkpoint,mvcc_log_dropped_on_open,index_method",
+        ));
+        config.path = dir.path().join("parks.db").to_str().unwrap().to_owned();
+        let db = TursoDatabase::new(config);
+        db.open().unwrap();
+        let replicator = Arc::new(Holding::default());
+        db.db_core()
+            .unwrap()
+            .set_log_replicator(replicator.clone())
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.prepare_single("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+        replicator
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = std::thread::spawn({
+            let conn = conn.clone();
+            move || {
+                let mut stmt = conn.prepare_single("INSERT INTO t VALUES (1)").unwrap();
+                let began = thread_cpu_ticks();
+                stmt.execute(None).unwrap();
+                thread_cpu_ticks() - began
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while replicator.held.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frame never reached the replicator"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for held in replicator.held.lock().unwrap().drain(..) {
+            held.complete(0);
+        }
+        let ticks = writer.join().unwrap();
+        // A second of waiting: a spinning thread takes about 100 ticks of it.
+        assert!(ticks < 30, "the waiting step took {ticks} ticks of CPU");
+    }
+
+    /// A failed open closes the file it opened, whose closing would drop the process's lock on it,
+    /// before the registry lets another open of the file go.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_open_leaves_no_file_open() {
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-database.db");
+        std::fs::write(&path, vec![0x5au8; 8192]).unwrap();
+        let probe = std::fs::File::open(&path).unwrap();
+        let locked = || {
+            // SAFETY: an all-zero `flock` is a valid one.
+            let mut query: libc::flock = unsafe { std::mem::zeroed() };
+            query.l_type = libc::F_WRLCK as libc::c_short;
+            query.l_whence = libc::SEEK_SET as libc::c_short;
+            // SAFETY: the descriptor is open and `query` outlives the call.
+            let asked = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_OFD_GETLK, &mut query) };
+            assert_eq!(asked, 0);
+            query.l_type != libc::F_UNLCK as libc::c_short
+        };
+        let mut config = config_with_features(None);
+        config.path = path.to_str().unwrap().to_owned();
+        let db = TursoDatabase::new(config);
+        assert!(db.open().is_err(), "a file of no database opened");
+        assert!(!locked(), "the failed open still holds the file");
+    }
 
     #[test]
     fn structured_constraint_errors_keep_sqlite_codes() {

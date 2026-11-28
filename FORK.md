@@ -2293,6 +2293,21 @@ CQEs are taken under the lock and their callbacks run once it is released; a wri
 still resubmitted under the lock, and its final outcome reported after it. Upstream has the same code.
 Test: `io::io_uring::tests::a_callback_may_submit_io`: without the change the callback's write never runs.
 
+### A statement that ends owing nothing costs less
+2026-11-28. `core/vdbe/mod.rs`, `core/vdbe/execute.rs`. `Program::abort`, which every reset runs, returns
+at once for a statement that ran to `Done` owing nothing: no operation, commit, `VACUUM`, subjournal or
+fresh MVCC transaction under way and its cleanup decision cleared, unless another database may hold a
+transaction left open in autocommit. `OpenWrite` takes the opcode's pager and the statement's cached MVCC
+store, as `OpenRead` does; `Transaction` borrows the connection instead of cloning its `Arc`; and
+`ProgramState::reset` resets a field only when it holds something. Upstream has none of these.
+Instructions per row (a WAL database in memory, 200,000 rows in transactions of 100, a statement a row,
+user instructions counted by `perf` on one core, three runs each agreeing to the instruction): key-order
+insert 11,598 to 11,242 (-3.1%), shuffled insert 32,316 to 31,960 (-1.1%), lookup 8,931 to 8,739
+(-2.1%), update 22,847 to 22,491 (-1.6%), delete 21,803 to 21,447 (-1.6%).
+Test: `vdbe::tests::a_done_statement_s_reset_ends_a_transaction_left_on_another_database` (fails when the
+early return ignores the other databases). The early return's conditions on a state a `Done` statement
+never holds are guards no test reaches.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

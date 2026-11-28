@@ -766,10 +766,14 @@ fn spilling_table_and_cache(conn: &Arc<Connection>) -> Result<()> {
 }
 
 fn spilling_fill(conn: &Arc<Connection>) -> Result<()> {
+    spilling_fill_rows(conn, SPILLING_ROWS)
+}
+
+fn spilling_fill_rows(conn: &Arc<Connection>, rows: u32) -> Result<()> {
     conn.execute(format!(
         "INSERT INTO t(a, b, c, d)
          SELECT random(), random(), random(), random()
-         FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {SPILLING_ROWS})
+         FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {rows})
                SELECT x FROM c);"
     ))?;
     Ok(())
@@ -882,5 +886,53 @@ fn test_a_crash_image_of_a_spilling_transaction_is_the_database_before_it(
     let (integrity, rows) = sqlite_counts(&sqlite_image);
     assert_eq!(integrity, "ok");
     assert_eq!(rows, 1);
+    Ok(())
+}
+
+/// The same spilling commit on an encrypted database: the frames written over are
+/// re-encrypted with a fresh nonce each time, the rewrite checksums the ciphertext, and the
+/// WAL, as the files hold it at the commit, recovers every row under the key.
+#[test]
+fn test_an_encrypted_spilling_commit_recovers_from_its_wal() -> Result<()> {
+    const HEXKEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    maybe_setup_tracing();
+    let tmp_db = crate::common::TempDatabaseBuilder::new()
+        .with_encryption("aegis256", HEXKEY)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    // An encrypted database keeps the page size it was opened with: 4 KiB pages, so more
+    // rows than the 512-byte tests use to overflow the same 20-page cache.
+    const ROWS: u32 = 12_000;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA wal_autocheckpoint=0;")?;
+    conn.execute("PRAGMA cache_size=20;")?;
+    conn.execute(
+        "CREATE TABLE t(k INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER);",
+    )?;
+    for column in ["a", "b", "c", "d"] {
+        conn.execute(format!("CREATE INDEX t_{column} ON t({column});"))?;
+    }
+    conn.execute("BEGIN IMMEDIATE;")?;
+    spilling_fill_rows(&conn, ROWS)?;
+    conn.execute("COMMIT;")?;
+    assert_eq!(
+        execute_and_get_strings(&conn, "PRAGMA integrity_check;")?,
+        vec!["ok"]
+    );
+
+    let image = tmp_db.path.with_file_name("encrypted-after-commit.db");
+    copy_database_files(&tmp_db.path, &image);
+    let hashed = turso_dbhash::hash_database(
+        image.to_str().unwrap(),
+        &turso_dbhash::DbHashOptions {
+            encryption: Some(turso_core::EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: HEXKEY.to_string(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(hashed.rows_hashed, ROWS as usize);
     Ok(())
 }

@@ -539,7 +539,15 @@ marker, which is appended as in SQLite. The frames written over keep their old c
 frame after them chains from those, so the commit rewrites the chain from the first frame written
 over to the last, before the WAL is synced (SQLite's `walRewriteChecksums`, 69843): a state of the
 commit machine, `CommitState::RewriteChecksums`, whose reads and writes are completions, in batches
-of 256 frames, so nothing blocks and memory does not grow with the transaction. `Wal` gains
+of 256 whole frames (headers and bodies, checked for their full length), so nothing blocks and
+memory does not grow with the transaction. When a rewrite is owed, the commit's last frame goes to
+disk without its commit marker, and the rewrite gives it the marker together with its true
+checksum: the marker never lands beside a checksum that holds for the chain as it stood before
+frames were written over, so a crash that lands that frame before theirs cannot commit a stale page
+(the auditor's A-511). The rewrite's checksum is kept for `commit_prepared_frames`, and the
+connection's chain is untouched until then, so a commit whose sync failed can be retried (A-512).
+The pages written over are submitted before the appended frames. Raw frames cannot follow a
+transaction that wrote frames over (A-514). `Wal` gains
 `prepare_commit_frames`, `checksum_rewrite_needed` and `checksum_rewrite_step`; `PreparedFrames`
 gains `overwrites` and `overwritten`. A frame at or below the committed mark is never written to,
 and neither is a frame `write_frame_raw` wrote: a sync pull's frames sit above the committed mark
@@ -551,13 +559,17 @@ commit, now in page order. A commit with no spill and no repeated page is what i
 
 What proves it: WorkReef's repro at 32,768 rows and a 2,000-page cache writes 28,153 frames for
 28,184 pages in 19 s, and at 2,000 rows and a 200-page cache 1,878 frames for 1,908 pages (179,266
-before); SQLite opens both and passes `integrity_check` with every row. Ten unit tests in
+before); SQLite opens both and passes `integrity_check` with every row. Nineteen unit tests in
 `core/storage/wal.rs` (a page spilled twice, a commit over a spilled page, a rewrite across batches
-and from a frame after the first, a last batch of one frame, a rollback, a savepoint rollback, the
-commit-marker page, a committed frame, a raw frame) each fail on a mutant of the code they cover;
-three tests in `tests/integration/wal/test_wal.rs`: frames written against pages, SQLite reading
-the WAL of a spilling commit, and a crash image taken in the middle of a spilling transaction that
-opens as the database before it.
+and from a frame after the first, a last batch of one frame, a rollback, savepoint rollbacks, the
+commit-marker page and the marker that waits for the rewrite, a retried commit, short reads and
+writes, a committed frame, a raw frame, a raw session after frames written over, the written-over
+page's state and the WAL's owed sync) each fail on a mutant of the code they cover (22 mutants run,
+all killed); five tests in `tests/integration/wal/test_wal.rs` (frames written against pages, SQLite
+reading the WAL of a spilling commit, a crash image taken in the middle of a spilling transaction
+that opens as the database before it, and an encrypted spilling commit recovered from its WAL under
+its key) and one in `test_commit_replicator.rs` (a spilling commit's pages reach the replicator
+once each, in page order).
 
 ## Additions
 

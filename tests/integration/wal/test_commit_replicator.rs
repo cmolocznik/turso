@@ -174,6 +174,48 @@ fn a_follower_given_each_commit_s_pages_holds_the_leader_s_database() {
     assert_eq!(compute_dbhash(&follower).hash, compute_dbhash(&leader).hash);
 }
 
+/// A transaction too big for the page cache spills pages and writes them over their frames at
+/// the commit: the replicator is still given every page of the commit, once each, in page
+/// order. (The cache never goes below 200 pages and spills past 90% of it.)
+#[test]
+fn a_spilling_commit_reaches_its_replicator_in_page_order() {
+    let (leader, recorder) = leader();
+    let conn = leader.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+    conn.execute("CREATE INDEX t_b ON t(b)").unwrap();
+    conn.execute("PRAGMA cache_size = 16").unwrap();
+    let before = recorder.commits.lock().unwrap().len();
+    conn.execute("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO t(a, b)
+         SELECT random(), 'spill ' || x || ' ' || hex(randomblob(20))
+         FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 12000)
+               SELECT x FROM c)",
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+    let commits = recorder.commits.lock().unwrap();
+    assert_eq!(commits.len(), before + 1);
+    let numbers: Vec<u32> = commits
+        .last()
+        .unwrap()
+        .pages
+        .iter()
+        .map(|page| page.number)
+        .collect();
+    assert!(
+        numbers.len() > 400,
+        "the commit must change far more pages than the cache holds: {}",
+        numbers.len()
+    );
+    assert!(
+        numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "the commit's pages must come once each, in page order"
+    );
+}
+
 #[test]
 fn a_commit_is_seen_only_once_its_replicator_lets_it_through() {
     let (leader, recorder) = leader();

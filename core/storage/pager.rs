@@ -5032,7 +5032,12 @@ impl Pager {
                         .last()
                         .expect("a commit that rewrites checksums prepared frames")
                         .final_max_frame;
-                    match wal.checksum_rewrite_step(last_frame) {
+                    let commit_db_size = self
+                        .commit_info
+                        .read()
+                        .db_size
+                        .expect("a commit with prepared frames knows its database size");
+                    match wal.checksum_rewrite_step(last_frame, commit_db_size) {
                         Ok(IOResult::Done(())) => {
                             self.commit_info.write().state = CommitState::WaitSync;
                         }
@@ -5191,11 +5196,15 @@ impl Pager {
     fn submit_prepared_frames(commit_info: &mut CommitInfo, wal: &Arc<dyn Wal>) -> Result<()> {
         let wal_file = wal.wal_file()?;
         let mut batch = WriteBatch::new(wal_file);
+        // The pages written over their frames go first, then the appended frames: a frame
+        // that follows another must not reach the disk before it where it can be helped.
         for prepared in &commit_info.prepared_frames {
-            batch.writev(prepared.offset, &prepared.bufs);
             for (offset, bufs) in &prepared.overwrites {
                 batch.writev(*offset, bufs);
             }
+        }
+        for prepared in &commit_info.prepared_frames {
+            batch.writev(prepared.offset, &prepared.bufs);
         }
         let mut group = CompletionGroup::new(|_| {});
         batch.submit(Some(&mut group))?;

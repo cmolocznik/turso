@@ -31,7 +31,7 @@ pub struct ReplicatedPage {
     pub after: Arc<[u8]>,
 }
 
-/// The pages of one commit, in the order of its frames.
+/// The pages of one commit, in page order.
 #[derive(Debug, Clone)]
 pub struct ReplicatedCommit {
     /// The database's size in pages after the commit.

@@ -5,7 +5,8 @@ upstream: the fork keeps up with upstream and keeps its own changes.
 
 - `main` mirrors upstream `main`. It only fast-forwards and holds no commit of ours.
 - `workreef`, the fork's default branch, is upstream plus every change below
-  (`git log --no-merges main..workreef`).
+  (`git log --no-merges main..workreef`). The forge and WorkReef cognition both build from it;
+  the forge's former branch, `commit-replicator`, is folded into it.
 - `fork/sync-upstream.sh` merges `main` into `workreef` four times a day, at 05:17, 11:17,
   17:17 and 23:17 Asia/Kuala_Lumpur (`fork/turso-sync.timer`, a systemd user timer). It
   fetches upstream, fast-forwards `main`, merges it, and commits and pushes the merge only once
@@ -1839,7 +1840,7 @@ checkpoint stages, and the forgetting once its boundary is published, in
 Why: a checkpoint staged page 1's MVCC-authored fields from the live header: the schema cookie,
 `user_version`, the application id and the two vacuum fields. Codex found that a database opened
 from its file alone, through a checkpoint at a cut, could then reopen with a `user_version` a
-migration above the cut set and no table of the migration. The forge keeps its schema's version
+migration above the cut set and no table of the migration. the forge keeps its schema's version
 in `user_version`.
 What: in a database opened with `drop_mvcc_log_on_open`, each commit that writes the header (a
 `SetCookie`, as a schema change or `PRAGMA user_version` does) keeps it by its commit timestamp. A
@@ -2138,7 +2139,7 @@ side can be empty, changes no query, as such a side's prefixes always hold the e
 2026-11-22, on branch `commit-replicator`, in the commit that adds this entry.
 `core/index_method/trigram/merge.rs`, and the query in `core/index_method/trigram/mod.rs`.
 Why: every statement that adds texts is a segment, and a query seeks in each, so an index written
-a statement at a time is read in as many seeks per trigram as it has segments. The forge writes it
+a statement at a time is read in as many seeks per trigram as it has segments. the forge writes it
 in small statements, as its replicated databases refuse a commit larger than one entry of the Raft
 log, 4 MiB, and so a merge must be written in steps no larger either.
 What: `OPTIMIZE INDEX` merges segments, in steps (`optimize_in_steps`), each writing at most a

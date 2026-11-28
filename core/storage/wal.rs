@@ -479,6 +479,22 @@ pub struct PreparedFrames {
     pub final_max_frame: u64,
     /// Epoch at preparation time
     pub epoch: u32,
+    /// Pages this transaction had already written to the WAL, written again over
+    /// the frame they already hold instead of after the last frame: (file offset
+    /// of the frame, the whole frame). Empty unless `prepare_commit_frames` made it.
+    pub overwrites: Vec<(u64, Vec<Arc<Buffer>>)>,
+    /// The pages of `overwrites` and the frame each holds.
+    pub overwritten: Vec<(PageRef, u64)>,
+}
+
+impl PreparedFrames {
+    /// Every page this batch writes, appended or written over its earlier frame.
+    pub fn pages(&self) -> impl Iterator<Item = &PageRef> {
+        self.metadata
+            .iter()
+            .map(|(page, _, _)| page)
+            .chain(self.overwritten.iter().map(|(page, _)| page))
+    }
 }
 
 /// Metadata published by the coordination backend once a WAL commit becomes visible.
@@ -823,6 +839,28 @@ pub trait Wal: Debug + Send + Sync {
         db_size_on_commit: Option<u32>,
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames>;
+
+    /// `prepare_frames` for a transaction's commit: a page this transaction already
+    /// wrote to the WAL (a cache spill) is written over the frame it holds, and not
+    /// after the last frame, except the last page of the batch when it carries the
+    /// commit marker. The overwritten frames are in `PreparedFrames::overwrites`.
+    fn prepare_commit_frames(
+        &self,
+        pages: &[PageRef],
+        page_sz: PageSize,
+        db_size_on_commit: Option<u32>,
+        prev: Option<&PreparedFrames>,
+    ) -> Result<PreparedFrames>;
+
+    /// Whether this write transaction wrote frames over their earlier copies, so that
+    /// the commit must rewrite the checksum chain after them before it syncs.
+    fn checksum_rewrite_needed(&self) -> bool;
+
+    /// Rewrites the checksum chain of the transaction's frames, from the first one
+    /// written over to `last_frame`, once their writes have completed and before the
+    /// WAL is synced. Yields while it waits for its reads and writes; call again
+    /// until it is done.
+    fn checksum_rewrite_step(&self, last_frame: u64) -> IOResultOr<()>;
 
     /// For each prepared frame, update in-memory WAL index and rolling checksum
     /// and advance max_frame to make committed frames visible to readers.
@@ -3073,6 +3111,56 @@ pub struct WalFile {
     /// reported durable under synchronous=FULL.
     /// Shared with the fsync completion callback, hence the Arc.
     dirty: Arc<AtomicBool>,
+
+    /// The first frame of this write transaction written over in place (0: none).
+    /// A frame written over keeps the checksum it had, and every frame after it
+    /// chains from that checksum, so the commit rewrites the chain from here on
+    /// (SQLite's `iReCksum`). Private to the connection that holds the write lock.
+    rechecksum_from: AtomicU64,
+    /// The commit's checksum rewrite, while it runs.
+    checksum_rewrite: Mutex<Option<ChecksumRewrite>>,
+    /// The chain's last checksum after a rewrite, for `commit_prepared_frames` to
+    /// keep instead of the one it prepared before the rewrite.
+    rewritten_checksum: Mutex<Option<(u32, u32)>>,
+    /// The last frame of this write transaction written with `write_frame_raw`: frames
+    /// another writer made, which sit above the committed mark until the raw session
+    /// commits and which this connection must never write over. A spill or a commit
+    /// writes over frames above this one only.
+    raw_frames_through: AtomicU64,
+    /// This write transaction has spilled pages to the WAL: only then can a commit find a
+    /// frame of its own to write a page over, so a commit that never spilled does not look.
+    spilled_in_transaction: AtomicBool,
+}
+
+/// Frames the checksum rewrite reads and writes back at a time.
+const CHECKSUM_REWRITE_FRAMES: u64 = 256;
+
+/// The rewrite of the checksum chain a commit owes after it wrote frames over
+/// their earlier copies (see `WalFile::rechecksum_from`).
+struct ChecksumRewrite {
+    /// The next frame to rewrite.
+    next: u64,
+    /// The last frame of the transaction.
+    last: u64,
+    /// The checksum of frame `next - 1`, or of the WAL header before frame 1;
+    /// `None` until the first read has returned it.
+    prev: Option<(u32, u32)>,
+    phase: RewritePhase,
+}
+
+enum RewritePhase {
+    /// Nothing is in flight.
+    Idle,
+    /// Reading the header of the frame before the first one to rewrite.
+    Seeding { buf: Arc<Buffer>, read: Completion },
+    /// Reading `count` frames from `next` into `buf`.
+    Reading {
+        count: u64,
+        buf: Arc<Buffer>,
+        read: Completion,
+    },
+    /// Writing `count` rewritten frames back.
+    Writing { count: u64, write: Completion },
 }
 
 impl fmt::Debug for WalFile {
@@ -3695,6 +3783,330 @@ impl WalFile {
             .store(pack_checksum(checksum), Ordering::Release);
     }
 
+    /// The body of `Wal::checksum_rewrite_step`: SQLite's `walRewriteChecksums`. Reads
+    /// the frames from the first one written over to `last_frame` a few at a time,
+    /// chains their checksums again from the checksum of the frame before, and writes
+    /// them back. It only writes frames above the committed high-water mark.
+    fn checksum_rewrite_step_inner(&self, last_frame: u64) -> IOResultOr<()> {
+        let header = self.coordination.wal_header();
+        let frame_size = header.page_size as u64 + WAL_FRAME_HEADER_SIZE as u64;
+        let mut slot = self.checksum_rewrite.lock();
+        if slot.is_none() {
+            let from = self.rechecksum_from.load(Ordering::Acquire);
+            turso_assert!(from != 0, "a checksum rewrite needs a frame to start from");
+            turso_assert!(
+                from <= last_frame,
+                "the checksum rewrite starts at or before the transaction's last frame",
+                { "from": from, "last_frame": last_frame }
+            );
+            *slot = Some(ChecksumRewrite {
+                next: from,
+                last: last_frame,
+                prev: None,
+                phase: RewritePhase::Idle,
+            });
+        }
+        let file = self.coordination.wal_file()?;
+        let failed = |slot: &mut Option<ChecksumRewrite>, what: &'static str| {
+            *slot = None;
+            Err(Box::new(LimboError::InternalError(format!(
+                "the WAL checksum rewrite could not {what}"
+            ))))
+        };
+        loop {
+            let rewrite = slot.as_mut().expect("the rewrite was set above");
+            match std::mem::replace(&mut rewrite.phase, RewritePhase::Idle) {
+                RewritePhase::Idle => {
+                    if rewrite.prev.is_none() {
+                        if rewrite.next == 1 {
+                            // The first frame chains from the WAL header.
+                            rewrite.prev = Some((header.checksum_1, header.checksum_2));
+                        } else {
+                            // The frame before the first one to rewrite holds the
+                            // checksum it chains from.
+                            let buf = Arc::new(Buffer::new_temporary(WAL_FRAME_HEADER_SIZE));
+                            let read = file.pread(
+                                self.frame_offset(rewrite.next - 1),
+                                Completion::new_read(buf.clone(), |_| None),
+                            )?;
+                            rewrite.phase = RewritePhase::Seeding {
+                                buf,
+                                read: read.clone(),
+                            };
+                            io_yield_one!(read);
+                        }
+                    }
+                    if rewrite.next > rewrite.last {
+                        let checksum = rewrite.prev.expect("seeded above");
+                        *slot = None;
+                        *self.rewritten_checksum.lock() = Some(checksum);
+                        self.set_last_checksum(checksum);
+                        self.rechecksum_from.store(0, Ordering::Release);
+                        return Ok(IOResult::Done(()));
+                    }
+                    let count = CHECKSUM_REWRITE_FRAMES.min(rewrite.last - rewrite.next + 1);
+                    let buf = Arc::new(Buffer::new_temporary((count * frame_size) as usize));
+                    let read = file.pread(
+                        self.frame_offset(rewrite.next),
+                        Completion::new_read(buf.clone(), |_| None),
+                    )?;
+                    rewrite.phase = RewritePhase::Reading {
+                        count,
+                        buf,
+                        read: read.clone(),
+                    };
+                    io_yield_one!(read);
+                }
+                RewritePhase::Seeding { buf, read } => {
+                    if !read.finished() {
+                        rewrite.phase = RewritePhase::Seeding {
+                            buf,
+                            read: read.clone(),
+                        };
+                        io_yield_one!(read);
+                    }
+                    if !read.succeeded() {
+                        return failed(&mut slot, "read the frame before its first frame");
+                    }
+                    let bytes = buf.as_slice();
+                    rewrite.prev = Some((
+                        u32::from_be_bytes(bytes[16..20].try_into().expect("four bytes")),
+                        u32::from_be_bytes(bytes[20..24].try_into().expect("four bytes")),
+                    ));
+                }
+                RewritePhase::Reading { count, buf, read } => {
+                    if !read.finished() {
+                        rewrite.phase = RewritePhase::Reading {
+                            count,
+                            buf,
+                            read: read.clone(),
+                        };
+                        io_yield_one!(read);
+                    }
+                    if !read.succeeded() {
+                        return failed(&mut slot, "read frames");
+                    }
+                    let mut prev = rewrite.prev.expect("seeded before the first read");
+                    let bytes = buf.as_mut_slice();
+                    for frame in bytes.chunks_exact_mut(frame_size as usize) {
+                        prev = recompute_wal_frame_checksum(frame, &header, prev);
+                    }
+                    rewrite.prev = Some(prev);
+                    let write = file.pwritev(
+                        self.frame_offset(rewrite.next),
+                        vec![buf],
+                        Completion::new_write(|_| {}),
+                    )?;
+                    rewrite.phase = RewritePhase::Writing {
+                        count,
+                        write: write.clone(),
+                    };
+                    io_yield_one!(write);
+                }
+                RewritePhase::Writing { count, write } => {
+                    if !write.finished() {
+                        rewrite.phase = RewritePhase::Writing {
+                            count,
+                            write: write.clone(),
+                        };
+                        io_yield_one!(write);
+                    }
+                    if !write.succeeded() {
+                        return failed(&mut slot, "write frames back");
+                    }
+                    rewrite.next += count;
+                }
+            }
+        }
+    }
+
+    /// The frame, above the committed high-water mark `committed`, that holds this
+    /// transaction's latest copy of the page, if it wrote one (a cache spill).
+    fn own_frame(&self, page_id: u64, committed: u64) -> Result<Option<u64>> {
+        // Raw frames above the committed mark are another writer's, not a spill of ours.
+        let floor = committed.max(self.raw_frames_through.load(Ordering::Acquire));
+        if self.max_frame.load(Ordering::Acquire) <= floor {
+            return Ok(None);
+        }
+        Ok(Wal::find_frame(self, page_id, None)?.filter(|frame| *frame > floor))
+    }
+
+    /// Notes that `frame` was written over, so the commit rewrites the checksums from it.
+    fn note_checksum_rewrite_from(&self, frame: u64) {
+        let _ = self
+            .rechecksum_from
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |from| {
+                (from == 0 || frame < from).then_some(frame)
+            });
+    }
+
+    /// Forgets a checksum rewrite: the transaction ended, or was rolled back.
+    fn clear_checksum_rewrite(&self) {
+        self.rechecksum_from.store(0, Ordering::Release);
+        self.raw_frames_through.store(0, Ordering::Release);
+        self.spilled_in_transaction.store(false, Ordering::Release);
+        *self.checksum_rewrite.lock() = None;
+        *self.rewritten_checksum.lock() = None;
+    }
+
+    /// `prepare_frames`, which with `overwrite` writes a page over the frame this
+    /// transaction already gave it (see `Wal::prepare_commit_frames`).
+    fn prepare_frames_with(
+        &self,
+        pages: &[PageRef],
+        page_sz: PageSize,
+        db_size_on_commit: Option<u32>,
+        prev: Option<&PreparedFrames>,
+        overwrite: bool,
+    ) -> Result<PreparedFrames> {
+        turso_assert!(
+            !pages.is_empty(),
+            "prepare_frames requires at least one page"
+        );
+        turso_assert!(
+            pages.len() <= IOV_MAX,
+            "supported up to IOV_MAX pages at once"
+        );
+        turso_assert!(
+            self.coordination.wal_is_initialized(),
+            "WAL must be initialized"
+        );
+
+        let header = self.coordination.wal_header();
+        let epoch = self.coordination.checkpoint_epoch();
+
+        turso_assert!(
+            header.page_size == page_sz.get(),
+            "page size mismatch between header and requested",
+            { "header_page_size": header.page_size, "requested_page_size": page_sz.get() }
+        );
+
+        // Either chain from previous batch of PreparedFrames or use committed WAL state.
+        // For the first batch, also check the authority's max_frame to handle
+        // cross-process WAL restarts where our local max_frame is stale.
+        let (mut rolling_checksum, mut next_frame_id) = match prev {
+            Some(p) => (p.final_checksum, p.final_max_frame + 1),
+            None => {
+                let snapshot = self.load_coordination_snapshot();
+                let local_state = self.connection_state();
+                if local_state.snapshot.max_frame > snapshot.max_frame {
+                    // The local position is past the committed high-water
+                    // mark exactly when this connection has spilled or
+                    // raw-inserted frames that carry no commit marker yet.
+                    // Chain from local state so we don't overwrite them.
+                    (
+                        local_state.snapshot.last_checksum,
+                        local_state.snapshot.max_frame + 1,
+                    )
+                } else {
+                    // Inside a write transaction the local position can
+                    // never be behind the committed mark: the upgrade
+                    // requires a fresh snapshot, and the mark cannot advance
+                    // while the write lock is held.
+                    turso_assert!(
+                        local_state.snapshot.max_frame == snapshot.max_frame,
+                        "connection WAL position must not be behind the committed high-water mark",
+                        {
+                            "local_max_frame": local_state.snapshot.max_frame,
+                            "authority_max_frame": snapshot.max_frame
+                        }
+                    );
+                    // At the mark the authority owns the seed; re-sync local
+                    // state if it drifted (e.g. a savepoint rollback
+                    // reinstalled a pre-header checksum at frame 0, or a
+                    // concurrent checkpoint advanced nbackfills).
+                    if snapshot != local_state.snapshot {
+                        self.install_connection_state(local_state.with_snapshot(snapshot));
+                    }
+                    (snapshot.last_checksum, snapshot.max_frame + 1)
+                }
+            }
+        };
+
+        // The first frame of a generation always chains from the WAL header
+        // checksum, like SQLite's walFrames at mxFrame == 0. Connection and
+        // authority state may still carry the pre-header checksum here: a
+        // restart resets the position before the next append writes the new
+        // header, and a savepoint rollback can reinstall a position captured
+        // in that window. The wal_is_initialized assert above guarantees
+        // `header` is the current generation's synced header.
+        if next_frame_id == 1 {
+            rolling_checksum = (header.checksum_1, header.checksum_2);
+        }
+
+        let first_frame_id = next_frame_id;
+
+        let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
+        let mut metadata = Vec::with_capacity(pages.len());
+        let mut overwrites = Vec::new();
+        let mut overwritten = Vec::new();
+        let page_transform = self.io_ctx.read().page_transform().clone();
+        // The committed high-water mark: a frame above it is this transaction's own. A
+        // transaction that never spilled has none, and its commit does not look.
+        let committed = (overwrite && self.spilled_in_transaction.load(Ordering::Acquire))
+            .then(|| self.load_coordination_snapshot().max_frame);
+
+        for (idx, page) in pages.iter().enumerate() {
+            let page_id = page.get().id();
+            let plain = page.get_contents().as_ptr();
+            // The commit marker goes in a frame of its own, as in SQLite.
+            let carries_commit = idx + 1 == pages.len() && db_size_on_commit.is_some();
+            if let (Some(committed), false) = (committed, carries_commit) {
+                if let Some(frame_id) = self.own_frame(page_id as u64, committed)? {
+                    let page_number =
+                        u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+                    // Its checksum is rewritten at commit, whatever it is here.
+                    let (_, frame_buf) = Self::prepare_transformed_frame(
+                        &self.buffer_pool,
+                        &header,
+                        (0, 0),
+                        page_number,
+                        0,
+                        plain,
+                        &page_transform,
+                    )?;
+                    overwrites.push((self.frame_offset(frame_id), vec![frame_buf]));
+                    overwritten.push((page.clone(), frame_id));
+                    self.note_checksum_rewrite_from(frame_id);
+                    continue;
+                }
+            }
+
+            // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
+            // however it might not be present in this batch so we cannot assert its presence
+            let frame_db_size = if idx + 1 == pages.len() {
+                db_size_on_commit.unwrap_or(0)
+            } else {
+                0
+            };
+            let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+            let (checksum, frame_buf) = Self::prepare_transformed_frame(
+                &self.buffer_pool,
+                &header,
+                rolling_checksum,
+                page_number,
+                frame_db_size,
+                plain,
+                &page_transform,
+            )?;
+            bufs.push(frame_buf);
+            metadata.push((page.clone(), next_frame_id, checksum));
+            rolling_checksum = checksum;
+            next_frame_id += 1;
+        }
+        let offset = self.frame_offset(first_frame_id);
+        Ok(PreparedFrames {
+            offset,
+            bufs,
+            metadata,
+            final_checksum: rolling_checksum,
+            final_max_frame: next_frame_id - 1,
+            epoch,
+            overwrites,
+            overwritten,
+        })
+    }
+
     /// Reconstruct the connection-local WAL state stored on this `WalFile`.
     fn connection_state(&self) -> WalConnectionState {
         WalConnectionState::new(
@@ -3992,6 +4404,8 @@ impl Wal for WalFile {
                 });
                 return Err(LimboError::Busy);
             }
+            // A write transaction owes no checksum rewrite when it begins.
+            self.clear_checksum_rewrite();
             // A checkpoint that only advanced nbackfills leaves our snapshot current: the
             // backfilled frames stay in the WAL while we hold our read lock, and commits do
             // not publish nbackfills. SQLite also leaves nBackfill out of this comparison.
@@ -4558,6 +4972,9 @@ impl Wal for WalFile {
         let c = file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
         self.complete_append_frame(page_id, frame_id, checksums);
+        // Not this connection's own spill: no later spill or commit may write over it.
+        self.raw_frames_through
+            .fetch_max(frame_id, Ordering::AcqRel);
         if db_size > 0 {
             self.finish_append_frames_commit()?;
         }
@@ -4828,7 +5245,19 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(max_frame);
         self.set_last_checksum(last_checksum);
         self.max_frame.store(max_frame, Ordering::Release);
-        if !is_savepoint {
+        if is_savepoint {
+            // Frames after the savepoint are gone, with the rewrite they owed. A frame
+            // before it that was written over keeps owing one: the savepoint's rollback
+            // restores the page as dirty, and the commit writes it again.
+            *self.checksum_rewrite.lock() = None;
+            *self.rewritten_checksum.lock() = None;
+            if self.rechecksum_from.load(Ordering::Acquire) > max_frame {
+                self.rechecksum_from.store(0, Ordering::Release);
+            }
+            self.raw_frames_through
+                .fetch_min(max_frame, Ordering::AcqRel);
+        } else {
+            self.clear_checksum_rewrite();
             self.reset_internal_states();
         }
     }
@@ -5043,122 +5472,25 @@ impl Wal for WalFile {
         db_size_on_commit: Option<u32>,
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames> {
-        turso_assert!(
-            !pages.is_empty(),
-            "prepare_frames requires at least one page"
-        );
-        turso_assert!(
-            pages.len() <= IOV_MAX,
-            "supported up to IOV_MAX pages at once"
-        );
-        turso_assert!(
-            self.coordination.wal_is_initialized(),
-            "WAL must be initialized"
-        );
+        self.prepare_frames_with(pages, page_sz, db_size_on_commit, prev, false)
+    }
 
-        let header = self.coordination.wal_header();
-        let epoch = self.coordination.checkpoint_epoch();
+    fn prepare_commit_frames(
+        &self,
+        pages: &[PageRef],
+        page_sz: PageSize,
+        db_size_on_commit: Option<u32>,
+        prev: Option<&PreparedFrames>,
+    ) -> Result<PreparedFrames> {
+        self.prepare_frames_with(pages, page_sz, db_size_on_commit, prev, true)
+    }
 
-        turso_assert!(
-            header.page_size == page_sz.get(),
-            "page size mismatch between header and requested",
-            { "header_page_size": header.page_size, "requested_page_size": page_sz.get() }
-        );
+    fn checksum_rewrite_needed(&self) -> bool {
+        self.rechecksum_from.load(Ordering::Acquire) != 0
+    }
 
-        // Either chain from previous batch of PreparedFrames or use committed WAL state.
-        // For the first batch, also check the authority's max_frame to handle
-        // cross-process WAL restarts where our local max_frame is stale.
-        let (mut rolling_checksum, mut next_frame_id) = match prev {
-            Some(p) => (p.final_checksum, p.final_max_frame + 1),
-            None => {
-                let snapshot = self.load_coordination_snapshot();
-                let local_state = self.connection_state();
-                if local_state.snapshot.max_frame > snapshot.max_frame {
-                    // The local position is past the committed high-water
-                    // mark exactly when this connection has spilled or
-                    // raw-inserted frames that carry no commit marker yet.
-                    // Chain from local state so we don't overwrite them.
-                    (
-                        local_state.snapshot.last_checksum,
-                        local_state.snapshot.max_frame + 1,
-                    )
-                } else {
-                    // Inside a write transaction the local position can
-                    // never be behind the committed mark: the upgrade
-                    // requires a fresh snapshot, and the mark cannot advance
-                    // while the write lock is held.
-                    turso_assert!(
-                        local_state.snapshot.max_frame == snapshot.max_frame,
-                        "connection WAL position must not be behind the committed high-water mark",
-                        {
-                            "local_max_frame": local_state.snapshot.max_frame,
-                            "authority_max_frame": snapshot.max_frame
-                        }
-                    );
-                    // At the mark the authority owns the seed; re-sync local
-                    // state if it drifted (e.g. a savepoint rollback
-                    // reinstalled a pre-header checksum at frame 0, or a
-                    // concurrent checkpoint advanced nbackfills).
-                    if snapshot != local_state.snapshot {
-                        self.install_connection_state(local_state.with_snapshot(snapshot));
-                    }
-                    (snapshot.last_checksum, snapshot.max_frame + 1)
-                }
-            }
-        };
-
-        // The first frame of a generation always chains from the WAL header
-        // checksum, like SQLite's walFrames at mxFrame == 0. Connection and
-        // authority state may still carry the pre-header checksum here: a
-        // restart resets the position before the next append writes the new
-        // header, and a savepoint rollback can reinstall a position captured
-        // in that window. The wal_is_initialized assert above guarantees
-        // `header` is the current generation's synced header.
-        if next_frame_id == 1 {
-            rolling_checksum = (header.checksum_1, header.checksum_2);
-        }
-
-        let first_frame_id = next_frame_id;
-
-        let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
-        let mut metadata = Vec::with_capacity(pages.len());
-        let page_transform = self.io_ctx.read().page_transform().clone();
-
-        for (idx, page) in pages.iter().enumerate() {
-            let page_id = page.get().id();
-            let plain = page.get_contents().as_ptr();
-
-            // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
-            // however it might not be present in this batch so we cannot assert its presence
-            let frame_db_size = if idx + 1 == pages.len() {
-                db_size_on_commit.unwrap_or(0)
-            } else {
-                0
-            };
-            let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
-            let (checksum, frame_buf) = Self::prepare_transformed_frame(
-                &self.buffer_pool,
-                &header,
-                rolling_checksum,
-                page_number,
-                frame_db_size,
-                plain,
-                &page_transform,
-            )?;
-            bufs.push(frame_buf);
-            metadata.push((page.clone(), next_frame_id, checksum));
-            rolling_checksum = checksum;
-            next_frame_id += 1;
-        }
-        let offset = self.frame_offset(first_frame_id);
-        Ok(PreparedFrames {
-            offset,
-            bufs,
-            metadata,
-            final_checksum: rolling_checksum,
-            final_max_frame: next_frame_id - 1,
-            epoch,
-        })
+    fn checksum_rewrite_step(&self, last_frame: u64) -> IOResultOr<()> {
+        self.checksum_rewrite_step_inner(last_frame)
     }
 
     /// For each prepared frame, update in-memory WAL index and rolling checksum.
@@ -5175,12 +5507,21 @@ impl Wal for WalFile {
             self.max_frame
                 .store(batch.final_max_frame, Ordering::Release);
         }
+        // The batches were prepared before the checksum rewrite, which gave the chain
+        // its real last checksum.
+        if let Some(checksum) = self.rewritten_checksum.lock().take() {
+            self.set_last_checksum(checksum);
+        }
     }
 
     /// Mark pages clean and set WAL tags after durable commit.
     fn finalize_committed_pages(&self, prepared: &[PreparedFrames]) {
         for batch in prepared {
             for (page, frame_id, _) in &batch.metadata {
+                page.clear_dirty();
+                page.set_wal_tag(*frame_id, batch.epoch);
+            }
+            for (page, frame_id) in &batch.overwritten {
                 page.clear_dirty();
                 page.set_wal_tag(*frame_id, batch.epoch);
             }
@@ -5222,6 +5563,14 @@ impl Wal for WalFile {
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
         let page_transform = self.io_ctx.read().page_transform().clone();
+        // A frame above the committed high-water mark is this transaction's own. A page
+        // it already wrote there (an earlier spill) is written over that frame, as
+        // SQLite's walFrames does, so a page costs the WAL one frame however often it
+        // leaves the cache. The checksums after it are rewritten at commit.
+        let committed = self.load_coordination_snapshot().max_frame;
+        self.spilled_in_transaction.store(true, Ordering::Release);
+        let mut overwrites: Vec<(u64, Vec<Arc<Buffer>>)> = Vec::new();
+        let mut overwritten: Vec<(PageRef, u64)> = Vec::new();
 
         // Rolling checksum input to each frame build
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
@@ -5238,6 +5587,22 @@ impl Wal for WalFile {
 
             let frame_db_size = 0; // this method is not used for the commit path
             let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
+            if let Some(frame_id) = self.own_frame(page_id as u64, committed)? {
+                // Its checksum is rewritten at commit, whatever it is here.
+                let (_, frame_bytes) = Self::prepare_transformed_frame(
+                    &self.buffer_pool,
+                    &header,
+                    (0, 0),
+                    page_number,
+                    frame_db_size,
+                    plain,
+                    &page_transform,
+                )?;
+                overwrites.push((self.frame_offset(frame_id), vec![frame_bytes]));
+                overwritten.push((page.clone(), frame_id));
+                self.note_checksum_rewrite_from(frame_id);
+                continue;
+            }
             let (new_checksum, frame_bytes) = Self::prepare_transformed_frame(
                 &self.buffer_pool,
                 &header,
@@ -5287,10 +5652,35 @@ impl Wal for WalFile {
             }
         };
 
-        let c = Completion::new_write(on_complete);
-
         let file = self.coordination.wal_file()?;
-        let c = file.pwritev(start_off, iovecs, c)?;
+        let c = if overwrites.is_empty() {
+            let c = Completion::new_write(on_complete);
+            file.pwritev(start_off, iovecs, c)?
+        } else {
+            // Pages written over their earlier frames and pages appended: one completion
+            // for all of them.
+            let tagged = overwritten.clone();
+            let mut group = CompletionGroup::new(move |res| {
+                if res.is_ok() {
+                    for (page, frame_id) in &tagged {
+                        page.set_wal_tag(*frame_id, epoch);
+                    }
+                }
+            });
+            if !iovecs.is_empty() {
+                let c = Completion::new_write(on_complete);
+                let _started =
+                    start_in_group(Some(&mut group), c, |c| file.pwritev(start_off, iovecs, c))?;
+            }
+            for (offset, bufs) in overwrites {
+                let c = Completion::new_write(|_| {});
+                let _started =
+                    start_in_group(Some(&mut group), c, |c| file.pwritev(offset, bufs, c))?;
+            }
+            // Written over, the WAL owes an fsync before a commit is durable.
+            self.dirty.store(true, Ordering::Release);
+            group.build()
+        };
 
         // Advance the connection-private write cursor (max_frame / rolling
         // checksum / dirty) synchronously so a following batch in the same
@@ -5412,6 +5802,11 @@ impl WalFile {
             frame_pages_epoch: AtomicU64::new(0),
             unread_changes: Mutex::new(ReadChanges::None),
             dirty: Arc::new(AtomicBool::new(false)),
+            rechecksum_from: AtomicU64::new(0),
+            checksum_rewrite: Mutex::new(None),
+            rewritten_checksum: Mutex::new(None),
+            raw_frames_through: AtomicU64::new(0),
+            spilled_in_transaction: AtomicBool::new(false),
         }
     }
 
@@ -6749,7 +7144,7 @@ pub mod test {
     use super::{
         CheckpointLocks, InProcessWalCoordination, ReadChanges, ReadGuardKind, RollbackTo,
         TryBeginReadResult, Wal, WalAutoActions, WalCommitState, WalConnectionState,
-        WalCoordination, WalFile, WalSnapshot, NO_LOCK_HELD,
+        WalCoordination, WalFile, WalSnapshot, CHECKSUM_REWRITE_FRAMES, NO_LOCK_HELD,
     };
     use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
@@ -6757,6 +7152,7 @@ pub mod test {
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
+    use crate::storage::sqlite3_ondisk::recompute_wal_frame_checksum;
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
@@ -7349,6 +7745,429 @@ pub mod test {
             "prepare_frames must chain after unpublished spill frames"
         );
         assert_eq!(prepared.final_max_frame, 2);
+    }
+
+    /// Commits `pages` the way the pager's commit does: writes the commit's frames and
+    /// the pages written over their earlier frames, rewrites the checksums when the WAL
+    /// owes it, then publishes.
+    fn commit_test_pages(io: &Arc<dyn IO>, wal: &WalFile, page_size: u32, pages: &[PageRef]) {
+        let prepared = wal
+            .prepare_commit_frames(pages, PageSize::new(page_size).unwrap(), Some(99), None)
+            .unwrap();
+        let file = wal.wal_file().unwrap();
+        let mut writes = vec![file
+            .pwritev(
+                prepared.offset,
+                prepared.bufs.clone(),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap()];
+        for (offset, bufs) in &prepared.overwrites {
+            writes.push(
+                file.pwritev(*offset, bufs.clone(), Completion::new_write(|_| {}))
+                    .unwrap(),
+            );
+        }
+        for write in writes {
+            io.wait_for_completion(write).unwrap();
+        }
+        if wal.checksum_rewrite_needed() {
+            loop {
+                match wal.checksum_rewrite_step(prepared.final_max_frame).unwrap() {
+                    IOResult::Done(()) => break,
+                    IOResult::IO(pending) => io.wait_for_completion(pending.0).unwrap(),
+                }
+            }
+        }
+        wal.commit_prepared_frames(&[prepared]);
+        wal.finish_append_frames_commit().unwrap();
+    }
+
+    /// Spills `pages` the way the pager's cache spill does and waits for the write.
+    fn spill_test_pages(io: &Arc<dyn IO>, wal: &WalFile, page_size: u32, pages: Vec<PageRef>) {
+        let c = wal
+            .append_frames_vectored(pages, PageSize::new(page_size).unwrap())
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+    }
+
+    fn read_test_frame(io: &Arc<dyn IO>, wal: &WalFile, frame_id: u64) -> Vec<u8> {
+        let frame_size = wal.page_size() as usize + WAL_FRAME_HEADER_SIZE;
+        let buf = Arc::new(Buffer::new_temporary(frame_size));
+        let c = wal
+            .wal_file()
+            .unwrap()
+            .pread(
+                wal.frame_offset(frame_id),
+                Completion::new_read(buf.clone(), |_| None),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        buf.as_slice().to_vec()
+    }
+
+    /// The first frame, from the one after `skip`, whose stored checksum is not the
+    /// one its predecessors chain to, if any.
+    fn first_broken_frame(io: &Arc<dyn IO>, wal: &WalFile, frames: u64) -> Option<u64> {
+        let header = wal.coordination.wal_header();
+        let mut prev = (header.checksum_1, header.checksum_2);
+        for frame_id in 1..=frames {
+            let mut frame = read_test_frame(io, wal, frame_id);
+            let stored = (
+                u32::from_be_bytes(frame[16..20].try_into().unwrap()),
+                u32::from_be_bytes(frame[20..24].try_into().unwrap()),
+            );
+            prev = recompute_wal_frame_checksum(&mut frame, &header, prev);
+            if stored != prev {
+                return Some(frame_id);
+            }
+        }
+        None
+    }
+
+    fn test_frame_body(io: &Arc<dyn IO>, wal: &WalFile, frame_id: u64) -> Vec<u8> {
+        read_test_frame(io, wal, frame_id)[WAL_FRAME_HEADER_SIZE..].to_vec()
+    }
+
+    #[test]
+    fn a_page_spilled_twice_is_written_over_its_first_frame() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let first = page_with_pattern(7, 0x10, &buffer_pool);
+        spill_test_pages(&io, &wal, page_size, vec![first]);
+        assert_eq!(wal.get_max_frame(), 1);
+
+        let second = page_with_pattern(7, 0x20, &buffer_pool);
+        let expected = second.get_contents().as_ptr().to_vec();
+        spill_test_pages(&io, &wal, page_size, vec![second]);
+        assert_eq!(
+            wal.get_max_frame(),
+            1,
+            "a page the transaction already wrote takes no new frame"
+        );
+        assert_eq!(test_frame_body(&io, &wal, 1), expected);
+        assert!(wal.checksum_rewrite_needed());
+        assert_eq!(
+            first_broken_frame(&io, &wal, 1),
+            Some(1),
+            "the written-over frame keeps a stale checksum until the commit rewrites it"
+        );
+
+        let commit_page = page_with_pattern(9, 0x90, &buffer_pool);
+        commit_test_pages(&io, &wal, page_size, &[commit_page]);
+        assert_eq!(wal.get_max_frame(), 2);
+        assert_eq!(first_broken_frame(&io, &wal, 2), None);
+        assert_eq!(test_frame_body(&io, &wal, 1), expected);
+        let commit_frame = read_test_frame(&io, &wal, 2);
+        assert_eq!(
+            u32::from_be_bytes(commit_frame[4..8].try_into().unwrap()),
+            99,
+            "the last frame carries the commit marker"
+        );
+        let last = (
+            u32::from_be_bytes(commit_frame[16..20].try_into().unwrap()),
+            u32::from_be_bytes(commit_frame[20..24].try_into().unwrap()),
+        );
+        assert_eq!(wal.get_last_checksum(), last);
+        assert!(!wal.checksum_rewrite_needed());
+    }
+
+    #[test]
+    fn a_commit_writes_a_spilled_page_over_its_frame() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![
+                page_with_pattern(7, 0x10, &buffer_pool),
+                page_with_pattern(8, 0x20, &buffer_pool),
+            ],
+        );
+        assert_eq!(wal.get_max_frame(), 2);
+        let untouched = test_frame_body(&io, &wal, 2);
+
+        let changed = page_with_pattern(7, 0x30, &buffer_pool);
+        let changed_bytes = changed.get_contents().as_ptr().to_vec();
+        let commit_page = page_with_pattern(9, 0x90, &buffer_pool);
+        commit_test_pages(&io, &wal, page_size, &[changed, commit_page]);
+
+        assert_eq!(
+            wal.get_max_frame(),
+            3,
+            "the commit appends the commit frame only"
+        );
+        assert_eq!(test_frame_body(&io, &wal, 1), changed_bytes);
+        assert_eq!(test_frame_body(&io, &wal, 2), untouched);
+        assert_eq!(first_broken_frame(&io, &wal, 3), None);
+    }
+
+    #[test]
+    fn a_commit_without_a_repeated_page_is_what_it_was() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let pages = [
+            page_with_pattern(7, 0x10, &buffer_pool),
+            page_with_pattern(8, 0x20, &buffer_pool),
+        ];
+        let prepared = wal
+            .prepare_commit_frames(&pages, PageSize::new(page_size).unwrap(), Some(99), None)
+            .unwrap();
+        assert!(prepared.overwrites.is_empty());
+        assert!(prepared.overwritten.is_empty());
+        assert!(!wal.checksum_rewrite_needed());
+        commit_test_pages(&io, &wal, page_size, &pages);
+        assert_eq!(wal.get_max_frame(), 2);
+        assert_eq!(first_broken_frame(&io, &wal, 2), None);
+    }
+
+    #[test]
+    fn the_checksum_rewrite_runs_across_batches_and_chains_from_the_frame_before() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        // A committed frame first, so the rewrite does not start at frame 1.
+        commit_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[page_with_pattern(2, 0x02, &buffer_pool)],
+        );
+        assert_eq!(wal.get_max_frame(), 1);
+
+        let pages_count = 2 * CHECKSUM_REWRITE_FRAMES as i64 + 40;
+        let first_pass = (10..10 + pages_count)
+            .map(|id| page_with_pattern(id, 0x40, &buffer_pool))
+            .collect::<Vec<_>>();
+        for chunk in first_pass.chunks(100) {
+            spill_test_pages(&io, &wal, page_size, chunk.to_vec());
+        }
+        assert_eq!(wal.get_max_frame(), 1 + pages_count as u64);
+        let second_pass = (10..10 + pages_count)
+            .map(|id| page_with_pattern(id, 0x60, &buffer_pool))
+            .collect::<Vec<_>>();
+        let expected: Vec<Vec<u8>> = second_pass
+            .iter()
+            .map(|page| page.get_contents().as_ptr().to_vec())
+            .collect();
+        for chunk in second_pass.chunks(100) {
+            spill_test_pages(&io, &wal, page_size, chunk.to_vec());
+        }
+        assert_eq!(
+            wal.get_max_frame(),
+            1 + pages_count as u64,
+            "the second pass wrote over the first"
+        );
+        commit_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[page_with_pattern(3, 0x03, &buffer_pool)],
+        );
+        let frames = 2 + pages_count as u64;
+        assert_eq!(wal.get_max_frame(), frames);
+        assert_eq!(first_broken_frame(&io, &wal, frames), None);
+        for (offset, bytes) in expected.iter().enumerate() {
+            assert_eq!(&test_frame_body(&io, &wal, 2 + offset as u64), bytes);
+        }
+    }
+
+    #[test]
+    fn the_commit_marker_page_is_appended_and_not_written_over() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let spilled = page_with_pattern(9, 0x10, &buffer_pool);
+        let spilled_bytes = spilled.get_contents().as_ptr().to_vec();
+        spill_test_pages(&io, &wal, page_size, vec![spilled]);
+        assert_eq!(wal.get_max_frame(), 1);
+
+        commit_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[page_with_pattern(9, 0x20, &buffer_pool)],
+        );
+        assert_eq!(
+            wal.get_max_frame(),
+            2,
+            "the commit marker goes in a frame of its own, as in SQLite"
+        );
+        assert_eq!(test_frame_body(&io, &wal, 1), spilled_bytes);
+        let marker = read_test_frame(&io, &wal, 2);
+        assert_eq!(u32::from_be_bytes(marker[4..8].try_into().unwrap()), 99);
+        assert_eq!(first_broken_frame(&io, &wal, 2), None);
+    }
+
+    #[test]
+    fn a_committed_frame_is_never_written_over() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let committed = page_with_pattern(2, 0x02, &buffer_pool);
+        let committed_bytes = committed.get_contents().as_ptr().to_vec();
+        commit_test_pages(&io, &wal, page_size, &[committed]);
+        assert_eq!(wal.get_max_frame(), 1);
+
+        // A frame above the committed mark first, so the page's latest frame is looked up.
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![page_with_pattern(8, 0x08, &buffer_pool)],
+        );
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![page_with_pattern(2, 0x77, &buffer_pool)],
+        );
+        assert_eq!(
+            wal.get_max_frame(),
+            3,
+            "a frame at or below the committed mark is another transaction's: the new copy is appended"
+        );
+        assert_eq!(test_frame_body(&io, &wal, 1), committed_bytes);
+        assert!(!wal.checksum_rewrite_needed());
+    }
+
+    #[test]
+    fn the_checksum_rewrite_reaches_a_last_batch_of_one_frame() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let pages_count = CHECKSUM_REWRITE_FRAMES as i64;
+        for pass in [0x40u8, 0x60] {
+            let pages = (10..10 + pages_count)
+                .map(|id| page_with_pattern(id, pass, &buffer_pool))
+                .collect::<Vec<_>>();
+            for chunk in pages.chunks(64) {
+                spill_test_pages(&io, &wal, page_size, chunk.to_vec());
+            }
+        }
+        assert_eq!(wal.get_max_frame(), pages_count as u64);
+        commit_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[page_with_pattern(3, 0x03, &buffer_pool)],
+        );
+        // Frames 1..=256 are one batch and the commit frame is a batch of one.
+        let frames = pages_count as u64 + 1;
+        assert_eq!(wal.get_max_frame(), frames);
+        assert_eq!(first_broken_frame(&io, &wal, frames), None);
+    }
+
+    #[test]
+    fn a_raw_frame_is_never_written_over_by_the_transaction_that_follows_it() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        // A sync pull writes frames raw, above the committed mark until its last frame,
+        // the one with a database size, commits them.
+        let raw_bytes = page_with_pattern(7, 0x10, &buffer_pool)
+            .get_contents()
+            .as_ptr()
+            .to_vec();
+        wal.write_frame_raw(
+            buffer_pool.clone(),
+            1,
+            7,
+            0,
+            &raw_bytes,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        assert_eq!(wal.get_max_frame(), 1);
+
+        // The same connection then commits a page the raw frame holds.
+        commit_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[
+                page_with_pattern(7, 0x30, &buffer_pool),
+                page_with_pattern(9, 0x90, &buffer_pool),
+            ],
+        );
+        assert_eq!(
+            wal.get_max_frame(),
+            3,
+            "the raw frame stays, and page 7 gets a frame of its own after it"
+        );
+        assert_eq!(test_frame_body(&io, &wal, 1), raw_bytes);
+        assert!(!wal.checksum_rewrite_needed());
+        assert_eq!(first_broken_frame(&io, &wal, 3), None);
+    }
+
+    #[test]
+    fn a_rolled_back_transaction_owes_no_checksum_rewrite() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![page_with_pattern(7, 0x10, &buffer_pool)],
+        );
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![page_with_pattern(7, 0x20, &buffer_pool)],
+        );
+        assert!(wal.checksum_rewrite_needed());
+        wal.rollback(None);
+        assert!(!wal.checksum_rewrite_needed());
+        assert_eq!(wal.get_max_frame(), 0);
+    }
+
+    #[test]
+    fn a_savepoint_rollback_keeps_the_rewrite_a_frame_before_it_still_owes() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![
+                page_with_pattern(7, 0x10, &buffer_pool),
+                page_with_pattern(8, 0x20, &buffer_pool),
+            ],
+        );
+        let checkpoint_seq = wal.checkpoint_seq.load(Ordering::Acquire);
+        let savepoint = RollbackTo {
+            frame: wal.get_max_frame(),
+            checksum: wal.get_last_checksum(),
+            checkpoint_seq,
+        };
+        // After the savepoint: page 7 written over (frame 1, before the savepoint),
+        // and page 20 appended (frame 3, after it).
+        spill_test_pages(
+            &io,
+            &wal,
+            page_size,
+            vec![
+                page_with_pattern(7, 0x30, &buffer_pool),
+                page_with_pattern(20, 0x40, &buffer_pool),
+            ],
+        );
+        assert_eq!(wal.get_max_frame(), 3);
+        assert!(wal.checksum_rewrite_needed());
+        wal.rollback(Some(savepoint));
+        assert_eq!(wal.get_max_frame(), 2);
+        assert!(
+            wal.checksum_rewrite_needed(),
+            "frame 1 was written over before the savepoint was undone and stays stale"
+        );
+        // The pager restores page 7 dirty from its subjournal and the commit writes it again.
+        let restored = page_with_pattern(7, 0x10, &buffer_pool);
+        let restored_bytes = restored.get_contents().as_ptr().to_vec();
+        commit_test_pages(
+            &io,
+            &wal,
+            page_size,
+            &[restored, page_with_pattern(9, 0x90, &buffer_pool)],
+        );
+        assert_eq!(wal.get_max_frame(), 3);
+        assert_eq!(test_frame_body(&io, &wal, 1), restored_bytes);
+        assert_eq!(first_broken_frame(&io, &wal, 3), None);
     }
 
     fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {

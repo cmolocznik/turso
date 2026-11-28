@@ -717,3 +717,170 @@ fn first_column_text(conn: &Arc<Connection>, sql: &str) -> Result<String> {
     })?;
     Ok(first.unwrap_or_default())
 }
+
+/// The frames in a WAL file of 512-byte pages: its size less the 32-byte header, over a
+/// frame's 24-byte header and a page.
+fn frames_in_wal_file(db_path: &std::path::Path) -> u64 {
+    let wal = std::fs::metadata(format!("{}-wal", db_path.display()))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    wal.saturating_sub(32) / (512 + 24)
+}
+
+/// Copies the database and its WAL as they are on disk now, as a crash would leave them.
+fn copy_database_files(db_path: &std::path::Path, to: &std::path::Path) {
+    std::fs::copy(db_path, to).unwrap();
+    let wal = format!("{}-wal", db_path.display());
+    if std::path::Path::new(&wal).exists() {
+        std::fs::copy(&wal, format!("{}-wal", to.display())).unwrap();
+    }
+}
+
+/// SQLite reading a copy of the files: the oracle for the WAL's checksum chain, which it
+/// verifies frame by frame and stops at the first frame that fails.
+fn sqlite_counts(db_path: &std::path::Path) -> (String, i64) {
+    let sqlite = rusqlite::Connection::open(db_path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    let rows: i64 = sqlite
+        .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    (integrity, rows)
+}
+
+const SPILLING_ROWS: u32 = 3000;
+
+fn spilling_table_and_cache(conn: &Arc<Connection>) -> Result<()> {
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA wal_autocheckpoint=0;")?;
+    conn.execute("PRAGMA cache_size=20;")?;
+    conn.execute(
+        "CREATE TABLE t(k INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER);",
+    )?;
+    for column in ["a", "b", "c", "d"] {
+        conn.execute(format!("CREATE INDEX t_{column} ON t({column});"))?;
+    }
+    Ok(())
+}
+
+fn spilling_fill(conn: &Arc<Connection>) -> Result<()> {
+    conn.execute(format!(
+        "INSERT INTO t(a, b, c, d)
+         SELECT random(), random(), random(), random()
+         FROM (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {SPILLING_ROWS})
+               SELECT x FROM c);"
+    ))?;
+    Ok(())
+}
+
+/// A transaction whose dirty pages do not fit the cache writes each page to the WAL once,
+/// as SQLite does, and not once for every time the cache let it go.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_a_spilling_transaction_writes_each_page_to_the_wal_once(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    spilling_table_and_cache(&conn)?;
+    let before = frames_in_wal_file(&tmp_db.path);
+
+    conn.execute("BEGIN IMMEDIATE;")?;
+    spilling_fill(&conn)?;
+    conn.execute("COMMIT;")?;
+
+    let written = frames_in_wal_file(&tmp_db.path) - before;
+    let pages = execute_and_get_ints(&conn, "PRAGMA page_count;")?[0] as u64;
+    assert!(
+        pages > 100,
+        "the test must overflow a 20-page cache many times over: {pages} pages"
+    );
+    assert!(
+        written <= pages + 2,
+        "the transaction wrote {written} frames for a database of {pages} pages"
+    );
+    assert_eq!(
+        execute_and_get_strings(&conn, "PRAGMA integrity_check;")?,
+        vec!["ok"]
+    );
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t;")?,
+        vec![SPILLING_ROWS as i64]
+    );
+    Ok(())
+}
+
+/// What the files hold at the moment of the commit is a WAL SQLite accepts whole: the
+/// checksum chain, which the commit rewrote after the pages written over their frames, holds
+/// to the last frame, so SQLite sees every row.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_sqlite_reads_the_wal_of_a_spilling_commit(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    spilling_table_and_cache(&conn)?;
+    conn.execute("BEGIN IMMEDIATE;")?;
+    spilling_fill(&conn)?;
+    conn.execute("COMMIT;")?;
+
+    let image = tmp_db.path.with_file_name("after-commit.db");
+    copy_database_files(&tmp_db.path, &image);
+    let (integrity, rows) = sqlite_counts(&image);
+    assert_eq!(integrity, "ok");
+    assert_eq!(
+        rows, SPILLING_ROWS as i64,
+        "SQLite must accept every frame of the commit"
+    );
+    Ok(())
+}
+
+/// A crash in the middle of a spilling transaction leaves frames written over, with stale
+/// checksums, above the last commit: the next open and SQLite both see the database as it
+/// was before the transaction.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_a_crash_image_of_a_spilling_transaction_is_the_database_before_it(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+    spilling_table_and_cache(&conn)?;
+    conn.execute("INSERT INTO t(a, b, c, d) VALUES (1, 2, 3, 4);")?;
+    let committed_frames = frames_in_wal_file(&tmp_db.path);
+
+    conn.execute("BEGIN IMMEDIATE;")?;
+    spilling_fill(&conn)?;
+    // Update the rows again so pages the cache already gave up are written over.
+    conn.execute("UPDATE t SET a = a + 1, b = b + 1, c = c + 1, d = d + 1;")?;
+    for completion in conn.cacheflush()? {
+        tmp_db.io.wait_for_completion(completion)?;
+    }
+    assert!(
+        frames_in_wal_file(&tmp_db.path) > committed_frames,
+        "the transaction must have spilled frames by now"
+    );
+
+    let image = tmp_db.path.with_file_name("crash-image.db");
+    copy_database_files(&tmp_db.path, &image);
+    let sqlite_image = tmp_db.path.with_file_name("crash-image-sqlite.db");
+    copy_database_files(&tmp_db.path, &sqlite_image);
+    conn.execute("ROLLBACK;")?;
+
+    let reopened = TempDatabase::new_with_existent(&image);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(
+        execute_and_get_ints(&reopened_conn, "SELECT count(*) FROM t;")?,
+        vec![1],
+        "an uncommitted transaction is not there after the crash"
+    );
+    assert_eq!(
+        execute_and_get_strings(&reopened_conn, "PRAGMA integrity_check;")?,
+        vec!["ok"]
+    );
+    let (integrity, rows) = sqlite_counts(&sqlite_image);
+    assert_eq!(integrity, "ok");
+    assert_eq!(rows, 1);
+    Ok(())
+}

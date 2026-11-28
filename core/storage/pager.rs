@@ -1248,6 +1248,10 @@ enum CommitState {
     WaitReplicated,
     /// All frames prepared, writes are in flight
     WaitWrites,
+    /// The commit wrote pages over frames this transaction had already written (cache
+    /// spills), which left the checksums after them stale: rewrite the chain before the
+    /// WAL is synced. Entered only when the WAL owes a rewrite.
+    RewriteChecksums,
     /// Wait for the WAL fsync that makes the commit durable. Every commit
     /// converges here once its writes (if any) have completed. The fsync is
     /// submitted here, and skipped when the WAL is not dirty (no frames
@@ -5011,9 +5015,39 @@ impl Pager {
                         .into());
                     }
                     commit_info.completion_group = None;
-                    // All writes complete; WaitSync submits the WAL fsync if
-                    // one is owed.
-                    commit_info.state = CommitState::WaitSync;
+                    // All writes complete. Pages written over their earlier frames
+                    // left the checksums after them stale: rewrite them before the
+                    // sync. Otherwise WaitSync submits the WAL fsync if one is owed.
+                    commit_info.state = if wal.checksum_rewrite_needed() {
+                        CommitState::RewriteChecksums
+                    } else {
+                        CommitState::WaitSync
+                    };
+                }
+                CommitState::RewriteChecksums => {
+                    let last_frame = self
+                        .commit_info
+                        .read()
+                        .prepared_frames
+                        .last()
+                        .expect("a commit that rewrites checksums prepared frames")
+                        .final_max_frame;
+                    match wal.checksum_rewrite_step(last_frame) {
+                        Ok(IOResult::Done(())) => {
+                            self.commit_info.write().state = CommitState::WaitSync;
+                        }
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(error) => {
+                            let mut commit_info = self.commit_info.write();
+                            if commit_info.replication.is_some() {
+                                panic!(
+                                    "a commit its replicator took could not have its WAL checksums rewritten: {error:?}"
+                                );
+                            }
+                            commit_info.prepared_frames.clear();
+                            return Err(error);
+                        }
+                    }
                 }
                 // To protect against partial writes, we MUST ensure that all write Completions
                 // finish before submitting the fsync. It is possible that a partial write will
@@ -5125,11 +5159,11 @@ impl Pager {
     /// this transaction found and the one its frame writes.
     fn replicated_commit(&self, commit_info: &CommitInfo) -> ReplicatedCommit {
         let before_images = self.before_images.read();
-        let pages = commit_info
+        let mut pages = commit_info
             .prepared_frames
             .iter()
-            .flat_map(|prepared| &prepared.metadata)
-            .map(|(page, _, _)| {
+            .flat_map(|prepared| prepared.pages())
+            .map(|page| {
                 let number = page.get().id() as u32;
                 let before = before_images.get(&number).cloned().unwrap_or_else(|| {
                     panic!("page {number} was committed without the image it had before")
@@ -5140,7 +5174,10 @@ impl Pager {
                     after: Arc::from(page.get_contents().as_ptr()),
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // The commit's pages in page order, whether a frame was appended for each or written
+        // over the frame a spill gave it.
+        pages.sort_by_key(|page| page.number);
         ReplicatedCommit {
             db_size: commit_info
                 .db_size
@@ -5156,6 +5193,9 @@ impl Pager {
         let mut batch = WriteBatch::new(wal_file);
         for prepared in &commit_info.prepared_frames {
             batch.writev(prepared.offset, &prepared.bufs);
+            for (offset, bufs) in &prepared.overwrites {
+                batch.writev(*offset, bufs);
+            }
         }
         let mut group = CompletionGroup::new(|_| {});
         batch.submit(Some(&mut group))?;
@@ -5184,7 +5224,7 @@ impl Pager {
         }
         // Chain from previous batch if any
         let prev = commit_info.prepared_frames.last();
-        let prepared = wal.prepare_frames(&pages, page_sz, commit_flag, prev)?;
+        let prepared = wal.prepare_commit_frames(&pages, page_sz, commit_flag, prev)?;
         tracing::debug!("prepare_collected_frames: offset={}", prepared.offset);
         commit_info.prepared_frames.push(prepared);
         Ok(())

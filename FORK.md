@@ -2264,6 +2264,21 @@ Test: `replicated_log::tests::frames_refused_by_another_s_write_lock_apply_once_
 connection's `BEGIN IMMEDIATE` held, the apply is `Busy`, the applier is in no transaction and committed nothing;
 after its `ROLLBACK` the same frames apply once.
 
+### A replicated commit's applier writes beside other writers
+2026-11-28. `sync/engine/src/replicated_log.rs`. The applier began every call's transaction `IMMEDIATE`, so a
+follower's own writer, its index's merge, had to run on the applier's connection, between its calls, and
+applying waited for each merge step (60 s and more seen, atoll-forge's followers). The applier now begins
+`CONCURRENT`, unless a frame changes the schema or the database header, which runs `IMMEDIATE` as every such
+change does. A writer of a row the frames write refuses the call as a conflict (`WriteWriteConflict`,
+`BusySnapshot`, `Conflict`, or `Busy` where another holds the write lock), nothing committed, the connection in
+no transaction (it rolls back only a transaction the refusal left open), and the same frames apply once when
+tried again. Frames are decoded once, up front (`DecodedFrames`), and `DecodedFrames::changes_schema` tells a
+caller which calls must run alone.
+Test: `replicated_log::tests::frames_apply_beside_another_writer_and_wait_for_one_of_their_rows`: a writer's open
+concurrent transaction on another table leaves the apply going; one that wrote a row the frames write refuses
+them whole, and they apply once it ends. `frames_refused_by_another_s_write_lock_apply_once_when_tried_again`
+now takes a conflict as well as `Busy`.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

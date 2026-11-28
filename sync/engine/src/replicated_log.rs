@@ -10,13 +10,17 @@
 //!
 //! The frames of one call are applied as one transaction of the applying
 //! database, on a connection that applies replicated commits: its own log
-//! replicator neither refuses them nor receives their frames.
+//! replicator neither refuses them nor receives their frames. The transaction
+//! is concurrent, so other writers of the database, such as a follower's own
+//! index merge, go on beside it; frames that change the schema or the header
+//! are applied alone, under the write lock, as every schema change is made.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use turso_core::{ConnectOpts, Connection, Database, ReplicatedFrame};
 
+use crate::client_proto::{LogicalOpType, LogicalTxnData};
 use crate::database_replay_generator::DatabaseReplayGenerator;
 use crate::database_sync_operations::{
     decode_mvcc_frame_txns, logical_txn_to_tape_operations, parse_mvcc_frame,
@@ -29,6 +33,9 @@ use crate::Result;
 /// Applies another database's frames to one database.
 pub struct ReplicatedLogApplier {
     replay: DatabaseReplaySession,
+    /// A test's, run while a call's transaction is open, before it commits.
+    #[cfg(test)]
+    before_commit: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl ReplicatedLogApplier {
@@ -37,6 +44,8 @@ impl ReplicatedLogApplier {
         let conn = db.connect(ConnectOpts::new())?;
         conn.set_applies_replicated_commits(true);
         Ok(Self {
+            #[cfg(test)]
+            before_commit: None,
             replay: DatabaseReplaySession {
                 conn: conn.clone(),
                 cached_delete_stmt: HashMap::new(),
@@ -65,70 +74,108 @@ impl ReplicatedLogApplier {
     /// frames changed nothing this database keeps, so that it committed
     /// nothing. Each frame's CRC must continue from the CRC it says comes
     /// before it. On an error, nothing of the frames is applied, and the
-    /// connection is in no transaction. Another transaction that holds the
-    /// database's write lock refuses the begin with `Busy`, nothing begun:
-    /// the caller tries the same frames again once it is free.
+    /// connection is in no transaction. Another transaction may refuse it,
+    /// nothing committed: one that holds the database's write lock, with
+    /// `Busy`, and one that wrote a row the frames write, with
+    /// `WriteWriteConflict`, `BusySnapshot` or `Conflict`. The caller tries
+    /// the same frames again once it is free.
     pub fn apply(&mut self, frames: &[ReplicatedFrame]) -> Result<Option<u64>> {
+        self.apply_decoded(&DecodedFrames::decode(frames)?)
+    }
+
+    /// [`Self::apply`], of frames decoded already.
+    pub fn apply_decoded(&mut self, frames: &DecodedFrames) -> Result<Option<u64>> {
         let before = self.replay.conn.last_commit_ts();
-        self.replay.conn.execute("BEGIN IMMEDIATE")?;
+        let begin = if frames.changes_schema() {
+            "BEGIN IMMEDIATE"
+        } else {
+            "BEGIN CONCURRENT"
+        };
+        self.replay.conn.execute(begin)?;
         self.replay.in_txn = true;
         let applied = drive(|coro| {
             let replay = &mut self.replay;
             async move {
-                for frame in frames {
-                    apply_frame(&coro, replay, frame).await?;
+                for txn in &frames.txns {
+                    // A run of a transaction's inserts into one table as one statement, as the
+                    // leader wrote them: an index that writes a statement's additions as one
+                    // segment keeps as few here.
+                    replay
+                        .replay_all(&coro, logical_txn_to_tape_operations(txn)?)
+                        .await?;
                 }
                 Ok(())
             }
         });
         self.replay.in_txn = false;
+        #[cfg(test)]
+        if let (Ok(()), Some(before_commit)) = (&applied, self.before_commit.as_mut()) {
+            before_commit();
+        }
         if let Err(err) = applied {
-            self.replay.conn.execute("ROLLBACK")?;
+            self.end_refused()?;
             return Err(err);
         }
         if let Err(err) = self.replay.conn.execute("COMMIT") {
-            // A commit refused leaves its transaction open: it is ended, so
-            // the next frames begin one of their own.
-            if !self.replay.conn.get_auto_commit() {
-                self.replay.conn.execute("ROLLBACK")?;
-            }
+            self.end_refused()?;
             return Err(err.into());
         }
         let after = self.replay.conn.last_commit_ts();
         Ok(after.filter(|_| after != before))
     }
+
+    /// Ends the transaction a refusal left open, so the next frames begin one
+    /// of their own; some refusals end it themselves.
+    fn end_refused(&self) -> Result<()> {
+        if !self.replay.conn.get_auto_commit() {
+            self.replay.conn.execute("ROLLBACK")?;
+        }
+        Ok(())
+    }
 }
 
-async fn apply_frame(
-    coro: &Coro<()>,
-    replay: &mut DatabaseReplaySession,
-    frame: &ReplicatedFrame,
-) -> Result<()> {
-    let parsed = parse_mvcc_frame(&frame.bytes, 0, Some(frame.crc_before))?;
-    if parsed.end != frame.bytes.len() {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "a replicated frame of {} bytes ends at {}",
-            frame.bytes.len(),
-            parsed.end
-        )));
+/// Frames decoded to apply: each transaction they hold, in order.
+pub struct DecodedFrames {
+    txns: Vec<LogicalTxnData>,
+}
+
+impl DecodedFrames {
+    /// Decodes `frames`, checking that each frame's CRC continues from the CRC
+    /// it says comes before it.
+    pub fn decode(frames: &[ReplicatedFrame]) -> Result<Self> {
+        let mut txns = Vec::new();
+        for frame in frames {
+            let parsed = parse_mvcc_frame(&frame.bytes, 0, Some(frame.crc_before))?;
+            if parsed.end != frame.bytes.len() {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "a replicated frame of {} bytes ends at {}",
+                    frame.bytes.len(),
+                    parsed.end
+                )));
+            }
+            let Some(changes) = parsed.changes else {
+                return Err(Error::DatabaseSyncEngineError(
+                    "a replicated frame has no portable changes, so its tables cannot be named"
+                        .to_string(),
+                ));
+            };
+            txns.extend(decode_mvcc_frame_txns(
+                &changes.portable_payload,
+                changes.recovery_payload,
+                changes.op_count,
+            )?);
+        }
+        Ok(Self { txns })
     }
-    let Some(changes) = parsed.changes else {
-        return Err(Error::DatabaseSyncEngineError(
-            "a replicated frame has no portable changes, so its tables cannot be named".to_string(),
-        ));
-    };
-    for txn in decode_mvcc_frame_txns(
-        &changes.portable_payload,
-        changes.recovery_payload,
-        changes.op_count,
-    )? {
-        // A run of a transaction's inserts into one table as one statement, as the leader wrote
-        // them: an index that writes a statement's additions as one segment keeps as few here.
-        replay
-            .replay_all(coro, logical_txn_to_tape_operations(&txn)?)
-            .await?;
+
+    /// Whether applying them changes the schema or the database header, which
+    /// only a transaction holding the write lock makes.
+    pub fn changes_schema(&self) -> bool {
+        self.txns.iter().flat_map(|txn| &txn.ops).any(|op| {
+            op.op_type == LogicalOpType::Schema as i32
+                || op.op_type == LogicalOpType::UpdateHeader as i32
+        })
     }
-    Ok(())
 }
 
 /// Runs `task` to its end on a blocking coroutine, whose statements wait for their own IO in
@@ -157,7 +204,7 @@ mod tests {
         SqliteDialect, Value,
     };
 
-    use super::ReplicatedLogApplier;
+    use super::{DecodedFrames, ReplicatedLogApplier};
 
     /// Keeps each frame of a leader's commits; a follower's takes none.
     struct Recorder {
@@ -269,10 +316,9 @@ mod tests {
     }
 
     /// Another connection's transaction that holds the follower's write
-    /// lock, as a checkpoint or the follower's own index merge may, refuses
-    /// the applier's begin with `Busy` and nothing begun: the connection is
-    /// in no transaction, nothing is committed, and the same frames apply
-    /// once when tried again after the lock is free.
+    /// lock refuses the applier's writes, as a conflict, and nothing is
+    /// committed: the connection is in no transaction, and the same frames
+    /// apply once when tried again after the lock is free.
     #[test]
     fn frames_refused_by_another_s_write_lock_apply_once_when_tried_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -291,7 +337,9 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(crate::errors::Error::TursoError(turso_core::LimboError::Busy))
+                Err(crate::errors::Error::TursoError(
+                    turso_core::LimboError::Busy | turso_core::LimboError::WriteWriteConflict
+                ))
             ),
             "{refused:?}"
         );
@@ -304,6 +352,111 @@ mod tests {
             rows(&follower, "SELECT v FROM log"),
             vec![vec![Value::build_text("once")]]
         );
+    }
+
+    /// A writer of the follower's own, as its index merge is, beside the
+    /// applier: one that writes other rows goes on beside it, and one that
+    /// writes a row the frames write refuses them whole, nothing committed,
+    /// until it ends.
+    #[test]
+    fn frames_apply_beside_another_writer_and_wait_for_one_of_their_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (leader, recorder) = open(&dir, "leader.db", true);
+        let (follower, _) = open(&dir, "follower.db", false);
+        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE own (v TEXT)").unwrap();
+        conn.execute("INSERT INTO log VALUES (1, 'first')").unwrap();
+        let mut applier = ReplicatedLogApplier::new(&follower).unwrap();
+        let schema = frames(&recorder);
+        assert!(DecodedFrames::decode(&schema).unwrap().changes_schema());
+        // A writer that commits while a call's transaction is open: beside rows, never beside a
+        // schema change.
+        let during = Arc::new(Mutex::new(Vec::new()));
+        let other = follower.connect(turso_core::ConnectOpts::new()).unwrap();
+        other.set_applies_replicated_commits(true);
+        other.execute("CREATE TABLE noted (v TEXT)").unwrap();
+        let commits = |applier: &mut ReplicatedLogApplier| {
+            let (other, during) = (other.clone(), during.clone());
+            applier.before_commit = Some(Box::new(move || {
+                let made = other
+                    .execute("BEGIN CONCURRENT")
+                    .and_then(|()| other.execute("INSERT INTO noted VALUES ('during')"))
+                    .and_then(|()| other.execute("COMMIT"));
+                if !other.get_auto_commit() {
+                    other.execute("ROLLBACK").unwrap();
+                }
+                during.lock().unwrap().push(made.is_ok());
+            }));
+        };
+        commits(&mut applier);
+        applier.apply(&schema).unwrap();
+        conn.execute("INSERT INTO log VALUES (4, 'fourth')")
+            .unwrap();
+        commits(&mut applier);
+        applier.apply(&frames(&recorder)).unwrap();
+        applier.before_commit = None;
+        assert_eq!(*during.lock().unwrap(), vec![false, true]);
+
+        // Frames that fail to replay leave nothing and no transaction.
+        let (bare, _) = open(&dir, "bare.db", false);
+        let mut elsewhere = ReplicatedLogApplier::new(&bare).unwrap();
+        conn.execute("INSERT INTO log VALUES (5, 'fifth')").unwrap();
+        let fifth = frames(&recorder);
+        assert!(elsewhere.apply(&fifth).is_err());
+        assert!(elsewhere.conn().get_auto_commit());
+        applier.apply(&fifth).unwrap();
+
+        let writer = follower.connect(turso_core::ConnectOpts::new()).unwrap();
+        writer.set_applies_replicated_commits(true);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("INSERT INTO own VALUES ('mine')").unwrap();
+        conn.execute("INSERT INTO log VALUES (2, 'second')")
+            .unwrap();
+        let pending = frames(&recorder);
+        assert!(!DecodedFrames::decode(&pending).unwrap().changes_schema());
+        applier.apply(&pending).unwrap();
+        writer.execute("COMMIT").unwrap();
+
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("UPDATE log SET v = 'held' WHERE id = 2")
+            .unwrap();
+        conn.execute("UPDATE log SET v = 'leader' WHERE id = 2")
+            .unwrap();
+        conn.execute("INSERT INTO log VALUES (3, 'third')").unwrap();
+        let pending = frames(&recorder);
+        let before = applier.conn().last_commit_ts();
+        let refused = applier.apply(&pending);
+        assert!(
+            matches!(
+                refused,
+                Err(crate::errors::Error::TursoError(
+                    turso_core::LimboError::WriteWriteConflict
+                        | turso_core::LimboError::BusySnapshot
+                        | turso_core::LimboError::Conflict(_)
+                        | turso_core::LimboError::Busy
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert!(applier.conn().get_auto_commit());
+        assert_eq!(applier.conn().last_commit_ts(), before);
+        assert_eq!(
+            rows(&follower, "SELECT count(*) FROM log"),
+            vec![vec![Value::from_i64(4)]]
+        );
+        writer.execute("ROLLBACK").unwrap();
+        applier.apply(&pending).unwrap();
+        for sql in ["SELECT * FROM log ORDER BY id", "SELECT * FROM own"] {
+            let expected = if sql.contains("own") {
+                vec![vec![Value::build_text("mine")]]
+            } else {
+                rows(&leader, sql)
+            };
+            assert_eq!(rows(&follower, sql), expected, "{sql}");
+        }
     }
 
     /// A table keyed by other than the rowid: the follower's rowids need not

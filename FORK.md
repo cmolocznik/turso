@@ -487,6 +487,27 @@ and the passive checkpoint tests). Tests:
 `wal::test_wal::a_truncate_checkpoint_is_refused_while_a_reader_holds_a_snapshot`. Not yet shown
 failing on a mutant.
 
+### A purge's erasure of the logical log is durable: the checkpoint keeps its fsync
+2026-11-28. `core/mvcc/database/checkpoint.rs` (`CheckpointState::FsyncLogicalLog`),
+`core/mvcc/persistent_storage/{mod.rs,logical_log.rs}` (`sync_beside_appends`, `LogRing::freed`).
+Upstream stopped fsyncing the logical log after a checkpoint truncates it: a crash that loses the
+truncation brings the old frames back, but recovery skips frames at or below the checkpoint, so SQL
+cannot see them. The bytes are still in the file, and the forge's purge records its erasure after a
+TRUNCATE succeeds, so after a crash the record would stand over bytes that were not erased (the
+auditor's A-486). The checkpoint keeps the fsync, run beside the commits' appends, between the log's
+truncate and the WAL's, and the log now remembers each segment file a checkpoint freed until an fsync
+has covered its truncate, so a rolled log's sealed segments are erased durably too. A failed fsync
+fails the checkpoint.
+Tests, in `tests/integration/storage/erasure.rs`, each on `UnreliableIo`, which loses every write no
+fsync has covered:
+`a_truncating_checkpoint_leaves_no_erased_byte_in_the_durable_log_after_a_crash`,
+`a_truncating_checkpoint_leaves_no_erased_byte_in_a_freed_log_segment_after_a_crash` and
+`a_truncating_checkpoint_fails_when_the_fsync_of_the_log_fails`; and
+`mvcc::database::a_commit_lands_while_a_passive_checkpoint_is_parked_in_its_log_sync` (no commit
+waits out the fsync).
+Each mutation is caught: no fsync state (all three crash tests fail); freed files not listed for the
+fsync (the freed-segment test fails).
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)
@@ -2363,12 +2384,6 @@ Ours 2026-10-28 `e6fd95447`; upstream took it the same day as `ad8e4895f`, the s
 ### A value an index method provides failed the collation lookup
 Ours 2026-10-28 `917f0acbd`; upstream took it the same day as `c6f1cafdd`, the same patch.
 `index_method::fts::tests::fts_score_from_the_index_has_no_column_collation` came with it.
-
-### A checkpoint's fsync of the logical log after its truncate
-Upstream stopped fsyncing the logical log after a checkpoint truncates it (a lost truncation brings
-back frames at or below `persistent_tx_ts_max`, which recovery skips). The merge of 2026-11-28 takes
-that: the checkpoint's `FsyncLogicalLog` state, our `Storage::sync_beside_appends` that ran it beside
-appends, and its test seam are gone, with the test that parked a checkpoint in that fsync.
 
 ## Considered and not taken
 

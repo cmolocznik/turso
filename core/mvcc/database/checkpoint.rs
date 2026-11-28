@@ -224,14 +224,19 @@ pub enum CheckpointState {
     /// `synchronous=NORMAL`, whose pager commit does not issue one, but a refused backfill returns
     /// before it.
     SyncRefusedWal,
-    /// Truncate the logical log. The log needs no fsync after this: if a crash loses the
-    /// truncation, the old frames come back, but their `commit_ts` is at or below
-    /// `persistent_tx_ts_max`, so recovery skips them.
+    /// Truncate the logical log. A crash that loses the truncation brings the old frames back, but
+    /// their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery skips them. The
+    /// truncation is still fsynced ([`CheckpointState::FsyncLogicalLog`]), because a purge's
+    /// erasure of the bytes must be durable once the checkpoint reports success.
     TruncateLogicalLog,
     /// Apply the finished truncate of the logical log to the in-memory log
     /// state. A truncate that completes after `DurableStorage::truncate`
     /// returned leaves the old log offset in place until this step.
     FinishTruncateLogicalLog,
+    /// Fsync the logical log files the truncate emptied (the active one and every freed segment),
+    /// beside the commits' appends, before the WAL is truncated. Upstream dropped this fsync as
+    /// recovery skips the old frames; the fork keeps it so that the erasure is durable.
+    FsyncLogicalLog,
     /// Truncate the WAL file after the DB file is durable.
     TruncateWal,
     GcTableRows {
@@ -1974,6 +1979,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         false
     }
 
+    /// Fsync the logical log's files, the freed ones included, so that what the truncate erased
+    /// stays erased after a crash. The sync runs beside commits' appends: none waits out its fsyncs.
+    fn fsync_logical_log(&self) -> Result<Completion> {
+        self.mvstore
+            .storage
+            .sync_beside_appends(self.pager.get_sync_type())
+    }
+
     fn truncate_logical_log(&self) -> Result<Completion> {
         use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
         let boundary = if self.clears_whole_logical_log() {
@@ -3586,8 +3599,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         "TRUNCATE checkpoint must zero the logical log file"
                     );
                 }
-                self.state = CheckpointState::TruncateWal;
+                self.state = CheckpointState::FsyncLogicalLog;
                 Ok(TransitionResult::Continue)
+            }
+
+            CheckpointState::FsyncLogicalLog => {
+                // Skip fsync when synchronous mode is off
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+                tracing::debug!("Fsyncing logical log file");
+                let c = self.fsync_logical_log()?;
+                self.state = CheckpointState::TruncateWal;
+                // if Completion Completed without errors we can continue
+                if c.succeeded() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions(c)))
+                }
             }
 
             CheckpointState::CheckpointWal => {

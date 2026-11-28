@@ -780,6 +780,10 @@ struct LogRing {
     /// The number of the next segment, past every number the log's files have held: a segment
     /// left by a recovery that ended before it can never share its number with a later one.
     next_seq: u64,
+    /// Each slot a checkpoint freed, with whether its truncate may not be durable yet. A purge's
+    /// erasure is durable only once those files are fsynced, so [`LogicalLog::sync_targets`] lists
+    /// them until they are.
+    freed: Vec<(usize, Arc<crate::sync::atomic::AtomicBool>)>,
 }
 
 enum Slot {
@@ -833,6 +837,12 @@ impl LogRing {
         });
         let ready = start_in_group(group, c, |c| file.truncate(0, c))?;
         self.slots[slot] = Slot::Free { file, ready };
+        match self.freed.iter().find(|(freed, _)| *freed == slot) {
+            Some((_, unsynced)) => unsynced.store(true, crate::sync::atomic::Ordering::Release),
+            None => self
+                .freed
+                .push((slot, Arc::new(crate::sync::atomic::AtomicBool::new(true)))),
+        }
         Ok(())
     }
 
@@ -963,6 +973,7 @@ impl LogicalLog {
             sealed: VecDeque::new(),
             roll_pending: false,
             next_seq: 1,
+            freed: Vec::new(),
         }));
         Ok(log)
     }
@@ -1590,8 +1601,8 @@ impl LogicalLog {
         sync_files(self.sync_targets(), sync_type)
     }
 
-    /// The files a sync of the log covers: each sealed segment not yet synced, then the active
-    /// file. Taken under the log's lock; [`sync_files`] then needs none, as an fsync covers every
+    /// The files a sync of the log covers: each sealed segment not yet synced, each file a checkpoint
+    /// truncated and no fsync has covered, then the active file. Taken under the log's lock; [`sync_files`] then needs none, as an fsync covers every
     /// byte written to its file before the call, whatever is appended meanwhile.
     pub(crate) fn sync_targets(&self) -> Vec<SyncTarget> {
         let mut targets = Vec::new();
@@ -1604,6 +1615,18 @@ impl LogicalLog {
                 targets.push(SyncTarget {
                     file: ring.file(sealed.slot).clone(),
                     unsynced: Some(sealed.unsynced.clone()),
+                });
+            }
+            // A file a checkpoint truncated holds nothing, but the truncate is not durable until
+            // it is fsynced: a crash would bring back what was erased.
+            for (slot, unsynced) in ring
+                .freed
+                .iter()
+                .filter(|(_, unsynced)| unsynced.load(crate::sync::atomic::Ordering::Acquire))
+            {
+                targets.push(SyncTarget {
+                    file: ring.file(*slot).clone(),
+                    unsynced: Some(unsynced.clone()),
                 });
             }
         }

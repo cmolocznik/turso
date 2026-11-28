@@ -803,3 +803,176 @@ fn pages_taken_off_the_freelist_leave_no_pointer_behind() {
         assert!(strays.is_empty(), "mvcc={mvcc}: {strays:#?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A purge's erasure must be durable: once a TRUNCATE checkpoint reports success, a power loss must
+// not bring the erased bytes back out of the logical log. SQL recovery skips the old frames, but
+// that does not erase them, and the forge's purge records its erasure after the checkpoint.
+// ---------------------------------------------------------------------------------------------
+
+/// A database on `io`, which loses every write no fsync has covered when it crashes, with MVCC, a
+/// passive checkpoint, full synchronous mode and `secure_delete`, and a table `t`.
+fn crashable_database(
+    io: &Arc<crate::unreliable_io::UnreliableIo>,
+    path: &str,
+) -> (Arc<Database>, Arc<Connection>) {
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1").unwrap();
+    conn.execute("PRAGMA synchronous = FULL").unwrap();
+    conn.execute("PRAGMA secure_delete = ON").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    (db, conn)
+}
+
+fn rows_text(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        let values: Vec<String> = row.get_values().map(|value| format!("{value}")).collect();
+        rows.push(values.join("|"));
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
+fn holds(bytes: Option<&Vec<u8>>, marker: &str) -> bool {
+    bytes.is_some_and(|bytes| {
+        bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    })
+}
+
+/// A TRUNCATE checkpoint that reports success has made the erasure of the log's tail durable.
+#[test]
+fn a_truncating_checkpoint_leaves_no_erased_byte_in_the_durable_log_after_a_crash() {
+    let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
+    let path = "erase-crash-tail.db";
+    let log = format!("{path}-log");
+    let marker = "OLD_CONTENT_THAT_A_PURGE_MUST_ERASE_DURABLY";
+    let (_db, conn) = crashable_database(&io, path);
+    conn.execute(format!("INSERT INTO t VALUES (1, '{marker}')"))
+        .unwrap();
+    assert!(
+        holds(io.durable_files().get(&log), marker),
+        "the setup did not make the value durable in the log"
+    );
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let answer = rows_text(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        answer.first().is_some_and(|row| row.starts_with("0|")),
+        "the checkpoint did not succeed: {answer:?}"
+    );
+    let durable = io.durable_files();
+    let (_dir, recovered) = io.crash_now_and_recover(path).unwrap();
+    assert_eq!(rows_text(&recovered, "SELECT count(*) FROM t"), ["0"]);
+    assert!(
+        !holds(durable.get(&log), marker),
+        "the TRUNCATE reported success but the erased value is still in the durable log"
+    );
+}
+
+/// The same for a segment a rolled log has sealed: the checkpoint frees it, and what it held must
+/// be gone from the durable file too.
+#[test]
+fn a_truncating_checkpoint_leaves_no_erased_byte_in_a_freed_log_segment_after_a_crash() {
+    struct CommitAfterSnapshot {
+        conn: Arc<Connection>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+    impl std::fmt::Debug for CommitAfterSnapshot {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CommitAfterSnapshot")
+        }
+    }
+    impl YieldInjector for CommitAfterSnapshot {
+        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+            if point == CheckpointYieldPoint::AfterCollectTableRows.point()
+                && !self.fired.swap(true, Ordering::AcqRel)
+            {
+                self.conn
+                    .execute("INSERT INTO t(v) VALUES (randomblob(512))")
+                    .unwrap();
+            }
+            false
+        }
+    }
+    let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
+    let path = "erase-crash-rolled.db";
+    let log = format!("{path}-log");
+    let marker = "OLD_CONTENT_IN_A_SEALED_SEGMENT_TO_ERASE";
+    let (db, conn) = crashable_database(&io, path);
+    conn.execute(format!("INSERT INTO t VALUES (1, '{marker}')"))
+        .unwrap();
+    // A passive checkpoint beside a commit that lands after its snapshot keeps frames: the first
+    // readies a second file, the second rolls into it, sealing the first with the value in it.
+    for _ in 0..2 {
+        let checkpointer = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
+        let injector = Arc::new(CommitAfterSnapshot {
+            conn: conn.clone(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        checkpointer.set_yield_injector(Some(injector.clone()));
+        checkpointer
+            .checkpoint(turso_core::CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            })
+            .unwrap();
+        checkpointer.set_yield_injector(None);
+        assert!(injector.fired.load(Ordering::Acquire));
+    }
+    // A commit after the roll lands in the second file.
+    conn.execute("INSERT INTO t(v) VALUES (randomblob(512))").unwrap();
+    let second = segment_path(&log, 1);
+    assert!(
+        io.durable_files().get(&second).is_some_and(|file| !file.is_empty()),
+        "the log did not roll into a second file"
+    );
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let answer = rows_text(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        answer.first().is_some_and(|row| row.starts_with("0|")),
+        "the checkpoint did not succeed: {answer:?}"
+    );
+    let durable = io.durable_files();
+    for slot in 0..LOG_SEGMENT_FILES {
+        assert!(
+            !holds(durable.get(&segment_path(&log, slot)), marker),
+            "the erased value is still in the durable file of log segment {slot}"
+        );
+    }
+}
+
+/// A log fsync that fails fails the checkpoint: the erasure is not reported durable.
+#[test]
+fn a_truncating_checkpoint_fails_when_the_fsync_of_the_log_fails() {
+    let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
+    let path = "erase-crash-fsync.db";
+    let (_db, conn) = crashable_database(&io, path);
+    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    io.fail_syncs_of(&format!("{path}-log"));
+    let mut stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(
+        stmt.run_ignore_rows().is_err(),
+        "a TRUNCATE whose log fsync failed reported success"
+    );
+}

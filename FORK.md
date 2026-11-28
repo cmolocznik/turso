@@ -2274,6 +2274,18 @@ the other let go. It takes it without waiting, and a held one is the misuse it i
 Tests: `a_statement_used_from_two_places_at_once_is_refused_at_once_never_waited_for` and
 `a_step_and_an_execute_poll_met_with_the_statement_held_return_the_misuse_at_once` (`turso` unit tests).
 
+### An open waits while a database of its file closes
+2026-11-28. `core/database.rs`. `Database::drop` took the registry's entry out as the last handle dropped,
+before the database's files closed. A file's lock is the process's (`fcntl`), and closing any descriptor of
+the file, or unlocking it, drops every lock the process holds on it: an open in that window locked the file,
+and the old files' close then unlocked it, so another process could open the database while this one had
+it open. The entry now stays, marked closing, until the database's files have closed, held by its last field,
+and an open waits for it, as it waits for a database being opened; a failed open closes what it opened before
+it takes its own mark out. Upstream has the same code.
+Test: `database::closing_tests::an_open_waits_for_a_closing_database_of_its_file_and_keeps_its_lock`
+(Linux): a close held between its mark and its files, an open of the file waits, and the reopened database
+holds its lock after the old files closed. With the entry removed as before, the open goes ahead.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

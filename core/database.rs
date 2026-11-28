@@ -608,8 +608,21 @@ impl OpenDbAsyncState {
     }
 }
 
+impl OpenDbAsyncState {
+    /// Drops everything the open holds that holds a file.
+    fn close_files(&mut self) {
+        self.mvcc_convert_stmt = None;
+        self.mvcc_bootstrap_conn = None;
+        self.conn = None;
+        self.pager = None;
+        self.building_db = None;
+        self.db = None;
+    }
+}
+
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
+        self.close_files();
         if let Some(registry_key) = self.registry_key.take() {
             let mut registry = DATABASE_MANAGER.lock();
             registry.remove(&registry_key);
@@ -624,7 +637,36 @@ pub(crate) enum RegistryEntry {
     Opening,
     /// The database has been opened and is (or was) live.
     Ready(Weak<Database>),
+    /// The last handle dropped, and the database's files are closing: an open of the file waits
+    /// until they have closed, as closing any descriptor of a file drops every lock the process
+    /// holds on it.
+    Closing,
 }
+
+/// A registered database's mark, its last field, so that it drops once the files the database
+/// holds have closed: it then takes the entry out of the registry.
+#[derive(Debug, Default)]
+struct ClosingMark(Option<DatabaseKey>);
+
+impl Drop for ClosingMark {
+    fn drop(&mut self) {
+        let Some(key) = self.0.take() else {
+            return;
+        };
+        let mut registry = DATABASE_MANAGER.lock();
+        if matches!(registry.get(&key), Some(RegistryEntry::Closing)) {
+            registry.remove(&key);
+        }
+    }
+}
+
+/// Run, once, as a database of the file under this key is closing: marked, its files not yet
+/// closed. Only a test sets one.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static WHILE_CLOSING: LazyLock<
+    parking_lot::Mutex<Option<(DatabaseKey, Box<dyn FnOnce() + Send>)>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(None));
 
 /// The database manager ensures that there is a single, shared
 /// `Database` object per a database file. We need because it is not safe
@@ -727,6 +769,9 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+
+    /// The registry mark, kept last: see [`ClosingMark`].
+    closing: ClosingMark,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -791,11 +836,24 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
         let Some(key) = self.registry_key.get() else {
             return;
         };
+        let key = key.clone();
         let mut registry = DATABASE_MANAGER.lock();
         // Another open of the same file may have replaced the entry already.
-        if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
+        if matches!(registry.get(&key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
         {
-            registry.remove(key);
+            registry.insert(key.clone(), RegistryEntry::Closing);
+            self.closing = ClosingMark(Some(key.clone()));
+        }
+        drop(registry);
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut hook = WHILE_CLOSING.lock();
+                matches!(&*hook, Some((of, _)) if *of == key).then(|| hook.take())
+            };
+            if let Some(Some((_, run))) = hook {
+                run();
+            }
         }
     }
 }
@@ -887,6 +945,7 @@ impl Database {
 
             pager_state: Arc::new(SharedPagerState::new(init_page_1)),
             registry_key: OnceLock::new(),
+            closing: ClosingMark::default(),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -1143,15 +1202,21 @@ impl Database {
             Err(_) => return Ok(None), // file doesn't exist yet
         };
         let key = DatabaseKey::File(file_id);
-        let registry = DATABASE_MANAGER.lock();
-        let db = match registry.get(&key) {
-            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
-                Some(db) => db,
-                None => return Ok(None),
-            },
-            _ => return Ok(None),
+        // A database of the file whose last handle dropped is waited for until its files have
+        // closed, before this open opens them (and locks them).
+        let db = loop {
+            let registry = DATABASE_MANAGER.lock();
+            match registry.get(&key) {
+                Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
+                    Some(db) => break db,
+                    None => {}
+                },
+                Some(RegistryEntry::Closing) => {}
+                _ => return Ok(None),
+            }
+            drop(registry);
+            std::thread::sleep(std::time::Duration::from_millis(1));
         };
-        drop(registry);
 
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
@@ -1401,12 +1466,15 @@ impl Database {
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
                         }
-                        // Weak ref expired — treat as absent, fall through to insert Opening.
-                        registry.insert(key.clone(), RegistryEntry::Opening);
+                        // The last handle dropped and its files are closing: wait for them.
+                        return Ok(IOResult::IO(types::IOCompletions(
+                            io::Completion::new_yield(),
+                        )));
                     }
-                    Some(RegistryEntry::Opening) => {
-                        // Another caller is already opening this path. Yield so the
-                        // event loop can make progress and we retry later.
+                    Some(RegistryEntry::Opening | RegistryEntry::Closing) => {
+                        // Another caller is already opening this path, or a database of it is
+                        // closing. Yield so the event loop can make progress and we retry
+                        // later.
                         return Ok(IOResult::IO(types::IOCompletions(
                             io::Completion::new_yield(),
                         )));
@@ -1451,7 +1519,9 @@ impl Database {
                 }
             }
             Err(_) => {
-                // On error, remove the Opening sentinel so other callers can proceed.
+                // On error, close what this open opened, then remove the Opening sentinel so
+                // other callers can proceed.
+                state.close_files();
                 if let Some(registry_key) = state.registry_key.take() {
                     let mut registry = DATABASE_MANAGER.lock();
                     registry.remove(&registry_key);
@@ -5868,5 +5938,64 @@ mod database_tests {
             .connect(ConnectOpts::new().with_page_codec(codec))
             .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
+    }
+}
+
+/// An open of a file waits while the last database of it closes, so that the old one's files,
+/// whose closing drops every lock the process holds on them, never take the new one's lock.
+#[cfg(all(test, target_os = "linux", feature = "fs"))]
+mod closing_tests {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// Whether the process holds a lock on `file`, as a query of an open file description's
+    /// write lock over it sees.
+    fn locked(file: &std::fs::File) -> bool {
+        // SAFETY: an all-zero `flock` is a valid one.
+        let mut query: libc::flock = unsafe { std::mem::zeroed() };
+        query.l_type = libc::F_WRLCK as libc::c_short;
+        query.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: the descriptor is open and `query` outlives the call.
+        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut query) };
+        assert_eq!(asked, 0, "{}", std::io::Error::last_os_error());
+        query.l_type != libc::F_UNLCK as libc::c_short
+    }
+
+    #[test]
+    fn an_open_waits_for_a_closing_database_of_its_file_and_keeps_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closing.db");
+        let path = path.to_str().unwrap().to_owned();
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let first = Database::open_file(io.clone(), &path, Arc::new(crate::SqliteDialect)).unwrap();
+        // Kept open throughout: closing it would drop the process's locks.
+        let probe = std::fs::File::open(&path).unwrap();
+        assert!(locked(&probe), "the open database holds no lock to see");
+        let key = DatabaseKey::File(crate::io::get_file_id(&path).unwrap());
+        let (closing, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        *WHILE_CLOSING.lock() = Some((
+            key,
+            Box::new(move || {
+                closing.send(()).unwrap();
+                released.recv().unwrap();
+            }),
+        ));
+        let closer = std::thread::spawn(move || drop(first));
+        entered.recv().unwrap();
+        let opener = std::thread::spawn({
+            let (io, path) = (io.clone(), path.clone());
+            move || Database::open_file(io, &path, Arc::new(crate::SqliteDialect))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let waited = !opener.is_finished();
+        release.send(()).unwrap();
+        closer.join().unwrap();
+        let second = opener.join().unwrap().unwrap();
+        assert!(waited, "opened while the old database's files were open");
+        assert!(locked(&probe), "the reopened database lost its lock");
+        drop(second);
     }
 }

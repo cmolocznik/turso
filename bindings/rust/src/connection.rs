@@ -364,7 +364,7 @@ impl Connection {
         let rowid_before = self.last_insert_rowid();
         let mut prepared = self.prepare(&stmt.sql).await?;
         let mut rows = prepared.query_without_operation_guard(stmt.params).await?;
-        let columns = rows.columns();
+        let columns = rows.columns_held()?;
         let mut buffered = Vec::new();
         while let Some(row) = rows.next().await? {
             buffered.push(row);
@@ -377,7 +377,7 @@ impl Connection {
         // row-returning statement does not update; report 0 for those
         // rather than the previous statement's count, matching the server.
         let rows_affected = if columns.is_empty() {
-            prepared.n_change()
+            prepared.held()?.n_change() as u64
         } else {
             0
         };

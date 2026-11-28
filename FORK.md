@@ -2267,6 +2267,13 @@ Upstream has the same code.
 Test: `functions::test_cdc::a_commit_that_waits_lets_its_cdc_transaction_id_go` (`io_memory_yield`): it
 failed with the id kept.
 
+### A future takes its statement without waiting
+2026-11-28. `bindings/rust/src/lib.rs`, `connection.rs`, `rows.rs`. A future of the binding locked its
+statement's mutex in its poll, so a statement used from two places at once held an executor thread until
+the other let go. It takes it without waiting, and a held one is the misuse it is.
+Tests: `a_statement_used_from_two_places_at_once_is_refused_at_once_never_waited_for` and
+`a_step_and_an_execute_poll_met_with_the_statement_held_return_the_misuse_at_once` (`turso` unit tests).
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

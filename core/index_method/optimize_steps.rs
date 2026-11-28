@@ -97,6 +97,29 @@ const GIVE_WAY: Duration = Duration::from_millis(100);
 /// How long a step that gives way sleeps between looks at whether the writer has taken the lock.
 const GIVE_WAY_POLL: Duration = Duration::from_millis(1);
 
+#[cfg(any(test, feature = "test_helper"))]
+crate::thread::thread_local! {
+    static BEFORE_CLAIMING_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Has the next step on this thread that follows its run's first, the one that claims a merge's
+/// work, run `hook` before it commits, so that a test can run another `OPTIMIZE INDEX` between
+/// the two. `None` takes it back.
+#[cfg(any(test, feature = "test_helper"))]
+pub fn set_before_claiming_commit_for_test(hook: Option<Box<dyn FnOnce()>>) {
+    BEFORE_CLAIMING_COMMIT.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(any(test, feature = "test_helper"))]
+fn before_claiming_commit() {
+    // Taken before it runs: a run inside it finds none.
+    let hook = BEFORE_CLAIMING_COMMIT.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// An `OPTIMIZE INDEX` of one index in steps, and where it is.
 pub(crate) struct OptimizeSteps {
     /// The index's database on the statement's connection.
@@ -318,7 +341,13 @@ impl OptimizeSteps {
                     let steps = self.steps()?.clone();
                     let mut commit = match statement {
                         Some(commit) => commit,
-                        None => steps.prepare("COMMIT")?,
+                        None => {
+                            #[cfg(any(test, feature = "test_helper"))]
+                            if !self.first {
+                                before_claiming_commit();
+                            }
+                            steps.prepare("COMMIT")?
+                        }
                     };
                     match drive(&mut commit) {
                         Ok(IOResult::IO(io)) => {

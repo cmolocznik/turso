@@ -2279,6 +2279,21 @@ concurrent transaction on another table leaves the apply going; one that wrote a
 them whole, and they apply once it ends. `frames_refused_by_another_s_write_lock_apply_once_when_tried_again`
 now takes a conflict as well as `Busy`.
 
+### Two merges beside each other took the same segments (index method keys never conflicted)
+2026-11-28. `core/mvcc/database/mod.rs`, `core/index_method/optimize_steps.rs`. MVCC's commit validation checked
+index keys for write-write conflicts only where the index was `UNIQUE`. An index method's backing B-trees are not
+declared so, yet hold one entry a key, so two concurrent transactions could write the same key and both commit.
+The trigram merge relies on that conflict: each claim is one key two merges of a segment both write. Beside each
+other, as atoll-forge's leader ran its merge by the policy beside a purge's whole merge, both claimed and merged
+the same segments, and every later `OPTIMIZE INDEX` failed `an entry to remove is missing`. A key without an
+appended rowid (a backing B-tree's, or a `WITHOUT ROWID` primary key) is now checked whole, a `NULL` in it a
+value like any other, by a direct lookup with no prefix key built. Owner's permission 2026-11-28, designed to
+atoll-forge's auditor (bus #1194, #1198, #1199).
+Test: `index_method::trigram::two_merging_at_once_claim_no_segment_twice`, now deterministic: a `test_helper`
+hook (`set_before_claiming_commit_for_test`) runs a whole second `OPTIMIZE INDEX` between a first run's claim and
+its commit; the first loses the commit and goes on. It failed `an entry to remove is missing` before this change,
+and does with the claims removed. Its old form, two runs stepped by turns, passed with the claims removed.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

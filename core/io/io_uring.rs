@@ -398,28 +398,28 @@ impl RingState {
         self.submit_entry(ring, &entry)
     }
 
-    /// Handle a writev CQE. SAFETY: caller must hold the `RingState` Mutex.
+    /// Handle a writev CQE: resubmits the rest of a partial write, or returns how the whole
+    /// write ended, for its callback to run once the lock is released. SAFETY: caller must hold
+    /// the `RingState` Mutex.
     unsafe fn handle_writev_completion(
         &mut self,
         ring: &io_uring::IoUring,
         mut state: WritevState,
         user_data: u64,
         result: i32,
-    ) -> Result<()> {
+    ) -> Result<Option<std::result::Result<i32, CompletionError>>> {
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
             tracing::error!("writev failed (user_data: {}): {}", user_data, err);
             state.free_last_iov(&mut self.iov_pool);
-            completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "pwritev"));
-            return Ok(());
+            return Ok(Some(Err(CompletionError::IOError(err.kind(), "pwritev"))));
         }
 
         let written = result;
 
         if written == 0 && state.remaining() > 0 {
             state.free_last_iov(&mut self.iov_pool);
-            completion_from_key(user_data).error(CompletionError::ShortWrite);
-            return Ok(());
+            return Ok(Some(Err(CompletionError::ShortWrite)));
         }
         state.advance(written as u64);
 
@@ -430,7 +430,7 @@ impl RingState {
                     state.total_written
                 );
                 state.free_last_iov(&mut self.iov_pool);
-                completion_from_key(user_data).complete(state.total_written as i32);
+                return Ok(Some(Ok(state.total_written as i32)));
             }
             remaining => {
                 tracing::trace!(
@@ -448,7 +448,7 @@ impl RingState {
                 wake_user_data(user_data);
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -596,7 +596,27 @@ impl IO for UringIO {
 impl UringIO {
     /// Drain whatever CQEs are currently ready into completion callbacks.
     /// Returns `true` if at least one CQE was processed.
+    ///
+    /// The CQEs are taken under the ring's lock, but their callbacks run after it is released: a
+    /// callback that submits more IO takes that lock, and would otherwise wait on itself.
     fn drain_cq(&self) -> Result<bool> {
+        let mut finished = Vec::new();
+        let taken = self.take_cqes(&mut finished);
+        for (user_data, result) in finished {
+            match result {
+                Ok(n) => completion_from_key(user_data).complete(n),
+                Err(e) => completion_from_key(user_data).error(e),
+            }
+        }
+        taken
+    }
+
+    /// Takes every ready CQE: a writev's partial completion is handled here, under the lock;
+    /// every other one is added to `finished` for its callback to run afterwards.
+    fn take_cqes(
+        &self,
+        finished: &mut Vec<(u64, std::result::Result<i32, CompletionError>)>,
+    ) -> Result<bool> {
         let mut state = self.state.lock();
         let mut drained_any = false;
         loop {
@@ -619,17 +639,23 @@ impl UringIO {
             if let Some(wstate) = state.writev_states.remove(&user_data) {
                 drop(cq);
                 // SAFETY: still holding `state` Mutex.
-                unsafe { state.handle_writev_completion(&self.ring, wstate, user_data, result)? };
+                let ended = unsafe {
+                    state.handle_writev_completion(&self.ring, wstate, user_data, result)?
+                };
+                if let Some(ended) = ended {
+                    finished.push((user_data, ended));
+                }
                 continue;
             }
-            if result < 0 {
-                let errno = -result;
-                let err = std::io::Error::from_raw_os_error(errno);
-                completion_from_key(user_data)
-                    .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
-            } else {
-                completion_from_key(user_data).complete(result);
-            }
+            finished.push((
+                user_data,
+                if result < 0 {
+                    let err = std::io::Error::from_raw_os_error(-result);
+                    Err(CompletionError::IOError(err.kind(), "io_uring_cqe"))
+                } else {
+                    Ok(result)
+                },
+            ));
         }
     }
 }
@@ -911,6 +937,45 @@ impl Drop for UringFile {
 mod tests {
     use super::*;
     use crate::io::common;
+
+    /// A completion's callback that submits more IO, which takes the ring's lock, runs once the
+    /// lock is released.
+    #[test]
+    fn a_callback_may_submit_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callback.db");
+        let io = std::sync::Arc::new(UringIO::new().unwrap());
+        let file = io
+            .open_file(path.to_str().unwrap(), crate::io::OpenFlags::Create, false)
+            .unwrap();
+        let buffer = std::sync::Arc::new(crate::Buffer::new_temporary(4096));
+        let (done, finished) = std::sync::mpsc::channel();
+        let first = Completion::new_write({
+            let (file, buffer) = (file.clone(), buffer.clone());
+            move |_| {
+                let done = done.clone();
+                let second = Completion::new_write(move |_| done.send(()).unwrap());
+                file.pwrite(4096, buffer.clone(), second).unwrap();
+            }
+        });
+        file.pwrite(0, buffer, first).unwrap();
+        // Driven apart, so that a callback waiting on the ring's lock fails the test.
+        let driver = std::thread::spawn(move || {
+            while finished.try_recv().is_err() {
+                io.step().unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !driver.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the callback's write never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        driver.join().unwrap();
+    }
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {

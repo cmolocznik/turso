@@ -2286,6 +2286,13 @@ Test: `database::closing_tests::an_open_waits_for_a_closing_database_of_its_file
 (Linux): a close held between its mark and its files, an open of the file waits, and the reopened database
 holds its lock after the old files closed. With the entry removed as before, the open goes ahead.
 
+### io_uring runs completion callbacks without the ring's lock
+2026-11-28. `core/io/io_uring.rs`. `drain_cq` ran every completion's callback while holding the ring
+state's mutex, so a callback that submits more IO, which takes that mutex, waited on itself forever. The
+CQEs are taken under the lock and their callbacks run once it is released; a writev's partial completion is
+still resubmitted under the lock, and its final outcome reported after it. Upstream has the same code.
+Test: `io::io_uring::tests::a_callback_may_submit_io`: without the change the callback's write never runs.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

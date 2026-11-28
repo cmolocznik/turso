@@ -1974,14 +1974,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         false
     }
 
-    /// Fsync the logical log file
-    /// The truncate's sync runs beside commits' appends: none waits out its fsyncs.
-    fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore
-            .storage
-            .sync_beside_appends(self.pager.get_sync_type())
-    }
-
     fn truncate_logical_log(&self) -> Result<Completion> {
         use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
         let boundary = if self.clears_whole_logical_log() {

@@ -11,12 +11,13 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::time::Duration;
 
-use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, Value};
+use turso_sqlite::SqliteDialect;
 
 fn open(path: &str) -> turso_core::Result<(Arc<Database>, Arc<Connection>)> {
     let io = Arc::new(PlatformIO::new()?);
     let db = Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None, Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     Ok((db, conn))
 }
 

@@ -41,7 +41,7 @@ pub struct ReplicatedLogApplier {
 impl ReplicatedLogApplier {
     /// An applier to `db`, on a connection of its own.
     pub fn new(db: &Arc<Database>) -> Result<Self> {
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.set_applies_replicated_commits(true);
         Ok(Self {
             #[cfg(test)]
@@ -199,9 +199,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use tempfile::TempDir;
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
         Completion, Database, DatabaseOpts, LogReplicator, OpenFlags, ReplicatedFrame,
-        SqliteDialect, Value,
+        Value,
     };
 
     use super::{DecodedFrames, ReplicatedLogApplier};
@@ -247,7 +248,7 @@ mod tests {
     }
 
     fn rows(db: &Arc<Database>, sql: &str) -> Vec<Vec<Value>> {
-        let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = db.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         let mut stmt = conn.prepare(sql).unwrap();
         let mut rows = Vec::new();
         stmt.run_with_row_callback(|row| {
@@ -275,7 +276,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         for sql in [
             "CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT UNIQUE, n INTEGER)",
             "CREATE INDEX things_by_name ON things (name)",
@@ -324,13 +325,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("CREATE TABLE log (v TEXT)").unwrap();
         let mut applier = ReplicatedLogApplier::new(&follower).unwrap();
         applier.apply(&frames(&recorder)).unwrap();
         conn.execute("INSERT INTO log VALUES ('once')").unwrap();
         let pending = frames(&recorder);
-        let holder = follower.connect(turso_core::ConnectOpts::new()).unwrap();
+        let holder = follower.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         holder.execute("BEGIN IMMEDIATE").unwrap();
         let before = applier.conn().last_commit_ts();
         let refused = applier.apply(&pending);
@@ -363,7 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
         conn.execute("CREATE TABLE own (v TEXT)").unwrap();
@@ -374,7 +375,7 @@ mod tests {
         // A writer that commits while a call's transaction is open: beside rows, never beside a
         // schema change.
         let during = Arc::new(Mutex::new(Vec::new()));
-        let other = follower.connect(turso_core::ConnectOpts::new()).unwrap();
+        let other = follower.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         other.set_applies_replicated_commits(true);
         other.execute("CREATE TABLE noted (v TEXT)").unwrap();
         let commits = |applier: &mut ReplicatedLogApplier| {
@@ -408,7 +409,7 @@ mod tests {
         assert!(elsewhere.conn().get_auto_commit());
         applier.apply(&fifth).unwrap();
 
-        let writer = follower.connect(turso_core::ConnectOpts::new()).unwrap();
+        let writer = follower.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         writer.set_applies_replicated_commits(true);
         writer.execute("BEGIN CONCURRENT").unwrap();
         writer.execute("INSERT INTO own VALUES ('mine')").unwrap();
@@ -467,7 +468,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         for sql in [
             "CREATE TABLE keyed (id TEXT PRIMARY KEY, v TEXT)",
             "INSERT INTO keyed VALUES ('a', 'one'), ('b', 'two'), ('c', 'three')",
@@ -522,7 +523,7 @@ mod tests {
             )
             .unwrap()
         };
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();
         conn.execute(
@@ -544,7 +545,7 @@ mod tests {
         };
         let db = follower();
         assert!(apply(db.clone(), frames(&recorder)));
-        let checkpoint = db.connect(turso_core::ConnectOpts::new()).unwrap();
+        let checkpoint = db.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         checkpoint
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
@@ -571,7 +572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         for sql in [
             "CREATE TABLE docs (path TEXT PRIMARY KEY, text TEXT)",
             "CREATE INDEX docs_by_trigram ON docs USING trigram (text)",
@@ -621,7 +622,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         conn.execute("INSERT INTO things VALUES (1, 'one')")
@@ -645,7 +646,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (leader, recorder) = open(&dir, "leader.db", true);
         let (follower, _) = open(&dir, "follower.db", false);
-        let conn = leader.connect(turso_core::ConnectOpts::new()).unwrap();
+        let conn = leader.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         conn.execute("INSERT INTO things VALUES (1, 'one')")
@@ -675,7 +676,7 @@ mod tests {
         )
         .unwrap();
         plain
-            .connect(turso_core::ConnectOpts::new())
+            .connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser))
             .unwrap()
             .execute("CREATE TABLE things (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();

@@ -110,6 +110,14 @@ impl MvccTestDbNoConn {
         self.restart_result().unwrap();
     }
 
+    /// Like `restart`, but lets go of the database without checking that nothing else holds it:
+    /// whatever still does (a background checkpoint's last step) lets it close when it ends, and
+    /// the open waits for that close, as the fork's registry makes it.
+    pub fn restart_releasing(&mut self) {
+        drop(self.db.take());
+        self.open().unwrap();
+    }
+
     /// Like `restart`, but returns the error of the open instead of panicking.
     pub fn restart_result(&mut self) -> turso_core::Result<()> {
         self.close();

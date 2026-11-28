@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use turso_core::index_method::ivf_rq;
-use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, Value};
+use turso_sqlite::SqliteDialect;
 
 const DIMS: usize = 16;
 
@@ -57,7 +58,7 @@ fn literal(v: &[f32]) -> String {
 fn open(path: &str) -> turso_core::Result<(Arc<Database>, Arc<Connection>)> {
     let io = Arc::new(PlatformIO::new()?);
     let db = Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new().with_index_method(true), None, Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     Ok((db, conn))
 }
 
@@ -95,7 +96,7 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     for t in 0..threads {
         let (db, next, commits, failures, conflicts, met) = (db.clone(), next.clone(), commits.clone(), failures.clone(), conflicts.clone(), met.clone());
         std::thread::spawn(move || {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             conn.execute("PRAGMA synchronous = NORMAL").unwrap();
             let mut random = Random((seed ^ (t as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1);
@@ -152,7 +153,7 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     {
         let (db, optimizes, failures, optimize_failures) = (db.clone(), optimizes.clone(), failures.clone(), optimize_failures.clone());
         std::thread::spawn(move || {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             loop {
                 match conn.execute("OPTIMIZE INDEX v_ivf") {

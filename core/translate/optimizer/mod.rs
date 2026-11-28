@@ -2290,7 +2290,7 @@ fn apply_custom_module_access(
     order_by: &mut Vec<(
         Box<ast::Expr>,
         SortOrder,
-        Option<turso_parser::ast::NullsOrder>,
+        Option<crate::ast::NullsOrder>,
     )>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,

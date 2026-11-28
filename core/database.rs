@@ -745,6 +745,31 @@ impl OpenDbAsyncState {
         }
         self.header_validation_state = HeaderValidationState::default();
     }
+
+    /// Marks this open as the open under way of the file at `path`, as its first look at the
+    /// registry does, and registers the mark: other opens of the file wait until this state
+    /// drops, or its open ends. For tests of an open that comes meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// If the file does not exist.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn mark_open_under_way_for_test(&mut self, io: &dyn IO, path: &str) -> Result<()> {
+        let key = DatabaseKey::File(io.file_id(path)?);
+        let done = Completion::new_remote_wait();
+        DATABASE_MANAGER
+            .lock()
+            .insert(key.clone(), RegistryEntry::Opening(done.clone()));
+        self.opening = Some(OpeningMark { key, done });
+        Ok(())
+    }
+
+    /// Whether this open holds its mark in the registry. For tests of an open that comes
+    /// meanwhile.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn has_registry_mark_for_test(&self) -> bool {
+        self.opening.is_some()
+    }
 }
 
 /// Per-path entry in the database registry. Each carries a completion that another thread
@@ -780,7 +805,7 @@ pub(crate) struct OpeningMark {
 
 /// Run, once, as an open of the file under each key ends: its mark about to be let go. Only a
 /// test sets one.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 #[allow(clippy::type_complexity)]
 pub(crate) static WHILE_OPENING_ENDS: LazyLock<
     parking_lot::Mutex<HashMap<DatabaseKey, Box<dyn FnOnce() + Send>>>,
@@ -788,7 +813,7 @@ pub(crate) static WHILE_OPENING_ENDS: LazyLock<
 
 impl Drop for OpeningMark {
     fn drop(&mut self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         {
             let hook = WHILE_OPENING_ENDS.lock().remove(&self.key);
             if let Some(run) = hook {
@@ -873,8 +898,9 @@ pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
 
-#[cfg(test)]
-pub(crate) fn remove_file_from_database_registry(path: &str) {
+#[cfg(any(test, feature = "test_helper"))]
+#[doc(hidden)]
+pub fn remove_file_from_database_registry(path: &str) {
     let file_id = io::get_file_id(path).unwrap();
     DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
 }
@@ -1142,6 +1168,24 @@ impl Database {
         hook: Box<dyn FnOnce() + Send>,
     ) -> Result<()> {
         WHILE_CLOSING
+            .lock()
+            .insert(DatabaseKey::File(io.file_id(path)?), hook);
+        Ok(())
+    }
+
+    /// Runs `hook`, once, as an open of the file at `path` ends: its mark in the registry about
+    /// to be let go. For tests of an open that comes meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// If the file does not exist.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn while_opening_ends_for_test(
+        io: &dyn IO,
+        path: &str,
+        hook: Box<dyn FnOnce() + Send>,
+    ) -> Result<()> {
+        WHILE_OPENING_ENDS
             .lock()
             .insert(DatabaseKey::File(io.file_id(path)?), hook);
         Ok(())
@@ -1435,7 +1479,8 @@ impl Database {
     /// With none registered for a file that exists, the open reserves the file in `state`
     /// before it opens (and locks) it, so no other open of the file opens it meanwhile; an open
     /// of the file under way, or a database of it closing, is waited for first, parked.
-    fn lookup_in_registry(
+    #[doc(hidden)]
+    pub fn lookup_in_registry(
         io: &Arc<dyn IO>,
         state: &mut OpenDbAsyncState,
         path: &str,
@@ -3059,11 +3104,14 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<Arc<Connection>> {
         self._connect(
+            ConnectOpts {
+                role: SessionRole::Superuser,
+                encryption_key,
+                page_codec,
+            },
+            ConnectionContext::default(),
             false,
             None,
-            encryption_key,
-            page_codec,
-            ConnectionContext::default(),
             StatsRefresh::Deferred,
         )
     }
@@ -4883,304 +4931,5 @@ mod database_tests {
                 IOResult::IO(completion) => completion.wait(&*io).unwrap(),
             }
         }
-    }
-}
-
-/// An open of a file waits while the last database of it closes, so that the old one's files,
-/// whose closing drops every lock the process holds on them, never take the new one's lock.
-#[cfg(all(test, target_os = "linux", feature = "fs"))]
-mod closing_tests {
-    use std::future::Future as _;
-    use std::os::fd::AsRawFd as _;
-    use std::sync::mpsc;
-
-    use super::*;
-
-    /// Whether the process holds a lock on `file`, as a query of an open file description's
-    /// write lock over it sees.
-    fn locked(file: &std::fs::File) -> bool {
-        // SAFETY: an all-zero `flock` is a valid one.
-        let mut query: libc::flock = unsafe { std::mem::zeroed() };
-        query.l_type = libc::F_WRLCK as libc::c_short;
-        query.l_whence = libc::SEEK_SET as libc::c_short;
-        // SAFETY: the descriptor is open and `query` outlives the call.
-        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut query) };
-        assert_eq!(asked, 0, "{}", std::io::Error::last_os_error());
-        query.l_type != libc::F_UNLCK as libc::c_short
-    }
-
-    #[test]
-    fn an_open_waits_for_a_closing_database_of_its_file_and_keeps_its_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("closing.db");
-        let path = path.to_str().unwrap().to_owned();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let first = Database::open_file(io.clone(), &path, Arc::new(crate::SqliteDialect)).unwrap();
-        // Kept open throughout: closing it would drop the process's locks.
-        let probe = std::fs::File::open(&path).unwrap();
-        assert!(locked(&probe), "the open database holds no lock to see");
-        let key = DatabaseKey::File(crate::io::get_file_id(&path).unwrap());
-        let (closing, entered) = mpsc::channel();
-        let (release, released) = mpsc::channel::<()>();
-        WHILE_CLOSING.lock().insert(
-            key,
-            Box::new(move || {
-                closing.send(()).unwrap();
-                released.recv().unwrap();
-            }),
-        );
-        let closer = std::thread::spawn(move || drop(first));
-        entered.recv().unwrap();
-        let opener = std::thread::spawn({
-            let io = io.clone();
-            move || Database::open_file(io, &path, Arc::new(crate::SqliteDialect))
-        });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let waited = !opener.is_finished();
-        release.send(()).unwrap();
-        closer.join().unwrap();
-        let second = opener.join().unwrap().unwrap();
-        assert!(waited, "opened while the old database's files were open");
-        assert!(locked(&probe), "the reopened database lost its lock");
-        drop(second);
-    }
-
-    /// Counts the times it is woken.
-    #[derive(Default)]
-    struct Woken(std::sync::atomic::AtomicUsize);
-
-    impl std::task::Wake for Woken {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    fn storage(io: &Arc<dyn IO>, path: &str) -> Arc<DatabaseFile> {
-        // Without a lock, as this open stands for a caller that has no other to lose.
-        let file = io
-            .open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)
-            .unwrap();
-        Arc::new(DatabaseFile::new(file))
-    }
-
-    /// An open that waits for a database of its file closing is pending on a completion the close
-    /// finishes, and woken then: never ready at once to look again, which would spin a thread
-    /// and starve an executor of its other tasks.
-    #[test]
-    fn an_async_open_waits_for_a_closing_database_pending_on_its_completion() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("async-closing.db");
-        let path = path.to_str().unwrap().to_owned();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let first = Database::open_file(io.clone(), &path, Arc::new(crate::SqliteDialect)).unwrap();
-        let key = DatabaseKey::File(crate::io::get_file_id(&path).unwrap());
-        let (closing, entered) = mpsc::channel();
-        let (release, released) = mpsc::channel::<()>();
-        WHILE_CLOSING.lock().insert(
-            key,
-            Box::new(move || {
-                closing.send(()).unwrap();
-                released.recv().unwrap();
-            }),
-        );
-        let closer = std::thread::spawn(move || drop(first));
-        entered.recv().unwrap();
-
-        let options = OpenOptions::new(Arc::new(crate::SqliteDialect)).storage(storage(&io, &path));
-        let mut state = OpenDbAsyncState::new();
-        let IOResult::IO(wait) = Database::open_async(&mut state, io.clone(), &path, &options)
-            .map_err(|e| *e)
-            .unwrap()
-        else {
-            panic!("opened while the old database's files were open");
-        };
-        assert!(wait.0.is_remote_wait(), "a wait that finishes at once");
-        assert!(!wait.finished());
-        let woken = Arc::new(Woken::default());
-        let waker = std::task::Waker::from(woken.clone());
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut waiting = Box::pin(wait.wait_async(io.as_ref()));
-        assert!(waiting.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(woken.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        release.send(()).unwrap();
-        closer.join().unwrap();
-        assert_eq!(woken.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(matches!(
-            waiting.as_mut().poll(&mut cx),
-            std::task::Poll::Ready(Ok(()))
-        ));
-        // Nothing of the file is registered now: this open goes ahead, waiting for nothing.
-        if let IOResult::IO(next) = Database::open_async(&mut state, io.clone(), &path, &options)
-            .map_err(|e| *e)
-            .unwrap()
-        {
-            assert!(!next.0.is_remote_wait());
-        }
-    }
-
-    /// An open of a file whose other open is under way waits for it, pending on the completion
-    /// its end finishes, and takes the database it registers.
-    #[test]
-    fn an_open_waits_for_the_open_of_its_file_under_way_and_takes_its_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("opening.db");
-        let path = path.to_str().unwrap().to_owned();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        // The file exists, as an open of it finds it.
-        drop(Database::open_file(io.clone(), &path, Arc::new(crate::SqliteDialect)).unwrap());
-
-        let options = OpenOptions::new(Arc::new(crate::SqliteDialect)).storage(storage(&io, &path));
-        // The first open is under way: its mark is in the registry, as its first call puts it.
-        let key = DatabaseKey::File(crate::io::get_file_id(&path).unwrap());
-        let done = Completion::new_remote_wait();
-        DATABASE_MANAGER
-            .lock()
-            .insert(key.clone(), RegistryEntry::Opening(done.clone()));
-        let mut first = OpenDbAsyncState::new();
-        first.opening = Some(OpeningMark { key, done });
-        let mut second = OpenDbAsyncState::new();
-        let IOResult::IO(wait) = Database::open_async(&mut second, io.clone(), &path, &options)
-            .map_err(|e| *e)
-            .unwrap()
-        else {
-            panic!("an open of a file under way went ahead");
-        };
-        assert!(wait.0.is_remote_wait(), "a wait that finishes at once");
-        assert!(!wait.finished());
-        let db = loop {
-            match Database::open_async(&mut first, io.clone(), &path, &options)
-                .map_err(|e| *e)
-                .unwrap()
-            {
-                IOResult::Done(db) => break db,
-                IOResult::IO(more) => more.wait(io.as_ref()).unwrap(),
-            }
-        };
-        assert!(wait.finished(), "the first open ended and let none go");
-        let IOResult::Done(taken) = Database::open_async(&mut second, io.clone(), &path, &options)
-            .map_err(|e| *e)
-            .unwrap()
-        else {
-            panic!("the second open did not take the first's database");
-        };
-        assert!(Arc::ptr_eq(&db, &taken));
-    }
-
-    /// A blocking open of a file whose other open is under way opens nothing, so takes no lock a
-    /// closing of its descriptor would drop, until that open ends; then it takes the database.
-    #[test]
-    fn a_blocking_open_waits_for_the_open_of_its_file_under_way_without_opening_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("blocking-opening.db");
-        let path = path.to_str().unwrap().to_owned();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        drop(Database::open_file(io.clone(), &path, Arc::new(crate::SqliteDialect)).unwrap());
-        let probe = std::fs::File::open(&path).unwrap();
-        assert!(!locked(&probe));
-        // An open under way: its mark in the registry, as an open that began holds it.
-        let key = DatabaseKey::File(crate::io::get_file_id(&path).unwrap());
-        let done = Completion::new_remote_wait();
-        DATABASE_MANAGER
-            .lock()
-            .insert(key.clone(), RegistryEntry::Opening(done.clone()));
-        let mut under_way = OpenDbAsyncState::new();
-        under_way.opening = Some(OpeningMark { key, done });
-
-        let (opened, opens) = mpsc::channel();
-        let opener = std::thread::spawn({
-            let io = io.clone();
-            move || {
-                opened
-                    .send(Database::open_file(
-                        io,
-                        &path,
-                        Arc::new(crate::SqliteDialect),
-                    ))
-                    .unwrap();
-            }
-        });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            opens.try_recv().is_err(),
-            "an open went ahead of the open under way"
-        );
-        assert!(
-            !locked(&probe),
-            "an open took the file's lock before the open under way ended"
-        );
-        drop(under_way);
-        let db = opens
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the open never went on once the open under way ended")
-            .unwrap();
-        opener.join().unwrap();
-        assert!(locked(&probe));
-        drop(db);
-    }
-
-    /// An open that finds nothing of its file registered reserves the file before it opens it,
-    /// so that an open of the file that comes meanwhile waits instead of opening it too.
-    #[test]
-    fn an_open_reserves_its_file_before_it_opens_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reserved.db");
-        let path = path.to_str().unwrap().to_owned();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        drop(Database::open_file(io.clone(), &path, Arc::new(crate::SqliteDialect)).unwrap());
-        let lookup = |io: &Arc<dyn IO>, state: &mut OpenDbAsyncState, path: &str| {
-            Database::lookup_in_registry(io, state, path, &None, &crate::SqliteDialect, None, None)
-                .unwrap()
-                .is_none()
-        };
-        let mut first = OpenDbAsyncState::new();
-        assert!(lookup(&io, &mut first, &path));
-        assert!(first.opening.is_some(), "nothing was reserved");
-
-        let (looked, looks) = mpsc::channel();
-        let second = std::thread::spawn({
-            let io = io.clone();
-            move || {
-                let mut state = OpenDbAsyncState::new();
-                let none = lookup(&io, &mut state, &path);
-                looked.send((none, state.opening.is_some())).unwrap();
-            }
-        });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            looks.try_recv().is_err(),
-            "a second open of the file went ahead of the first"
-        );
-        drop(first);
-        let (none, reserved) = looks
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the second open never went on");
-        assert!(none && reserved);
-        second.join().unwrap();
-    }
-
-    /// A failed open lets go of the file it opened before its mark lets another open of the file
-    /// go: closing it after would drop the lock that open took.
-    #[test]
-    fn a_failed_open_closes_its_file_before_it_lets_another_open_go() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("failed.db");
-        std::fs::write(&path, vec![0x5au8; 8192]).unwrap();
-        let path = path.to_str().unwrap().to_owned();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let probe = std::fs::File::open(&path).unwrap();
-        let key = DatabaseKey::File(crate::io::get_file_id(&path).unwrap());
-        let (seen, saw) = mpsc::channel();
-        let probe_in_hook = probe.try_clone().unwrap();
-        WHILE_OPENING_ENDS.lock().insert(
-            key,
-            Box::new(move || seen.send(locked(&probe_in_hook)).unwrap()),
-        );
-        let opened = Database::open_file(io, &path, Arc::new(crate::SqliteDialect));
-        assert!(opened.is_err(), "a file of no database opened");
-        assert!(
-            !saw.recv().unwrap(),
-            "the open's mark was let go while its file was still open"
-        );
     }
 }

@@ -1,19 +1,20 @@
+// Tests moved here from turso_core's own unit tests, which can no longer parse SQL.
 //! The logical log rolls under writes that never pause: a passive checkpoint that has to keep
 //! frames, as every one does while commits land after its snapshot, seals the segment being
 //! written and the log goes on in another file, which a later checkpoint frees. Recovery reads the
 //! segments as one log.
 
-use super::TransactionState;
-use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
-use crate::mvcc::database::tests::MvccTestDbNoConn;
-use crate::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
-use crate::storage::wal::CheckpointMode;
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::sync::Arc;
-use crate::{Connection, StepResult};
+use super::test_db::MvccTestDbNoConn;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use turso_core::mvcc::database::checkpoint::CheckpointYieldPoint;
+use turso_core::mvcc::database::TransactionState;
+use turso_core::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
+use turso_core::{CheckpointMode, Connection, StepResult};
+use turso_sqlite::SqliteDialect;
 
 /// A busy timeout no test here waits out: each park in them ends by the release it waits for.
 const PARKS_UNTIL_RELEASED: Duration = Duration::from_secs(60);
@@ -93,11 +94,18 @@ impl TestDb {
     }
 
     fn log_size(&self) -> u64 {
-        self.db.get_mvcc_store().storage.logical_log_size().unwrap()
+        self.db
+            .get_mvcc_store()
+            .storage_for_testing()
+            .logical_log_size()
+            .unwrap()
     }
 
     fn segments(&self) -> usize {
-        self.db.get_mvcc_store().storage.logical_log_segments()
+        self.db
+            .get_mvcc_store()
+            .storage_for_testing()
+            .logical_log_segments()
     }
 
     /// The path of the file of slot `slot` of the log.
@@ -151,26 +159,26 @@ fn test_a_database_beside_log_files_left_by_another_refuses_to_open() {
         .unwrap();
     donor.insert();
     let leftover = std::fs::read(donor.slot_path(1)).unwrap();
-    assert!(leftover.len() > crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE);
+    assert!(leftover.len() > turso_core::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE);
 
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("fresh.db");
     let path = path.to_str().unwrap();
     let log = std::path::Path::new(path).with_extension("db-log");
     std::fs::write(segment_path(&log.to_string_lossy(), 1), &leftover).unwrap();
-    let io: Arc<dyn crate::IO> = Arc::new(crate::PlatformIO::new().unwrap());
-    let opened = crate::Database::open_file_with_flags(
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opened = turso_core::Database::open_file_with_flags(
         io,
         path,
-        crate::OpenFlags::default(),
-        crate::DatabaseOpts::new()
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new()
             .with_mvcc(true)
             .with_experimental_mvcc_passive_checkpoint(true),
         None,
-        Arc::new(crate::SqliteDialect),
+        Arc::new(SqliteDialect),
     );
     assert!(
-        matches!(opened, Err(crate::LimboError::Corrupt(_))),
+        matches!(opened, Err(turso_core::LimboError::Corrupt(_))),
         "a database opened beside another log's files"
     );
 }
@@ -252,7 +260,7 @@ fn test_a_truncate_that_cannot_free_what_came_before_it_reports_busy() {
         .begin_tx(db.checkpointer.pager.load().clone())
         .unwrap();
     let set_state = |state: TransactionState| {
-        store.txs.get(&making).unwrap().value().state.store(state);
+        store.set_tx_state_for_testing(making, state);
     };
     // Below every commit made so far, so no snapshot covers any of them.
     set_state(TransactionState::Preparing(1));
@@ -263,7 +271,7 @@ fn test_a_truncate_that_cannot_free_what_came_before_it_reports_busy() {
     };
     let res = truncate();
     assert!(
-        matches!(res, Err(crate::LimboError::Busy)),
+        matches!(res, Err(turso_core::LimboError::Busy)),
         "a TRUNCATE that cannot free what came before it must report Busy, got {res:?}"
     );
     assert_eq!(
@@ -380,7 +388,7 @@ fn test_a_busy_truncate_stepped_again_goes_on_toward_its_first_goal() {
         .begin_tx(db.checkpointer.pager.load().clone())
         .unwrap();
     let set_state = |state: TransactionState| {
-        store.txs.get(&making).unwrap().value().state.store(state);
+        store.set_tx_state_for_testing(making, state);
     };
     // Below every commit made so far, so no snapshot covers any of them.
     set_state(TransactionState::Preparing(1));
@@ -469,36 +477,44 @@ fn test_a_rolled_log_reopened_without_passive_checkpoints_is_cleared_by_a_blocki
     } = rolled;
     drop((checkpointer, writer));
     let path = db.get_db().path.clone();
-    drop(db.db.take());
+    db.close();
     let reopen = || {
-        crate::database::remove_file_from_database_registry(&path);
-        crate::Database::open_file_with_flags(
-            Arc::new(crate::PlatformIO::new().unwrap()),
+        turso_core::remove_file_from_database_registry(&path);
+        turso_core::Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
             &path,
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
             None,
-            Arc::new(crate::SqliteDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap()
     };
     let blocking = reopen();
-    let conn = blocking.connect(crate::ConnectOpts::new()).unwrap();
+    let conn = blocking
+        .connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))
+        .unwrap();
     assert_eq!(count(&conn), 4);
     conn.checkpoint(CheckpointMode::Truncate {
         upper_bound_inclusive: None,
     })
     .unwrap();
     let store = blocking.get_mv_store().as_ref().cloned().unwrap();
-    assert_eq!(store.storage.logical_log_segments(), 1);
-    assert_eq!(store.storage.logical_log_size().unwrap(), 0);
+    assert_eq!(store.storage_for_testing().logical_log_segments(), 1);
+    assert_eq!(store.storage_for_testing().logical_log_size().unwrap(), 0);
     for slot in &slots {
         let len = std::fs::metadata(slot).map_or(0, |metadata| metadata.len());
         assert_eq!(len, 0, "{slot} kept {len} bytes");
     }
     drop((conn, store, blocking));
     let reopened = reopen();
-    let conn = reopened.connect(crate::ConnectOpts::new()).unwrap();
+    let conn = reopened
+        .connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))
+        .unwrap();
     assert_eq!(count(&conn), 4);
     assert_integrity_ok(&conn);
 }
@@ -539,8 +555,8 @@ impl YieldInjector for ReadOnceTheWalIsWritten {
 
 /// Steps `stmt` with `waker`, driving its IO, until it parks in a checkpoint (`None`) or ends.
 fn step_until_parked_or_done(
-    stmt: &mut crate::Statement,
-    io: &Arc<dyn crate::IO>,
+    stmt: &mut turso_core::Statement,
+    io: &Arc<dyn turso_core::IO>,
     waker: &std::task::Waker,
 ) -> Option<StepResult> {
     for _ in 0..100_000 {
@@ -567,7 +583,7 @@ impl TestDb {
 
     /// A TRUNCATE statement to step with a waker, on a connection whose busy timeout is
     /// `busy_timeout`, as long as the checkpoint may park.
-    fn truncate_parking_for(&self, busy_timeout: Duration) -> crate::Statement {
+    fn truncate_parking_for(&self, busy_timeout: Duration) -> turso_core::Statement {
         self.checkpointer.set_busy_timeout(busy_timeout);
         self.checkpointer
             .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -580,7 +596,7 @@ impl TestDb {
         &self,
         busy_timeout: Duration,
     ) -> (
-        crate::Statement,
+        turso_core::Statement,
         Arc<ReadOnceTheWalIsWritten>,
         Arc<Wakes>,
         std::task::Waker,
@@ -783,7 +799,7 @@ fn test_a_truncate_parks_on_a_commit_its_pass_cannot_cover_until_that_commit_end
         .begin_tx(db.checkpointer.pager.load().clone())
         .unwrap();
     let set_state = |state: TransactionState| {
-        store.txs.get(&making).unwrap().value().state.store(state);
+        store.set_tx_state_for_testing(making, state);
     };
     // Below every commit made so far, so no snapshot covers any of them.
     set_state(TransactionState::Preparing(1));
@@ -833,7 +849,7 @@ fn test_a_truncate_stepped_without_a_waker_reports_busy_beside_a_reader() {
     db.checkpointer.set_yield_injector(None);
     assert!(injector.reading.load(Ordering::Acquire));
     assert!(
-        matches!(res, Err(crate::LimboError::Busy)),
+        matches!(res, Err(turso_core::LimboError::Busy)),
         "without a waker the TRUNCATE must report Busy beside a reader, got {res:?}"
     );
     injector.reader.execute("COMMIT").unwrap();
@@ -847,8 +863,8 @@ fn test_a_truncate_stepped_without_a_waker_reports_busy_beside_a_reader() {
 /// one ends, which wakes it, and then runs.
 #[test]
 fn test_a_truncate_parks_on_a_checkpoint_running_on_another_thread() {
-    use crate::mvcc::database::checkpoint_state_machine::CheckpointStateMachine;
-    use crate::state_machine::{StateTransition, TransitionResult};
+    use turso_core::mvcc::database::checkpoint::CheckpointStateMachine;
+    use turso_core::state_machine::{StateTransition, TransitionResult};
 
     let db = TestDb::open();
     db.insert();
@@ -865,7 +881,7 @@ fn test_a_truncate_parks_on_a_checkpoint_running_on_another_thread() {
             other.clone(),
             true,
             other.get_sync_mode(),
-            crate::MAIN_DB_ID,
+            turso_core::MAIN_DB_ID,
             CheckpointMode::Passive {
                 upper_bound_inclusive: None,
             },

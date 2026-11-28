@@ -531,5 +531,16 @@ fn an_encrypted_log_rolls_and_recovery_decrypts_every_segment() {
         commits
     };
     assert_eq!(replay(0x42), [1, 2, 3, 4, 5, 6]);
-    assert_eq!(replay(0x24), Vec::<u64>::new());
+    // A wrong key is refused, not read as an empty log (upstream's rule since its encrypted
+    // frames were reworked; the fork's reader used to end the log at the first frame it could not
+    // authenticate, which made a wrong key look like a log with nothing in it).
+    let log = open_with(0x24);
+    let mut reader = LogChainReader::new(log.files(), Some(encryption(0x24)));
+    let header = io.block(|| reader.try_read_header_nonblock()).unwrap();
+    assert!(matches!(header, HeaderReadResult::Valid(_)));
+    reader.plan(0).unwrap();
+    assert!(
+        io.block(|| reader.next_frame()).is_err(),
+        "a log read with the wrong key must be refused"
+    );
 }

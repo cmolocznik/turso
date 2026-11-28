@@ -2,7 +2,12 @@ use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase}
 use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{ConnectOpts, Connection, LimboError, Result, SessionRole};
+use turso_core::{
+    CheckpointMode, CheckpointResult, ConnectOpts, Connection, IOExt, LimboError, Result,
+    SessionRole, SyncMode,
+};
+
+use super::test_checkpoint::get_database;
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -491,4 +496,224 @@ fn test_wal_with_bad_header_checksum_is_ignored() -> anyhow::Result<()> {
     let count: i64 = sqlite.query_row("SELECT count(*) FROM t", (), |row| row.get(0))?;
     assert_eq!(count, 51);
     Ok(())
+}
+
+fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
+    for _ in 0..n_txns {
+        conn.execute("begin transaction").unwrap();
+        for i in 0..rows_per_txn {
+            conn.execute(format!("insert into test(value) values ('v{i}')"))
+                .unwrap();
+        }
+        conn.execute("commit").unwrap();
+    }
+}
+
+fn count_test_table(conn: &Arc<Connection>) -> i64 {
+    let mut stmt = conn.prepare("select count(*) from test").unwrap();
+    let mut count: i64 = 0;
+    stmt.run_with_row_callback(|row| {
+        count = row.get(0).unwrap();
+        Ok(())
+    })
+    .unwrap();
+    count
+}
+
+fn run_checkpoint_until_done(pager: &turso_core::Pager, mode: CheckpointMode) -> CheckpointResult {
+    // Use pager.checkpoint() instead of wal.checkpoint() directly because
+    // WAL truncation (for TRUNCATE mode) now happens in pager's TruncateWalFile phase.
+    pager
+        .io
+        .block(|| pager.checkpoint(mode, SyncMode::Full, true))
+        .unwrap()
+}
+
+fn check_read_lock_slot(conn: &Arc<Connection>, _expected_slot: usize) -> bool {
+    let pager = conn.pager.load();
+    let _wal = pager.wal().unwrap();
+    #[cfg(debug_assertions)]
+    {
+        let wal_any = _wal.as_any();
+        if let Some(wal_file) = wal_any.downcast_ref::<turso_core::WalFile>() {
+            return wal_file
+                .max_frame_read_lock_index
+                .load(std::sync::atomic::Ordering::Acquire)
+                == _expected_slot;
+        }
+    }
+
+    false
+}
+
+/// A reader of a fully backfilled WAL reads the database file alone, under read mark 0, so a
+/// writer of another connection restarts the WAL beside it, as beside a reader in another
+/// process (`subprocess_db_file_reader_allows_wal_restart_but_stops_backfill`). The reader
+/// keeps its snapshot, and no frame of the restarted WAL reaches the database file while it
+/// reads.
+#[test]
+fn test_db_file_reader_of_another_connection_allows_wal_restart_but_stops_backfill() {
+    let (db, _path) = get_database();
+    let writer = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    writer
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    bulk_inserts(&writer, 10, 5);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let backfilled = run_checkpoint_until_done(&writer.pager.load(), passive);
+    assert!(backfilled.everything_backfilled());
+
+    let reader = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    reader.execute("begin").unwrap();
+    assert_eq!(count_test_table(&reader), 50);
+    assert!(
+        check_read_lock_slot(&reader, 0),
+        "the reader reads the database file"
+    );
+
+    writer.execute("update test set value = 'new'").unwrap();
+    let max_frame = writer.pager.load().wal().unwrap().get_max_frame_in_wal();
+    assert!(
+        max_frame < backfilled.wal_max_frame,
+        "a database file reader of another connection must not stop the WAL restart, \
+         but the write appended at frame {max_frame} after frame {}",
+        backfilled.wal_max_frame
+    );
+    let pager = writer.pager.load();
+    let blocked = pager
+        .io
+        .block(|| pager.checkpoint(passive, SyncMode::Full, true));
+    assert!(
+        matches!(blocked, Err(LimboError::Busy)),
+        "no frame of the restarted WAL may reach the database file while the reader reads: \
+         {blocked:?}"
+    );
+    let mut stmt = reader
+        .prepare("select count(*) from test where value = 'new'")
+        .unwrap();
+    let mut updated: i64 = -1;
+    stmt.run_with_row_callback(|row| {
+        updated = row.get(0).unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(updated, 0, "the reader's snapshot must not see the update");
+    drop(stmt);
+    reader.execute("commit").unwrap();
+
+    let checkpoint = run_checkpoint_until_done(&writer.pager.load(), passive);
+    assert!(checkpoint.everything_backfilled());
+    let mut stmt = writer
+        .prepare("select count(*) from test where value = 'new'")
+        .unwrap();
+    stmt.run_with_row_callback(|row| {
+        updated = row.get(0).unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(updated, 50);
+}
+
+/// A commit's automatic checkpoint waits while another connection holds a read snapshot: the
+/// commit still succeeds, however far the WAL grows past the automatic checkpoint's threshold,
+/// and the frames the reader could still see stay in the WAL until it ends. WorkReef Cognition
+/// relies on this (its writes must not fail because a recall is reading).
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn an_automatic_checkpoint_waits_for_a_reader_and_never_fails_the_commit(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let writer = tmp_db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)")?;
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN")?;
+    assert_eq!(
+        execute_and_get_ints(&reader, "SELECT count(*) FROM t")?,
+        vec![0]
+    );
+
+    // Far past the default automatic checkpoint threshold (1,000 frames): each insert is a
+    // commit, and none may fail while the reader holds its snapshot.
+    for _ in 0..700 {
+        writer.execute("INSERT INTO t VALUES (randomblob(4096))")?;
+    }
+    let held = execute_and_get_ints(&writer, "PRAGMA wal_checkpoint(PASSIVE)")?;
+    assert!(
+        held[1] > 1000,
+        "the WAL must have passed the automatic checkpoint's threshold: {held:?}"
+    );
+    assert!(
+        held[2] < held[1],
+        "frames after the reader's snapshot cannot be backfilled while it is open: {held:?}"
+    );
+
+    reader.execute("COMMIT")?;
+    writer.execute("INSERT INTO t VALUES (randomblob(4096))")?;
+    let after = execute_and_get_ints(&writer, "PRAGMA wal_checkpoint(PASSIVE)")?;
+    assert_eq!(after[0], 0, "not busy once the reader has ended: {after:?}");
+    assert_eq!(
+        after[1], after[2],
+        "every frame is backfilled once the reader has ended: {after:?}"
+    );
+    Ok(())
+}
+
+/// An explicit `PRAGMA wal_checkpoint(TRUNCATE)` while another connection holds a read snapshot is
+/// refused (busy, "database is locked") and leaves the WAL as it was; once the reader ends it
+/// succeeds. The forge's purge and WorkReef Cognition's erasure both depend on this: a truncate
+/// must never pretend to have emptied a WAL a reader still needs.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn a_truncate_checkpoint_is_refused_while_a_reader_holds_a_snapshot(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let writer = tmp_db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)")?;
+    writer.execute("INSERT INTO t VALUES (1)")?;
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN")?;
+    assert_eq!(execute_and_get_ints(&reader, "SELECT x FROM t")?, vec![1]);
+    writer.execute("INSERT INTO t VALUES (2)")?;
+
+    // Refused is an error (busy, "database is locked") or a row whose busy column is not 0
+    // (1, or NULL when no frames were counted).
+    match first_column_text(&writer, "PRAGMA wal_checkpoint(TRUNCATE)") {
+        Err(LimboError::Busy) => {}
+        Ok(busy) => assert!(
+            busy != "0",
+            "a truncate beside a reader must be refused, but it reported not busy"
+        ),
+        Err(other) => panic!("a truncate beside a reader must be busy, not {other:?}"),
+    }
+    assert_eq!(
+        execute_and_get_ints(&reader, "SELECT x FROM t")?,
+        vec![1],
+        "the reader's snapshot is untouched"
+    );
+
+    reader.execute("COMMIT")?;
+    let done = execute_and_get_ints(&writer, "PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(done[0], 0, "the truncate succeeds once the reader ends: {done:?}");
+    Ok(())
+}
+
+/// The first column of the first row `sql` returns, as text (`""` for NULL).
+fn first_column_text(conn: &Arc<Connection>, sql: &str) -> Result<String> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut first = None;
+    stmt.run_with_row_callback(|row| {
+        if first.is_none() {
+            first = row.get_values().next().map(|value| format!("{value}"));
+        }
+        Ok(())
+    })?;
+    Ok(first.unwrap_or_default())
 }

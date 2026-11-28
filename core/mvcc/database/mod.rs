@@ -72,7 +72,12 @@ pub use checkpoint::{sqlite_schema_btree_identity, CheckpointState, CheckpointSt
 
 mod background_checkpoint;
 use background_checkpoint::BackgroundCheckpoint;
+#[cfg(any(test, feature = "test_helper"))]
+#[doc(hidden)]
+pub use background_checkpoint::BackgroundCheckpointProbe;
 pub use background_checkpoint::{background_checkpoint_stats, CheckpointPool, CheckpointPoolStats};
+#[doc(hidden)]
+pub use background_checkpoint::{far_behind, owes_checkpoint, BEHIND};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -91,8 +96,6 @@ use super::portable_logical::{
     PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
-#[cfg(test)]
-mod rolling_log_tests;
 #[cfg(test)]
 pub mod tests;
 
@@ -4550,7 +4553,7 @@ pub enum RecoverLogicalLogState {
     /// Reading the CREATE TYPE statements already in the types table, so that
     /// schemas rebuilt during replay give indexes their columns' type orders.
     QueryTypes {
-        reader: Box<StreamingLogicalLogReader>,
+        reader: Box<LogChainReader>,
         preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
         persistent_tx_ts_max: u64,
         cookie: u32,
@@ -4621,10 +4624,11 @@ pub struct WalPos {
 }
 
 /// The test seam's hook (see `MvStore::after_read_mark_hook`).
-#[cfg(test)]
-pub(crate) struct ReadMarkHook(pub(crate) Box<dyn FnOnce() + Send>);
+#[cfg(any(test, feature = "test_helper"))]
+#[doc(hidden)]
+pub struct ReadMarkHook(pub Box<dyn FnOnce() + Send>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl Debug for ReadMarkHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ReadMarkHook")
@@ -4893,7 +4897,7 @@ impl<A: ConcurrentAllocator> RootBindings<A> {
 
     /// Whether the reverse index holds exactly one key per binding with a root page. The caller
     /// holds `door` or has no concurrent mutator.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test_helper"))]
     fn index_is_exact(&self) -> bool {
         let mut expected: Vec<(u64, MVTableId)> = self
             .entries
@@ -4905,8 +4909,9 @@ impl<A: ConcurrentAllocator> RootBindings<A> {
         expected == held
     }
 
-    #[cfg(test)]
-    pub(crate) fn index_matches_bindings(&self) -> bool {
+    #[cfg(any(test, feature = "test_helper"))]
+    #[doc(hidden)]
+    pub fn index_matches_bindings(&self) -> bool {
         let _door = self.door.lock();
         self.index_is_exact()
     }
@@ -5078,8 +5083,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     durable_bound: RwLock<DurableBound>,
     /// Test seam: runs once in the begin path between the reader's WAL mark capture and its clock
     /// publication, where a checkpoint publish can land.
-    #[cfg(test)]
-    pub(crate) after_read_mark_hook: std::sync::Mutex<Option<ReadMarkHook>>,
+    #[cfg(any(test, feature = "test_helper"))]
+    #[doc(hidden)]
+    pub after_read_mark_hook: std::sync::Mutex<Option<ReadMarkHook>>,
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
@@ -5274,7 +5280,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             durable_bound: RwLock::new(DurableBound::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             after_read_mark_hook: std::sync::Mutex::new(None),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpoint_publish_in_progress: AtomicBool::new(false),
@@ -5332,8 +5338,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Whether a checkpoint is running on the store.
-    #[cfg(test)]
-    pub(crate) fn checkpoint_in_progress(&self) -> bool {
+    #[cfg(any(test, feature = "test_helper"))]
+    #[doc(hidden)]
+    pub fn checkpoint_in_progress(&self) -> bool {
         self.checkpoint_in_progress.load(Ordering::Acquire)
     }
 
@@ -5459,15 +5466,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn checkpoint_waiters(&self) -> usize {
+    #[cfg(any(test, feature = "test_helper"))]
+    #[doc(hidden)]
+    pub fn checkpoint_waiters(&self) -> usize {
         self.checkpoint_waiters.lock().len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn background_checkpoint_probe(
-        &self,
-    ) -> background_checkpoint::BackgroundCheckpointProbe {
+    #[cfg(any(test, feature = "test_helper"))]
+    #[doc(hidden)]
+    pub fn background_checkpoint_probe(&self) -> background_checkpoint::BackgroundCheckpointProbe {
         self.background_checkpoint.probe()
     }
 
@@ -5683,7 +5690,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// hold it in read mode for their whole lifetime, so acquiring it in write
     /// mode proves there are no active MVCC transactions and prevents new ones
     /// from starting until VACUUM releases it.
-    pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
+    #[doc(hidden)]
+    pub fn try_begin_vacuum_gate(&self) -> Result<()> {
         if !self.blocking_checkpoint_lock.write() {
             return Err(LimboError::Busy);
         }
@@ -5695,7 +5703,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
-    pub(crate) fn release_vacuum_gate(&self) {
+    #[doc(hidden)]
+    pub fn release_vacuum_gate(&self) {
         self.blocking_checkpoint_lock.unlock();
     }
 
@@ -6965,7 +6974,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// its mark predates both recorded bounds, so it reads every row from the version store.
     #[inline]
     fn run_after_read_mark_hook(&self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         {
             let hook = self.after_read_mark_hook.lock().unwrap().take();
             if let Some(hook) = hook {
@@ -6975,7 +6984,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// The checkpoint boundary transaction `tx_id`'s read reaches (`Transaction::durable_at_begin`).
-    pub(crate) fn durable_at_begin_of(&self, tx_id: TxID) -> Option<u64> {
+    #[doc(hidden)]
+    pub fn durable_at_begin_of(&self, tx_id: TxID) -> Option<u64> {
         self.txs.get(&tx_id).map(|tx| tx.value().durable_at_begin)
     }
 
@@ -9340,6 +9350,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .state
                 .store(TransactionState::Preparing(ts));
         });
+    }
+
+    /// Sets the state of transaction `tx_id`, as a commit in flight would
+    /// leave it.
+    #[cfg(feature = "test_helper")]
+    pub fn set_tx_state_for_testing(&self, tx_id: TxID, state: TransactionState) {
+        self.txs
+            .get(&tx_id)
+            .expect("the transaction is active")
+            .value()
+            .state
+            .store(state);
+    }
+
+    /// The state of every transaction the store holds.
+    #[cfg(feature = "test_helper")]
+    pub fn tx_states_for_testing(&self) -> Vec<TransactionState> {
+        self.txs
+            .iter()
+            .map(|entry| entry.value().state.load())
+            .collect()
+    }
+
+    /// The durable storage the store writes its logical log to.
+    #[cfg(feature = "test_helper")]
+    pub fn storage_for_testing(&self) -> &Arc<dyn crate::mvcc::persistent_storage::DurableStorage> {
+        &self.storage
     }
 
     /// The number of entries in the write set of transaction `tx_id`, and the

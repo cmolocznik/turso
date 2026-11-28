@@ -504,6 +504,7 @@ dependencies = [
  "tokio",
  "turso",
  "turso_core",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -1912,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
  "thiserror",
  "tracing",
@@ -1922,8 +1923,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_ast"
+version = "0.9.0-pre.6"
+dependencies = [
+ "bitflags",
+ "miette",
+ "strum",
+ "strum_macros",
+ "thiserror",
+ "turso_macros",
+]
+
+[[package]]
 name = "turso_core"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
  "aegis",
  "aes",
@@ -1984,9 +1997,9 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "turso_ast",
  "turso_ext",
  "turso_macros",
- "turso_parser",
  "twox-hash",
  "uncased",
  "uuid",
@@ -1995,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -2004,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2013,20 +2026,16 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
- "bitflags",
  "memchr",
- "miette",
- "strum",
- "strum_macros",
- "thiserror",
+ "turso_ast",
  "turso_macros",
 ]
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -2038,15 +2047,24 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "turso_sdk_kit_macros",
+ "turso_sqlite",
 ]
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.9.0-pre.2"
+version = "0.9.0-pre.6"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "turso_sqlite"
+version = "0.9.0-pre.6"
+dependencies = [
+ "turso_core",
+ "turso_parser",
 ]
 
 [[package]]

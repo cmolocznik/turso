@@ -5007,27 +5007,6 @@ mod tests {
         assert!(matches!(*returned, LimboError::InternalError(ref msg) if msg == "test error"));
     }
 
-    /// A statement that ended `Done` owing nothing skips `abort`'s cleanup, but not the end of
-    /// a transaction another database was left holding once no statement runs.
-    #[test]
-    fn a_done_statement_s_reset_ends_a_transaction_left_on_another_database() {
-        let io = Arc::new(crate::MemoryIO::new());
-        let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TEMP TABLE t (x)").unwrap();
-        let mut stmt = conn.prepare("SELECT 1").unwrap();
-        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
-        let temp = conn
-            .get_pager_from_database_index(&crate::TEMP_DB_ID)
-            .unwrap();
-        temp.begin_read_tx().unwrap();
-        assert!(temp.holds_read_lock());
-        stmt.reset().unwrap();
-        assert!(!temp.holds_read_lock());
-    }
-
     #[test]
     fn active_opcode_helpers_initialize_defaults() {
         let mut state = ProgramState::new(1, 0);

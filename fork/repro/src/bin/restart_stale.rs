@@ -8,7 +8,8 @@
 //! write, which restarts the WAL again; A reads every row. Prints what A's last read saw.
 use std::sync::Arc;
 
-use turso_core::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, Value};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Value};
+use turso_sqlite::SqliteDialect;
 
 fn rows(conn: &Arc<Connection>, sql: &str) -> turso_core::Result<Vec<Vec<Value>>> {
     let mut stmt = conn.prepare(sql)?;
@@ -47,7 +48,7 @@ fn main() {
     let io = Arc::new(MemoryIO::new());
     {
         let db = Database::open_file(io.clone(), "restart-stale.db", Arc::new(SqliteDialect)).unwrap();
-        let setup = db.connect(ConnectOpts::new()).unwrap();
+        let setup = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         setup.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         setup.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, body TEXT NOT NULL)").unwrap();
         for id in 1..=300 {
@@ -57,8 +58,8 @@ fn main() {
         setup.close().unwrap();
     }
     let db = Database::open_file(io, "restart-stale.db", Arc::new(SqliteDialect)).unwrap();
-    let a = db.connect(ConnectOpts::new()).unwrap();
-    let b = db.connect(ConnectOpts::new()).unwrap();
+    let a = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
+    let b = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     println!("A before: {}", versions(&a));
     b.execute(format!("UPDATE t SET v = 1, body = '{}'", "b".repeat(length))).unwrap();
     b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -66,7 +67,7 @@ fn main() {
     a.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     let seen = versions(&a);
     println!("A after its own checkpoint: {seen}");
-    let fresh = db.connect(ConnectOpts::new()).unwrap();
+    let fresh = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     println!("a new connection: {}", versions(&fresh));
     std::process::exit(if seen.starts_with("300 rows by version {1: 300}, 0") { 0 } else { 1 });
 }

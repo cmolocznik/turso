@@ -291,13 +291,13 @@ fn commit_with_failing_sync(replicated: bool) -> turso_core::Result<()> {
     let path = path.to_str().unwrap().to_string();
     let io = Arc::new(UnreliableIo::new());
     let db =
-        turso_core::Database::open_file(io.clone(), &path, Arc::new(turso_core::SqliteDialect))
+        turso_core::Database::open_file(io.clone(), &path, Arc::new(turso_sqlite::SqliteDialect))
             .unwrap();
     if replicated {
         db.set_commit_replicator(Arc::new(Recorder::default()))
             .unwrap();
     }
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let conn = db.connect(turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA data_sync_retry = 1").unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     io.fail_syncs_of(&format!("{path}-wal"));

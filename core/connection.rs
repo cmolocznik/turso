@@ -370,7 +370,8 @@ impl StorageStatsRead {
 
 /// A statement's part in its connection's MVCC transaction, counted in
 /// `Connection::n_active_txn_statements` while it is held.
-pub(crate) struct TxnPart(Arc<AtomicI32>);
+#[doc(hidden)]
+pub struct TxnPart(Arc<AtomicI32>);
 
 impl Drop for TxnPart {
     fn drop(&mut self) {
@@ -391,7 +392,8 @@ pub struct Connection {
     pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
-    pub(crate) pager: ArcSwap<Pager>,
+    #[doc(hidden)]
+    pub pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
@@ -2382,7 +2384,7 @@ impl Connection {
     pub(crate) fn connect_beside(&self, database_id: usize) -> Result<Arc<Connection>> {
         let pager = self.get_pager_from_database_index(&database_id)?;
         let key = match database_id {
-            MAIN_DB_ID => self.encryption_key.read().clone(),
+            MAIN_DB_ID => self.encryption_key.clone(),
             _ => None,
         };
         let connection = self
@@ -3291,7 +3293,8 @@ impl Connection {
     /// makes it safe for `f` to call back into the connection (e.g. `mv_store_for_db`,
     /// which re-reads the attached-database catalog).
     #[inline(always)]
-    pub(crate) fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
+    #[doc(hidden)]
+    pub fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
     {
@@ -4693,7 +4696,8 @@ impl Connection {
     /// A part in the connection's MVCC transaction for a root statement: taken by each statement
     /// that runs a Transaction instruction, which begins or joins the transaction, and by a COMMIT
     /// or ROLLBACK, which ends it and may wait mid-commit; held until the statement finishes.
-    pub(crate) fn take_txn_part(&self) -> TxnPart {
+    #[doc(hidden)]
+    pub fn take_txn_part(&self) -> TxnPart {
         self.n_active_txn_statements.fetch_add(1, Ordering::SeqCst);
         TxnPart(self.n_active_txn_statements.clone())
     }
@@ -4781,7 +4785,8 @@ impl Connection {
     }
 
     #[inline(always)]
-    pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
+    #[doc(hidden)]
+    pub fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
         tracing::debug!("set_mv_tx: {:?}", tx_id_and_mode);
         *self.mv_tx.write() = tx_id_and_mode;
     }
@@ -5272,7 +5277,8 @@ impl Connection {
 
     /// Get the next attached MVCC transaction.
     /// Returns an arbitrary entry from `attached_mv_txs`, or `None` if empty.
-    pub(crate) fn next_attached_mv_tx(&self) -> Option<(usize, u64, TransactionMode)> {
+    #[doc(hidden)]
+    pub fn next_attached_mv_tx(&self) -> Option<(usize, u64, TransactionMode)> {
         self.attached_mv_txs
             .read()
             .iter()

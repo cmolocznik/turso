@@ -29,6 +29,7 @@ name = "leak_tests"
 path = "leak/mod.rs"
 
 [dependencies]
+libc = "0.2.172"
 turso_sqlite = { workspace = true }
 anyhow.workspace = true
 env_logger = { workspace = true }
@@ -78,6 +79,7 @@ default = [
     "percentile",
     "autovacuum",
     "conn_raw_api",
+    "fts_inspect",
 ]
 fs = ["turso_core/fs"]
 uuid = ["turso_core/uuid"]
@@ -88,6 +90,7 @@ encryption = ["turso_core/encryption"]
 percentile = ["turso_core/percentile"]
 autovacuum = ["turso_core/autovacuum"]
 conn_raw_api = []
+fts_inspect = ["turso_core/fts_inspect"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]

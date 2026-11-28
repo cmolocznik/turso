@@ -143,6 +143,9 @@ pub use file_copy::FileCopy;
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 pub use database::is_memory_like;
+#[cfg(any(test, feature = "test_helper"))]
+#[doc(hidden)]
+pub use database::remove_file_from_database_registry;
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub use database::{

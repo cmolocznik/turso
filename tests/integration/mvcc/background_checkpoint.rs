@@ -1,11 +1,23 @@
-use super::*;
-use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
-use crate::mvcc::database::tests::MvccTestDbNoConn;
-use crate::mvcc::persistent_storage::logical_log::LOG_SEGMENT_FILES;
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
-use crate::{Connection, DatabaseOpts, LimboError, MvStore, StepResult};
-use parking_lot::{Condvar, Mutex};
+// Tests moved here from turso_core's own unit tests, which can no longer parse SQL.
+//! Tests of the MVCC background checkpoint pool.
+
+use super::test_db::MvccTestDbNoConn;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+use turso_core::mvcc::database::checkpoint::CheckpointYieldPoint;
+use turso_core::mvcc::database::{
+    far_behind, owes_checkpoint, BackgroundCheckpointProbe, CheckpointPool, BEHIND,
+};
+use turso_core::mvcc::persistent_storage::logical_log::LOG_SEGMENT_FILES;
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
+use turso_core::{CheckpointMode, Connection, DatabaseOpts, LimboError, StepResult};
+
+type MvStore = turso_core::mvcc::database::MvStore<
+    turso_core::mvcc::MvccClock,
+    turso_core::alloc::DynAllocator,
+>;
 
 /// Waits up to ten seconds for `done`.
 fn wait_until(mut done: impl FnMut() -> bool) -> bool {
@@ -69,7 +81,7 @@ impl TestDb {
     /// returns how many rows it inserted.
     fn fill(&self) -> i64 {
         for inserted in 0..1000 {
-            if self.store.storage.should_checkpoint() {
+            if self.store.storage_for_testing().should_checkpoint() {
                 return inserted;
             }
             self.insert(256);
@@ -78,11 +90,11 @@ impl TestDb {
     }
 
     fn log(&self) -> u64 {
-        self.store.storage.logical_log_offset()
+        self.store.storage_for_testing().logical_log_offset()
     }
 
     fn owes(&self) -> bool {
-        owes_checkpoint(self.store.storage.as_ref())
+        owes_checkpoint(self.store.storage_for_testing().as_ref())
     }
 
     fn rows(&self) -> i64 {
@@ -119,9 +131,12 @@ struct HoldAfterSnapshot {
 impl HoldAfterSnapshot {
     fn wait_held(&self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut state = self.state.lock();
+        let mut state = self.state.lock().unwrap();
         while !state.0 {
-            if self.changed.wait_until(&mut state, deadline).timed_out() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (next, waited) = self.changed.wait_timeout(state, left).unwrap();
+            state = next;
+            if waited.timed_out() {
                 break;
             }
         }
@@ -129,7 +144,7 @@ impl HoldAfterSnapshot {
     }
 
     fn release(&self) {
-        self.state.lock().1 = true;
+        self.state.lock().unwrap().1 = true;
         self.changed.notify_all();
     }
 }
@@ -137,12 +152,12 @@ impl HoldAfterSnapshot {
 impl YieldInjector for HoldAfterSnapshot {
     fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
         if point == CheckpointYieldPoint::AfterCollectTableRows.point() {
-            let mut state = self.state.lock();
+            let mut state = self.state.lock().unwrap();
             if !state.1 {
                 state.0 = true;
                 self.changed.notify_all();
                 while !state.1 {
-                    self.changed.wait(&mut state);
+                    state = self.changed.wait(state).unwrap();
                 }
             }
         }
@@ -248,9 +263,9 @@ fn test_background_checkpoint_is_off_by_default() {
         conn.execute("INSERT INTO t(v) VALUES (randomblob(256))")
             .unwrap();
         assert!(
-            store.storage.logical_log_offset() < 8192,
+            store.storage_for_testing().logical_log_offset() < 8192,
             "insert {i} left {} log bytes",
-            store.storage.logical_log_offset()
+            store.storage_for_testing().logical_log_offset()
         );
     }
     assert_eq!(probe.checkpoints(), 0);
@@ -459,8 +474,8 @@ fn test_the_pool_keeps_the_log_bounded_under_writes_that_never_pause() {
     let mut most = 0;
     let mut segments = 0;
     let ran = wait_until(|| {
-        most = most.max(db.store.storage.logical_log_size().unwrap());
-        segments = segments.max(db.store.storage.logical_log_segments());
+        most = most.max(db.store.storage_for_testing().logical_log_size().unwrap());
+        segments = segments.max(db.store.storage_for_testing().logical_log_segments());
         db.probe.checkpoints() >= 50
     });
     writer.on.store(false, Ordering::Release);
@@ -488,8 +503,8 @@ fn test_the_pool_keeps_the_log_bounded_under_writes_that_never_pause() {
     } = db;
     store.set_background_checkpoint(false);
     assert!(!probe.scheduled());
-    drop((conn, store, writer));
-    restarted.restart();
+    drop((conn, store, writer, probe));
+    restarted.restart_releasing();
     let conn = restarted.connect();
     let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
     let mut recovered = None;
@@ -633,7 +648,7 @@ fn test_a_failing_checkpoint_is_retried_later_and_holds_no_thread() {
     let mut most = 0;
     for _ in 0..80 {
         failing.insert(256);
-        most = most.max(failing.store.storage.uncheckpointed_bytes());
+        most = most.max(failing.store.storage_for_testing().uncheckpointed_bytes());
     }
     fail.on.store(false, Ordering::Release);
     assert!(
@@ -656,7 +671,7 @@ fn test_a_failing_checkpoint_is_retried_later_and_holds_no_thread() {
 }
 
 /// Steps `stmt` until it is done, false, or waits for a checkpoint running on its database, true.
-fn step_until_parked_or_done(db: &TestDb, stmt: &mut crate::Statement) -> bool {
+fn step_until_parked_or_done(db: &TestDb, stmt: &mut turso_core::Statement) -> bool {
     loop {
         match stmt.step().unwrap() {
             StepResult::IO if db.store.checkpoint_waiters() > 0 => return true,
@@ -694,13 +709,13 @@ fn test_a_commit_far_behind_waits_for_the_checkpoint_running_on_its_database() {
             break;
         }
     }
-    let behind = db.store.storage.uncheckpointed_bytes();
+    let behind = db.store.storage_for_testing().uncheckpointed_bytes();
     let mut stmt = parked.unwrap_or_else(|| {
         panic!("1000 commits returned while the pool's checkpoint ran, {behind} bytes behind")
     });
-    let threshold = db.store.storage.checkpoint_threshold() as u64;
+    let threshold = db.store.storage_for_testing().checkpoint_threshold() as u64;
     assert!(
-        far_behind(db.store.storage.as_ref()) && behind < (BEHIND + 1) * threshold,
+        far_behind(db.store.storage_for_testing().as_ref()) && behind < (BEHIND + 1) * threshold,
         "the commit waited {behind} bytes behind, at a {threshold}-byte threshold"
     );
     hold.release();
@@ -709,9 +724,9 @@ fn test_a_commit_far_behind_waits_for_the_checkpoint_running_on_its_database() {
     }
     assert_eq!(db.store.checkpoint_waiters(), 0);
     assert!(
-        wait_until(|| !far_behind(db.store.storage.as_ref())),
+        wait_until(|| !far_behind(db.store.storage_for_testing().as_ref())),
         "{} uncheckpointed bytes after the commit went on, {:?}",
-        db.store.storage.uncheckpointed_bytes(),
+        db.store.storage_for_testing().uncheckpointed_bytes(),
         pool.stats()
     );
     db.assert_intact();
@@ -731,7 +746,7 @@ fn test_commits_checkpoint_inline_while_the_pool_is_far_behind_on_their_database
     let mut most = 0;
     for _ in 0..200 {
         behind.insert(256);
-        most = most.max(behind.store.storage.uncheckpointed_bytes());
+        most = most.max(behind.store.storage_for_testing().uncheckpointed_bytes());
     }
     let assists = behind.probe.assists();
     hold.release();

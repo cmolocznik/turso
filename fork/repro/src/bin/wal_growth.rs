@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO};
+use turso_sqlite::SqliteDialect;
 
 fn wal_header(path: &str) -> Option<(u64, u32)> {
     let bytes = std::fs::read(path).ok()?;
@@ -31,7 +32,7 @@ fn main() {
     let wal = format!("{path}-wal");
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file_with_flags(io, &path, OpenFlags::default(), DatabaseOpts::new(), None, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA synchronous = NORMAL").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, body BLOB NOT NULL)").unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -41,7 +42,7 @@ fn main() {
     for _ in 0..threads {
         let (db, stop, commits, failures, latencies) = (db.clone(), stop.clone(), commits.clone(), failures.clone(), latencies.clone());
         handles.push(std::thread::spawn(move || {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             conn.execute("PRAGMA synchronous = NORMAL").unwrap();
             if let Ok(pages) = std::env::var("AUTOCHECKPOINT") {
@@ -62,7 +63,7 @@ fn main() {
     for _ in 0..readers {
         let (db, stop, reads) = (db.clone(), stop.clone(), reads.clone());
         handles.push(std::thread::spawn(move || {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             while !stop.load(Ordering::Relaxed) {
                 let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
@@ -75,7 +76,7 @@ fn main() {
         let every = Duration::from_millis(std::env::var("CHECKPOINT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(200));
         let (db, stop) = (db.clone(), stop.clone());
         handles.push(std::thread::spawn(move || {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             let (mut runs, mut busy, mut errors, mut longest) = (0u64, 0u64, 0u64, Duration::ZERO);
             while !stop.load(Ordering::Relaxed) {

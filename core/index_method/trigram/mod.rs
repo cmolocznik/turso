@@ -40,7 +40,7 @@ pub use merge::set_trigram_step_bytes_for_test;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use turso_parser::ast::{self, SortOrder};
+use crate::ast::{self, SortOrder};
 
 use crate::numeric::Numeric;
 use crate::types::IOResultOr;
@@ -120,6 +120,7 @@ pub struct TrigramIndexMethod;
 impl IndexMethod for TrigramIndexMethod {
     fn attach(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         let [text] = configuration.columns.as_slice() else {
@@ -140,7 +141,7 @@ impl IndexMethod for TrigramIndexMethod {
         );
         Ok(Arc::new(TrigramAttachment {
             configuration: configuration.clone(),
-            patterns: parse_patterns(&[&pattern])?,
+            patterns: parse_patterns(dialect, &[&pattern])?,
         }))
     }
 }

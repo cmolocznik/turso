@@ -1,9 +1,13 @@
 //! `fts_filtered_score`: the top documents a filter admits, scored with every
 //! BM25 statistic counted over exactly that set, held to an exact oracle.
+//!
+//! Tests moved here from turso_core's own unit tests, which can no longer parse SQL.
 
-use super::*;
-use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect};
 use std::collections::HashMap as StdHashMap;
+use turso_core::index_method::fts::{register_tokenizer, tantivy};
+use turso_core::sync::Arc;
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, Value};
+use turso_sqlite::SqliteDialect;
 
 /// A small deterministic generator, so a failure names its seed.
 struct Rng(u64);
@@ -362,7 +366,7 @@ fn oracle_population(docs: &StdHashMap<i64, Doc>, filter: &F) -> Vec<u8> {
 fn open(mvcc: bool) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("filtered.db");
-    let io: Arc<dyn crate::IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn turso_core::IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file_with_flags(
         io,
         path.to_str().unwrap(),
@@ -372,7 +376,9 @@ fn open(mvcc: bool) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     if mvcc {
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     }
@@ -681,25 +687,42 @@ fn a_phrase_admits_by_position_and_leaves_the_score_alone() {
         let plain = run_filtered(&conn, &format!("{{\"must\":{must}}}"), filter, 1000);
         let phrased = run_filtered(
             &conn,
-            &format!("{{\"must\":{must},\"phrase\":[[3,\"{}\"],[{},\"{}\"]]}}", word(a), 3 + gap, word(b)),
+            &format!(
+                "{{\"must\":{must},\"phrase\":[[3,\"{}\"],[{},\"{}\"]]}}",
+                word(a),
+                3 + gap,
+                word(b)
+            ),
             filter,
             1000,
         );
         // The oracle: a document carrying `a` and, `gap` words on, `b`.
         let carries = |doc: &Doc| doc.words.windows(gap + 1).any(|w| w[0] == a && w[gap] == b);
-        let mut want: Vec<i64> = docs.iter().filter(|(_, d)| d.closed == 0 && carries(d)).map(|(id, _)| *id).collect();
+        let mut want: Vec<i64> = docs
+            .iter()
+            .filter(|(_, d)| d.closed == 0 && carries(d))
+            .map(|(id, _)| *id)
+            .collect();
         let mut got: Vec<i64> = phrased.iter().map(|(_, id)| *id).collect();
         want.sort_unstable();
         got.sort_unstable();
         assert_eq!(got, want, "phrase {a} +{gap} {b}");
-        let plain: StdHashMap<i64, f64> = plain.into_iter().map(|(score, id)| (id, score)).collect();
+        let plain: StdHashMap<i64, f64> =
+            plain.into_iter().map(|(score, id)| (id, score)).collect();
         for (score, id) in &phrased {
-            assert_eq!(plain[id].to_bits(), score.to_bits(), "doc {id}: the phrase moved its score");
+            assert_eq!(
+                plain[id].to_bits(),
+                score.to_bits(),
+                "doc {id}: the phrase moved its score"
+            );
         }
         admitted_some += usize::from(!got.is_empty());
         refused_some += usize::from(got.len() < plain.len());
     }
-    assert!(admitted_some >= 5 && refused_some >= 5, "admitted {admitted_some}, refused {refused_some}");
+    assert!(
+        admitted_some >= 5 && refused_some >= 5,
+        "admitted {admitted_some}, refused {refused_some}"
+    );
 }
 
 /// The same filters read again and again while the index changes under them:
@@ -713,7 +736,9 @@ fn a_filter_read_again_answers_its_own_view_after_every_change() {
     for mvcc in [false, true] {
         let mut rng = Rng(0x5eed_a5e7 | 1);
         let (_dir, db, conn) = open(mvcc);
-        let other = db.connect(ConnectOpts::new()).unwrap();
+        let other = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let filters: Vec<F> = (0..4).map(|_| random_filter(&mut rng, 0)).collect();
         let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
         let mut next_id = 1i64;
@@ -736,11 +761,15 @@ fn a_filter_read_again_answers_its_own_view_after_every_change() {
                     for _ in 0..6 {
                         let id = ids[rng.below(ids.len() as u64) as usize];
                         if rng.below(2) == 0 {
-                            conn.execute(format!("DELETE FROM docs WHERE id = {id}")).unwrap();
+                            conn.execute(format!("DELETE FROM docs WHERE id = {id}"))
+                                .unwrap();
                             docs.remove(&id);
                         } else if let Some(doc) = docs.get_mut(&id) {
                             let shape = 1 + rng.below(5) as i64;
-                            conn.execute(format!("UPDATE docs SET closed = 1, shape = {shape} WHERE id = {id}")).unwrap();
+                            conn.execute(format!(
+                                "UPDATE docs SET closed = 1, shape = {shape} WHERE id = {id}"
+                            ))
+                            .unwrap();
                             doc.closed = 1;
                             doc.shape = Some(shape);
                         }
@@ -754,9 +783,19 @@ fn a_filter_read_again_answers_its_own_view_after_every_change() {
                     for (name, reader) in [("writer", &conn), ("other", &other)] {
                         for again in 0..2 {
                             let context = format!("mvcc={mvcc} round={round} read={read} {name} again={again} filter={}", filter.json());
-                            assert_eq!(population(reader, &filter.json()), oracle_population(&docs, filter), "{context}: population");
+                            assert_eq!(
+                                population(reader, &filter.json()),
+                                oracle_population(&docs, filter),
+                                "{context}: population"
+                            );
                             let got = filtered(reader, &terms, &filter.json(), 10);
-                            assert_agrees(&docs, &got, &oracle(&docs, filter, &terms), 10, &context);
+                            assert_agrees(
+                                &docs,
+                                &got,
+                                &oracle(&docs, filter, &terms),
+                                10,
+                                &context,
+                            );
                             reads += 1;
                         }
                     }
@@ -833,9 +872,15 @@ fn concurrent_writers_a_rollback_and_a_merge_keep_the_filtered_answer_exact() {
     let first: Vec<(i64, Doc)> = (1..=80).map(|id| (id, random_doc(&mut rng))).collect();
     conn.execute(insert_sql(&first)).unwrap();
     docs.extend(first);
-    let a = db.connect(ConnectOpts::new()).unwrap();
-    let b = db.connect(ConnectOpts::new()).unwrap();
-    let c = db.connect(ConnectOpts::new()).unwrap();
+    let a = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let b = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let c = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     let to_a: Vec<(i64, Doc)> = (100..=140).map(|id| (id, random_doc(&mut rng))).collect();
     let to_b: Vec<(i64, Doc)> = (200..=240).map(|id| (id, random_doc(&mut rng))).collect();
     let to_c: Vec<(i64, Doc)> = (300..=340).map(|id| (id, random_doc(&mut rng))).collect();
@@ -1312,6 +1357,7 @@ fn a_registered_tokenizer_serves_its_index_and_an_unregistered_one_is_refused() 
 }
 
 /// One segment of the inspection report.
+#[cfg(feature = "test_helper")]
 #[derive(Debug)]
 struct SegmentReport {
     live: u64,
@@ -1320,6 +1366,7 @@ struct SegmentReport {
 }
 
 /// The `fts_segments` report of `docs_fts`, probing `body` for a term.
+#[cfg(feature = "test_helper")]
 fn segments(conn: &Arc<Connection>, term: &str) -> Vec<SegmentReport> {
     let mut statement = conn
         .prepare("SELECT fts_segments(body, ?1) AS report FROM docs ORDER BY report DESC LIMIT 1")
@@ -1352,12 +1399,13 @@ fn segments(conn: &Arc<Connection>, term: &str) -> Vec<SegmentReport> {
 /// secure_delete, none of the segment rows that held the erased document is
 /// left in the backing store or the database file, while before the
 /// OPTIMIZE they still are.
+#[cfg(feature = "test_helper")]
 #[test]
 fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_file() {
     for mvcc in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("erase.db");
-        let io: Arc<dyn crate::IO> = Arc::new(PlatformIO::new().unwrap());
+        let io: Arc<dyn turso_core::IO> = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io.clone(),
             path.to_str().unwrap(),
@@ -1367,7 +1415,9 @@ fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_fi
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         if mvcc {
             conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         }
@@ -1386,7 +1436,7 @@ fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_fi
         // The erased document is the only one of its segment.
         conn.execute("INSERT INTO docs VALUES (999, 'zqxplantedsecretterm shared', 1)")
             .unwrap();
-        let before = super::tests::backing_bytes(&conn, &io);
+        let before = super::fts::backing_bytes(&conn, &io);
         conn.execute("DELETE FROM docs WHERE id = 999").unwrap();
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         let file = std::fs::read(&path).unwrap();
@@ -1426,7 +1476,7 @@ fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_fi
             shared.iter().any(|s| s.term),
             "mvcc={mvcc}: the probe sees a term that is there"
         );
-        let after = super::tests::backing_bytes(&conn, &io);
+        let after = super::fts::backing_bytes(&conn, &io);
         let kept = before
             .iter()
             .filter(|blob| blob.len() >= 64 && after.contains(*blob))
@@ -1452,7 +1502,9 @@ fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_fi
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let mut statement = conn
             .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT 500")
             .unwrap();

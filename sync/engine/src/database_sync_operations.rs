@@ -1000,6 +1000,17 @@ fn validate_mvcc_log_header(buf: &[u8]) -> Result<u32> {
             "invalid MVCC logical-log header magic".to_string(),
         ));
     }
+    // Version 2 is the header of a log whose frames carry no portable changes, which a log that
+    // rolls starts as until a frame needs them (core's `LogicalLog::new_header`): it is the plain
+    // log of a database not yet upgraded, as a version 3 log of plain frames is.
+    if buf[4] == 2 {
+        return Err(turso_core::LimboError::Corrupt(
+            "MVCC logical-log header has no portable changes (version 2); \
+             the remote database must be upgraded with PRAGMA journal_mode = 'mvcc'"
+                .to_string(),
+        )
+        .into());
+    }
     if buf[4] != MVCC_LOG_VERSION {
         return Err(Error::DatabaseSyncEngineError(format!(
             "unsupported MVCC logical-log version {}",

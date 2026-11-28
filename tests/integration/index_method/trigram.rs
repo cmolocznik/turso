@@ -171,9 +171,9 @@ fn code_match_gives_the_same_rows_with_and_without_the_index(tmp_db: TempDatabas
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn code_match_gives_the_same_rows_when_every_io_waits() {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let open = |name: &str| {
         let db = Database::open_file_with_flags(
@@ -185,7 +185,7 @@ fn code_match_gives_the_same_rows_when_every_io_waits() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA page_size = 512").unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         conn.execute(TABLE).unwrap();
@@ -348,9 +348,9 @@ fn rows_and_waits(
 /// table of `texts` texts written in eight statements, so in eight segments.
 #[cfg(feature = "io_memory_yield")]
 fn waits_among(texts: usize) -> (usize, usize) {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let io = Arc::new(MemoryYieldIO::new());
     let db = Database::open_file_with_flags(
@@ -362,7 +362,7 @@ fn waits_among(texts: usize) -> (usize, usize) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA page_size = 512").unwrap();
     conn.execute(TABLE).unwrap();
     conn.execute(INDEX).unwrap();
@@ -384,7 +384,7 @@ fn waits_among(texts: usize) -> (usize, usize) {
         .unwrap();
 
     let query = |pattern: &str, expected_rows: usize| {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         let (rows, waits) = rows_and_waits(
             &conn,
@@ -518,9 +518,9 @@ fn writers_go_on_between_the_steps_of_a_merge() {
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn a_merged_index_is_read_in_fewer_seeks() {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let io = Arc::new(MemoryYieldIO::new());
     let db = Database::open_file_with_flags(
@@ -532,7 +532,7 @@ fn a_merged_index_is_read_in_fewer_seeks() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA page_size = 512").unwrap();
     conn.execute(TABLE).unwrap();
     conn.execute(INDEX).unwrap();
@@ -552,7 +552,7 @@ fn a_merged_index_is_read_in_fewer_seeks() {
     conn.execute("UPDATE docs SET text = text || ' needle' WHERE path = 'p3_5'")
         .unwrap();
     let waits = || {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         let (rows, waits) = rows_and_waits(
             &conn,
@@ -578,9 +578,9 @@ fn a_merged_index_is_read_in_fewer_seeks() {
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn a_merge_drops_the_texts_removed_before_it() {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let io = Arc::new(MemoryYieldIO::new());
     let db = Database::open_file_with_flags(
@@ -592,7 +592,7 @@ fn a_merge_drops_the_texts_removed_before_it() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA page_size = 512").unwrap();
     conn.execute(TABLE).unwrap();
     conn.execute(INDEX).unwrap();
@@ -613,7 +613,7 @@ fn a_merge_drops_the_texts_removed_before_it() {
     conn.execute("DELETE FROM docs WHERE text NOT LIKE '%kept%'")
         .unwrap();
     let waits = |pattern: &str| {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         let (rows, waits) = rows_and_waits(
             &conn,
@@ -731,9 +731,9 @@ fn two_merging_at_once_claim_no_segment_twice() {
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn a_whole_merge_drops_every_removed_text_where_the_policy_merges_nothing() {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let io = Arc::new(MemoryYieldIO::new());
     let db = Database::open_file_with_flags(
@@ -745,7 +745,7 @@ fn a_whole_merge_drops_every_removed_text_where_the_policy_merges_nothing() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA page_size = 512").unwrap();
     conn.execute(TABLE).unwrap();
     conn.execute(INDEX).unwrap();
@@ -766,7 +766,7 @@ fn a_whole_merge_drops_every_removed_text_where_the_policy_merges_nothing() {
     conn.execute("DELETE FROM docs WHERE text LIKE '%qqgonexx%'")
         .unwrap();
     let waits = |pattern: &str, expected: usize| {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         let (rows, waits) = rows_and_waits(
             &conn,

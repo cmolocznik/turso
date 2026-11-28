@@ -56,7 +56,7 @@ async fn a_statement_reports_the_rows_it_walked_and_its_sorts_and_reset_zeroes_t
     assert_eq!((m.rows_read, m.sort_operations), (0, 0));
 
     let mut sorted = conn
-        .prepare("SELECT id FROM t ORDER BY v LIMIT 5")
+        .prepare("SELECT id FROM t ORDER BY v")
         .await
         .unwrap();
     let mut rows = sorted.query(()).await.unwrap();

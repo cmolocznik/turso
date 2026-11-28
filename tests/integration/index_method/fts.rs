@@ -178,3 +178,147 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         "accepted invalid weights: {accepted:?}"
     );
 }
+
+/// Drive a resumable step to its end, waiting on the I/O it asks for.
+#[cfg(feature = "test_helper")]
+fn drive<T>(
+    io: &Arc<dyn turso_core::IO>,
+    mut step: impl FnMut() -> turso_core::types::IOResultOr<T>,
+) -> T {
+    loop {
+        match step().unwrap() {
+            turso_core::types::IOResult::Done(value) => return value,
+            turso_core::types::IOResult::IO(completion) => completion.wait(io.as_ref()).unwrap(),
+        }
+    }
+}
+
+/// The bytes of every row of the FTS index `docs_fts`'s backing store, read in a transaction.
+#[cfg(feature = "test_helper")]
+pub(super) fn backing_bytes(
+    conn: &Arc<Connection>,
+    io: &Arc<dyn turso_core::IO>,
+) -> std::collections::HashSet<Vec<u8>> {
+    conn.execute("BEGIN").unwrap();
+    conn.prepare("SELECT count(*) FROM docs")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
+        conn,
+        turso_core::MAIN_DB_ID,
+        "docs_fts",
+    )
+    .unwrap();
+    drive(io, || dumper.step());
+    let rows = std::mem::take(&mut dumper.row_bytes)
+        .into_iter()
+        .collect::<std::collections::HashSet<Vec<u8>>>();
+    drop(dumper);
+    conn.execute("COMMIT").unwrap();
+    rows
+}
+
+/// REINDEX makes an FTS index afresh from the table's rows: after documents are deleted and the
+/// index made again, a search finds the documents left alone, and under `secure_delete` none of the
+/// segment files and tombstones of the index it replaced is left in the checkpointed file, in WAL
+/// and in MVCC mode.
+#[cfg(feature = "test_helper")]
+#[test]
+fn reindex_makes_the_index_afresh_and_leaves_none_of_the_old_one_in_the_file() {
+    use std::collections::HashSet;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO};
+    let ids = |conn: &Arc<Connection>, term: &str| -> Vec<i64> {
+        conn.prepare(format!(
+            "SELECT id FROM docs WHERE fts_match(body, '{term}') ORDER BY id"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect()
+    };
+    for mvcc in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reindex.db");
+        let io: Arc<dyn turso_core::IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("PRAGMA secure_delete = ON").unwrap();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        for batch in 0..8 {
+            let values: Vec<String> = (batch * 50..batch * 50 + 50)
+                .map(|id| {
+                    format!(
+                        "({id}, 'shared words of document mark{id} and some more text {}')",
+                        "filler ".repeat(id as usize % 7)
+                    )
+                })
+                .collect();
+            conn.execute(format!("INSERT INTO docs VALUES {}", values.join(",")))
+                .unwrap();
+        }
+        conn.execute("DELETE FROM docs WHERE id % 3 = 0").unwrap();
+        let old = backing_bytes(&conn, &io);
+        conn.execute("DELETE FROM docs WHERE id % 2 = 0").unwrap();
+        conn.execute("REINDEX docs_fts").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(ids(&conn, "mark40"), Vec::<i64>::new(), "mvcc={mvcc}");
+        assert_eq!(ids(&conn, "mark41"), vec![41], "mvcc={mvcc}");
+        assert_eq!(ids(&conn, "mark39"), Vec::<i64>::new(), "mvcc={mvcc}");
+        assert_eq!(
+            ids(&conn, "shared").len(),
+            (0..400).filter(|id| id % 2 == 1 && id % 3 != 0).count(),
+            "mvcc={mvcc}"
+        );
+        let new = backing_bytes(&conn, &io);
+        drop(conn);
+        drop(db);
+        let kept = old
+            .iter()
+            .filter(|blob| blob.len() >= 16 && new.contains(*blob))
+            .count();
+        assert_eq!(
+            kept, 0,
+            "mvcc={mvcc}: the index made again holds {kept} rows of the one it replaced"
+        );
+        let gone: Vec<&Vec<u8>> = old.iter().filter(|blob| blob.len() >= 16).collect();
+        assert!(
+            gone.len() > 8,
+            "mvcc={mvcc}: the old index held only {} rows",
+            gone.len()
+        );
+        let file = std::fs::read(&path).unwrap();
+        let prefixes: HashSet<&[u8]> = gone.iter().map(|blob| &blob[..16]).collect();
+        let seen: HashSet<&[u8]> = file.windows(16).filter(|w| prefixes.contains(w)).collect();
+        let left = gone
+            .iter()
+            .filter(|blob| {
+                seen.contains(&blob[..16]) && file.windows(blob.len()).any(|w| w == blob.as_slice())
+            })
+            .count();
+        assert_eq!(
+            left,
+            0,
+            "mvcc={mvcc}: {left} of {} rows of the old index left in the file",
+            gone.len()
+        );
+    }
+}

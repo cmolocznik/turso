@@ -1,6 +1,9 @@
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 mod fts;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+mod fts_filtered;
+mod ivf_rq;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 mod json;
 mod path_trie;
 mod trigram;

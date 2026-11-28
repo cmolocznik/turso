@@ -15,7 +15,8 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, Value};
+use turso_sqlite::SqliteDialect;
 
 const WRITERS: usize = 4;
 /// Each writer's ids follow its number times this.
@@ -25,7 +26,7 @@ fn open(path: &str) -> turso_core::Result<(Arc<Database>, Arc<Connection>)> {
     let io = Arc::new(PlatformIO::new()?);
     let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
     let db = Database::open_file_with_flags(io, path, OpenFlags::default(), opts, None, Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     Ok((db, conn))
 }
 
@@ -57,7 +58,7 @@ fn log_bytes(dir: &str) -> u64 {
 
 /// Commits until killed, printing `committed WRITER ID` after each commit, ID its highest row.
 fn writer(db: Arc<Database>, number: usize, seed: u64) -> turso_core::Result<()> {
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous = NORMAL")?;
     let base = number as i64 * RANGE;
     let mut next = int(&conn, &format!("SELECT coalesce(max(id), {base}) FROM t WHERE id > {base} AND id <= {}", base + RANGE))? + 1;

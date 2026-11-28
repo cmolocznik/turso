@@ -1,3 +1,4 @@
+mod background_checkpoint;
 mod checkpoint;
 mod concurrent_inserts;
 // The cursor work counters exist in debug builds only.
@@ -8,6 +9,7 @@ mod group_commit;
 mod hermitage;
 mod logical_log;
 mod persistence;
+mod rolling_log;
 mod store;
 mod test_db;
 mod transactions;

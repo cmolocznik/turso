@@ -56,11 +56,13 @@ const RETRY_LONGEST: Duration = Duration::from_secs(1);
 
 /// The uncheckpointed log, in checkpoint thresholds, at which a database's commits checkpoint
 /// inline again.
-const BEHIND: u64 = 4;
+#[doc(hidden)]
+pub const BEHIND: u64 = 4;
 
 /// Whether `storage`'s uncheckpointed log has reached `BEHIND` thresholds, past which its commits
 /// no longer leave the checkpoint to anyone else.
-pub(crate) fn far_behind(storage: &dyn DurableStorage) -> bool {
+#[doc(hidden)]
+pub fn far_behind(storage: &dyn DurableStorage) -> bool {
     let threshold = storage.checkpoint_threshold();
     threshold > 0 && storage.uncheckpointed_bytes() >= BEHIND.saturating_mul(threshold as u64)
 }
@@ -226,7 +228,7 @@ struct Member {
     failures: AtomicU64,
     deferrals: AtomicU64,
     assists: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     hooks: Mutex<TestHooks>,
 }
 
@@ -252,7 +254,7 @@ enum Outcome {
     Panicked,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 #[derive(Default)]
 struct TestHooks {
     injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
@@ -266,11 +268,8 @@ impl CheckpointPool {
         Self::with_timing(thread_limit, KEEP_ALIVE, QUIET_FOR)
     }
 
-    pub(crate) fn with_timing(
-        thread_limit: usize,
-        keep_alive: Duration,
-        quiet_for: Duration,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn with_timing(thread_limit: usize, keep_alive: Duration, quiet_for: Duration) -> Self {
         Self {
             pool: Arc::new(Pool {
                 schedule: Mutex::new(Schedule::default()),
@@ -653,7 +652,7 @@ impl Pool {
                 return Outcome::Failed;
             }
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         member.hooks.lock().install(&conn);
         let began = Instant::now();
         loop {
@@ -762,7 +761,8 @@ impl Pool {
 
 /// Whether the log holds uncheckpointed bytes past its threshold. At a threshold of zero an empty
 /// log is not past it.
-fn owes_checkpoint(storage: &dyn DurableStorage) -> bool {
+#[doc(hidden)]
+pub fn owes_checkpoint(storage: &dyn DurableStorage) -> bool {
     storage.should_checkpoint() && storage.uncheckpointed_bytes() > 0
 }
 
@@ -779,7 +779,7 @@ impl Member {
             failures: AtomicU64::new(0),
             deferrals: AtomicU64::new(0),
             assists: AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             hooks: Mutex::new(TestHooks::default()),
         }
     }
@@ -895,7 +895,7 @@ impl BackgroundCheckpoint {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn probe(&self) -> BackgroundCheckpointProbe {
         BackgroundCheckpointProbe {
             member: self.binding.load().member.clone(),
@@ -921,36 +921,37 @@ impl Drop for BackgroundCheckpoint {
 }
 
 /// A view of one store's place in its pool that outlives the store, for tests.
-#[cfg(test)]
-pub(crate) struct BackgroundCheckpointProbe {
+#[cfg(any(test, feature = "test_helper"))]
+#[doc(hidden)]
+pub struct BackgroundCheckpointProbe {
     member: Arc<Member>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl BackgroundCheckpointProbe {
-    pub(crate) fn checkpoints(&self) -> u64 {
+    pub fn checkpoints(&self) -> u64 {
         self.member.checkpoints.load(Ordering::Acquire)
     }
 
-    pub(crate) fn failures(&self) -> u64 {
+    pub fn failures(&self) -> u64 {
         self.member.failures.load(Ordering::Acquire)
     }
 
-    pub(crate) fn deferrals(&self) -> u64 {
+    pub fn deferrals(&self) -> u64 {
         self.member.deferrals.load(Ordering::Acquire)
     }
 
-    pub(crate) fn assists(&self) -> u64 {
+    pub fn assists(&self) -> u64 {
         self.member.assists.load(Ordering::Acquire)
     }
 
     /// Whether the pool holds the database: queued, checkpointing it, or with a timer armed.
-    pub(crate) fn scheduled(&self) -> bool {
+    pub fn scheduled(&self) -> bool {
         self.member.phase.load(Ordering::Acquire) & !ASKED != IDLE
     }
 
     /// Gives every later turn's connection `injector`.
-    pub(crate) fn set_injector(
+    pub fn set_injector(
         &self,
         injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
     ) {
@@ -958,7 +959,7 @@ impl BackgroundCheckpointProbe {
     }
 
     /// Gives every later turn's connection `injector`.
-    pub(crate) fn set_failure_injector(
+    pub fn set_failure_injector(
         &self,
         injector: Option<Arc<dyn crate::mvcc::yield_points::FailureInjector>>,
     ) {
@@ -966,7 +967,7 @@ impl BackgroundCheckpointProbe {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl TestHooks {
     /// Gives a turn's new connection the injectors set, if any.
     fn install(&self, conn: &crate::Connection) {
@@ -978,6 +979,3 @@ impl TestHooks {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

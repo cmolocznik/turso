@@ -28,9 +28,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use turso_parser::ast::{self, SortOrder};
+use crate::ast::{self, SortOrder};
 
-use crate::json::jsonb::ElementType;
+use crate::json::jsonb::{unescape_string, ElementType, Jsonb};
 use crate::json::{convert_dbtype_to_jsonb, Conv};
 use crate::numeric::Numeric;
 use crate::types::IOResultOr;
@@ -85,6 +85,7 @@ pub struct PathTrieIndexMethod;
 impl IndexMethod for PathTrieIndexMethod {
     fn attach(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         let [path, seq] = configuration.columns.as_slice() else {
@@ -102,7 +103,7 @@ impl IndexMethod for PathTrieIndexMethod {
         );
         Ok(Arc::new(PathTrieAttachment {
             configuration: configuration.clone(),
-            patterns: parse_patterns(&[&pattern])?,
+            patterns: parse_patterns(dialect, &[&pattern])?,
             depth,
         }))
     }
@@ -923,15 +924,18 @@ impl PathPatterns {
             .array_iterator()
             .map_err(|_| invalid("it is not an array"))?;
         let mut globs = Vec::new();
-        while let Some(((_, element), next)) = json
-            .array_iterator_next(&position)
+        let mut element = Jsonb::empty();
+        while let Some((_, next)) = json
+            .array_iterator_next(&position, &mut element)
             .map_err(|_| invalid("out of memory"))?
         {
             match element.element_type()? {
                 ElementType::TEXT
                 | ElementType::TEXTJ
                 | ElementType::TEXT5
-                | ElementType::TEXTRAW => globs.push(element.scalar_string_value()?),
+                | ElementType::TEXTRAW => {
+                    globs.push(unescape_string(&element.scalar_payload_text()?))
+                }
                 _ => return Err(invalid("an element is not a string")),
             }
             position = next;

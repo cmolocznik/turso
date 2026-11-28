@@ -3037,7 +3037,8 @@ pub struct WalFile {
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
-    max_frame_read_lock_index: AtomicUsize,
+    #[doc(hidden)]
+    pub max_frame_read_lock_index: AtomicUsize,
     /// Max frame allowed to lookup range=(minframe..max_frame)
     max_frame: AtomicU64,
     /// Start of range to look for frames range=(minframe..max_frame)
@@ -10844,83 +10845,6 @@ pub mod test {
             .unwrap();
         let new_max = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
         assert_eq!(new_max, 1, "first append after RESTART starts at frame 1");
-    }
-
-    #[test]
-    /// A reader of a fully backfilled WAL reads the database file alone, under read mark 0, so a
-    /// writer of another connection restarts the WAL beside it, as beside a reader in another
-    /// process (`subprocess_db_file_reader_allows_wal_restart_but_stops_backfill`). The reader
-    /// keeps its snapshot, and no frame of the restarted WAL reaches the database file while it
-    /// reads.
-    #[test]
-    fn test_db_file_reader_of_another_connection_allows_wal_restart_but_stops_backfill() {
-        let (db, _path) = get_database();
-        let writer = db.connect(ConnectOpts::new()).unwrap();
-        writer
-            .execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&writer, 10, 5);
-        let passive = CheckpointMode::Passive {
-            upper_bound_inclusive: None,
-        };
-        let backfilled = run_checkpoint_until_done(&writer.pager.load(), passive);
-        assert!(backfilled.everything_backfilled());
-
-        let reader = db.connect(ConnectOpts::new()).unwrap();
-        reader.execute("begin").unwrap();
-        assert_eq!(count_test_table(&reader), 50);
-        assert!(
-            check_read_lock_slot(&reader, 0),
-            "the reader reads the database file"
-        );
-
-        writer.execute("update test set value = 'new'").unwrap();
-        let max_frame = writer
-            .pager
-            .load()
-            .wal
-            .as_ref()
-            .unwrap()
-            .get_max_frame_in_wal();
-        assert!(
-            max_frame < backfilled.wal_max_frame,
-            "a database file reader of another connection must not stop the WAL restart, \
-             but the write appended at frame {max_frame} after frame {}",
-            backfilled.wal_max_frame
-        );
-        let pager = writer.pager.load();
-        let blocked = pager
-            .io
-            .block(|| pager.checkpoint(passive, SyncMode::Full, true));
-        assert!(
-            matches!(blocked, Err(LimboError::Busy)),
-            "no frame of the restarted WAL may reach the database file while the reader reads: \
-             {blocked:?}"
-        );
-        let mut stmt = reader
-            .prepare("select count(*) from test where value = 'new'")
-            .unwrap();
-        let mut updated: i64 = -1;
-        stmt.run_with_row_callback(|row| {
-            updated = row.get(0).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(updated, 0, "the reader's snapshot must not see the update");
-        drop(stmt);
-        reader.execute("commit").unwrap();
-
-        let checkpoint = run_checkpoint_until_done(&writer.pager.load(), passive);
-        assert!(checkpoint.everything_backfilled());
-        let mut stmt = writer
-            .prepare("select count(*) from test where value = 'new'")
-            .unwrap();
-        stmt.run_with_row_callback(|row| {
-            updated = row.get(0).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(updated, 50);
     }
 
     #[test]

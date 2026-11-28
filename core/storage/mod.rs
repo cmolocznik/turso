@@ -20,8 +20,6 @@ pub(crate) mod checksum;
 pub mod commit_replicator;
 pub mod database;
 pub(crate) mod encryption;
-#[cfg(test)]
-mod erasure_tests;
 pub(crate) mod journal_mode;
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;

@@ -1440,6 +1440,8 @@ impl ScalarFunc {
             | Self::Concat
             | Self::ConcatWs
             | Self::Glob
+            | Self::PathSync
+            | Self::CodeMatch
             | Self::IfNull
             | Self::Iif
             | Self::Instr

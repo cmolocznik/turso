@@ -3052,9 +3052,9 @@ fn test_cdc_order_upsert_do_update_rowid_change_fk_cascade_parent_before_child(d
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn a_commit_that_waits_lets_its_cdc_transaction_id_go() {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let db = Database::open_file_with_flags(
         Arc::new(MemoryYieldIO::new()),
@@ -3065,7 +3065,7 @@ fn a_commit_that_waits_lets_its_cdc_transaction_id_go() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute("PRAGMA capture_data_changes_conn('id')")

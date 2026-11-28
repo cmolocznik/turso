@@ -4240,6 +4240,8 @@ pub struct FtsBackingRowDumper {
     started: bool,
     advance_pending: bool,
     pub rows: Vec<(String, i64, usize, u64)>,
+    #[doc(hidden)]
+    pub row_bytes: Vec<Vec<u8>>,
 }
 
 #[cfg(feature = "test_helper")]
@@ -4255,6 +4257,7 @@ impl FtsBackingRowDumper {
             started: false,
             advance_pending: false,
             rows: Vec::new(),
+            row_bytes: Vec::new(),
         })
     }
 
@@ -4279,6 +4282,7 @@ impl FtsBackingRowDumper {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
             });
             self.rows.push((path, chunk_no, bytes.len(), hash));
+            self.row_bytes.push(bytes);
             self.advance_pending = true;
         }
     }
@@ -5402,7 +5406,5 @@ fn add_json_value(
     Ok(())
 }
 
-#[cfg(test)]
-mod filtered_tests;
 #[cfg(test)]
 mod tests;

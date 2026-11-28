@@ -4676,10 +4676,10 @@ fn test_commit_without_tx() {
     );
 }
 
-/// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
-/// we shouldn't commit an insert without inserting rows to this new index that is being created.
-/// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
-/// regular concurrent insert that will not take into account new index.
+/// A CREATE INDEX whose commit has taken its timestamp but not yet published the new schema
+/// refuses every transaction that would begin under the old schema: an INSERT beginning then is
+/// refused Busy, so no insert can commit without writing to the index. Once the CREATE INDEX has
+/// landed, the INSERT goes in with its index entry.
 #[test]
 fn test_insert_in_middle_commit_of_create_index_returns_err() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -4719,38 +4719,26 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
         yielded,
         "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
     );
+    conn_a.set_yield_injector(None);
 
-    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
-    // but the global schema view still doesn't know about the new index `i`.
-    // The INSERT compiles its bytecode against the stale schema and emits
-    // IdxInsert ops only for the indexes the stale schema knows about.
+    // T2 (conn_b): an INSERT beginning now would compile against the schema
+    // without the index `i` and write no entry to it.
     conn_b.execute("BEGIN CONCURRENT").unwrap();
-    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let refused = conn_b.execute("INSERT INTO t VALUES (2, 20)");
+    assert!(
+        matches!(refused, Err(LimboError::Busy)),
+        "an INSERT beginning under the unpublished schema is refused, got {refused:?}"
+    );
 
-    // T1 finishes finalizing the CREATE INDEX. After this point, the global
-    // header carries the new schema_cookie and `last_committed_schema_change_ts`
-    // is bumped to T1's `end_ts`.
     create_idx.run_ignore_rows().unwrap();
     drop(create_idx);
 
-    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
-    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
-    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
-    // though its writes never touched the new index.
-
-    let commit_result = conn_b.execute("COMMIT");
-
-    assert!(
-        matches!(
-            commit_result,
-            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
-        ),
-        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
-         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
-         schema (missing index `i`), so its INSERT silently skipped writing \
-         to that index. Allowing the commit leaves `i` permanently short the \
-         row tx_b wrote."
-    );
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn_b, "SELECT id FROM t INDEXED BY i WHERE c = 20");
+    assert_eq!(rows.len(), 1, "the INSERT wrote its index entry");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_integrity_ok(&conn_b);
 }
 
 #[test]
@@ -11146,6 +11134,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
         }
+        fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+            self.inner.frame_len_bound(m)
+        }
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)
         }
@@ -11373,6 +11364,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+            self.inner.frame_len_bound(m)
         }
         fn on_log_write_complete(&self) -> Result<Completion> {
             if self.arm.swap(false, Ordering::AcqRel) {
@@ -13954,4 +13948,1080 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
         objects.iter().any(|object| object.name == "items"),
         "DML-only portable frame should resolve user table after cross-connection checkpoint"
     );
+}
+
+// Tests moved from turso_core's own unit tests (the fork's MVCC checkpoint, passive-GC and
+// create-index tests), which can no longer parse SQL.
+
+use super::transactions::commit_tx;
+use turso_core::types::IOResult;
+
+fn generate_simple_string_record(data: &str) -> ImmutableRecord {
+    ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap()
+}
+
+fn step_until_done(stmt: &mut Statement, io: &Arc<dyn IO>, context: &str) {
+    for _ in 0..100_000 {
+        match stmt.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::Row => {}
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected {context} step after yield: {other:?}"),
+        }
+    }
+    panic!("{context} did not finish");
+}
+
+/// The WAL position a connection's checkpoints leave: the checkpoint sequence, which each restart
+/// advances, the WAL's last frame, and the last frame backfilled into the database file.
+fn wal_state(conn: &Arc<Connection>) -> (u32, u64, u64) {
+    let pager = conn.pager.load();
+    let wal = pager.wal.as_ref().unwrap();
+    (
+        wal.get_checkpoint_seq(),
+        wal.get_max_frame_in_wal(),
+        wal.backfill_frame(),
+    )
+}
+
+/// A writer's transaction, on a connection where one other statement takes part beside the
+/// writer's, ready for `commit_tx_continued`.
+fn continued_commit_beside_another_statement(
+    db: &MvccTestDb,
+) -> (
+    turso_core::connection::TxnPart,
+    turso_core::connection::TxnPart,
+    TxID,
+) {
+    let own = db.conn.take_txn_part();
+    let other = db.conn.take_txn_part();
+    let tx_id = db
+        .mvcc_store
+        .begin_exclusive_tx(db.conn.pager.load().clone(), None, &db.conn, None)
+        .unwrap();
+    db.conn.set_mv_tx(Some((tx_id, TransactionMode::Write)));
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "a"))
+        .unwrap();
+    (own, other, tx_id)
+}
+
+/// The resolution the root-page reverse index replaced: walk every binding.
+fn owner_by_scan(
+    store: &MvStore<MvccClock, DynAllocator>,
+    root: u64,
+    ts: u64,
+) -> Option<MVTableId> {
+    store
+        .table_id_to_rootpage
+        .iter()
+        .filter(|entry| {
+            let e = entry.value();
+            e.root_page == Some(root) && (e.is_live() || ts < e.end)
+        })
+        .min_by_key(|entry| entry.value().end)
+        .map(|entry| *entry.key())
+}
+
+/// Passive Rule 3 under an open scan: a scan that began after a checkpoint published its rows reads
+/// them from the B-tree (they are B-tree-equivalent for it), so the GC that drops their lone current
+/// SkipMap copies while it runs neither repeats nor loses a row. A reader that began before that
+/// checkpoint pins the copies (it is not covered), so the first checkpoint leaves them in place.
+/// Only the table's copies drop under the open scan; the index's wait for no snapshot to be open.
+fn passive_scan_survives_rule3_drop_mid_scan(sql: &str, expected: &[String]) {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..200 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    setup.execute("COMMIT").unwrap();
+
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let pinned = mv.debug_gc_snapshot();
+    assert!(
+        pinned.rows_versions >= 200 && pinned.index_versions >= 200,
+        "a reader that began before the checkpoint keeps the copies: {pinned:?}"
+    );
+    pin.execute("COMMIT").unwrap();
+
+    let scanner = db.connect();
+    let mut stmt = scanner.prepare(sql).unwrap();
+    let io = stmt.get_pager().io.clone();
+    let mut seen: Vec<String> = Vec::new();
+    let step = |stmt: &mut Statement, seen: &mut Vec<String>, limit: usize| loop {
+        if seen.len() >= limit {
+            return false;
+        }
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                seen.push(row.get_value(0).to_string());
+            }
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            StepResult::Done => return true,
+            other => panic!("unexpected step {other:?}"),
+        }
+    };
+    assert!(!step(&mut stmt, &mut seen, 50), "the scan is still open");
+
+    // A write since the last checkpoint gives it something to do; its Finalize GC runs under
+    // the open scan.
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("INSERT INTO t VALUES (1000, 'v01000')")
+        .unwrap();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    let dropped = mv.debug_gc_snapshot();
+    assert!(
+        dropped.rows_versions < pinned.rows_versions - 150,
+        "the table's lone current copies drop under the open scan: before {pinned:?}, after {dropped:?}"
+    );
+    // An index chain's lone current copy is dropped only while no snapshot is open.
+    assert!(
+        dropped.index_versions >= pinned.index_versions,
+        "the index's lone current copies stay under the open scan: before {pinned:?}, after {dropped:?}"
+    );
+
+    assert!(step(&mut stmt, &mut seen, usize::MAX), "the scan completes");
+    assert_eq!(seen, expected, "every row exactly once, in order");
+}
+
+
+#[test]
+fn passive_backward_scan_survives_rule3_drop_mid_scan() {
+    let expected: Vec<String> = (0..200).rev().map(|i| i.to_string()).collect();
+    passive_scan_survives_rule3_drop_mid_scan("SELECT id FROM t ORDER BY id DESC", &expected);
+}
+
+/// What this test checks: a passive checkpoint parked after staging its page-1 header, while a
+/// schema change commits, does not publish that older header's schema cookie over the newer one;
+/// so a concurrent writer that began after the schema change commits beside the next checkpoint.
+/// Why this matters: the regressed cookie made every writer that began between the two
+/// checkpoints fail its commit with a schema conflict no schema change caused (a vector staging
+/// page after a space registration).
+#[test]
+fn passive_checkpoint_publishes_no_schema_cookie_older_than_a_schema_change_it_overlapped() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+
+    // A checkpoint parked after its pager commit, before it publishes.
+    let ckpt_conn = db.connect();
+    ckpt_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    ckpt_conn.set_yield_injector(Some(park.clone()));
+    let mut delayed = ckpt_conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    let io = ckpt_conn.pager.load().io.clone();
+    let mut parked = false;
+    for _ in 0..200_000 {
+        match delayed.step().unwrap() {
+            turso_core::StepResult::Yield | turso_core::StepResult::IO => {
+                if park.is_empty() {
+                    parked = true;
+                    break;
+                }
+                io.step().unwrap();
+            }
+            turso_core::StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    ckpt_conn.set_yield_injector(None);
+    assert!(parked, "the checkpoint should park before publishing");
+
+    // A schema change commits while it is parked, inside a concurrent transaction.
+    let ddl = db.connect();
+    ddl.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("CREATE TABLE fresh(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    ddl.execute("COMMIT").unwrap();
+    let mv_store = ddl.mv_store().as_ref().cloned().expect("an MVCC database");
+    let global_cookie = || mv_store.with_header(|h| h.schema_cookie.get(), None).ok();
+    let schema_version = || db.get_db().clone_schema().schema_version;
+    let after_ddl = global_cookie();
+    // The checkpoint publishes: the cookie must not go back below the schema change's.
+    step_until_done(&mut delayed, &io, "parked checkpoint");
+    assert_eq!(
+        global_cookie(),
+        after_ddl,
+        "the checkpoint published another cookie than the schema change's (schema version {})",
+        schema_version()
+    );
+
+    // A writer that begins now commits beside the next checkpoint.
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO fresh VALUES (1)").unwrap();
+    let next = db.connect();
+    next.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    writer
+        .execute("COMMIT")
+        .expect("no schema changed after the writer began");
+}
+
+#[test]
+fn passive_forward_scan_survives_rule3_drop_mid_scan() {
+    let expected: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+    passive_scan_survives_rule3_drop_mid_scan("SELECT id FROM t ORDER BY id", &expected);
+}
+
+/// Passive Rule 3 no longer waits for quiescence: under an open snapshot that began after the
+/// checkpoint published its rows, the checkpoint's GC drops their materialized lone currents.
+#[test]
+fn passive_gc_drops_materialized_currents_under_an_open_snapshot() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..300 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'x')"))
+            .unwrap();
+    }
+    setup.execute("COMMIT").unwrap();
+    // A reader that began before the publish keeps the copies through the first checkpoint.
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    pin.execute("COMMIT").unwrap();
+
+    // A snapshot opened after the publish, and a fresh write for the next checkpoint.
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    reader.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("INSERT INTO t VALUES (1000, 'y')").unwrap();
+    let before = mv.debug_gc_snapshot().rows_versions;
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let after = mv.debug_gc_snapshot().rows_versions;
+    assert!(
+        before >= 300 && after + 300 <= before,
+        "the open snapshot no longer pins the materialized currents: {before} -> {after}"
+    );
+    let rows = get_rows(&reader, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].to_string(),
+        "300",
+        "the snapshot still sees every row"
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn passive_index_scan_survives_rule3_drop_mid_scan() {
+    let expected: Vec<String> = (0..200).map(|i| format!("v{i:05}")).collect();
+    passive_scan_survives_rule3_drop_mid_scan("SELECT v FROM t ORDER BY v", &expected);
+}
+
+/// A writer that overwrites a row through a cursor positioned on it (the index method's staging
+/// does, with no delete first) asks the version store whether it holds a version the writer sees,
+/// and supersedes it when it does. The answer must hold for a lone current copy that is
+/// B-tree-equivalent for the writer: answering "none" there makes the cursor add a B-tree-resident
+/// version beside the live copy, and every commit of the row then conflicts with it.
+#[test]
+fn passive_overwrite_of_a_covered_row_supersedes_its_live_copy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..20 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    // The pin's bound predates the checkpoint, so no GC drops a copy while the writers run.
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let id = mv
+        .rows
+        .iter()
+        .map(|entry| entry.key().clone())
+        .find(|id| {
+            id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID && id.row_id == RowKey::Int(5)
+        })
+        .expect("row 5 keeps its lone current copy");
+
+    for round in 0..3 {
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("SELECT count(*) FROM t").unwrap();
+        let tx_id = writer
+            .get_mv_tx()
+            .map(|(tx_id, _)| tx_id)
+            .expect("the writer holds a transaction");
+        let found = mv.read_from_table_or_index(tx_id, &id, None).unwrap();
+        assert!(
+            found.is_some(),
+            "round {round}: the version store answers the row the writer sees"
+        );
+        let updated = mv
+            .update_to_table_or_index(
+                tx_id,
+                generate_simple_string_row(id.table_id, 5, &format!("w{round}")),
+                None,
+            )
+            .unwrap();
+        assert!(updated, "round {round}: the update supersedes the live copy");
+        writer
+            .execute("COMMIT")
+            .unwrap_or_else(|e| panic!("round {round}: the overwrite commits: {e:?}"));
+    }
+    pin.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(20)]]
+    );
+}
+
+/// A passive checkpoint that publishes between a reader's WAL mark capture and its begin: the
+/// reader's mark predates the checkpoint's frames, so it takes the bound its own mark reaches (the
+/// earlier one) and reads the newly checkpointed rows from the version store, each exactly once.
+#[test]
+fn passive_reader_takes_the_bound_its_mark_reaches_when_a_publish_lands_before_its_begin() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..100 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let first_bound = mv.watermarks().durable_txid_max;
+    assert!(first_bound > 0, "the first checkpoint published a bound");
+
+    // Holds the GC floor at the first bound, so the second checkpoint drops no current copy.
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    for i in 100..200 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+
+    let db_arc = db.get_db();
+    let published = Arc::new(AtomicU64::new(0));
+    let published_in_hook = published.clone();
+    let mv_in_hook = mv.clone();
+    *mv.after_read_mark_hook.lock().unwrap() = Some(ReadMarkHook(Box::new(move || {
+        let checkpointer = db_arc
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        published_in_hook.store(mv_in_hook.watermarks().durable_txid_max, Ordering::SeqCst);
+    })));
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let seen: Vec<String> = get_rows(&reader, "SELECT id FROM t ORDER BY id")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        mv.after_read_mark_hook.lock().unwrap().is_none(),
+        "the publish ran inside the reader's begin"
+    );
+    let second_bound = published.load(Ordering::SeqCst);
+    assert!(
+        second_bound > first_bound,
+        "the checkpoint inside the begin published a newer bound ({second_bound} <= {first_bound})"
+    );
+    let expected: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+    assert_eq!(seen, expected, "every row exactly once");
+    let tx_id = reader
+        .get_mv_tx()
+        .map(|(tx_id, _)| tx_id)
+        .expect("the reader holds a transaction");
+    assert_eq!(
+        mv.durable_at_begin_of(tx_id),
+        Some(first_bound),
+        "the reader takes the bound its own mark reaches"
+    );
+    reader.execute("COMMIT").unwrap();
+    pin.execute("COMMIT").unwrap();
+}
+
+/// A writer whose rows' lone current copies Passive Rule 3 drops while it is open still commits
+/// its update of one of them: the drop takes no committed event past its begin.
+#[test]
+fn passive_writer_commits_an_update_of_a_row_whose_copy_dropped_while_it_was_open() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..200 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    pin.execute("COMMIT").unwrap();
+    let kept = mv.debug_gc_snapshot();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&writer, "SELECT v FROM t WHERE id = 5"),
+        vec![vec![Value::from_text("v00005")]]
+    );
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("INSERT INTO t VALUES (1000, 'v01000')")
+        .unwrap();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    let dropped = mv.debug_gc_snapshot();
+    assert!(
+        dropped.rows_versions < kept.rows_versions - 150,
+        "the lone current copies drop under the open writer: before {kept:?}, after {dropped:?}"
+    );
+
+    writer
+        .execute("UPDATE t SET v = 'w00005' WHERE id = 5")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT v FROM t WHERE id = 5"),
+        vec![vec![Value::from_text("w00005")]]
+    );
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(201)]]
+    );
+}
+
+/// A page freed and handed to a new table keeps its older owner visible to older snapshots and
+/// resolves the newer owner after, and the claim retires an owner left live by a raced drop.
+#[test]
+fn root_page_reuse_resolves_each_owner_at_its_own_snapshots() {
+    use turso_core::mvcc::database::WalPos;
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let (first, second, third) = (
+        MVTableId::from(-10_i64),
+        MVTableId::from(-20_i64),
+        MVTableId::from(-30_i64),
+    );
+    store.record_rootpage_alloc(first, 7, 100, WalPos::ORIGIN);
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 150),
+        Some(first)
+    );
+    store.retire_rootpage(first, 200);
+    store.record_rootpage_alloc(second, 7, 200, WalPos::ORIGIN);
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 150),
+        Some(first)
+    );
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 200),
+        Some(second)
+    );
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, u64::MAX),
+        Some(second)
+    );
+    // The page is claimed again while the second owner is still marked live: the claim retires it.
+    store.record_rootpage_alloc(third, 7, 300, WalPos::ORIGIN);
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 250),
+        Some(second)
+    );
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, u64::MAX),
+        Some(third)
+    );
+    // A table moved to another page leaves the first page.
+    store.insert_table_id_to_rootpage(third, Some(9));
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(9, u64::MAX),
+        Some(third)
+    );
+    assert_eq!(store.try_get_table_id_from_root_page_at(7, u64::MAX), None);
+    // Reclaiming the retired owners drops them from the page.
+    assert_eq!(store.gc_rootpage_entries(u64::MAX - 1), 2);
+    assert_eq!(
+        store.table_id_to_rootpage.owners_of(7),
+        Vec::<MVTableId>::new()
+    );
+    assert!(store.table_id_to_rootpage.index_matches_bindings());
+}
+
+/// The reverse index answers exactly what a walk over the bindings answers, for every page and
+/// snapshot, after random bind / reuse / retire / reclaim / remove / replace / clear sequences.
+#[test]
+fn root_page_reverse_index_equals_the_scan_after_random_binding_churn() {
+    use turso_core::mvcc::database::WalPos;
+    const PAGES: u64 = 12;
+    const TABLES: i64 = 40;
+    let mut compared = 0usize;
+    let mut resolved = 0usize;
+    for seed in 0..64u64 {
+        let db = MvccTestDb::new();
+        let store = &db.mvcc_store;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut clock = 10u64;
+        for _ in 0..300 {
+            clock += rng.random_range(1..5);
+            let table = MVTableId::from(-rng.random_range(100..100 + TABLES));
+            let page = rng.random_range(2..2 + PAGES);
+            match rng.random_range(0..8) {
+                0 => store.insert_table_id_to_rootpage(table, Some(page)),
+                1 => store.insert_table_id_to_rootpage(table, None),
+                2 => store.record_rootpage_alloc(table, page, clock, WalPos::STAGED),
+                3 => store.retire_rootpage(table, clock),
+                4 => {
+                    let lwm = clock.saturating_sub(rng.random_range(0..30));
+                    store.gc_rootpage_entries(lwm);
+                }
+                5 => store.remove_table_id_to_rootpage(&table),
+                6 => store.publish_rootpage_visible(table, WalPos::ORIGIN),
+                _ => {
+                    if rng.random_range(0..40) == 0 {
+                        store.table_id_to_rootpage.clear();
+                    }
+                }
+            }
+            assert!(
+                store.table_id_to_rootpage.index_matches_bindings(),
+                "seed {seed}: the reverse index drifted from the bindings"
+            );
+            for root in 2..2 + PAGES {
+                for ts in [0, clock / 2, clock, clock + 1, u64::MAX] {
+                    let by_index = store.try_get_table_id_from_root_page_at(root as i64, ts);
+                    assert_eq!(
+                        by_index,
+                        owner_by_scan(store, root, ts),
+                        "seed {seed}: page {root} at {ts}"
+                    );
+                    compared += 1;
+                    resolved += usize::from(by_index.is_some());
+                }
+            }
+        }
+    }
+    assert!(
+        compared > 100_000,
+        "the churn must compare many resolutions: {compared}"
+    );
+    assert!(
+        resolved * 20 > compared,
+        "the churn must resolve a real share of them: {resolved} of {compared}"
+    );
+}
+
+/// A passive checkpoint that commits beside a reader of the database file cannot backfill its
+/// frames: they would land in the file under the reader. The next checkpoint backfills them
+/// first, once the reader has ended, so that its own write restarts the WAL instead of appending
+/// to it.
+#[test]
+fn test_a_passive_checkpoint_backfills_what_the_last_one_left_and_restarts_the_wal() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+        .unwrap();
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let insert = |rows: usize| {
+        for _ in 0..rows {
+            conn.execute("INSERT INTO t(v) VALUES (randomblob(512))")
+                .unwrap();
+        }
+    };
+    insert(20);
+    conn.checkpoint(passive).unwrap();
+    let (_, first_max, first_backfilled) = wal_state(&conn);
+    assert!(first_max > 0 && first_backfilled == first_max);
+
+    let reader = db.connect();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(20)
+    );
+    insert(20);
+    conn.checkpoint(passive).unwrap();
+    let (seq, max, backfilled) = wal_state(&conn);
+    assert!(
+        backfilled < max,
+        "the reader of the database file kept the checkpoint from backfilling"
+    );
+    reader.execute("COMMIT").unwrap();
+
+    insert(20);
+    conn.checkpoint(passive).unwrap();
+    let (next_seq, next_max, next_backfilled) = wal_state(&conn);
+    assert_eq!(
+        next_seq,
+        seq + 1,
+        "the checkpoint after the reader ended appended to the WAL, from frame {max} to frame \
+         {next_max}, instead of restarting it"
+    );
+    assert_eq!(next_backfilled, next_max);
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(60)
+    );
+}
+
+/// What this test checks: the same commit, dropped mid-way after the other statement has left,
+/// rolls the transaction back and leaves no successor.
+/// Why this matters: a statement whose commit fails busy keeps the transaction state its dropped
+/// commit left, so a successor here would hold the connection's transaction open.
+#[test]
+fn test_continued_commit_dropped_after_the_other_left_leaves_no_successor() {
+    let db = MvccTestDb::new();
+    let (own, other, tx_id) = continued_commit_beside_another_statement(&db);
+    db.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut sm = db
+        .mvcc_store
+        .commit_tx_continued(tx_id, &db.conn, turso_core::MAIN_DB_ID, 1)
+        .unwrap();
+    loop {
+        match sm.step(&db.mvcc_store).unwrap() {
+            IOResult::IO(io) if io.is_explicit_yield() => break,
+            IOResult::IO(io) => io.wait(db.conn.db.io.as_ref()).unwrap(),
+            IOResult::Done(()) => panic!("the commit landed before its injected yield"),
+        }
+    }
+    db.conn.set_yield_injector(None);
+    drop(other);
+    drop(sm);
+    assert_eq!(db.conn.get_mv_tx(), None);
+    assert!(
+        db.mvcc_store.tx_states_for_testing().is_empty(),
+        "the transaction is rolled back and no successor was drawn"
+    );
+    drop(own);
+}
+
+/// What this test checks: a commit for a statement that took part beside another
+/// (`commit_tx_continued`) lands after the other has left, and leaves no successor: the
+/// transaction ends with the commit.
+/// Why this matters: a successor nobody reads would hold the connection's transaction open, and
+/// the connection's next statement would read under its snapshot.
+#[test]
+fn test_continued_commit_landing_after_the_other_left_leaves_no_successor() {
+    let db = MvccTestDb::new();
+    let (own, other, tx_id) = continued_commit_beside_another_statement(&db);
+    let mut sm = db
+        .mvcc_store
+        .commit_tx_continued(tx_id, &db.conn, turso_core::MAIN_DB_ID, 1)
+        .unwrap();
+    drop(other);
+    while let IOResult::IO(io) = sm.step(&db.mvcc_store).unwrap() {
+        io.wait(db.conn.db.io.as_ref()).unwrap();
+    }
+    assert_eq!(db.conn.get_mv_tx(), None);
+    assert!(
+        db.mvcc_store.tx_states_for_testing().is_empty(),
+        "no successor was drawn"
+    );
+    drop(own);
+}
+
+/// An INSERT that begins while a CREATE INDEX is still building compiles against the schema
+/// without the index, so its COMMIT after the CREATE INDEX lands is refused: it would leave the
+/// index short the row it wrote.
+#[test]
+fn test_insert_begun_during_create_index_build_is_refused_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    // T1 (conn_a): CREATE INDEX, yielding at its scan's first seek, before its commit begins.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::SeekStart.point()
+    ])));
+    let mut create_idx = conn_a.prepare("CREATE INDEX i ON t(c)").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match create_idx.step().unwrap() {
+            StepResult::Yield => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "CREATE INDEX should yield at its scan's first seek"
+    );
+    conn_a.set_yield_injector(None);
+
+    // T2 (conn_b) begins under the schema without `i`, and its INSERT writes no entry to it.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    create_idx.run_ignore_rows().unwrap();
+    drop(create_idx);
+
+    let commit_result = conn_b.execute("COMMIT");
+    assert!(
+        matches!(
+            commit_result,
+            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
+        ),
+        "tx_b's COMMIT returned {commit_result:?}: tx_b began with a schema missing index `i`, so \
+         committing it would leave `i` permanently short the row tx_b wrote"
+    );
+}
+
+/// A passive checkpoint that keeps the logical log, because a commit landed after its snapshot,
+/// must count only the bytes it did not cover against the threshold. Counting the whole log, the
+/// threshold stays tripped by bytes already checkpointed, and every later commit starts another
+/// checkpoint.
+#[test]
+fn test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'collected')")
+        .unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let covered = mvcc_store.storage_for_testing().logical_log_offset();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        turso_core::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    while checkpoint_sm.state() != CheckpointState::BeginPagerTxn {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint finished before collecting rows"),
+        }
+    }
+    let sibling = db.connect();
+    sibling
+        .execute("INSERT INTO t VALUES (2, 'after-snapshot')")
+        .unwrap();
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        finished,
+        "passive checkpoint must complete after the sibling commit"
+    );
+    let end = mvcc_store.storage_for_testing().logical_log_offset();
+    assert!(
+        end > covered,
+        "the log must keep the commit that landed after the snapshot"
+    );
+
+    // Only the sibling's bytes are uncovered: a threshold above them and below the log's size
+    // must not ask for a checkpoint, and one at them must.
+    let uncovered = end - covered;
+    mvcc_store.set_checkpoint_threshold(uncovered as i64 + 1);
+    assert!(
+        !mvcc_store.storage_for_testing().should_checkpoint(),
+        "{covered} checkpointed bytes of a {end}-byte log still counted against the threshold"
+    );
+    mvcc_store.set_checkpoint_threshold(uncovered as i64);
+    assert!(mvcc_store.storage_for_testing().should_checkpoint());
+}
+
+/// With passive checkpoints an explicit TRUNCATE that finds another checkpoint running reports
+/// `Busy`, as the flag-off path does, never a false-success no-op: one would leave in the logical
+/// log every commit the running checkpoint does not cover, its caller believing the log empty.
+#[test]
+fn test_passive_truncate_beside_a_running_checkpoint_reports_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut running = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        turso_core::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(matches!(
+        running.step(&()).unwrap(),
+        TransitionResult::Continue
+    ));
+    assert!(
+        mvcc_store.checkpoint_in_progress(),
+        "the first step takes the database"
+    );
+    let log = mvcc_store.get_logical_log_file().size().unwrap();
+    assert!(log > 0);
+
+    let other = db.connect();
+    let res = other.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "a TRUNCATE beside a running checkpoint must report Busy, got {res:?}"
+    );
+    let res = other.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    });
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "Connection::checkpoint beside a running checkpoint must report Busy, got {res:?}"
+    );
+    assert_eq!(
+        mvcc_store.get_logical_log_file().size().unwrap(),
+        log,
+        "a refused TRUNCATE leaves the log as it was"
+    );
+
+    loop {
+        match running.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+    conn.execute("INSERT INTO t VALUES (2, 'after')").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        mvcc_store.get_logical_log_file().size().unwrap(),
+        0,
+        "once the running checkpoint ends, a TRUNCATE empties the log"
+    );
+    let rows = get_rows(&other, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1][1].to_string(), "after");
+}
+
+/// What this test checks: the refusing writes (`insert_row`, `insert_btree_resident_row` and
+/// `delete_row` with `refuse_unseen`) fail at the write with WriteWriteConflict, writing nothing,
+/// over a write the transaction's snapshot does not include: another transaction's insert,
+/// uncommitted or committed after the snapshot, its version of a row the B-tree holds, and its
+/// delete of one. They pass over the transaction's own writes and those of one that rolled back,
+/// and the plain writes still go in, to lose at commit.
+/// Why this matters: inserts, and writes of rows only the B-tree holds, are otherwise checked only
+/// at commit, where the whole transaction fails; refused at the write, an index method's
+/// maintenance is undone and a writer's change left to it.
+#[test]
+fn test_refusing_writes_fail_at_the_write_over_unseen_writes() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let store = db.mvcc_store.clone();
+    let begin = || store.begin_tx(db.conn.pager.load().clone()).unwrap();
+    let id = |n: i64| RowID::new(table_id, RowKey::Int(n));
+    let row = |n: i64, text: &str| generate_simple_string_row(table_id, n, text);
+    let refused = |r: Result<()>| matches!(r, Err(LimboError::WriteWriteConflict));
+    let rollback = |tx| {
+        store.rollback_tx(
+            tx,
+            db.conn.pager.load().clone(),
+            &db.conn,
+            turso_core::MAIN_DB_ID,
+        )
+    };
+
+    let (tx1, tx2) = (begin(), begin());
+    store.insert(tx1, row(7, "first")).unwrap();
+    assert!(refused(store.insert_row(tx2, row(7, "second"), None, true)));
+    commit_tx(store.clone(), &db.conn, tx1).unwrap();
+    assert!(refused(store.insert_row(tx2, row(7, "second"), None, true)));
+    store
+        .insert_row(tx2, row(7, "second"), None, false)
+        .unwrap();
+    rollback(tx2);
+
+    let (tx3, tx4) = (begin(), begin());
+    store.insert(tx3, row(8, "rolled back")).unwrap();
+    rollback(tx3);
+    store.insert_row(tx4, row(8, "fresh"), None, true).unwrap();
+    store.insert_row(tx4, row(9, "own"), None, true).unwrap();
+    assert!(store.delete_row(tx4, id(9), None, None, true).unwrap());
+    commit_tx(store.clone(), &db.conn, tx4).unwrap();
+
+    let (tx5, tx6) = (begin(), begin());
+    store
+        .insert_btree_resident_row(tx5, row(20, "v2"), None, false)
+        .unwrap();
+    assert!(refused(store.insert_btree_resident_row(
+        tx6,
+        row(20, "v3"),
+        None,
+        true
+    )));
+    let record = generate_simple_string_record("v1");
+    assert!(matches!(
+        store.delete_row(tx6, id(20), None, Some(&record), true),
+        Err(LimboError::WriteWriteConflict)
+    ));
+    assert!(store
+        .delete_row(tx6, id(20), None, Some(&record), false)
+        .unwrap());
+}
+
+/// A TRUNCATE checkpoint empties the logical log before it truncates the WAL, so a crash between
+/// the two leaves an empty log over WAL frames the checkpoint already backfilled into the synced
+/// database file. The database must open with every committed row, as after a Passive checkpoint.
+#[test]
+fn test_reopen_after_crash_between_logical_log_and_wal_truncation() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let log_path = std::path::Path::new(&db_path).with_extension("db-log");
+    let wal_path = std::path::PathBuf::from(format!("{db_path}-wal"));
+    let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint_sm = CheckpointStateMachine::new(
+            pager.clone(),
+            db.get_mvcc_store(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            turso_core::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        // Step the checkpoint until it has emptied the logical log while the WAL file still
+        // holds its frames, and stop it there.
+        let mut stopped = false;
+        for _ in 0..10_000 {
+            if size(&log_path) == 0 && size(&wal_path) > WAL_HEADER_SIZE as u64 {
+                stopped = true;
+                break;
+            }
+            match checkpoint_sm.step(&()).unwrap() {
+                TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => break,
+            }
+        }
+        assert!(
+            stopped,
+            "the checkpoint never had an empty log beside committed WAL frames"
+        );
+    }
+
+    turso_core::remove_file_from_database_registry(&db_path);
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("open should recover, not fail closed");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should recover the committed WAL");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1, "committed row must survive recovery");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
 }

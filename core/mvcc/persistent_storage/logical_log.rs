@@ -345,7 +345,8 @@ const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START;
 const LOG_HDR_FLAG_SEGMENT: u8 = 1 << 0;
 /// The files a log that rolls writes through: the segment being written, the ones sealed behind it
 /// until a checkpoint covers them, and one freed for the next roll.
-pub(crate) const LOG_SEGMENT_FILES: usize = 4;
+#[doc(hidden)]
+pub const LOG_SEGMENT_FILES: usize = 4;
 pub const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 pub const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
@@ -755,7 +756,8 @@ pub struct LogicalLog {
 }
 
 /// The path of slot `slot` of the log whose first file is `base`.
-pub(crate) fn segment_path(base: &str, slot: usize) -> String {
+#[doc(hidden)]
+pub fn segment_path(base: &str, slot: usize) -> String {
     if slot == 0 {
         base.to_string()
     } else {
@@ -1246,7 +1248,7 @@ impl LogicalLog {
         // header rewritten in place.
         let is_first_write = self.offset == 0;
         if is_first_write && self.header.is_none() {
-            let header = LogHeader::new(&self.io);
+            let header = self.new_header(portable_changes_enabled);
             self.running_crc = header.chain_seed();
             self.header = Some(header);
         }
@@ -1612,13 +1614,27 @@ impl LogicalLog {
         targets
     }
 
+    /// The header of a log with none yet. Upstream starts every new log as version 3, so that a
+    /// copy built from appended bytes never needs a header rewritten in place. A log that rolls
+    /// keeps the fork's rule: it starts as version 2, the version that says its frames carry no
+    /// portable changes, and only such a log rolls on its own ([`Self::rolls`]); the first frame
+    /// that carries portable changes upgrades it, as before. A log whose frames a log replicator
+    /// takes rolls whatever its version is, so it starts as version 3.
+    fn new_header(&self, portable_changes_enabled: bool) -> LogHeader {
+        if self.ring.is_some() && !portable_changes_enabled && !self.rolls_with_portable_changes {
+            LogHeader::new_with_version(&self.io, LOG_VERSION_V2)
+        } else {
+            LogHeader::new(&self.io)
+        }
+    }
+
     fn current_or_new_header(&self) -> Result<LogHeader> {
         if let Some(header) = self.header.clone() {
             return Ok(header);
         }
         if self.offset == 0 {
             // Valid path: checkpoint can run before the first logical-log append.
-            return Ok(LogHeader::new(&self.io));
+            return Ok(self.new_header(false));
         }
         Err(LimboError::InternalError(
             "Logical log header not initialized".to_string(),

@@ -177,9 +177,9 @@ fn a_depth_that_is_no_small_whole_number_is_refused(tmp_db: TempDatabase) {
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn path_sync_gives_the_same_rows_when_every_io_waits() {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let open = |name: &str| {
         let db = Database::open_file_with_flags(
@@ -191,7 +191,7 @@ fn path_sync_gives_the_same_rows_when_every_io_waits() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA page_size = 512").unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         conn.execute(TABLE).unwrap();
@@ -554,9 +554,9 @@ fn rows_and_waits(
 /// of 20 files each, each query on a connection that has nothing cached.
 #[cfg(feature = "io_memory_yield")]
 fn waits_in_a_table_of(directories: usize) -> (usize, usize, usize) {
+    use turso_sqlite::SqliteDialect;
     use turso_core::{
-        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, SqliteDialect,
-    };
+        ConnectOpts, Database, DatabaseOpts, MemoryYieldIO, OpenFlags, };
 
     let io = Arc::new(MemoryYieldIO::new());
     let db = Database::open_file_with_flags(
@@ -568,7 +568,7 @@ fn waits_in_a_table_of(directories: usize) -> (usize, usize, usize) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("PRAGMA page_size = 512").unwrap();
     conn.execute(TABLE).unwrap();
     conn.execute(INDEX).unwrap();
@@ -586,7 +586,7 @@ fn waits_in_a_table_of(directories: usize) -> (usize, usize, usize) {
         .unwrap();
 
     let query = |patterns: &str, since: &str, expected_rows: usize| {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
         conn.execute("PRAGMA cache_size = 12").unwrap();
         let (rows, waits) = rows_and_waits(
             &conn,

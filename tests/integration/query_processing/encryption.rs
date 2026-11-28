@@ -2179,7 +2179,9 @@ fn test_encrypted_database_open_in_progress_rejects_invalid_credentials() -> any
             else {
                 panic!("reader must wait while the creator is opening the database");
             };
-            assert!(pending.is_explicit_yield());
+            // The fork's registry makes the wait a completion that the owner's release finishes,
+            // not a yield to re-poll: either way the open waits.
+            assert!(pending.is_explicit_yield() || pending.0.is_wait());
         }
         let drive = |state: &mut turso_core::OpenDbAsyncState,
                      options: &OpenOptions|

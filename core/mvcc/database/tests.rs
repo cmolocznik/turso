@@ -576,7 +576,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // Reader pinned below the materialization frame: keep both current and delete.
     for mut v in [stamped_insert(), stamped_delete()] {
         let dropped =
-            MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, true, frame(50), false);
+            MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, true, frame(50), false, 0);
         assert_eq!(
             dropped, 0,
             "version needed by a reader pinned below frame 100 must be kept"
@@ -588,7 +588,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // currents unless drop_current_if_in_btree (Truncate).
     let mut deleted = stamped_delete();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut deleted, 10, 10, true, frame(100), false);
+        MvStore::<MvccClock>::gc_version_chain(&mut deleted, 10, 10, true, frame(100), false, 0);
     assert_eq!(
         dropped, 1,
         "materialized + reader-reachable superseded delete must be reclaimed"
@@ -597,7 +597,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), false);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), false, 0);
     assert_eq!(
         dropped, 0,
         "Passive keeps the current SkipMap version when drop_current_if_in_btree is false"
@@ -606,7 +606,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true, 0);
     assert_eq!(
         dropped, 0,
         "Passive keeps a live copy while a snapshot is open, even when materialized"
@@ -615,7 +615,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, u64::MAX, 10, true, frame(100), true);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, u64::MAX, 10, true, frame(100), true, 0);
     assert_eq!(
         dropped, 1,
         "Passive Rule 3 drops a materialized current once no snapshot is open"
@@ -631,7 +631,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
             10,
             true,
             WalPos::STAGED,
-            drop_current_if_in_btree,
+            drop_current_if_in_btree, 0,
         );
         assert_eq!(
             dropped, 0,
@@ -1212,6 +1212,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
+        durable_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
@@ -2378,6 +2379,7 @@ fn transaction_display() {
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
+        durable_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
@@ -2592,7 +2594,7 @@ fn test_gc_rule1_aborted_garbage_removed() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -2614,7 +2616,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // Only aborted removed; superseded has e=5 > lwm=2 so retained
     assert_eq!(dropped, 1);
@@ -2642,7 +2644,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
@@ -2663,7 +2665,7 @@ fn test_gc_rule2_superseded_above_lwm_retained() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -2687,7 +2689,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
         2,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // e=5 > ckpt_max=2, no current → tombstone guard retains it
     assert_eq!(dropped, 0);
@@ -2707,7 +2709,7 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // e=5 <= ckpt_max=5, e=5 <= lwm=10 → removable
     assert_eq!(dropped, 1);
@@ -2730,7 +2732,7 @@ fn test_gc_rule3_drop_current_when_in_btree() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -2747,7 +2749,7 @@ fn test_gc_rule3_truncate_idle_only() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0, "open snapshot must block Truncate Rule 3 clear");
     assert_eq!(versions.len(), 1);
@@ -2758,7 +2760,7 @@ fn test_gc_rule3_truncate_idle_only() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -2780,7 +2782,7 @@ fn test_gc_rule3_not_checkpointed_retained() {
         3,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -2801,7 +2803,7 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
         10,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // lwm=5 != u64::MAX, so a transaction is open and Rule 3 must not fire.
     assert_eq!(dropped, 0);
@@ -2820,7 +2822,7 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -2838,7 +2840,7 @@ fn test_gc_rule3_current_collected_after_checkpoint() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 0);
@@ -2861,7 +2863,7 @@ fn test_gc_rule3_after_history_reclaimed() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -2878,7 +2880,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
         10,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -2893,7 +2895,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
         10,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -2912,7 +2914,7 @@ fn test_gc_txid_refs_retained() {
         u64::MAX,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -2931,7 +2933,7 @@ fn test_gc_txid_end_retained() {
         u64::MAX,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -2957,7 +2959,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
         2,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // Tombstone must be retained: e=5 > ckpt_max=2, and pending insert doesn't count.
     // Only nothing changes (pending insert is not aborted garbage either).
@@ -2984,7 +2986,7 @@ fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
         2,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // Superseded removed (has_current=true for committed version), current remains.
     assert_eq!(dropped, 1);
@@ -3009,7 +3011,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         2,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -3021,7 +3023,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -3036,7 +3038,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         2,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -3048,7 +3050,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -3075,7 +3077,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
         2,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -3088,7 +3090,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -3111,7 +3113,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
         3,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0, "tombstone retained: e=5 > ckpt_max=3");
     assert_eq!(versions.len(), 1);
@@ -3123,7 +3125,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1, "tombstone collected: e=5 <= ckpt_max=5");
     assert_eq!(versions.len(), 0);
@@ -3149,7 +3151,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
         20,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -3166,7 +3168,7 @@ fn test_gc_noop_on_empty() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 0);
 }
@@ -3191,7 +3193,7 @@ fn test_gc_combined_rules() {
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 4);
     assert!(versions.is_empty());
@@ -3228,7 +3230,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1023);
     assert_eq!(versions.len(), 1);
@@ -3250,7 +3252,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert_eq!(dropped, 1024);
     assert!(versions.is_empty());
@@ -3273,7 +3275,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     assert!(small.is_empty());
     // A `Vec` keeps a small allocation. The stable build keeps one version
@@ -3593,7 +3595,7 @@ fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     versions.len() <= before
 }
@@ -3611,7 +3613,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     let snapshot = v1.clone();
     MvStore::<MvccClock>::gc_version_chain(
@@ -3620,7 +3622,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     // Compare content, not just length — a swap bug would pass a length-only check.
     v1.len() == snapshot.len()
@@ -3642,7 +3644,7 @@ fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     versions
         .iter()
@@ -3666,7 +3668,7 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     let txid_begins_after: usize = versions
         .iter()
@@ -3695,7 +3697,7 @@ fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     let txid_ends_after: usize = versions.iter().filter(filter).count();
     txid_ends_after == txid_ends_before
@@ -3723,7 +3725,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
     let current_after: usize = versions
         .iter()
@@ -3754,7 +3756,7 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
 
     // Check: if pre-GC chain had no committed current version AND had a
@@ -3798,7 +3800,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
-        true,
+        true, 0,
     );
 
     let has_committed_current = versions
@@ -3972,6 +3974,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         }
         fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
             self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn frame_len_bound(&self, m: &LogRecord) -> Result<usize> {
+            self.inner.frame_len_bound(m)
         }
         fn sync(&self, t: FileSyncType) -> Result<Completion> {
             self.inner.sync(t)

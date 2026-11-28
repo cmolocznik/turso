@@ -602,9 +602,7 @@ impl Statement {
                 return Ok(result);
             }
         }
-        if self
-            .program
-            .connection
+        if self.connection
             .mv_commits_in_flight
             .load(Ordering::Acquire)
             > 0
@@ -678,7 +676,7 @@ impl Statement {
     fn wait_for_sibling_commit(&mut self, waker: Option<&Waker>) -> Option<StepResult> {
         if self.state.is_committing()
             || !matches!(self.origin, StatementOrigin::Root)
-            || self.program.connection.is_nested_stmt()
+            || self.connection.is_nested_stmt()
         {
             return None;
         }
@@ -937,8 +935,9 @@ impl Statement {
     }
 
     /// Whether the statement is parked in an explicit checkpoint, waiting for a release.
-    #[cfg(test)]
-    pub(crate) fn parked_checkpoint(&self) -> bool {
+    #[cfg(any(test, feature = "test_helper"))]
+    #[doc(hidden)]
+    pub fn parked_checkpoint(&self) -> bool {
         self.state.parked_checkpoint.is_some()
     }
 
@@ -2045,121 +2044,5 @@ mod tests {
     #[test]
     fn statement_stays_small() {
         assert!(std::mem::size_of::<Statement>() <= 256);
-    }
-
-    /// Counts the steps and sleeps asked of a memory IO.
-    #[derive(Default)]
-    struct WaitCountingIO {
-        inner: MemoryIO,
-        steps: crate::sync::atomic::AtomicUsize,
-        sleeps: crate::sync::atomic::AtomicUsize,
-    }
-
-    impl crate::Clock for WaitCountingIO {
-        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
-            self.inner.current_time_monotonic()
-        }
-        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
-            self.inner.current_time_wall_clock()
-        }
-    }
-
-    impl IO for WaitCountingIO {
-        fn open_file(
-            &self,
-            path: &str,
-            flags: OpenFlags,
-            direct: bool,
-        ) -> crate::Result<Arc<dyn crate::File>> {
-            self.inner.open_file(path, flags, direct)
-        }
-        fn remove_file(&self, path: &str) -> crate::Result<()> {
-            self.inner.remove_file(path)
-        }
-        fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
-            self.inner.file_id(path)
-        }
-        fn supports_shared_wal_coordination(&self) -> bool {
-            self.inner.supports_shared_wal_coordination()
-        }
-        fn step(&self) -> crate::Result<()> {
-            self.steps
-                .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
-            self.inner.step()
-        }
-        fn sleep(&self, duration: std::time::Duration) {
-            self.sleeps
-                .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
-            self.inner.sleep(duration)
-        }
-    }
-
-    /// A blocking runner refused the write lock until its busy timeout ends sleeps out each delay
-    /// the busy handler asks for. It used to step the IO in a loop instead, which on a backend
-    /// whose step returns at once spun a core until the timeout passed.
-    #[test]
-    fn blocking_runners_sleep_out_a_busy_wait() {
-        use crate::sync::atomic::Ordering;
-        let io = Arc::new(WaitCountingIO::default());
-        let db = Database::open_file(io.clone(), "busy-wait-sleeps.db", Arc::new(SqliteDialect))
-            .unwrap();
-        let holder = db.connect(ConnectOpts::new()).unwrap();
-        holder.execute("CREATE TABLE t (x)").unwrap();
-        holder.execute("BEGIN IMMEDIATE").unwrap();
-        let waiter = db.connect(ConnectOpts::new()).unwrap();
-        waiter.set_busy_timeout(std::time::Duration::from_millis(60));
-        type Runner = fn(&mut Statement) -> crate::Result<()>;
-        let runners: [(&str, Runner); 4] = [
-            ("run_ignore_rows", |stmt| stmt.run_ignore_rows()),
-            ("run_collect_rows", |stmt| stmt.run_collect_rows().map(drop)),
-            ("run_with_row_callback", |stmt| {
-                stmt.run_with_row_callback(|_| Ok(()))
-            }),
-            ("run_one_step_blocking", |stmt| {
-                stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map(drop)
-            }),
-        ];
-        for (name, run) in runners {
-            io.steps.store(0, Ordering::Relaxed);
-            io.sleeps.store(0, Ordering::Relaxed);
-            let mut stmt = waiter.prepare("INSERT INTO t VALUES (1)").unwrap();
-            let error = run(&mut stmt).unwrap_err();
-            assert!(matches!(error, LimboError::Busy), "{name}: {error:?}");
-            let steps = io.steps.load(Ordering::Relaxed);
-            let sleeps = io.sleeps.load(Ordering::Relaxed);
-            assert!(
-                sleeps > 0 && steps < 32,
-                "{name} stepped the IO {steps} times and slept {sleeps} times"
-            );
-        }
-        holder.execute("ROLLBACK").unwrap();
-    }
-
-    /// Opening a blob for writing while another connection holds the write lock sleeps out each
-    /// delay of its busy handler, as the blocking runners do.
-    #[test]
-    fn blob_open_sleeps_out_a_busy_wait() {
-        use crate::sync::atomic::Ordering;
-        let io = Arc::new(WaitCountingIO::default());
-        let db = Database::open_file(io.clone(), "blob-busy-sleeps.db", Arc::new(SqliteDialect))
-            .unwrap();
-        let holder = db.connect(ConnectOpts::new()).unwrap();
-        holder.execute("CREATE TABLE t (x)").unwrap();
-        holder.execute("INSERT INTO t VALUES (x'00')").unwrap();
-        holder.execute("BEGIN IMMEDIATE").unwrap();
-        let waiter = db.connect(ConnectOpts::new()).unwrap();
-        waiter.set_busy_timeout(std::time::Duration::from_millis(60));
-        io.steps.store(0, Ordering::Relaxed);
-        let Err(error) = waiter.blob_open("t", "x", 1, true) else {
-            panic!("the blob opened for writing beside a held write lock");
-        };
-        assert!(matches!(error, LimboError::Busy), "{error:?}");
-        let steps = io.steps.load(Ordering::Relaxed);
-        let sleeps = io.sleeps.load(Ordering::Relaxed);
-        assert!(
-            sleeps > 0 && steps < 32,
-            "blob_open stepped the IO {steps} times and slept {sleeps} times"
-        );
-        holder.execute("ROLLBACK").unwrap();
     }
 }

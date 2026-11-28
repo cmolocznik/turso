@@ -1,3 +1,4 @@
+// Tests moved here from turso_core's own unit tests, which can no longer parse SQL.
 //! A deleted row leaves no byte in the database's files once a truncating checkpoint has run. A
 //! b-tree page never keeps a byte of a cell it no longer holds, nor a new page a byte of the
 //! buffer it was given; under `PRAGMA secure_delete = ON` a freed page is zeroed as well; and the
@@ -6,13 +7,6 @@
 //! checkpointed database outside its live structure must be zero, and no value a row stopped
 //! holding may be found in any file.
 
-use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
-use crate::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
-use crate::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect,
-};
 use rand_chacha::{
     rand_core::{RngCore, SeedableRng},
     ChaCha8Rng,
@@ -22,6 +16,12 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use turso_core::mvcc::database::checkpoint::CheckpointYieldPoint;
+use turso_core::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO};
+use turso_sqlite::SqliteDialect;
 
 fn u16_at(bytes: &[u8], at: usize) -> usize {
     u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize
@@ -340,7 +340,9 @@ fn open(path: &Path) -> (Arc<Database>, Arc<Connection>) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     (db, conn)
 }
 
@@ -588,7 +590,9 @@ fn a_truncating_checkpoint_beside_a_writer_leaves_no_deleted_value_in_any_file()
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("PRAGMA secure_delete = ON").unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -620,7 +624,9 @@ fn a_truncating_checkpoint_beside_a_writer_leaves_no_deleted_value_in_any_file()
         "the scan misses deleted values before the checkpoint"
     );
     let writer = Arc::new(CommitAfterEverySnapshot {
-        conn: db.connect(ConnectOpts::new()).unwrap(),
+        conn: db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap(),
         next: AtomicU64::new(9_000_000_000),
         markers: Mutex::new(Vec::new()),
     });
@@ -736,7 +742,9 @@ fn secure_delete_is_set_for_the_database() {
     let dir = scratch();
     let path = dir.path().join("pragma.db");
     let (db, conn) = open(&path);
-    let other = db.connect(ConnectOpts::new()).unwrap();
+    let other = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(integer(&conn, "PRAGMA secure_delete"), 0);
     for (value, code) in [
         ("ON", 1),

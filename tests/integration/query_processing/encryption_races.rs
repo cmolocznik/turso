@@ -100,7 +100,7 @@ fn manager_schedule(
         panic!("the competing open must wait for the registry owner");
     };
     assert!(
-        pending.is_explicit_yield(),
+        pending.is_explicit_yield() || pending.0.is_wait(),
         "a competing open must wait on the registry owner"
     );
     trace.observe("waiter yielded on the registry owner");
@@ -247,7 +247,7 @@ fn manager_schedule(
                             registry_epoch += 1;
                         }
                         Ok(IOResult::IO(pending)) => {
-                            if pending.is_explicit_yield() {
+                            if pending.is_explicit_yield() || pending.0.is_wait() {
                                 actor.waiting_epoch = Some(registry_epoch);
                             }
                             actor.pending = Some(pending);

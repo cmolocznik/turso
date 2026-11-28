@@ -663,7 +663,7 @@ pub fn op_checkpoint(
                         // timeout, counted from its first park, does.
                         let now = Instant::now();
                         let deadline =
-                            checkpoint_park_timeout(&program.connection).map(|timeout| {
+                            checkpoint_park_timeout(connection).map(|timeout| {
                                 *state.checkpoint_park_deadline.get_or_insert(now + timeout)
                             });
                         if let Some(deadline) = deadline.filter(|deadline| now < *deadline) {
@@ -5406,9 +5406,9 @@ pub fn op_transaction_inner(
                 }
                 if is_top_level_statement
                     && state.txn_part.is_none()
-                    && state.mv_store(&program.connection).is_some()
+                    && state.mv_store(connection).is_some()
                 {
-                    state.txn_part = Some(program.connection.take_txn_part());
+                    state.txn_part = Some(connection.take_txn_part());
                 }
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -14180,14 +14180,14 @@ pub fn op_index_method_optimize(
         .as_index_method_mut();
     // On a step connection the statement is one step of an OPTIMIZE INDEX in steps.
     use crate::index_method::optimize_steps::OptimizeStep;
-    match OptimizeStep::of(&program.connection) {
+    match OptimizeStep::of(connection) {
         OptimizeStep::Whole => {
             return_if_io!(state, cursor.optimize(&context));
         }
         step => {
             let first = step == OptimizeStep::First;
             let progress = return_if_io!(state, cursor.optimize_step(&context, first));
-            crate::index_method::optimize_steps::record_progress(&program.connection, progress);
+            crate::index_method::optimize_steps::record_progress(connection, progress);
         }
     }
 
@@ -14196,13 +14196,14 @@ pub fn op_index_method_optimize(
 }
 
 pub fn op_index_method_optimize_steps(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(IndexMethodOptimizeSteps { db, index }, insn);
-    if program.connection.is_readonly(*db) {
+    if connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
     let steps = state.optimize_steps.get_or_insert_with(|| {
@@ -14210,7 +14211,7 @@ pub fn op_index_method_optimize_steps(
             *db, index,
         ))
     });
-    let stepped = steps.step(&program.connection);
+    let stepped = steps.step(connection);
     if steps.take_lock_wait_over() {
         state.lock_wait_over = true;
     }
@@ -14271,6 +14272,7 @@ pub fn op_index_method_accept(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
+    _connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(IndexMethodAccept { cursor_id }, insn);

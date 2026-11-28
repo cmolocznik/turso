@@ -1433,7 +1433,7 @@ fn test_completed_writer_commits_beside_a_sibling_mvcc_reader() {
         .conn
         .get_mv_tx()
         .expect("the reader goes on in the transaction's successor");
-    assert_eq!(mode, crate::TransactionMode::Read);
+    assert_eq!(mode, turso_core::TransactionMode::Read);
 
     finish_without_rows(&mut reader);
     assert_eq!(
@@ -1445,12 +1445,12 @@ fn test_completed_writer_commits_beside_a_sibling_mvcc_reader() {
 }
 
 /// Steps `stmt` past I/O to its next row id, or None at its end.
-fn next_id(stmt: &mut crate::Statement) -> Option<i64> {
+fn next_id(stmt: &mut turso_core::Statement) -> Option<i64> {
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Row => return Some(stmt.row().unwrap().get::<i64>(0).unwrap()),
-            crate::StepResult::Done => return None,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Row => return Some(stmt.row().unwrap().get::<i64>(0).unwrap()),
+            turso_core::StepResult::Done => return None,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
             other => panic!("expected a row or the end, got {other:?}"),
         }
     }
@@ -1482,16 +1482,16 @@ fn keys_10_20_30(path: &str) -> SameConnectionMvcc {
 
 /// A reader of the keys that looks up, at each key, the row five ids on: a fresh seek at each
 /// key, which reads at the reader's view then.
-fn prepare_reader_looking_ahead(conn: &Arc<Connection>) -> crate::Statement {
+fn prepare_reader_looking_ahead(conn: &Arc<Connection>) -> turso_core::Statement {
     conn.prepare("SELECT k, (SELECT v FROM rows WHERE id = k + 5) FROM keys ORDER BY k")
         .unwrap()
 }
 
 /// The reader's next key and the value it found five ids on, or None at its end.
-fn next_ahead(stmt: &mut crate::Statement) -> Option<(i64, Option<String>)> {
+fn next_ahead(stmt: &mut turso_core::Statement) -> Option<(i64, Option<String>)> {
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Row => {
+            turso_core::StepResult::Row => {
                 let row = stmt.row().unwrap();
                 let value = match row.get_value(1) {
                     Value::Null => None,
@@ -1499,8 +1499,8 @@ fn next_ahead(stmt: &mut crate::Statement) -> Option<(i64, Option<String>)> {
                 };
                 return Some((row.get::<i64>(0).unwrap(), value));
             }
-            crate::StepResult::Done => return None,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Done => return None,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
             other => panic!("expected a row or the end, got {other:?}"),
         }
     }
@@ -1509,7 +1509,7 @@ fn next_ahead(stmt: &mut crate::Statement) -> Option<(i64, Option<String>)> {
 /// A reader of the keys that looks up, at each key, the row five ids on in `table` twice: through
 /// a subquery, which opens its cursor at each key, and through a join, whose cursor stays open from
 /// the reader's start.
-fn prepare_reader_looking_ahead_twice(conn: &Arc<Connection>, table: &str) -> crate::Statement {
+fn prepare_reader_looking_ahead_twice(conn: &Arc<Connection>, table: &str) -> turso_core::Statement {
     conn.prepare(format!(
         "SELECT k, (SELECT v FROM {table} WHERE id = k + 5), r.v FROM keys \
          LEFT JOIN {table} AS r ON r.id = k + 5 ORDER BY k"
@@ -1519,14 +1519,14 @@ fn prepare_reader_looking_ahead_twice(conn: &Arc<Connection>, table: &str) -> cr
 
 /// The reader's next key and the value it found five ids on through each cursor, or None at its
 /// end.
-fn next_ahead_twice(stmt: &mut crate::Statement) -> Option<(i64, Option<String>, Option<String>)> {
+fn next_ahead_twice(stmt: &mut turso_core::Statement) -> Option<(i64, Option<String>, Option<String>)> {
     let text = |value: &Value| match value {
         Value::Null => None,
         value => Some(value.to_string()),
     };
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Row => {
+            turso_core::StepResult::Row => {
                 let row = stmt.row().unwrap();
                 return Some((
                     row.get::<i64>(0).unwrap(),
@@ -1534,8 +1534,8 @@ fn next_ahead_twice(stmt: &mut crate::Statement) -> Option<(i64, Option<String>,
                     text(row.get_value(2)),
                 ));
             }
-            crate::StepResult::Done => return None,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Done => return None,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
             other => panic!("expected a row or the end, got {other:?}"),
         }
     }
@@ -1593,7 +1593,7 @@ fn test_a_resumed_commit_draws_one_successor() {
         .prepare("INSERT INTO rows VALUES (25, 'twentyfive')")
         .unwrap();
     env.conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::BeforeFinishCommittedTx.point(),
+        turso_core::mvcc::database::CommitYieldPoint::BeforeFinishCommittedTx.point(),
     ])));
     expect_injected_yield(
         &mut writer,
@@ -1625,12 +1625,12 @@ fn test_reader_waits_while_a_sibling_commit_is_in_flight() {
         .prepare("INSERT INTO rows VALUES (25, 'twentyfive')")
         .unwrap();
     env.conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+        turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     expect_injected_yield(&mut writer, "INSERT's commit");
     env.conn.set_yield_injector(None);
     assert!(
-        matches!(reader.step().unwrap(), crate::StepResult::Yield),
+        matches!(reader.step().unwrap(), turso_core::StepResult::Yield),
         "the reader waits for the commit of its transaction"
     );
     finish_without_rows(&mut writer);
@@ -1655,7 +1655,7 @@ fn test_reader_dropped_while_a_writer_commits_leaves_no_successor() {
         .prepare("INSERT INTO rows VALUES (15, 'fifteen')")
         .unwrap();
     env.conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+        turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     expect_injected_yield(&mut writer, "INSERT's commit");
     env.conn.set_yield_injector(None);
@@ -1664,7 +1664,7 @@ fn test_reader_dropped_while_a_writer_commits_leaves_no_successor() {
     assert_eq!(env.conn.get_mv_tx(), None);
     assert_eq!(
         env.conn.get_tx_state(),
-        crate::connection::TransactionState::None
+        turso_core::connection::TransactionState::None
     );
     assert_eq!(env.observer_ids(), vec![10, 15, 20]);
 }
@@ -1710,14 +1710,14 @@ fn test_writer_dropped_mid_commit_beside_a_reader_leaves_it_its_transaction() {
         .prepare("INSERT INTO rows VALUES (25, 'twentyfive')")
         .unwrap();
     env.conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+        turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     expect_injected_yield(&mut writer, "INSERT's commit");
     env.conn.set_yield_injector(None);
     drop(writer);
     assert_eq!(
         env.conn.get_tx_state(),
-        crate::connection::TransactionState::Read,
+        turso_core::connection::TransactionState::Read,
         "the reader keeps its transaction"
     );
     assert!(env.conn.pager.load().holds_read_lock(), "and its read lock");
@@ -1741,7 +1741,7 @@ fn test_writer_writing_nothing_beside_a_reader_gives_up_the_exclusive_transactio
         .unwrap();
     assert_eq!(
         env.conn.get_mv_tx(),
-        Some((tx_id, crate::TransactionMode::Read)),
+        Some((tx_id, turso_core::TransactionMode::Read)),
         "the reader keeps the transaction it read"
     );
     env.observer
@@ -1761,7 +1761,7 @@ fn test_successor_holds_a_blocking_checkpoint_off_until_its_reader_ends() {
     let env = keys_10_20_30(":memory:successor-holds-checkpoint-off");
     let mv_store = env
         .conn
-        .mv_store_for_db(crate::MAIN_DB_ID)
+        .mv_store_for_db(turso_core::MAIN_DB_ID)
         .expect("an MVCC database");
     let mut reader = prepare_reader_looking_ahead(&env.conn);
     assert_eq!(next_ahead(&mut reader), Some((10, None)));
@@ -1814,7 +1814,7 @@ fn main_keys_and_attached_rows(
     );
     let aux_path = dir.path().join(format!("{name}-aux.db"));
     let aux_path = aux_path.to_str().unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     drive_attach(&conn, aux_path, "aux");
     conn.execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
         .unwrap();
@@ -1822,12 +1822,12 @@ fn main_keys_and_attached_rows(
         .unwrap();
     conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
-    let observer = db.connect(ConnectOpts::new()).unwrap();
+    let observer = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     drive_attach(&observer, aux_path, "aux");
     (dir, db, conn, observer)
 }
 
-fn prepare_reader_looking_ahead_in_aux(conn: &Arc<Connection>) -> crate::Statement {
+fn prepare_reader_looking_ahead_in_aux(conn: &Arc<Connection>) -> turso_core::Statement {
     conn.prepare("SELECT k, (SELECT v FROM aux.rows WHERE id = k + 5) FROM keys ORDER BY k")
         .unwrap()
 }
@@ -1870,7 +1870,7 @@ fn test_a_transaction_kept_for_a_reader_gone_during_the_commit_ends_with_it() {
         .prepare("INSERT INTO aux.rows VALUES (25, 'twentyfive')")
         .unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+        turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     expect_injected_yield(&mut writer, "INSERT's attached commit");
     conn.set_yield_injector(None);
@@ -1884,7 +1884,7 @@ fn test_a_transaction_kept_for_a_reader_gone_during_the_commit_ends_with_it() {
     assert_eq!(conn.next_attached_mv_tx(), None);
     assert_eq!(
         conn.get_tx_state(),
-        crate::connection::TransactionState::None
+        turso_core::connection::TransactionState::None
     );
     assert_eq!(
         ids_from_query(&observer, "SELECT id FROM aux.rows"),
@@ -1906,7 +1906,7 @@ fn test_commit_dropped_mid_commit_beside_a_reader_leaves_it_both_views() {
         .unwrap();
     let mut commit = conn.prepare("COMMIT").unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+        turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     expect_injected_yield(&mut commit, "COMMIT");
     conn.set_yield_injector(None);
@@ -1941,7 +1941,7 @@ fn main_keys_and_memory_attachment(
         main_path.to_str().unwrap(),
         DatabaseOpts::new().with_attach(true),
     );
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     drive_attach(&conn, ":memory:", "mem");
     conn.execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
         .unwrap();
@@ -1952,7 +1952,7 @@ fn main_keys_and_memory_attachment(
     (dir, db, conn)
 }
 
-fn prepare_reader_looking_ahead_in_mem(conn: &Arc<Connection>) -> crate::Statement {
+fn prepare_reader_looking_ahead_in_mem(conn: &Arc<Connection>) -> turso_core::Statement {
     conn.prepare("SELECT k, (SELECT v FROM mem.rows WHERE id = k + 5) FROM keys ORDER BY k")
         .unwrap()
 }
@@ -2015,18 +2015,18 @@ fn main_keys_and_temp_rows(name: &str) -> (tempfile::TempDir, Arc<Database>, Arc
     let dir = tempfile::TempDir::new().unwrap();
     let main_path = dir.path().join(format!("{name}.db"));
     let db = open_mvcc_database_with_opts(main_path.to_str().unwrap(), DatabaseOpts::new());
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     conn.execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute("INSERT INTO keys VALUES (10), (20), (30)")
         .unwrap();
     conn.execute("CREATE TEMP TABLE rows(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
-    assert!(conn.mv_store_for_db(crate::TEMP_DB_ID).is_none());
+    assert!(conn.mv_store_for_db(turso_core::TEMP_DB_ID).is_none());
     (dir, db, conn)
 }
 
-fn prepare_reader_looking_ahead_in_temp(conn: &Arc<Connection>) -> crate::Statement {
+fn prepare_reader_looking_ahead_in_temp(conn: &Arc<Connection>) -> turso_core::Statement {
     conn.prepare("SELECT k, (SELECT v FROM temp.rows WHERE id = k + 5) FROM keys ORDER BY k")
         .unwrap()
 }
@@ -2035,7 +2035,7 @@ fn temp_holds_read_tx(conn: &Arc<Connection>) -> bool {
     conn.with_all_attached_pagers_with_index(|pagers| {
         pagers
             .iter()
-            .any(|(db_id, pager)| *db_id == crate::TEMP_DB_ID && pager.holds_read_lock())
+            .any(|(db_id, pager)| *db_id == turso_core::TEMP_DB_ID && pager.holds_read_lock())
     })
 }
 
@@ -2157,20 +2157,20 @@ fn test_suspended_read_does_not_finish_sibling_read_transaction() {
 
 /// Step a statement that reads no table to its first row. It runs no Transaction instruction, so
 /// it takes no part in the connection's transaction.
-fn prepare_reading_no_table(conn: &Arc<Connection>) -> crate::Statement {
+fn prepare_reading_no_table(conn: &Arc<Connection>) -> turso_core::Statement {
     let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
     match stmt.step().unwrap() {
-        crate::StepResult::Row => stmt,
+        turso_core::StepResult::Row => stmt,
         other => panic!("expected the first row, got {other:?}"),
     }
 }
 
-fn finish_rows(stmt: &mut crate::Statement) {
+fn finish_rows(stmt: &mut turso_core::Statement) {
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Done => return,
-            crate::StepResult::Row => {}
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Done => return,
+            turso_core::StepResult::Row => {}
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
             other => panic!("expected the statement to finish, got {other:?}"),
         }
     }
@@ -2331,7 +2331,7 @@ fn test_reader_dropped_while_commit_waits_leaves_the_transaction_to_it() {
         .execute("INSERT INTO rows VALUES (1, 'one')")
         .unwrap();
     env.conn.set_yield_injector(Some(FixedYieldInjector::new([
-        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+        turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     let mut commit = env.conn.prepare("COMMIT").unwrap();
     expect_injected_yield(&mut commit, "COMMIT");
@@ -2342,7 +2342,7 @@ fn test_reader_dropped_while_commit_waits_leaves_the_transaction_to_it() {
     assert_eq!(env.conn.get_mv_tx(), None);
     assert_eq!(
         env.conn.get_tx_state(),
-        crate::connection::TransactionState::None
+        turso_core::connection::TransactionState::None
     );
 }
 
@@ -3431,4 +3431,156 @@ fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
         1,
         "dropping the last statement releases the replaced registration"
     );
+}
+
+/// Counts the steps and sleeps asked of a memory IO.
+#[derive(Default)]
+struct WaitCountingIO {
+    inner: MemoryIO,
+    steps: turso_core::sync::atomic::AtomicUsize,
+    sleeps: turso_core::sync::atomic::AtomicUsize,
+}
+
+impl turso_core::Clock for WaitCountingIO {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for WaitCountingIO {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+    fn supports_shared_wal_coordination(&self) -> bool {
+        self.inner.supports_shared_wal_coordination()
+    }
+    fn step(&self) -> turso_core::Result<()> {
+        self.steps
+            .fetch_add(1, turso_core::sync::atomic::Ordering::Relaxed);
+        self.inner.step()
+    }
+    fn sleep(&self, duration: std::time::Duration) {
+        self.sleeps
+            .fetch_add(1, turso_core::sync::atomic::Ordering::Relaxed);
+        self.inner.sleep(duration)
+    }
+}
+
+/// A blocking runner refused the write lock until its busy timeout ends sleeps out each delay
+/// the busy handler asks for. It used to step the IO in a loop instead, which on a backend
+/// whose step returns at once spun a core until the timeout passed.
+#[test]
+fn blocking_runners_sleep_out_a_busy_wait() {
+    use turso_core::sync::atomic::Ordering;
+    let io = Arc::new(WaitCountingIO::default());
+    let db =
+        Database::open_file(io.clone(), "busy-wait-sleeps.db", Arc::new(SqliteDialect)).unwrap();
+    let holder = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    holder.execute("CREATE TABLE t (x)").unwrap();
+    holder.execute("BEGIN IMMEDIATE").unwrap();
+    let waiter = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    waiter.set_busy_timeout(std::time::Duration::from_millis(60));
+    type Runner = fn(&mut turso_core::Statement) -> turso_core::Result<()>;
+    let runners: [(&str, Runner); 4] = [
+        ("run_ignore_rows", |stmt| stmt.run_ignore_rows()),
+        ("run_collect_rows", |stmt| stmt.run_collect_rows().map(drop)),
+        ("run_with_row_callback", |stmt| {
+            stmt.run_with_row_callback(|_| Ok(()))
+        }),
+        ("run_one_step_blocking", |stmt| {
+            stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map(drop)
+        }),
+    ];
+    for (name, run) in runners {
+        io.steps.store(0, Ordering::Relaxed);
+        io.sleeps.store(0, Ordering::Relaxed);
+        let mut stmt = waiter.prepare("INSERT INTO t VALUES (1)").unwrap();
+        let error = run(&mut stmt).unwrap_err();
+        assert!(matches!(error, LimboError::Busy), "{name}: {error:?}");
+        let steps = io.steps.load(Ordering::Relaxed);
+        let sleeps = io.sleeps.load(Ordering::Relaxed);
+        assert!(
+            sleeps > 0 && steps < 32,
+            "{name} stepped the IO {steps} times and slept {sleeps} times"
+        );
+    }
+    holder.execute("ROLLBACK").unwrap();
+}
+
+/// Opening a blob for writing while another connection holds the write lock sleeps out each
+/// delay of its busy handler, as the blocking runners do.
+#[test]
+fn blob_open_sleeps_out_a_busy_wait() {
+    use turso_core::sync::atomic::Ordering;
+    let io = Arc::new(WaitCountingIO::default());
+    let db =
+        Database::open_file(io.clone(), "blob-busy-sleeps.db", Arc::new(SqliteDialect)).unwrap();
+    let holder = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    holder.execute("CREATE TABLE t (x)").unwrap();
+    holder.execute("INSERT INTO t VALUES (x'00')").unwrap();
+    holder.execute("BEGIN IMMEDIATE").unwrap();
+    let waiter = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    waiter.set_busy_timeout(std::time::Duration::from_millis(60));
+    io.steps.store(0, Ordering::Relaxed);
+    let Err(error) = waiter.blob_open("t", "x", 1, true) else {
+        panic!("the blob opened for writing beside a held write lock");
+    };
+    assert!(matches!(error, LimboError::Busy), "{error:?}");
+    let steps = io.steps.load(Ordering::Relaxed);
+    let sleeps = io.sleeps.load(Ordering::Relaxed);
+    assert!(
+        sleeps > 0 && steps < 32,
+        "blob_open stepped the IO {steps} times and slept {sleeps} times"
+    );
+    holder.execute("ROLLBACK").unwrap();
+}
+
+/// A statement that ended `Done` owing nothing skips `abort`'s cleanup, but not the end of
+/// a transaction another database was left holding once no statement runs.
+#[test]
+fn a_done_statement_s_reset_ends_a_transaction_left_on_another_database() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TEMP TABLE t (x)").unwrap();
+    let mut stmt = conn.prepare("SELECT 1").unwrap();
+    assert!(matches!(
+        stmt.step().unwrap(),
+        turso_core::StepResult::Row
+    ));
+    assert!(matches!(
+        stmt.step().unwrap(),
+        turso_core::StepResult::Done
+    ));
+    let temp = conn
+        .get_pager_from_database_index(&turso_core::TEMP_DB_ID)
+        .unwrap();
+    temp.begin_read_tx().unwrap();
+    assert!(temp.holds_read_lock());
+    stmt.reset().unwrap();
+    assert!(!temp.holds_read_lock());
 }

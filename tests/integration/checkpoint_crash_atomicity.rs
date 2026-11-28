@@ -436,7 +436,7 @@ fn an_mvcc_checkpoint_refused_its_backfill_syncs_the_wal_before_truncating_the_l
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")?;
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -451,7 +451,7 @@ fn an_mvcc_checkpoint_refused_its_backfill_syncs_the_wal_before_truncating_the_l
     );
     conn.execute("PRAGMA synchronous=NORMAL")?;
 
-    let reader = db.connect(ConnectOpts::new())?;
+    let reader = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     reader.execute("BEGIN")?;
     query_rows(&reader, "SELECT count(*) FROM t")?;
     let db_file_before = io.durable_files().get(db_path_sim).cloned();
@@ -483,7 +483,7 @@ fn an_mvcc_checkpoint_refused_its_backfill_syncs_the_wal_before_truncating_the_l
         None,
         Arc::new(SqliteDialect),
     )?;
-    let recovered = recovered_db.connect(ConnectOpts::new())?;
+    let recovered = recovered_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     assert_eq!(
         query_rows(&recovered, "SELECT v FROM t")?,
         vec!["durable".to_string()],

@@ -7,17 +7,19 @@ upstream: the fork keeps up with upstream and keeps its own changes.
 - `workreef`, the fork's default branch, is upstream plus every change below
   (`git log --no-merges main..workreef`). The forge and WorkReef cognition both build from it;
   the forge's former branch, `commit-replicator`, is folded into it.
-- `fork/sync-upstream.sh` merges `main` into `workreef` four times a day, at 05:17, 11:17,
-  17:17 and 23:17 Asia/Kuala_Lumpur (`fork/turso-sync.timer`, a systemd user timer). It
-  fetches upstream, fast-forwards `main`, merges it, and commits and pushes the merge only once
-  the merged tree compiles with its tests, passes the core and FTS suites and clippy, passes
-  `ivf_crash`'s kill rounds under WAL, MVCC and MVCC with four writers, and passes `mvcc_rolling`'s
-  over a logical log that rolls. A test that fails beside the others and passes run again alone
-  is named in the merge's message, its verdict and on the agent bus; one that fails alone fails
-  the run. A conflict or a failed check leaves `workreef` as it was and alerts. Each merge's commit message names the upstream
-  commits it took and the checks it passed; each run's log and verdict are in
-  `/home/me/cognition-data/turso-sync`, and a `hold` file there skips runs while a timed
-  measurement needs the machine.
+- Upstream is merged into `workreef` by hand, by the fork's agent sessions, not by a job: nothing
+  merges automatically. `workreef` holds upstream through `d4bbe58ea` (2026-11-27), merged
+  2026-11-28; `main` was moved to the same commit that day. A merge is committed and pushed only
+  once the merged tree compiles with its tests, passes the core and FTS suites, the integration
+  suite, the bindings' (with the features `fts`, `conn_raw_api` and `statement_metrics` too), the
+  sync engine's and the sdk-kit's, clippy with every feature, `ivf_crash`'s kill rounds under WAL,
+  MVCC and MVCC with four writers, and `mvcc_rolling`'s over a logical log that rolls, and has been
+  audited. The merge's commit message names what it took and the checks it passed.
+  `fork/sync-upstream.sh` and `fork/turso-sync.timer` are files in this tree for running those
+  checks as a job. No unit is installed anywhere.
+- Upstream moved SQL parsing out of `core` on 2026-11-04 (`turso_sqlite`, `turso_ast`), so `core`'s
+  own unit tests can no longer run SQL. The fork's tests that do live in `tests/integration`, as
+  upstream's moved there.
 - `fork/repro` holds the harnesses the entries below cite (`ivf_crash`, `mvcc_reopen`,
   `read_changes`, `wal_growth` and the rest), a crate of its own on the compiler WorkReef
   cognition builds with.
@@ -28,39 +30,6 @@ fixes the same thing its own way, the entry moves to "Taken upstream".
 
 ## Fixes
 
-### Lost wakeup in `Completion::set_waker`
-2026-10-28 `c07ac5ffc`, 2026-10-29 `c2e1ee261`, 2026-10-30 `0829e6128` and `9046b8b59`; upstream PR
-#10948 holds the same change as `a571f0ed3`, `480f7230d` and `74e3aa403`.
-`core/io/completions.rs`. `set_waker` tested `finished()` and then stored the waker under the
-context lock, so a completion finished on another thread between the two woke no one, and the task
-that registered was never polled again: a hang that happens now and then. The waker is now stored
-first and the completion tested after.
-Test: `io::completions::tests::shuttle_set_waker_racing_complete_always_wakes`, run by
-`make test-shuttle`. It runs every interleaving of `set_waker` against `complete` on another
-thread; on upstream `main` it finds the one that loses the wakeup. Shuttle cannot see the std
-`OnceLock` holding a completion's result, so under `cfg(shuttle)` `Context::set_waker` yields
-before its store.
-Storing first, `set_waker` now reaches `Context::wake` for a completion already finished, where it
-used to wake with no lock held, and `wake` woke the waker under the context lock: a waker that
-registers again on the same completion from its wake, as polling the completion inline does,
-deadlocked. The waker is now taken under the lock and woken once the lock is free.
-Test: `io::completions::tests::a_waker_registering_again_from_its_wake_does_not_deadlock` (a
-finished completion's waker registers again from its wake three times; under the lock, it
-deadlocked).
-A completion held one waker, and a second task's waker replaced it. The replaced one was woken so
-that its task could register again, which replaced the other: two tasks waiting on one completion,
-as two statements of one connection do on the pager's in-flight spill write, woke each other until
-it finished. Polled from their wakes they overflowed the stack; on upstream `main`, which wakes the
-replaced waker under the context lock, they deadlock. The PR's automated review found it.
-`0829e6128` woke the replaced waker once the lock was free, and `9046b8b59` replaced that: the
-context keeps a waker for each task waiting on the completion, one per task by `Waker::will_wake`,
-the first held inline so that a single waiter costs what it did. Registering wakes no task, and
-every wake of the completion takes all its wakers and wakes them once the lock is free. A task that
-stops waiting leaves its waker until that wake.
-Tests: `io::completions::tests::two_tasks_waiting_on_one_completion_are_each_woken_once_when_it_finishes`
-(on `0829e6128` the second registration wakes the first task; on upstream `main` it deadlocks) and
-`a_completion_lets_its_wakers_go_when_it_wakes`.
-
 ### The checkpoint trigger counts only uncheckpointed log bytes
 2026-10-28 `3776ed6be`.
 `core/mvcc/persistent_storage/mod.rs`, `core/mvcc/database/checkpoint_state_machine.rs`. A
@@ -70,7 +39,7 @@ threshold, so once tripped it stayed tripped and every later commit started anot
 The storage now keeps a checkpoint floor, the offset the last checkpoint covered (sampled with its
 snapshot, raised once the durable boundary has advanced, reset by any truncate), and counts only
 the bytes past it. Truncation is unchanged: it still tests the highest appended commit.
-Test: `mvcc::database::tests::test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes`.
+Test: `mvcc::database::test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes`.
 Upstream `main`: "316 checkpointed bytes of a 373-byte log still counted against the threshold".
 On 0.8.3, 2 writers at a 256 KB threshold: inline writer commit p99 165-194 ms → 9.4-12.8 ms. On
 upstream `main` the same A/B shows no gain: 15 idle runs each of `fork/repro`'s `mvcc_inline` (2
@@ -87,7 +56,7 @@ checkpointed table whose rows were all updated, point lookups went quadratic: on
 with the fix (`fork/repro`'s `shadow_seek`). An exact seek has at most one B-tree match, so it now
 stops when that row is shadowed or the row reached is not its target; the MVCC side still supplies
 the newer version.
-Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
+Test: `mvcc::database::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
 exact seek's B-tree steps through the cursor's yield hook: the seek for row 1 takes 155 on upstream
 `main` and 2 with the fix.
 The PR's automated review found a visible target checked twice, once by the rule and again by the
@@ -118,7 +87,7 @@ commits) left a database that would not open within 3, 6 and 7 kills on three se
 passive checkpoint (`7e8aa5c58`) had made recovery accept this state; `b80c92fb9` then refused it
 again outside passive mode. Nothing in it is lost or left to replay, so recovery now backfills the
 WAL and writes a fresh header whatever the mode. With the fix the three seeds pass 200 kills each.
-Test: `mvcc::database::tests::test_reopen_after_crash_between_logical_log_and_wal_truncation`, which
+Test: `mvcc::database::test_reopen_after_crash_between_logical_log_and_wal_truncation`, which
 stops a checkpoint once the log is empty and the WAL file still holds its frames, and reopens.
 Found by the ivf_rq kill harness below.
 
@@ -140,7 +109,7 @@ part are counted (`Connection::n_active_txn_statements`). A COMMIT or ROLLBACK t
 ends the transaction, so a COMMIT waiting mid-commit keeps another statement from ending the
 transaction under it.
 
-Tests, in `core/vdbe/statement_lifecycle_tests.rs`, all under MVCC:
+Tests, in `tests/integration/statement_lifecycle.rs`, all under MVCC:
 - `test_writer_beside_a_statement_reading_no_table_commits_at_its_halt`
 - `test_reads_beside_a_statement_reading_no_table_see_commits_made_between_them`
 - `test_reader_ends_the_transaction_beside_a_statement_reading_no_table`
@@ -207,7 +176,7 @@ a COMMIT or ROLLBACK is refused.
   fresh one MVCC), and TEMP, the one database that uses WAL, keeps its read transaction for the
   readers.
 
-Tests, under MVCC, in `core/vdbe/statement_lifecycle_tests.rs` but the last two:
+Tests, under MVCC, in `tests/integration/statement_lifecycle.rs` but the last two:
 - `test_completed_writer_commits_beside_a_sibling_mvcc_reader` (upstream's deferral test, turned);
 - `test_mvcc_completed_writer_changes_survive_an_abandoned_reader` and
   `test_mvcc_completed_writer_changes_survive_a_failing_joined_writer` (the two pinned losses);
@@ -230,7 +199,7 @@ Tests, under MVCC, in `core/vdbe/statement_lifecycle_tests.rs` but the last two:
 - `test_reader_keeps_its_temp_read_transaction_beside_a_committed_writer` and
   `..._beside_a_failed_writer`: TEMP's read transaction stays with the reader and ends with it;
 - `fts_writes_commit_with_a_writer_beside_a_reader` (FTS);
-- in `core/mvcc/database/tests.rs`,
+- in `tests/integration/mvcc/database.rs`,
   `test_continued_commit_landing_after_the_other_left_leaves_no_successor` and
   `test_continued_commit_dropped_after_the_other_left_leaves_no_successor`: a commit that lands, or
   is dropped, after the statement it would have gone on for has left.
@@ -274,7 +243,7 @@ The concurrent simulator's plans read the ordinal and the count as before.
 Found by the fail-first of the entry before: a resumed commit that drew a second successor past the
 exclusive transaction changed no test, because no test's commit ever resumed there.
 
-Tests, in `core/mvcc/database/tests.rs`:
+Tests, in `tests/integration/mvcc/database.rs`:
 - `test_insert_in_middle_commit_of_create_index_returns_err` (upstream's) yields where it says, mid
   commit of the CREATE INDEX, where an INSERT beginning is refused Busy;
 - `test_insert_begun_during_create_index_build_is_refused_at_commit` keeps the case the test reached
@@ -305,7 +274,7 @@ to 4.66 GB, both about linearly. Three causes, each fixed:
   The next checkpoint then began on a WAL not fully backfilled and appended to it. A passive
   checkpoint now first backfills what an earlier one left, then takes its snapshot, so that its
   write restarts the WAL. Test:
-  `mvcc::database::tests::test_a_passive_checkpoint_backfills_what_the_last_one_left_and_restarts_the_wal`
+  `mvcc::database::test_a_passive_checkpoint_backfills_what_the_last_one_left_and_restarts_the_wal`
   (before: from frame 7 to frame 14, with no restart).
 - **Commits outran the checkpoint.** A commit with the log `BEHIND` thresholds behind checkpointed
   inline only when no checkpoint ran, and under writes that never pause one nearly always does. It
@@ -341,7 +310,7 @@ checkpoints that reported success, the planted text had not reached the database
 erased words were still in the logical log. Now only a commit's own checkpoint leaves the work to
 the running one; any other reports Busy. A pool turn that meets a running checkpoint gives way to it
 on that Busy, in place of a check before its checkpoint that left a window between the two.
-Tests: `mvcc::database::tests::test_passive_truncate_beside_a_running_checkpoint_reports_busy`. A
+Tests: `mvcc::database::test_passive_truncate_beside_a_running_checkpoint_reports_busy`. A
 passive checkpoint stopped after its first step holds the database. On another connection, PRAGMA
 wal_checkpoint(TRUNCATE) and `Connection::checkpoint` must each report Busy and leave the log as it
 was, and once the running one ends a TRUNCATE empties the log. On the code before, the pragma
@@ -382,19 +351,19 @@ storage that does not count them reads as one segment. A commit's own checkpoint
 passive, and unchanged.
 
 Tests:
-- `storage::erasure_tests::a_truncating_checkpoint_beside_a_writer_leaves_no_deleted_value_in_any_file`:
+- `storage::erasure::a_truncating_checkpoint_beside_a_writer_leaves_no_deleted_value_in_any_file`:
   rows are inserted, half of them checkpointed into the file, and deleted, and a TRUNCATE runs beside
   a writer that commits once each of its passes has taken its snapshot. No deleted value is left in
   the database file, the WAL or any of the log's files, and every live value and every row
   committed beside it is found. On the code before, 200 deleted values were left in the log.
-- `mvcc::database::rolling_log_tests::test_a_truncate_that_cannot_free_what_came_before_it_reports_busy`:
+- `mvcc::rolling_log::test_a_truncate_that_cannot_free_what_came_before_it_reports_busy`:
   a commit still being made, below every other, keeps any snapshot from covering them. The TRUNCATE
   rolls the log, can free no more and reports Busy, its frames kept; once the commit is made, the
   next TRUNCATE empties the log. On the code before, it reported success.
-- `mvcc::database::rolling_log_tests::test_a_truncates_later_passes_run_beside_a_reader_of_the_wal`:
+- `mvcc::rolling_log::test_a_truncates_later_passes_run_beside_a_reader_of_the_wal`:
   a reader begins on another connection once a later pass has written the WAL, and the TRUNCATE
   completes beside it. With every pass a TRUNCATE, it reported Busy.
-- `mvcc::database::rolling_log_tests::test_a_busy_truncate_stepped_again_goes_on_toward_its_first_goal`:
+- `mvcc::rolling_log::test_a_busy_truncate_stepped_again_goes_on_toward_its_first_goal`:
   a TRUNCATE statement that reported Busy is stepped again after more commits and finishes in one
   pass. Started afresh, it took more.
 - Upstream's `test_passive_truncate_keeps_log_frames_committed_after_snapshot` now checks that the
@@ -448,7 +417,7 @@ TRUNCATEs of 20 completed: median 58 ms, slowest 102 ms. Each parked two to four
 7 ms in all, and none reported Busy or slept.
 
 Tests, each stepping `PRAGMA wal_checkpoint(TRUNCATE)` with a waker that counts its wakes:
-- `mvcc::database::rolling_log_tests::test_a_truncate_parks_on_a_reader_of_the_wal_until_that_reader_ends`:
+- `mvcc::rolling_log::test_a_truncate_parks_on_a_reader_of_the_wal_until_that_reader_ends`:
   a reader of the frames the TRUNCATE copies keeps it parked, and stepped again it stays parked.
   Nothing wakes it while that reader reads, not even a reader that begins meanwhile on the
   database file. The first reader's end wakes it, and it ends while the later reader still reads.
@@ -491,6 +460,32 @@ transaction left to end, so the mark is cleared and nothing runs, as rusqlite's
 Test: `a_transaction_the_engine_rolled_back_and_was_dropped_leaves_its_connection_working`
 (`bindings/rust/tests/integration_tests.rs`), through a statement and through a batch: each
 failed so without the fix.
+
+### Upstream's version 3 log headers switched off the rolling log
+2026-11-28. `core/mvcc/persistent_storage/logical_log.rs` (`LogicalLog::new_header`),
+`sync/engine/src/database_sync_operations.rs`. A log rolls only while its frames carry no portable
+changes, which its header says by being version 2 (`LogicalLog::rolls`), unless a log replicator
+takes the frames. Upstream began starting every new log as version 3 (`0db45d633`, 2026-11-17), so
+that a copy built from appended bytes never needs the header rewritten, and no log rolled any more.
+A log that rolls now starts as version 2 again, unless a replicator takes its frames or its first
+frame carries portable changes, and upgrades as before. The sync engine reads a version 2 log as the
+plain log it is: a pull of it fails with the same "no portable changes" error as a version 3 log of
+plain frames.
+Also in the merge: a log read with the wrong key is refused, as upstream's encrypted frames refuse
+it, where our reader used to end the log at the first frame it could not authenticate.
+Tests: `persistent_storage::rolling_tests` (ten, among them `an_encrypted_log_rolls_and_recovery_decrypts_every_segment`,
+which also checks the wrong key), `mvcc::rolling_log` in `tests/integration`, and
+`plain_frames::pull_of_plain_frames_fails` in the sync engine's `mvcc_logical_pull` tests.
+
+### Two checkpoint behaviours WorkReef Cognition relies on, held by tests of their own
+2026-11-28. `tests/integration/wal/test_wal.rs`. In WAL mode, a commit's automatic checkpoint waits
+while a reader holds a snapshot instead of failing the commit, and an explicit
+`PRAGMA wal_checkpoint(TRUNCATE)` beside a reader is refused (busy, "database is locked") and
+succeeds once the reader ends. MVCC has them already (`truncate_checkpoint_is_busy_while_a_reader_transaction_is_open`
+and the passive checkpoint tests). Tests:
+`wal::test_wal::an_automatic_checkpoint_waits_for_a_reader_and_never_fails_the_commit` and
+`wal::test_wal::a_truncate_checkpoint_is_refused_while_a_reader_holds_a_snapshot`. Not yet shown
+failing on a mutant.
 
 ## Additions
 
@@ -537,7 +532,7 @@ threshold leave a small log that no request follows, by design, and the test wai
 log. The test now holds the pool's checkpoint after its snapshot and commits behind it, which makes
 the checkpoint keep the log, and waits for the pool to empty it once the writes pause.
 
-Tests, in `core/mvcc/database/background_checkpoint/tests.rs`, each on a pool of its own:
+Tests, in `tests/integration/mvcc/background_checkpoint.rs`, each on a pool of its own:
 - `test_background_checkpoint_runs_off_the_commit_and_truncates_when_writes_pause`,
   `test_a_kept_log_waits_for_its_writes_to_pause`, `test_background_checkpoint_is_off_by_default`;
 - `test_one_pool_checkpoints_many_databases_on_its_threads`: 24 databases on two threads;
@@ -635,7 +630,7 @@ Tests:
   `a_sync_after_a_roll_makes_the_sealed_segment_durable`, on files that lose at a power loss what
   no sync covered; `an_encrypted_log_rolls_and_recovery_decrypts_every_segment`, whose segments
   each have a salt of their own;
-- `core/mvcc/database/rolling_log_tests.rs`, through passive checkpoints that each see a commit land
+- `tests/integration/mvcc/rolling_log.rs`, through passive checkpoints that each see a commit land
   after their snapshot: `test_a_log_every_checkpoint_has_to_keep_rolls_and_stays_bounded` (60
   checkpoints, then a restart), `test_recovery_replays_a_log_rolled_over_segments`,
   `test_a_restart_after_the_first_file_was_freed_keeps_the_newer_segments`,
@@ -1224,7 +1219,7 @@ steps it, then waits for what holds it, parked until the release that ends the w
 that timeout. A blocking caller gets Busy instead, and with the busy timeout the statement retries
 itself and keeps its goal, where a new statement starts afresh.
 
-`core/storage/erasure_tests.rs` reads the checkpointed files back. Its checker walks every b-tree,
+`tests/integration/storage/erasure.rs` reads the checkpointed files back. Its checker walks every b-tree,
 overflow chain and freelist page of the database file and reports every nonzero byte that none of
 them holds. The tests:
 - `deleted_rows_leave_no_byte_in_the_files_after_a_truncating_checkpoint`: rows are inserted,
@@ -1499,7 +1494,7 @@ to 9 in each later round.
 
 ### FTS filtered scoring, filter columns and embedder tokenizers (`fts_filtered_score`)
 2026-11-11, branch `fts-cognition` on `b235afd8f`. `core/index_method/fts/mod.rs`,
-`core/index_method/fts/filter.rs`, `core/index_method/fts/filtered_tests.rs`; the function in
+`core/index_method/fts/filter.rs`, `tests/integration/index_method/fts_filtered.rs`; the function in
 `core/function.rs`, `core/dialect/sqlite/mod.rs`, `core/util.rs`,
 `core/translate/expr/translator.rs` and `core/vdbe/execute.rs`.
 WorkReef cognition ranks words over only the memories a recall is admitted to, with every BM25
@@ -1513,7 +1508,7 @@ ORDER BY score DESC LIMIT ?3` evaluates the JSON filter (`all`, `any`, `in`, `ra
 `within`) per segment into a document set, counts the document count, the field-norm token
 totals and every query term's document frequency over it, and takes the top documents with
 Tantivy's pruning scorers under those statistics. Searched columns come before filter columns;
-a filtered function with no FTS index is an error. Proof: `filtered_tests.rs` — the top documents
+a filtered function with no FTS index is an error. Proof: `tests/integration/index_method/fts_filtered.rs` — the top documents
 equal an exact BM25 oracle over the admitted set on random corpora in WAL and MVCC (deletes,
 updates that move a document's filter values, OPTIMIZE merges), statistics follow the filter,
 concurrent writers, a rollback and a merge, refused filters and columns, a registered tokenizer,
@@ -1867,7 +1862,7 @@ the replicator. A checkpoint on another thread could take its snapshot in betwee
 What: the leader hands the frame to the replicator before it marks the record written. The writer
 still waits on the replicator's completion after the mark, as before.
 Tests: `an_abandoned_waiter_s_frame_reaches_the_replicator_while_it_is_still_preparing` in
-`core/mvcc/database/group_commit_tests.rs`, built with `conn_raw_api`
+`tests/integration/mvcc/group_commit.rs`, built with `conn_raw_api`
 (`cargo test -p turso_core --features conn_raw_api`). It holds two commits in one group and drops
 the waiter's after the leader issued its write. The replicator then notes whether each frame's
 transaction is `Preparing` as the frame arrives. On the code before, the waiter's frame arrived
@@ -2344,11 +2339,22 @@ Instructions per row (a WAL database in memory, 200,000 rows in transactions of 
 user instructions counted by `perf` on one core, three runs each agreeing to the instruction): key-order
 insert 11,598 to 11,242 (-3.1%), shuffled insert 32,316 to 31,960 (-1.1%), lookup 8,931 to 8,739
 (-2.1%), update 22,847 to 22,491 (-1.6%), delete 21,803 to 21,447 (-1.6%).
-Test: `vdbe::tests::a_done_statement_s_reset_ends_a_transaction_left_on_another_database` (fails when the
+Test: `statement_lifecycle::a_done_statement_s_reset_ends_a_transaction_left_on_another_database` (fails when the
 early return ignores the other databases). The early return's conditions on a state a `Done` statement
 never holds are guards no test reaches.
 
 ## Taken upstream
+
+### Lost wakeup in `Completion::set_waker`
+Ours 2026-10-28 to 2026-10-30 (`c07ac5ffc`, `c2e1ee261`, `0829e6128`, `9046b8b59`); upstream took the
+first part on 2026-11-15 as `1262f752b` ("register a completion's waker before testing whether it
+finished"). The merge of 2026-11-28 took upstream's `core/io/completions.rs`. Our three further tests,
+which cover what the first part leaves (a waker registering again from its wake, two tasks waiting on
+one completion, wakers let go when it wakes), are kept in that file and pass on upstream's code:
+`io::completions::tests::a_waker_registering_again_from_its_wake_does_not_deadlock`,
+`..::two_tasks_waiting_on_one_completion_are_each_woken_once_when_it_finishes` and
+`..::a_completion_lets_its_wakers_go_when_it_wakes`, beside upstream's
+`shuttle_set_waker_racing_complete_always_wakes`.
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT
 Ours 2026-10-28 `e6fd95447`; upstream took it the same day as `ad8e4895f`, the same patch.
@@ -2357,6 +2363,12 @@ Ours 2026-10-28 `e6fd95447`; upstream took it the same day as `ad8e4895f`, the s
 ### A value an index method provides failed the collation lookup
 Ours 2026-10-28 `917f0acbd`; upstream took it the same day as `c6f1cafdd`, the same patch.
 `index_method::fts::tests::fts_score_from_the_index_has_no_column_collation` came with it.
+
+### A checkpoint's fsync of the logical log after its truncate
+Upstream stopped fsyncing the logical log after a checkpoint truncates it (a lost truncation brings
+back frames at or below `persistent_tx_ts_max`, which recovery skips). The merge of 2026-11-28 takes
+that: the checkpoint's `FsyncLogicalLog` state, our `Storage::sync_beside_appends` that ran it beside
+appends, and its test seam are gone, with the test that parked a checkpoint in that fsync.
 
 ## Considered and not taken
 

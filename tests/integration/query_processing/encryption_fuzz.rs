@@ -1151,7 +1151,7 @@ fn poll(trace: &mut Trace, world: &mut World, actor: usize) -> bool {
             let pending = active.statement.io_completions();
             if pending
                 .as_ref()
-                .is_some_and(|pending| pending.is_explicit_yield())
+                .is_some_and(|pending| pending.is_explicit_yield() || pending.0.is_wait())
             {
                 active.waiting_since = Some(world.epoch);
 

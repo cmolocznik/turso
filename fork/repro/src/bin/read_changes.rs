@@ -10,7 +10,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use turso_core::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, Value};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Value};
+use turso_sqlite::SqliteDialect;
 
 type Rows = BTreeMap<i64, (i64, usize)>;
 
@@ -58,12 +59,12 @@ fn read(conn: &Arc<Connection>) -> Result<Rows, String> {
 
 fn workload(mvcc: bool, seed: u64, actions: usize) -> Result<usize, String> {
     let db = Database::open_file(Arc::new(MemoryIO::new()), &format!("read-changes-{mvcc}-{seed}.db"), Arc::new(SqliteDialect)).unwrap();
-    let setup = db.connect(ConnectOpts::new()).unwrap();
+    let setup = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap();
     if mvcc {
         setup.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     }
     setup.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, body TEXT NOT NULL)").unwrap();
-    let conns: Vec<_> = (0..4).map(|_| db.connect(ConnectOpts::new()).unwrap()).collect();
+    let conns: Vec<_> = (0..4).map(|_| db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)).unwrap()).collect();
     for conn in &conns {
         conn.execute("PRAGMA cache_size = 64").unwrap();
     }

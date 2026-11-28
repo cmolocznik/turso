@@ -13700,8 +13700,7 @@ mod tests {
     /// many freeblocks and on the fast path over one.
     #[test]
     pub fn defragmentation_keeps_no_copy_of_a_cell_it_moved() {
-        let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let pager = pager_of_new_database();
         let usable_space = 4096;
         for (max_frag_bytes, dropped) in [(-1, vec![1, 3, 5, 7]), (60, vec![5])] {
             let page = get_page(2);
@@ -13710,7 +13709,7 @@ mod tests {
             for i in 0..10 {
                 let blob = Value::from_slice(&vec![0xa0 + i as u8; 100 + 10 * i]).unwrap();
                 let record = ImmutableRecord::from_registers(&[Register::Value(blob)], 1).unwrap();
-                cells.push(add_record(i, i, page.clone(), record, &conn));
+                cells.push(add_record(i, i, page.clone(), record, &pager));
             }
             for (removed, at) in dropped.iter().enumerate() {
                 drop_cell(contents, at - removed, usable_space).unwrap();
